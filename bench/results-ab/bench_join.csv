@@ -1,0 +1,907 @@
+corpus,query,label,method,qid,est,act,ms,plan
+designed3,join,3deg,q3c,1441,143,222,9.511,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+designed3,join,3deg,pgsphere,1441,673,222,2.964,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+designed3,join,3deg,skycell,1441,255,222,2.337,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+designed3,join,3deg,q3c,1442,140,273,5.422,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+designed3,join,3deg,pgsphere,1442,673,273,2.872,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+designed3,join,3deg,skycell,1442,234,273,2.291,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+designed3,join,3deg,q3c,1443,304,259,11.75,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+designed3,join,3deg,pgsphere,1443,673,259,3.086,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+designed3,join,3deg,skycell,1443,233,259,2.742,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+designed3,join,3deg,q3c,1444,1126,3594,40.216,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+designed3,join,3deg,pgsphere,1444,673,3594,39.29,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+designed3,join,3deg,skycell,1444,2853,3594,46.32,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+designed3,join,3deg,q3c,1445,409,1111,14.56,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+designed3,join,3deg,pgsphere,1445,673,1111,13.216,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+designed3,join,3deg,skycell,1445,1174,1111,95.82,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+designed3,join,3deg,q3c,1446,152,654,15.091,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+designed3,join,3deg,pgsphere,1446,673,654,12.902,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+designed3,join,3deg,skycell,1446,338,654,6.207,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+designed3,join,3deg,q3c,1447,117,233,6.11,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+designed3,join,3deg,pgsphere,1447,673,233,6.184,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+designed3,join,3deg,skycell,1447,318,233,2.913,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+designed3,join,3deg,q3c,1448,5900,14851,160.124,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+designed3,join,3deg,pgsphere,1448,673,14851,170.503,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+designed3,join,3deg,skycell,1448,13735,14851,132.653,Bitmap Heap Scan+Bitmap Index Scan+Hash Join+Index Only Scan
+designed3,join,3deg,q3c,1449,542,253,3.888,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+designed3,join,3deg,pgsphere,1449,673,253,2.622,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+designed3,join,3deg,skycell,1449,331,253,2.712,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+designed3,join,3deg,q3c,1450,1454,4338,56.274,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+designed3,join,3deg,pgsphere,1450,673,4338,57.513,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+designed3,join,3deg,skycell,1450,3917,4338,45.978,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+designed3,join,3deg,q3c,1451,171,212,3.642,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+designed3,join,3deg,pgsphere,1451,673,212,2.331,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+designed3,join,3deg,skycell,1451,290,212,2.166,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+designed3,join,3deg,q3c,1452,741,2715,34.225,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+designed3,join,3deg,pgsphere,1452,673,2715,30.77,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+designed3,join,3deg,skycell,1452,2650,2715,26.254,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+designed3,join,3deg,q3c,1453,162,205,4.061,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+designed3,join,3deg,pgsphere,1453,673,205,2.402,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+designed3,join,3deg,skycell,1453,252,205,2.167,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+designed3,join,3deg,q3c,1454,627,2234,25.145,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+designed3,join,3deg,pgsphere,1454,673,2234,25.021,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+designed3,join,3deg,skycell,1454,2181,2234,22.63,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+designed3,join,3deg,q3c,1455,128,230,3.95,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+designed3,join,3deg,pgsphere,1455,673,230,2.232,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+designed3,join,3deg,skycell,1455,291,230,2.157,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+designed3,join,3deg,q3c,1456,654,1915,21.836,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+designed3,join,3deg,pgsphere,1456,673,1915,25.46,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+designed3,join,3deg,skycell,1456,1840,1915,19.024,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+designed3,join3,3deg,q3c,1441,50,68,2.448,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+designed3,join3,3deg,pgsphere,1441,236,68,1.617,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+designed3,join3,3deg,skycell,1441,89,68,0.946,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+designed3,join3,3deg,q3c,1442,49,90,2.348,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+designed3,join3,3deg,pgsphere,1442,236,90,1.245,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+designed3,join3,3deg,skycell,1442,81,90,1.032,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+designed3,join3,3deg,q3c,1443,107,98,2.43,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+designed3,join3,3deg,pgsphere,1443,236,98,1.195,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+designed3,join3,3deg,skycell,1443,81,98,1.093,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+designed3,join3,3deg,q3c,1444,393,1184,16.943,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+designed3,join3,3deg,pgsphere,1444,236,1184,18.987,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+designed3,join3,3deg,skycell,1444,993,1184,15.964,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+designed3,join3,3deg,q3c,1445,143,352,6.19,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+designed3,join3,3deg,pgsphere,1445,236,352,5.327,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+designed3,join3,3deg,skycell,1445,409,352,4.081,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+designed3,join3,3deg,q3c,1446,53,234,4.181,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+designed3,join3,3deg,pgsphere,1446,236,234,2.718,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+designed3,join3,3deg,skycell,1446,118,234,2.412,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+designed3,join3,3deg,q3c,1447,41,87,2.731,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+designed3,join3,3deg,pgsphere,1447,236,87,1.107,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+designed3,join3,3deg,skycell,1447,111,87,1.057,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+designed3,join3,3deg,q3c,1448,2059,4845,62.769,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+designed3,join3,3deg,pgsphere,1448,236,4845,67.45,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+designed3,join3,3deg,skycell,1448,4784,4845,61.002,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+designed3,join3,3deg,q3c,1449,189,90,2.966,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+designed3,join3,3deg,pgsphere,1449,236,90,1.363,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+designed3,join3,3deg,skycell,1449,115,90,1.159,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+designed3,join3,3deg,q3c,1450,508,1458,20.899,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+designed3,join3,3deg,pgsphere,1450,236,1458,22.246,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+designed3,join3,3deg,skycell,1450,1364,1458,18.137,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+designed3,join3,3deg,q3c,1451,60,60,2.575,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+designed3,join3,3deg,pgsphere,1451,236,60,1.07,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+designed3,join3,3deg,skycell,1451,101,60,1.048,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+designed3,join3,3deg,q3c,1452,259,908,14.267,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+designed3,join3,3deg,pgsphere,1452,236,908,13.416,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+designed3,join3,3deg,skycell,1452,922,908,11.072,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+designed3,join3,3deg,q3c,1453,56,87,2.562,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+designed3,join3,3deg,pgsphere,1453,236,87,1.156,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+designed3,join3,3deg,skycell,1453,88,87,1.323,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+designed3,join3,3deg,q3c,1454,218,758,15.295,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+designed3,join3,3deg,pgsphere,1454,236,758,14.95,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+designed3,join3,3deg,skycell,1454,759,758,14.841,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+designed3,join3,3deg,q3c,1455,45,76,24.263,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+designed3,join3,3deg,pgsphere,1455,236,76,7.188,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+designed3,join3,3deg,skycell,1455,101,76,6.091,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+designed3,join3,3deg,q3c,1456,229,684,131.701,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+designed3,join3,3deg,pgsphere,1456,236,684,20.021,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+designed3,join3,3deg,skycell,1456,640,684,14.616,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+gaia,filter,1',q3c,801,1,0,1.732,Bitmap Heap Scan+Bitmap Index Scan
+gaia,filter,1',pgsphere,801,1,0,0.059,Index Scan
+gaia,filter,1',skycell,801,1,0,0.025,Index Scan
+gaia,filter,1',q3c,802,1,1,1.513,Bitmap Heap Scan+Bitmap Index Scan
+gaia,filter,1',pgsphere,802,1,1,0.035,Index Scan
+gaia,filter,1',skycell,802,1,1,0.022,Index Scan
+gaia,filter,1',q3c,803,1,0,1.349,Bitmap Heap Scan+Bitmap Index Scan
+gaia,filter,1',pgsphere,803,1,0,0.03,Index Scan
+gaia,filter,1',skycell,803,1,0,0.022,Index Scan
+gaia,filter,1',q3c,804,1,0,1.396,Bitmap Heap Scan+Bitmap Index Scan
+gaia,filter,1',pgsphere,804,1,0,0.033,Index Scan
+gaia,filter,1',skycell,804,1,0,0.031,Bitmap Heap Scan+Bitmap Index Scan
+gaia,filter,1',q3c,805,1,0,1.379,Bitmap Heap Scan+Bitmap Index Scan
+gaia,filter,1',pgsphere,805,1,0,0.032,Index Scan
+gaia,filter,1',skycell,805,1,0,0.03,Bitmap Heap Scan+Bitmap Index Scan
+gaia,filter,1',q3c,806,1,0,1.521,Bitmap Heap Scan+Bitmap Index Scan
+gaia,filter,1',pgsphere,806,1,0,0.03,Index Scan
+gaia,filter,1',skycell,806,1,0,0.023,Index Scan
+gaia,filter,1',q3c,807,1,0,1.431,Bitmap Heap Scan+Bitmap Index Scan
+gaia,filter,1',pgsphere,807,1,0,0.039,Index Scan
+gaia,filter,1',skycell,807,1,0,0.022,Index Scan
+gaia,filter,1',q3c,808,1,1,1.38,Bitmap Heap Scan+Bitmap Index Scan
+gaia,filter,1',pgsphere,808,1,1,0.028,Index Scan
+gaia,filter,1',skycell,808,1,1,0.026,Index Scan
+gaia,filter,1',q3c,809,1,0,1.411,Bitmap Heap Scan+Bitmap Index Scan
+gaia,filter,1',pgsphere,809,1,0,0.032,Index Scan
+gaia,filter,1',skycell,809,1,0,0.02,Index Scan
+gaia,filter,1',q3c,810,1,0,1.284,Bitmap Heap Scan+Bitmap Index Scan
+gaia,filter,1',pgsphere,810,1,0,0.048,Index Scan
+gaia,filter,1',skycell,810,1,0,0.024,Index Scan
+gaia,filter,1',q3c,811,1,0,1.275,Bitmap Heap Scan+Bitmap Index Scan
+gaia,filter,1',pgsphere,811,1,0,0.027,Index Scan
+gaia,filter,1',skycell,811,1,0,0.02,Index Scan
+gaia,filter,1',q3c,812,1,0,1.409,Bitmap Heap Scan+Bitmap Index Scan
+gaia,filter,1',pgsphere,812,1,0,0.022,Index Scan
+gaia,filter,1',skycell,812,1,0,0.03,Bitmap Heap Scan+Bitmap Index Scan
+gaia,filter,1',q3c,813,1,0,1.339,Bitmap Heap Scan+Bitmap Index Scan
+gaia,filter,1',pgsphere,813,1,0,0.024,Index Scan
+gaia,filter,1',skycell,813,1,0,0.021,Index Scan
+gaia,filter,1',q3c,814,1,0,1.246,Bitmap Heap Scan+Bitmap Index Scan
+gaia,filter,1',pgsphere,814,1,0,0.031,Index Scan
+gaia,filter,1',skycell,814,1,0,0.044,Index Scan
+gaia,filter,1',q3c,815,1,0,1.49,Bitmap Heap Scan+Bitmap Index Scan
+gaia,filter,1',pgsphere,815,1,0,0.042,Index Scan
+gaia,filter,1',skycell,815,1,0,0.023,Index Scan
+gaia,join,1',q3c,801,1,0,1.636,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+gaia,join,1',pgsphere,801,1,0,0.055,Index Only Scan+Index Scan+Nested Loop
+gaia,join,1',skycell,801,1,0,0.042,Index Only Scan+Index Scan+Nested Loop
+gaia,join,1',q3c,802,1,0,1.519,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+gaia,join,1',pgsphere,802,1,0,0.047,Index Only Scan+Index Scan+Nested Loop
+gaia,join,1',skycell,802,1,0,0.042,Index Only Scan+Index Scan+Nested Loop
+gaia,join,1',q3c,803,1,0,1.302,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+gaia,join,1',pgsphere,803,1,0,0.037,Index Only Scan+Index Scan+Nested Loop
+gaia,join,1',skycell,803,1,0,0.035,Index Only Scan+Index Scan+Nested Loop
+gaia,join,1',q3c,804,1,1,1.317,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+gaia,join,1',pgsphere,804,1,1,0.042,Index Only Scan+Index Scan+Nested Loop
+gaia,join,1',skycell,804,1,1,0.051,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+gaia,join,1',q3c,805,1,0,1.344,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+gaia,join,1',pgsphere,805,1,0,0.039,Index Only Scan+Index Scan+Nested Loop
+gaia,join,1',skycell,805,1,0,0.049,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+gaia,join,1',q3c,806,1,0,1.464,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+gaia,join,1',pgsphere,806,1,0,0.043,Index Only Scan+Index Scan+Nested Loop
+gaia,join,1',skycell,806,1,0,0.039,Index Only Scan+Index Scan+Nested Loop
+gaia,join,1',q3c,807,1,0,1.393,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+gaia,join,1',pgsphere,807,1,0,0.046,Index Only Scan+Index Scan+Nested Loop
+gaia,join,1',skycell,807,1,0,0.041,Index Only Scan+Index Scan+Nested Loop
+gaia,join,1',q3c,808,1,0,1.411,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+gaia,join,1',pgsphere,808,1,0,0.04,Index Only Scan+Index Scan+Nested Loop
+gaia,join,1',skycell,808,1,0,0.038,Index Only Scan+Index Scan+Nested Loop
+gaia,join,1',q3c,809,1,0,1.426,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+gaia,join,1',pgsphere,809,1,0,0.043,Index Only Scan+Index Scan+Nested Loop
+gaia,join,1',skycell,809,1,0,0.037,Index Only Scan+Index Scan+Nested Loop
+gaia,join,1',q3c,810,1,0,1.251,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+gaia,join,1',pgsphere,810,1,0,0.051,Index Only Scan+Index Scan+Nested Loop
+gaia,join,1',skycell,810,1,0,0.04,Index Only Scan+Index Scan+Nested Loop
+gaia,join,1',q3c,811,1,0,1.267,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+gaia,join,1',pgsphere,811,1,0,0.04,Index Only Scan+Index Scan+Nested Loop
+gaia,join,1',skycell,811,1,0,0.035,Index Only Scan+Index Scan+Nested Loop
+gaia,join,1',q3c,812,1,0,1.62,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+gaia,join,1',pgsphere,812,1,0,0.041,Index Only Scan+Index Scan+Nested Loop
+gaia,join,1',skycell,812,1,0,0.053,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+gaia,join,1',q3c,813,1,0,1.382,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+gaia,join,1',pgsphere,813,1,0,0.043,Index Only Scan+Index Scan+Nested Loop
+gaia,join,1',skycell,813,1,0,0.038,Index Only Scan+Index Scan+Nested Loop
+gaia,join,1',q3c,814,1,0,1.274,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+gaia,join,1',pgsphere,814,1,0,0.041,Index Only Scan+Index Scan+Nested Loop
+gaia,join,1',skycell,814,1,0,0.038,Index Only Scan+Index Scan+Nested Loop
+gaia,join,1',q3c,815,1,0,1.336,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+gaia,join,1',pgsphere,815,1,0,0.041,Index Only Scan+Index Scan+Nested Loop
+gaia,join,1',skycell,815,1,0,0.035,Index Only Scan+Index Scan+Nested Loop
+gaia,join3,1',q3c,801,1,0,1.613,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+gaia,join3,1',pgsphere,801,1,0,0.086,Index Only Scan+Index Scan+Nested Loop
+gaia,join3,1',skycell,801,1,0,0.075,Index Only Scan+Index Scan+Nested Loop
+gaia,join3,1',q3c,802,1,0,1.641,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+gaia,join3,1',pgsphere,802,1,0,0.081,Index Only Scan+Index Scan+Nested Loop
+gaia,join3,1',skycell,802,1,0,0.074,Index Only Scan+Index Scan+Nested Loop
+gaia,join3,1',q3c,803,1,0,1.376,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+gaia,join3,1',pgsphere,803,1,0,0.075,Index Only Scan+Index Scan+Nested Loop
+gaia,join3,1',skycell,803,1,0,0.076,Index Only Scan+Index Scan+Nested Loop
+gaia,join3,1',q3c,804,1,0,1.402,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+gaia,join3,1',pgsphere,804,1,0,0.078,Index Only Scan+Index Scan+Nested Loop
+gaia,join3,1',skycell,804,1,0,0.105,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+gaia,join3,1',q3c,805,1,0,1.365,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+gaia,join3,1',pgsphere,805,1,0,0.077,Index Only Scan+Index Scan+Nested Loop
+gaia,join3,1',skycell,805,1,0,0.082,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+gaia,join3,1',q3c,806,1,0,1.497,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+gaia,join3,1',pgsphere,806,1,0,0.075,Index Only Scan+Index Scan+Nested Loop
+gaia,join3,1',skycell,806,1,0,0.08,Index Only Scan+Index Scan+Nested Loop
+gaia,join3,1',q3c,807,1,0,1.563,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+gaia,join3,1',pgsphere,807,1,0,0.081,Index Only Scan+Index Scan+Nested Loop
+gaia,join3,1',skycell,807,1,0,0.08,Index Only Scan+Index Scan+Nested Loop
+gaia,join3,1',q3c,808,1,0,1.585,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+gaia,join3,1',pgsphere,808,1,0,0.081,Index Only Scan+Index Scan+Nested Loop
+gaia,join3,1',skycell,808,1,0,0.08,Index Only Scan+Index Scan+Nested Loop
+gaia,join3,1',q3c,809,1,0,1.436,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+gaia,join3,1',pgsphere,809,1,0,0.086,Index Only Scan+Index Scan+Nested Loop
+gaia,join3,1',skycell,809,1,0,0.073,Index Only Scan+Index Scan+Nested Loop
+gaia,join3,1',q3c,810,1,0,1.355,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+gaia,join3,1',pgsphere,810,1,0,0.093,Index Only Scan+Index Scan+Nested Loop
+gaia,join3,1',skycell,810,1,0,0.082,Index Only Scan+Index Scan+Nested Loop
+gaia,join3,1',q3c,811,1,0,1.347,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+gaia,join3,1',pgsphere,811,1,0,0.079,Index Only Scan+Index Scan+Nested Loop
+gaia,join3,1',skycell,811,1,0,0.084,Index Only Scan+Index Scan+Nested Loop
+gaia,join3,1',q3c,812,1,0,1.575,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+gaia,join3,1',pgsphere,812,1,0,0.075,Index Only Scan+Index Scan+Nested Loop
+gaia,join3,1',skycell,812,1,0,0.088,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+gaia,join3,1',q3c,813,1,0,1.386,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+gaia,join3,1',pgsphere,813,1,0,0.078,Index Only Scan+Index Scan+Nested Loop
+gaia,join3,1',skycell,813,1,0,0.079,Index Only Scan+Index Scan+Nested Loop
+gaia,join3,1',q3c,814,1,0,1.312,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+gaia,join3,1',pgsphere,814,1,0,0.077,Index Only Scan+Index Scan+Nested Loop
+gaia,join3,1',skycell,814,1,0,0.079,Index Only Scan+Index Scan+Nested Loop
+gaia,join3,1',q3c,815,1,0,1.488,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+gaia,join3,1',pgsphere,815,1,0,0.087,Index Only Scan+Index Scan+Nested Loop
+gaia,join3,1',skycell,815,1,0,0.078,Index Only Scan+Index Scan+Nested Loop
+gaia,filter,30',q3c,1301,10,23,1.273,Bitmap Heap Scan+Bitmap Index Scan
+gaia,filter,30',pgsphere,1301,64,23,0.056,Index Scan
+gaia,filter,30',skycell,1301,14,23,0.036,Index Scan
+gaia,filter,30',q3c,1302,210,265,1.343,Bitmap Heap Scan+Bitmap Index Scan
+gaia,filter,30',pgsphere,1302,64,265,0.157,Index Scan
+gaia,filter,30',skycell,1302,317,265,0.197,Bitmap Heap Scan+Bitmap Index Scan
+gaia,filter,30',q3c,1303,6,5,1.635,Bitmap Heap Scan+Bitmap Index Scan
+gaia,filter,30',pgsphere,1303,64,5,0.025,Index Scan
+gaia,filter,30',skycell,1303,8,5,0.026,Index Scan
+gaia,filter,30',q3c,1304,232,660,1.55,Bitmap Heap Scan+Bitmap Index Scan
+gaia,filter,30',pgsphere,1304,64,660,0.349,Index Scan
+gaia,filter,30',skycell,1304,701,660,0.298,Bitmap Heap Scan+Bitmap Index Scan
+gaia,filter,30',q3c,1305,3,4,1.348,Bitmap Heap Scan+Bitmap Index Scan
+gaia,filter,30',pgsphere,1305,64,4,0.031,Index Scan
+gaia,filter,30',skycell,1305,4,4,0.042,Bitmap Heap Scan+Bitmap Index Scan
+gaia,filter,30',q3c,1306,241,860,1.575,Bitmap Heap Scan+Bitmap Index Scan
+gaia,filter,30',pgsphere,1306,64,860,0.53,Index Scan
+gaia,filter,30',skycell,1306,705,860,0.329,Bitmap Heap Scan+Bitmap Index Scan
+gaia,filter,30',q3c,1307,10,50,1.403,Bitmap Heap Scan+Bitmap Index Scan
+gaia,filter,30',pgsphere,1307,64,50,0.051,Index Scan
+gaia,filter,30',skycell,1307,44,50,0.052,Bitmap Heap Scan+Bitmap Index Scan
+gaia,filter,30',q3c,1308,121,207,1.372,Bitmap Heap Scan+Bitmap Index Scan
+gaia,filter,30',pgsphere,1308,64,207,0.157,Index Scan
+gaia,filter,30',skycell,1308,205,207,0.153,Bitmap Heap Scan+Bitmap Index Scan
+gaia,filter,30',q3c,1309,7,19,1.433,Bitmap Heap Scan+Bitmap Index Scan
+gaia,filter,30',pgsphere,1309,64,19,0.038,Index Scan
+gaia,filter,30',skycell,1309,12,19,0.032,Index Scan
+gaia,filter,30',q3c,1310,15,54,1.783,Bitmap Heap Scan+Bitmap Index Scan
+gaia,filter,30',pgsphere,1310,64,54,0.077,Index Scan
+gaia,filter,30',skycell,1310,65,54,0.087,Bitmap Heap Scan+Bitmap Index Scan
+gaia,filter,30',q3c,1311,4,9,1.338,Bitmap Heap Scan+Bitmap Index Scan
+gaia,filter,30',pgsphere,1311,64,9,0.035,Index Scan
+gaia,filter,30',skycell,1311,8,9,0.044,Bitmap Heap Scan+Bitmap Index Scan
+gaia,filter,30',q3c,1312,114,496,1.545,Bitmap Heap Scan+Bitmap Index Scan
+gaia,filter,30',pgsphere,1312,64,496,0.299,Index Scan
+gaia,filter,30',skycell,1312,381,496,0.213,Bitmap Heap Scan+Bitmap Index Scan
+gaia,filter,30',q3c,1313,3,8,1.36,Bitmap Heap Scan+Bitmap Index Scan
+gaia,filter,30',pgsphere,1313,64,8,0.027,Index Scan
+gaia,filter,30',skycell,1313,8,8,0.031,Bitmap Heap Scan+Bitmap Index Scan
+gaia,filter,30',q3c,1314,106,112,1.437,Bitmap Heap Scan+Bitmap Index Scan
+gaia,filter,30',pgsphere,1314,64,112,0.102,Index Scan
+gaia,filter,30',skycell,1314,212,112,0.105,Bitmap Heap Scan+Bitmap Index Scan
+gaia,filter,30',q3c,1315,58,136,1.471,Bitmap Heap Scan+Bitmap Index Scan
+gaia,filter,30',pgsphere,1315,64,136,0.131,Index Scan
+gaia,filter,30',skycell,1315,76,136,0.111,Bitmap Heap Scan+Bitmap Index Scan
+gaia,join,30',q3c,1301,3,8,1.4,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+gaia,join,30',pgsphere,1301,19,8,0.125,Index Only Scan+Index Scan+Nested Loop
+gaia,join,30',skycell,1301,4,8,0.091,Index Only Scan+Index Scan+Nested Loop
+gaia,join,30',q3c,1302,63,78,1.757,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+gaia,join,30',pgsphere,1302,19,78,0.543,Index Only Scan+Index Scan+Nested Loop
+gaia,join,30',skycell,1302,96,78,0.582,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+gaia,join,30',q3c,1303,2,2,1.37,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+gaia,join,30',pgsphere,1303,19,2,0.061,Index Only Scan+Index Scan+Nested Loop
+gaia,join,30',skycell,1303,2,2,0.064,Index Only Scan+Index Scan+Nested Loop
+gaia,join,30',q3c,1304,69,209,2.568,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+gaia,join,30',pgsphere,1304,19,209,1.368,Index Only Scan+Index Scan+Nested Loop
+gaia,join,30',skycell,1304,212,209,1.269,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+gaia,join,30',q3c,1305,1,3,1.324,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+gaia,join,30',pgsphere,1305,19,3,0.051,Index Only Scan+Index Scan+Nested Loop
+gaia,join,30',skycell,1305,1,3,0.07,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+gaia,join,30',q3c,1306,72,244,2.821,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+gaia,join,30',pgsphere,1306,19,244,1.812,Index Only Scan+Index Scan+Nested Loop
+gaia,join,30',skycell,1306,213,244,1.517,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+gaia,join,30',q3c,1307,3,10,1.455,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+gaia,join,30',pgsphere,1307,19,10,0.163,Index Only Scan+Index Scan+Nested Loop
+gaia,join,30',skycell,1307,13,10,0.173,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+gaia,join,30',q3c,1308,36,71,2.199,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+gaia,join,30',pgsphere,1308,19,71,0.544,Index Only Scan+Index Scan+Nested Loop
+gaia,join,30',skycell,1308,62,71,0.537,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+gaia,join,30',q3c,1309,2,10,1.625,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+gaia,join,30',pgsphere,1309,19,10,0.091,Index Only Scan+Index Scan+Nested Loop
+gaia,join,30',skycell,1309,4,10,0.101,Index Only Scan+Index Scan+Nested Loop
+gaia,join,30',q3c,1310,4,10,1.573,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+gaia,join,30',pgsphere,1310,19,10,0.16,Index Only Scan+Index Scan+Nested Loop
+gaia,join,30',skycell,1310,20,10,0.155,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+gaia,join,30',q3c,1311,1,2,1.354,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+gaia,join,30',pgsphere,1311,19,2,0.074,Index Only Scan+Index Scan+Nested Loop
+gaia,join,30',skycell,1311,3,2,0.086,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+gaia,join,30',q3c,1312,34,148,2.474,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+gaia,join,30',pgsphere,1312,19,148,1.043,Index Only Scan+Index Scan+Nested Loop
+gaia,join,30',skycell,1312,115,148,0.942,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+gaia,join,30',q3c,1313,1,2,1.361,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+gaia,join,30',pgsphere,1313,19,2,0.065,Index Only Scan+Index Scan+Nested Loop
+gaia,join,30',skycell,1313,2,2,0.067,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+gaia,join,30',q3c,1314,32,38,1.608,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+gaia,join,30',pgsphere,1314,19,38,0.271,Index Only Scan+Index Scan+Nested Loop
+gaia,join,30',skycell,1314,64,38,0.262,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+gaia,join,30',q3c,1315,17,39,1.643,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+gaia,join,30',pgsphere,1315,19,39,0.36,Index Only Scan+Index Scan+Nested Loop
+gaia,join,30',skycell,1315,23,39,0.315,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+gaia,join3,30',q3c,1301,1,2,1.499,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+gaia,join3,30',pgsphere,1301,6,2,0.125,Index Only Scan+Index Scan+Nested Loop
+gaia,join3,30',skycell,1301,1,2,0.106,Index Only Scan+Index Scan+Nested Loop
+gaia,join3,30',q3c,1302,22,23,1.703,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+gaia,join3,30',pgsphere,1302,6,23,0.379,Index Only Scan+Index Scan+Nested Loop
+gaia,join3,30',skycell,1302,33,23,0.379,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+gaia,join3,30',q3c,1303,1,0,1.452,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+gaia,join3,30',pgsphere,1303,6,0,0.085,Index Only Scan+Index Scan+Nested Loop
+gaia,join3,30',skycell,1303,1,0,0.088,Index Only Scan+Index Scan+Nested Loop
+gaia,join3,30',q3c,1304,24,64,2.175,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+gaia,join3,30',pgsphere,1304,6,64,0.848,Index Only Scan+Index Scan+Nested Loop
+gaia,join3,30',skycell,1304,73,64,0.758,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+gaia,join3,30',q3c,1305,1,1,1.582,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+gaia,join3,30',pgsphere,1305,6,1,0.091,Index Only Scan+Index Scan+Nested Loop
+gaia,join3,30',skycell,1305,1,1,0.109,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+gaia,join3,30',q3c,1306,25,78,2.311,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+gaia,join3,30',pgsphere,1306,6,78,1.154,Index Only Scan+Index Scan+Nested Loop
+gaia,join3,30',skycell,1306,74,78,0.898,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+gaia,join3,30',q3c,1307,1,6,1.667,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+gaia,join3,30',pgsphere,1307,6,6,0.139,Index Only Scan+Index Scan+Nested Loop
+gaia,join3,30',skycell,1307,4,6,0.156,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+gaia,join3,30',q3c,1308,12,18,1.68,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+gaia,join3,30',pgsphere,1308,6,18,0.346,Index Only Scan+Index Scan+Nested Loop
+gaia,join3,30',skycell,1308,22,18,0.341,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+gaia,join3,30',q3c,1309,1,3,1.671,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+gaia,join3,30',pgsphere,1309,6,3,0.106,Index Only Scan+Index Scan+Nested Loop
+gaia,join3,30',skycell,1309,1,3,0.115,Index Only Scan+Index Scan+Nested Loop
+gaia,join3,30',q3c,1310,2,4,1.654,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+gaia,join3,30',pgsphere,1310,6,4,0.214,Index Only Scan+Index Scan+Nested Loop
+gaia,join3,30',skycell,1310,7,4,0.245,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+gaia,join3,30',q3c,1311,1,0,1.742,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+gaia,join3,30',pgsphere,1311,6,0,0.096,Index Only Scan+Index Scan+Nested Loop
+gaia,join3,30',skycell,1311,1,0,0.134,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+gaia,join3,30',q3c,1312,11,51,2.09,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+gaia,join3,30',pgsphere,1312,6,51,0.685,Index Only Scan+Index Scan+Nested Loop
+gaia,join3,30',skycell,1312,40,51,0.57,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+gaia,join3,30',q3c,1313,1,1,1.591,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+gaia,join3,30',pgsphere,1313,6,1,0.092,Index Only Scan+Index Scan+Nested Loop
+gaia,join3,30',skycell,1313,1,1,0.103,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+gaia,join3,30',q3c,1314,11,16,1.744,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+gaia,join3,30',pgsphere,1314,6,16,0.217,Index Only Scan+Index Scan+Nested Loop
+gaia,join3,30',skycell,1314,22,16,0.237,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+gaia,join3,30',q3c,1315,6,19,1.756,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+gaia,join3,30',pgsphere,1315,6,19,0.291,Index Only Scan+Index Scan+Nested Loop
+gaia,join3,30',skycell,1315,8,19,0.259,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+gaia,filter,1deg,q3c,1401,33,105,1.354,Bitmap Heap Scan+Bitmap Index Scan
+gaia,filter,1deg,pgsphere,1401,255,105,0.085,Index Scan
+gaia,filter,1deg,skycell,1401,160,105,0.091,Bitmap Heap Scan+Bitmap Index Scan
+gaia,filter,1deg,q3c,1402,27,307,1.507,Bitmap Heap Scan+Bitmap Index Scan
+gaia,filter,1deg,pgsphere,1402,255,307,0.165,Index Scan
+gaia,filter,1deg,skycell,1402,393,307,0.19,Bitmap Heap Scan+Bitmap Index Scan
+gaia,filter,1deg,q3c,1403,10,21,1.331,Bitmap Heap Scan+Bitmap Index Scan
+gaia,filter,1deg,pgsphere,1403,255,21,0.053,Index Scan
+gaia,filter,1deg,skycell,1403,31,21,0.059,Bitmap Heap Scan+Bitmap Index Scan
+gaia,filter,1deg,q3c,1404,194,411,1.337,Bitmap Heap Scan+Bitmap Index Scan
+gaia,filter,1deg,pgsphere,1404,255,411,0.228,Index Scan
+gaia,filter,1deg,skycell,1404,641,411,0.225,Bitmap Heap Scan+Bitmap Index Scan
+gaia,filter,1deg,q3c,1405,52,57,1.382,Bitmap Heap Scan+Bitmap Index Scan
+gaia,filter,1deg,pgsphere,1405,255,57,0.076,Index Scan
+gaia,filter,1deg,skycell,1405,26,57,0.062,Bitmap Heap Scan+Bitmap Index Scan
+gaia,filter,1deg,q3c,1406,47,353,1.44,Bitmap Heap Scan+Bitmap Index Scan
+gaia,filter,1deg,pgsphere,1406,255,353,0.241,Index Scan
+gaia,filter,1deg,skycell,1406,268,353,0.186,Bitmap Heap Scan+Bitmap Index Scan
+gaia,filter,1deg,q3c,1407,19,16,1.242,Bitmap Heap Scan+Bitmap Index Scan
+gaia,filter,1deg,pgsphere,1407,255,16,0.04,Index Scan
+gaia,filter,1deg,skycell,1407,32,16,0.052,Bitmap Heap Scan+Bitmap Index Scan
+gaia,filter,1deg,q3c,1408,1702,3279,2.392,Bitmap Heap Scan+Bitmap Index Scan
+gaia,filter,1deg,pgsphere,1408,255,3279,1.58,Index Scan
+gaia,filter,1deg,skycell,1408,3318,3279,0.922,Bitmap Heap Scan+Bitmap Index Scan
+gaia,filter,1deg,q3c,1409,1195,2275,2.057,Bitmap Heap Scan+Bitmap Index Scan
+designed,filter,1',skycell,806,1,0,0.046,Bitmap Heap Scan+Bitmap Index Scan
+gaia,filter,1deg,pgsphere,1409,255,2275,1.206,Index Scan
+gaia,filter,1deg,skycell,1409,1900,2275,0.671,Bitmap Heap Scan+Bitmap Index Scan
+gaia,filter,1deg,q3c,1410,257,987,1.621,Bitmap Heap Scan+Bitmap Index Scan
+gaia,filter,1deg,pgsphere,1410,255,987,0.628,Index Scan
+gaia,filter,1deg,skycell,1410,904,987,0.33,Bitmap Heap Scan+Bitmap Index Scan
+gaia,filter,1deg,q3c,1411,201,90,1.427,Bitmap Heap Scan+Bitmap Index Scan
+gaia,filter,1deg,pgsphere,1411,255,90,0.086,Index Scan
+gaia,filter,1deg,skycell,1411,60,90,0.085,Bitmap Heap Scan+Bitmap Index Scan
+gaia,filter,1deg,q3c,1412,475,767,1.626,Bitmap Heap Scan+Bitmap Index Scan
+gaia,filter,1deg,pgsphere,1412,255,767,0.439,Index Scan
+gaia,filter,1deg,skycell,1412,634,767,0.318,Bitmap Heap Scan+Bitmap Index Scan
+gaia,filter,1deg,q3c,1413,350,1206,1.716,Bitmap Heap Scan+Bitmap Index Scan
+gaia,filter,1deg,pgsphere,1413,255,1206,0.636,Index Scan
+gaia,filter,1deg,skycell,1413,1552,1206,0.443,Bitmap Heap Scan+Bitmap Index Scan
+gaia,filter,1deg,q3c,1414,1208,3001,1.972,Bitmap Heap Scan+Bitmap Index Scan
+gaia,filter,1deg,pgsphere,1414,255,3001,1.386,Index Scan
+gaia,filter,1deg,skycell,1414,2848,3001,0.828,Bitmap Heap Scan+Bitmap Index Scan
+gaia,filter,1deg,q3c,1415,19,21,1.266,Bitmap Heap Scan+Bitmap Index Scan
+gaia,filter,1deg,pgsphere,1415,255,21,0.046,Index Scan
+gaia,filter,1deg,skycell,1415,34,21,0.051,Bitmap Heap Scan+Bitmap Index Scan
+gaia,join,1deg,q3c,1401,10,34,1.797,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+gaia,join,1deg,pgsphere,1401,76,34,0.32,Index Only Scan+Index Scan+Nested Loop
+gaia,join,1deg,skycell,1401,48,34,0.286,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+gaia,join,1deg,q3c,1402,8,101,2.134,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+gaia,join,1deg,pgsphere,1402,76,101,0.728,Index Only Scan+Index Scan+Nested Loop
+gaia,join,1deg,skycell,1402,119,101,0.803,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+gaia,join,1deg,q3c,1403,3,8,1.514,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+gaia,join,1deg,pgsphere,1403,76,8,0.111,Index Only Scan+Index Scan+Nested Loop
+gaia,join,1deg,skycell,1403,9,8,0.123,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+gaia,join,1deg,q3c,1404,58,129,2.081,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+gaia,join,1deg,pgsphere,1404,76,129,0.878,Index Only Scan+Index Scan+Nested Loop
+gaia,join,1deg,skycell,1404,193,129,0.866,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+gaia,join,1deg,q3c,1405,15,14,1.639,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+gaia,join,1deg,pgsphere,1405,76,14,0.225,Index Only Scan+Index Scan+Nested Loop
+gaia,join,1deg,skycell,1405,8,14,0.191,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+gaia,join,1deg,q3c,1406,14,102,2.076,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+gaia,join,1deg,pgsphere,1406,76,102,0.881,Index Only Scan+Index Scan+Nested Loop
+gaia,join,1deg,skycell,1406,81,102,0.778,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+gaia,join,1deg,q3c,1407,6,13,1.28,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+gaia,join,1deg,pgsphere,1407,76,13,0.106,Index Only Scan+Index Scan+Nested Loop
+gaia,join,1deg,skycell,1407,10,13,0.116,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+gaia,join,1deg,q3c,1408,509,1015,7.477,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+gaia,join,1deg,pgsphere,1408,76,1015,6.618,Index Only Scan+Index Scan+Nested Loop
+gaia,join,1deg,skycell,1408,1002,1015,5.639,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+gaia,join,1deg,q3c,1409,357,675,5.717,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+gaia,join,1deg,pgsphere,1409,76,675,4.539,Index Only Scan+Index Scan+Nested Loop
+gaia,join,1deg,skycell,1409,574,675,3.893,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+gaia,join,1deg,q3c,1410,77,286,3.296,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+gaia,join,1deg,pgsphere,1410,76,286,2.181,Index Only Scan+Index Scan+Nested Loop
+gaia,join,1deg,skycell,1410,273,286,1.846,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+gaia,join,1deg,q3c,1411,60,24,1.654,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+gaia,join,1deg,pgsphere,1411,76,24,0.301,Index Only Scan+Index Scan+Nested Loop
+gaia,join,1deg,skycell,1411,18,24,0.256,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+gaia,join,1deg,q3c,1412,142,235,2.929,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+gaia,join,1deg,pgsphere,1412,76,235,1.727,Index Only Scan+Index Scan+Nested Loop
+gaia,join,1deg,skycell,1412,191,235,1.513,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+gaia,join,1deg,q3c,1413,104,369,3.799,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+gaia,join,1deg,pgsphere,1413,76,369,2.479,Index Only Scan+Index Scan+Nested Loop
+gaia,join,1deg,skycell,1413,469,369,2.211,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+gaia,join,1deg,q3c,1414,361,884,7.92,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+gaia,join,1deg,pgsphere,1414,76,884,5.726,Index Only Scan+Index Scan+Nested Loop
+gaia,join,1deg,skycell,1414,860,884,5.027,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+gaia,join,1deg,q3c,1415,6,7,1.391,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+gaia,join,1deg,pgsphere,1415,76,7,0.118,Index Only Scan+Index Scan+Nested Loop
+gaia,join,1deg,skycell,1415,10,7,0.121,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+gaia,join3,1deg,q3c,1401,3,18,1.673,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+gaia,join3,1deg,pgsphere,1401,27,18,0.242,Index Only Scan+Index Scan+Nested Loop
+gaia,join3,1deg,skycell,1401,17,18,0.244,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+gaia,join3,1deg,q3c,1402,3,37,1.955,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+gaia,join3,1deg,pgsphere,1402,27,37,0.476,Index Only Scan+Index Scan+Nested Loop
+gaia,join3,1deg,skycell,1402,41,37,0.504,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+gaia,join3,1deg,q3c,1403,1,4,1.605,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+gaia,join3,1deg,pgsphere,1403,27,4,0.132,Index Only Scan+Index Scan+Nested Loop
+gaia,join3,1deg,skycell,1403,3,4,0.133,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+gaia,join3,1deg,q3c,1404,20,44,1.89,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+gaia,join3,1deg,pgsphere,1404,27,44,0.603,Index Only Scan+Index Scan+Nested Loop
+gaia,join3,1deg,skycell,1404,67,44,0.565,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+gaia,join3,1deg,q3c,1405,5,3,1.653,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+gaia,join3,1deg,pgsphere,1405,27,3,0.188,Index Only Scan+Index Scan+Nested Loop
+gaia,join3,1deg,skycell,1405,3,3,0.178,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+gaia,join3,1deg,q3c,1406,5,32,1.978,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+gaia,join3,1deg,pgsphere,1406,27,32,0.558,Index Only Scan+Index Scan+Nested Loop
+gaia,join3,1deg,skycell,1406,28,32,0.507,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+gaia,join3,1deg,q3c,1407,2,5,1.48,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+gaia,join3,1deg,pgsphere,1407,27,5,0.114,Index Only Scan+Index Scan+Nested Loop
+gaia,join3,1deg,skycell,1407,3,5,0.135,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+gaia,join3,1deg,q3c,1408,178,344,4.737,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+gaia,join3,1deg,pgsphere,1408,27,344,3.787,Index Only Scan+Index Scan+Nested Loop
+gaia,join3,1deg,skycell,1408,347,344,2.952,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+gaia,join3,1deg,q3c,1409,125,237,3.739,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+gaia,join3,1deg,pgsphere,1409,27,237,2.734,Index Only Scan+Index Scan+Nested Loop
+gaia,join3,1deg,skycell,1409,199,237,2.125,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+gaia,join3,1deg,q3c,1410,27,101,2.49,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+gaia,join3,1deg,pgsphere,1410,27,101,1.39,Index Only Scan+Index Scan+Nested Loop
+gaia,join3,1deg,skycell,1410,95,101,1.042,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+gaia,join3,1deg,q3c,1411,21,7,1.694,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+gaia,join3,1deg,pgsphere,1411,27,7,0.226,Index Only Scan+Index Scan+Nested Loop
+gaia,join3,1deg,skycell,1411,6,7,0.207,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+gaia,join3,1deg,q3c,1412,50,81,2.435,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+gaia,join3,1deg,pgsphere,1412,27,81,1.067,Index Only Scan+Index Scan+Nested Loop
+gaia,join3,1deg,skycell,1412,67,81,0.889,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+gaia,join3,1deg,q3c,1413,36,143,2.663,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+gaia,join3,1deg,pgsphere,1413,27,143,1.464,Index Only Scan+Index Scan+Nested Loop
+gaia,join3,1deg,skycell,1413,162,143,1.297,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+gaia,join3,1deg,q3c,1414,126,283,4.007,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+gaia,join3,1deg,pgsphere,1414,27,283,3.311,Index Only Scan+Index Scan+Nested Loop
+gaia,join3,1deg,skycell,1414,298,283,2.637,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+gaia,join3,1deg,q3c,1415,2,0,1.529,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+gaia,join3,1deg,pgsphere,1415,27,0,0.103,Index Only Scan+Index Scan+Nested Loop
+gaia,join3,1deg,skycell,1415,3,0,0.124,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+designed,filter,1',q3c,807,1,0,1.426,Bitmap Heap Scan+Bitmap Index Scan
+designed,filter,1',q3c,801,1,0,2.166,Bitmap Heap Scan+Bitmap Index Scan
+designed,filter,1',pgsphere,801,1,0,0.072,Index Scan
+designed,filter,1',skycell,801,1,0,0.038,Index Scan
+designed,filter,1',q3c,802,1,2,1.609,Bitmap Heap Scan+Bitmap Index Scan
+designed,filter,1',pgsphere,802,1,2,0.039,Index Scan
+designed,filter,1',skycell,802,1,2,0.038,Bitmap Heap Scan+Bitmap Index Scan
+designed,filter,1',q3c,803,1,0,1.675,Bitmap Heap Scan+Bitmap Index Scan
+designed,filter,1',pgsphere,803,1,0,0.03,Index Scan
+designed,filter,1',skycell,803,1,0,0.022,Index Scan
+designed,filter,1',q3c,804,1,0,2.475,Bitmap Heap Scan+Bitmap Index Scan
+designed,filter,1',pgsphere,804,1,0,0.041,Index Scan
+designed,filter,1',skycell,804,1,0,0.037,Index Scan
+designed,filter,1',q3c,805,1,0,1.465,Bitmap Heap Scan+Bitmap Index Scan
+designed,filter,1',pgsphere,805,1,0,0.049,Index Scan
+designed,filter,1',skycell,805,1,0,0.03,Index Scan
+designed,filter,1',q3c,806,1,0,1.462,Bitmap Heap Scan+Bitmap Index Scan
+designed,filter,1',pgsphere,806,1,0,0.035,Index Scan
+designed,filter,1',pgsphere,807,1,0,0.037,Index Scan
+designed,filter,1',skycell,807,1,0,0.03,Index Scan
+designed,filter,1',q3c,808,1,2,1.669,Bitmap Heap Scan+Bitmap Index Scan
+designed,filter,1',pgsphere,808,1,2,0.038,Index Scan
+designed,filter,1',skycell,808,1,2,0.052,Bitmap Heap Scan+Bitmap Index Scan
+designed,filter,1',q3c,809,1,0,1.452,Bitmap Heap Scan+Bitmap Index Scan
+designed,filter,1',pgsphere,809,1,0,0.058,Index Scan
+designed,filter,1',skycell,809,1,0,0.064,Bitmap Heap Scan+Bitmap Index Scan
+designed,filter,1',q3c,810,1,0,2.412,Bitmap Heap Scan+Bitmap Index Scan
+designed,filter,1',pgsphere,810,1,0,0.067,Index Scan
+designed,filter,1',skycell,810,1,0,0.04,Index Scan
+designed,filter,1',q3c,811,1,1,2.347,Bitmap Heap Scan+Bitmap Index Scan
+designed,filter,1',pgsphere,811,1,1,0.06,Index Scan
+designed,filter,1',skycell,811,1,1,0.07,Index Scan
+designed,filter,1',q3c,812,1,0,1.69,Bitmap Heap Scan+Bitmap Index Scan
+designed,filter,1',pgsphere,812,1,0,0.069,Index Scan
+designed,filter,1',skycell,812,1,0,0.072,Bitmap Heap Scan+Bitmap Index Scan
+designed,filter,1',q3c,813,1,0,1.308,Bitmap Heap Scan+Bitmap Index Scan
+designed,filter,1',pgsphere,813,1,0,0.032,Index Scan
+designed,filter,1',skycell,813,1,0,0.028,Index Scan
+designed,filter,1',q3c,814,1,1,1.383,Bitmap Heap Scan+Bitmap Index Scan
+designed,filter,1',pgsphere,814,1,1,0.03,Index Scan
+designed,filter,1',skycell,814,1,1,0.028,Index Scan
+designed,filter,1',q3c,815,1,0,1.362,Bitmap Heap Scan+Bitmap Index Scan
+designed,filter,1',pgsphere,815,1,0,0.028,Index Scan
+designed,filter,1',skycell,815,1,0,0.027,Index Scan
+designed,join,1',q3c,801,1,0,1.369,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+designed,join,1',pgsphere,801,1,0,0.052,Index Only Scan+Index Scan+Nested Loop
+designed,join,1',skycell,801,1,0,0.038,Index Only Scan+Index Scan+Nested Loop
+designed,join,1',q3c,802,1,0,1.379,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+designed,join,1',pgsphere,802,1,0,0.049,Index Only Scan+Index Scan+Nested Loop
+designed,join,1',skycell,802,1,0,0.049,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+designed,join,1',q3c,803,1,0,1.413,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+designed,join,1',pgsphere,803,1,0,0.039,Index Only Scan+Index Scan+Nested Loop
+designed,join,1',skycell,803,1,0,0.036,Index Only Scan+Index Scan+Nested Loop
+designed,join,1',q3c,804,1,0,1.462,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+designed,join,1',pgsphere,804,1,0,0.041,Index Only Scan+Index Scan+Nested Loop
+designed,join,1',skycell,804,1,0,0.042,Index Only Scan+Index Scan+Nested Loop
+designed,join,1',q3c,805,1,0,1.357,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+designed,join,1',pgsphere,805,1,0,0.052,Index Only Scan+Index Scan+Nested Loop
+designed,join,1',skycell,805,1,0,0.037,Index Only Scan+Index Scan+Nested Loop
+designed,join,1',q3c,806,1,0,1.305,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+designed,join,1',pgsphere,806,1,0,0.043,Index Only Scan+Index Scan+Nested Loop
+designed,join,1',skycell,806,1,0,0.053,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+designed,join,1',q3c,807,1,0,1.283,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+designed,join,1',pgsphere,807,1,0,0.047,Index Only Scan+Index Scan+Nested Loop
+designed,join,1',skycell,807,1,0,0.036,Index Only Scan+Index Scan+Nested Loop
+designed,join,1',q3c,808,1,0,1.375,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+designed,join,1',pgsphere,808,1,0,0.049,Index Only Scan+Index Scan+Nested Loop
+designed,join,1',skycell,808,1,0,0.061,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+designed,join,1',q3c,809,1,0,1.388,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+designed,join,1',pgsphere,809,1,0,0.044,Index Only Scan+Index Scan+Nested Loop
+designed,join,1',skycell,809,1,0,0.045,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+designed,join,1',q3c,810,1,0,1.363,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+designed,join,1',pgsphere,810,1,0,0.04,Index Only Scan+Index Scan+Nested Loop
+designed,join,1',skycell,810,1,0,0.041,Index Only Scan+Index Scan+Nested Loop
+designed,join,1',q3c,811,1,0,1.389,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+designed,join,1',pgsphere,811,1,0,0.043,Index Only Scan+Index Scan+Nested Loop
+designed,join,1',skycell,811,1,0,0.039,Index Only Scan+Index Scan+Nested Loop
+designed,join,1',q3c,812,1,0,1.403,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+designed,join,1',pgsphere,812,1,0,0.042,Index Only Scan+Index Scan+Nested Loop
+designed,join,1',skycell,812,1,0,0.046,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+designed,join,1',q3c,813,1,0,1.314,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+designed,join,1',pgsphere,813,1,0,0.045,Index Only Scan+Index Scan+Nested Loop
+designed,join,1',skycell,813,1,0,0.036,Index Only Scan+Index Scan+Nested Loop
+designed,join,1',q3c,814,1,0,1.424,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+designed,join,1',pgsphere,814,1,0,0.038,Index Only Scan+Index Scan+Nested Loop
+designed,join,1',skycell,814,1,0,0.037,Index Only Scan+Index Scan+Nested Loop
+designed,join,1',q3c,815,1,0,1.417,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+designed,join,1',pgsphere,815,1,0,0.037,Index Only Scan+Index Scan+Nested Loop
+designed,join,1',skycell,815,1,0,0.042,Index Only Scan+Index Scan+Nested Loop
+designed,join3,1',q3c,801,1,0,1.422,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+designed,join3,1',pgsphere,801,1,0,0.09,Index Only Scan+Index Scan+Nested Loop
+designed,join3,1',skycell,801,1,0,0.075,Index Only Scan+Index Scan+Nested Loop
+designed,join3,1',q3c,802,1,0,1.413,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+designed,join3,1',pgsphere,802,1,0,0.081,Index Only Scan+Index Scan+Nested Loop
+designed,join3,1',skycell,802,1,0,0.091,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+designed,join3,1',q3c,803,1,0,1.517,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+designed,join3,1',pgsphere,803,1,0,0.094,Index Only Scan+Index Scan+Nested Loop
+designed,join3,1',skycell,803,1,0,0.074,Index Only Scan+Index Scan+Nested Loop
+designed,join3,1',q3c,804,1,0,1.563,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+designed,join3,1',pgsphere,804,1,0,0.078,Index Only Scan+Index Scan+Nested Loop
+designed,join3,1',skycell,804,1,0,0.079,Index Only Scan+Index Scan+Nested Loop
+designed,join3,1',q3c,805,1,0,1.392,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+designed,join3,1',pgsphere,805,1,0,0.089,Index Only Scan+Index Scan+Nested Loop
+designed,join3,1',skycell,805,1,0,0.074,Index Only Scan+Index Scan+Nested Loop
+designed,join3,1',q3c,806,1,0,1.349,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+designed,join3,1',pgsphere,806,1,0,0.079,Index Only Scan+Index Scan+Nested Loop
+designed,join3,1',skycell,806,1,0,0.085,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+designed,join3,1',q3c,807,1,0,1.34,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+designed,join3,1',pgsphere,807,1,0,0.082,Index Only Scan+Index Scan+Nested Loop
+designed,join3,1',skycell,807,1,0,0.074,Index Only Scan+Index Scan+Nested Loop
+designed,join3,1',q3c,808,1,0,1.421,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+designed,join3,1',pgsphere,808,1,0,0.08,Index Only Scan+Index Scan+Nested Loop
+designed,join3,1',skycell,808,1,0,0.1,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+designed,join3,1',q3c,809,1,0,1.429,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+designed,join3,1',pgsphere,809,1,0,0.082,Index Only Scan+Index Scan+Nested Loop
+designed,join3,1',skycell,809,1,0,0.083,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+designed,join3,1',q3c,810,1,0,1.402,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+designed,join3,1',pgsphere,810,1,0,0.086,Index Only Scan+Index Scan+Nested Loop
+designed,join3,1',skycell,810,1,0,0.078,Index Only Scan+Index Scan+Nested Loop
+designed,join3,1',q3c,811,1,0,1.44,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+designed,join3,1',pgsphere,811,1,0,0.08,Index Only Scan+Index Scan+Nested Loop
+designed,join3,1',skycell,811,1,0,0.077,Index Only Scan+Index Scan+Nested Loop
+designed,join3,1',q3c,812,1,0,1.444,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+designed,join3,1',pgsphere,812,1,0,0.079,Index Only Scan+Index Scan+Nested Loop
+designed,join3,1',skycell,812,1,0,0.082,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+designed,join3,1',q3c,813,1,0,1.359,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+designed,join3,1',pgsphere,813,1,0,0.083,Index Only Scan+Index Scan+Nested Loop
+designed,join3,1',skycell,813,1,0,0.074,Index Only Scan+Index Scan+Nested Loop
+designed,join3,1',q3c,814,1,0,1.452,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+designed,join3,1',pgsphere,814,1,0,0.076,Index Only Scan+Index Scan+Nested Loop
+designed,join3,1',skycell,814,1,0,0.081,Index Only Scan+Index Scan+Nested Loop
+designed,join3,1',q3c,815,1,0,1.423,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+designed,join3,1',pgsphere,815,1,0,0.075,Index Only Scan+Index Scan+Nested Loop
+designed,join3,1',skycell,815,1,0,0.074,Index Only Scan+Index Scan+Nested Loop
+designed,filter,30',q3c,1301,67,42,1.383,Bitmap Heap Scan+Bitmap Index Scan
+designed,filter,30',pgsphere,1301,64,42,0.051,Index Scan
+designed,filter,30',skycell,1301,37,42,0.066,Bitmap Heap Scan+Bitmap Index Scan
+designed,filter,30',q3c,1302,47,170,1.38,Bitmap Heap Scan+Bitmap Index Scan
+designed,filter,30',pgsphere,1302,64,170,0.207,Index Scan
+designed,filter,30',skycell,1302,291,170,0.169,Bitmap Heap Scan+Bitmap Index Scan
+designed,filter,30',q3c,1303,32,44,1.403,Bitmap Heap Scan+Bitmap Index Scan
+designed,filter,30',pgsphere,1303,64,44,0.107,Index Scan
+designed,filter,30',skycell,1303,110,44,0.093,Bitmap Heap Scan+Bitmap Index Scan
+designed,filter,30',q3c,1304,53,544,1.594,Bitmap Heap Scan+Bitmap Index Scan
+designed,filter,30',pgsphere,1304,64,544,0.338,Index Scan
+designed,filter,30',skycell,1304,212,544,0.232,Bitmap Heap Scan+Bitmap Index Scan
+designed,filter,30',q3c,1305,11,16,1.46,Bitmap Heap Scan+Bitmap Index Scan
+designed,filter,30',pgsphere,1305,64,16,0.052,Index Scan
+designed,filter,30',skycell,1305,25,16,0.043,Bitmap Heap Scan+Bitmap Index Scan
+designed,filter,30',q3c,1306,264,509,1.598,Bitmap Heap Scan+Bitmap Index Scan
+designed,filter,30',pgsphere,1306,64,509,0.324,Index Scan
+designed,filter,30',skycell,1306,427,509,0.253,Bitmap Heap Scan+Bitmap Index Scan
+designed,filter,30',q3c,1307,27,33,2.407,Bitmap Heap Scan+Bitmap Index Scan
+designed,filter,30',pgsphere,1307,64,33,0.071,Index Scan
+designed,filter,30',skycell,1307,49,33,0.072,Bitmap Heap Scan+Bitmap Index Scan
+designed,filter,30',q3c,1308,17,23,1.607,Bitmap Heap Scan+Bitmap Index Scan
+designed,filter,30',pgsphere,1308,64,23,0.061,Index Scan
+designed,filter,30',skycell,1308,36,23,0.069,Bitmap Heap Scan+Bitmap Index Scan
+designed,filter,30',q3c,1309,12,24,1.36,Bitmap Heap Scan+Bitmap Index Scan
+designed,filter,30',pgsphere,1309,64,24,0.052,Index Scan
+designed,filter,30',skycell,1309,23,24,0.046,Bitmap Heap Scan+Bitmap Index Scan
+designed,filter,30',q3c,1310,8,16,1.415,Bitmap Heap Scan+Bitmap Index Scan
+designed,filter,30',pgsphere,1310,64,16,0.069,Index Scan
+designed,filter,30',skycell,1310,22,16,0.056,Bitmap Heap Scan+Bitmap Index Scan
+designed,filter,30',q3c,1311,10,28,1.382,Bitmap Heap Scan+Bitmap Index Scan
+designed,filter,30',pgsphere,1311,64,28,0.047,Index Scan
+designed,filter,30',skycell,1311,24,28,0.054,Bitmap Heap Scan+Bitmap Index Scan
+designed,filter,30',q3c,1312,8,25,1.372,Bitmap Heap Scan+Bitmap Index Scan
+designed,filter,30',pgsphere,1312,64,25,0.052,Index Scan
+designed,filter,30',skycell,1312,24,25,0.053,Bitmap Heap Scan+Bitmap Index Scan
+designed,filter,30',q3c,1313,7,16,1.393,Bitmap Heap Scan+Bitmap Index Scan
+designed,filter,30',pgsphere,1313,64,16,0.048,Index Scan
+designed,filter,30',skycell,1313,24,16,0.057,Bitmap Heap Scan+Bitmap Index Scan
+designed,filter,30',q3c,1314,11,27,1.323,Bitmap Heap Scan+Bitmap Index Scan
+designed,filter,30',pgsphere,1314,64,27,0.047,Index Scan
+designed,filter,30',skycell,1314,43,27,0.066,Bitmap Heap Scan+Bitmap Index Scan
+designed,filter,30',q3c,1315,111,163,1.358,Bitmap Heap Scan+Bitmap Index Scan
+designed,filter,30',pgsphere,1315,64,163,0.111,Index Scan
+designed,filter,30',skycell,1315,65,163,0.105,Bitmap Heap Scan+Bitmap Index Scan
+designed,join,30',q3c,1301,20,18,1.461,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+designed,join,30',pgsphere,1301,19,18,0.142,Index Only Scan+Index Scan+Nested Loop
+designed,join,30',skycell,1301,11,18,0.192,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+designed,join,30',q3c,1302,14,54,2.038,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+designed,join,30',pgsphere,1302,19,54,0.596,Index Only Scan+Index Scan+Nested Loop
+designed,join,30',skycell,1302,86,54,0.566,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+designed,join,30',q3c,1303,9,7,1.594,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+designed,join,30',pgsphere,1303,19,7,0.17,Index Only Scan+Index Scan+Nested Loop
+designed,join,30',skycell,1303,33,7,0.194,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+designed,join,30',q3c,1304,16,156,4.32,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+designed,join,30',pgsphere,1304,19,156,1.796,Index Only Scan+Index Scan+Nested Loop
+designed,join,30',skycell,1304,63,156,1.777,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+designed,join,30',q3c,1305,3,4,1.716,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+designed,join,30',pgsphere,1305,19,4,0.097,Index Only Scan+Index Scan+Nested Loop
+designed,join,30',skycell,1305,7,4,0.093,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+designed,join,30',q3c,1306,78,152,3.539,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+designed,join,30',pgsphere,1306,19,152,1.541,Index Only Scan+Index Scan+Nested Loop
+designed,join,30',skycell,1306,126,152,1.434,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+designed,join,30',q3c,1307,8,14,1.412,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+designed,join,30',pgsphere,1307,19,14,0.14,Index Only Scan+Index Scan+Nested Loop
+designed,join,30',skycell,1307,15,14,0.141,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+designed,join,30',q3c,1308,5,8,1.467,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+designed,join,30',pgsphere,1308,19,8,0.123,Index Only Scan+Index Scan+Nested Loop
+designed,join,30',skycell,1308,11,8,0.158,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+designed,join,30',q3c,1309,4,9,1.385,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+designed,join,30',pgsphere,1309,19,9,0.109,Index Only Scan+Index Scan+Nested Loop
+designed,join,30',skycell,1309,7,9,0.106,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+designed,join,30',q3c,1310,2,7,1.432,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+designed,join,30',pgsphere,1310,19,7,0.104,Index Only Scan+Index Scan+Nested Loop
+designed,join,30',skycell,1310,6,7,0.106,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+designed,join,30',q3c,1311,3,10,1.409,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+designed,join,30',pgsphere,1311,19,10,0.096,Index Only Scan+Index Scan+Nested Loop
+designed,join,30',skycell,1311,7,10,0.104,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+designed,join,30',q3c,1312,2,6,1.406,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+designed,join,30',pgsphere,1312,19,6,0.102,Index Only Scan+Index Scan+Nested Loop
+designed,join,30',skycell,1312,7,6,0.11,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+designed,join,30',q3c,1313,2,4,1.749,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+designed,join,30',pgsphere,1313,19,4,0.092,Index Only Scan+Index Scan+Nested Loop
+designed,join,30',skycell,1313,7,4,0.094,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+designed,join,30',q3c,1314,3,6,1.496,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+designed,join,30',pgsphere,1314,19,6,0.11,Index Only Scan+Index Scan+Nested Loop
+designed,join,30',skycell,1314,13,6,0.117,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+designed,join,30',q3c,1315,33,56,1.715,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+designed,join,30',pgsphere,1315,19,56,0.462,Index Only Scan+Index Scan+Nested Loop
+designed,join,30',skycell,1315,19,56,0.479,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+designed,join3,30',q3c,1301,7,5,1.508,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+designed,join3,30',pgsphere,1301,6,5,0.144,Index Only Scan+Index Scan+Nested Loop
+designed,join3,30',skycell,1301,4,5,0.15,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+designed,join3,30',q3c,1302,5,16,1.753,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+designed,join3,30',pgsphere,1302,6,16,0.32,Index Only Scan+Index Scan+Nested Loop
+designed,join3,30',skycell,1302,30,16,0.331,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+designed,join3,30',q3c,1303,3,0,2.331,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+designed,join3,30',pgsphere,1303,6,0,0.171,Index Only Scan+Index Scan+Nested Loop
+designed,join3,30',skycell,1303,11,0,0.155,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+designed,join3,30',q3c,1304,5,44,1.905,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+designed,join3,30',pgsphere,1304,6,44,0.771,Index Only Scan+Index Scan+Nested Loop
+designed,join3,30',skycell,1304,22,44,0.72,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+designed,join3,30',q3c,1305,1,3,1.391,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+designed,join3,30',pgsphere,1305,6,3,0.683,Index Only Scan+Index Scan+Nested Loop
+designed,join3,30',skycell,1305,2,3,0.264,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+designed,join3,30',q3c,1306,27,40,2.078,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+designed,join3,30',pgsphere,1306,6,40,0.791,Index Only Scan+Index Scan+Nested Loop
+designed,join3,30',skycell,1306,44,40,0.712,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+designed,join3,30',q3c,1307,3,5,1.372,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+designed,join3,30',pgsphere,1307,6,5,0.13,Index Only Scan+Index Scan+Nested Loop
+designed,join3,30',skycell,1307,5,5,0.139,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+designed,join3,30',q3c,1308,2,2,1.513,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+designed,join3,30',pgsphere,1308,6,2,0.117,Index Only Scan+Index Scan+Nested Loop
+designed,join3,30',skycell,1308,4,2,0.146,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+designed,join3,30',q3c,1309,1,2,1.44,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+designed,join3,30',pgsphere,1309,6,2,0.117,Index Only Scan+Index Scan+Nested Loop
+designed,join3,30',skycell,1309,2,2,0.113,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+designed,join3,30',q3c,1310,1,1,1.507,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+designed,join3,30',pgsphere,1310,6,1,0.218,Index Only Scan+Index Scan+Nested Loop
+designed,join3,30',skycell,1310,2,1,0.197,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+designed,join3,30',q3c,1311,1,4,1.487,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+designed,join3,30',pgsphere,1311,6,4,0.228,Index Only Scan+Index Scan+Nested Loop
+designed,join3,30',skycell,1311,2,4,0.188,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+designed,join3,30',q3c,1312,1,5,1.803,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+designed,join3,30',pgsphere,1312,6,5,0.155,Index Only Scan+Index Scan+Nested Loop
+designed,join3,30',skycell,1312,2,5,0.284,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+designed,join3,30',q3c,1313,1,1,1.51,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+designed,join3,30',pgsphere,1313,6,1,0.105,Index Only Scan+Index Scan+Nested Loop
+designed,join3,30',skycell,1313,2,1,0.112,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+designed,join3,30',q3c,1314,1,3,1.482,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+designed,join3,30',pgsphere,1314,6,3,0.115,Index Only Scan+Index Scan+Nested Loop
+designed,join3,30',skycell,1314,4,3,0.14,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+designed,join3,30',q3c,1315,11,15,1.582,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+designed,join3,30',pgsphere,1315,6,15,0.296,Index Only Scan+Index Scan+Nested Loop
+designed,join3,30',skycell,1315,6,15,0.291,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+designed,filter,1deg,q3c,1401,143,82,1.399,Bitmap Heap Scan+Bitmap Index Scan
+designed,filter,1deg,pgsphere,1401,256,82,0.093,Index Scan
+designed,filter,1deg,skycell,1401,196,82,0.106,Bitmap Heap Scan+Bitmap Index Scan
+designed,filter,1deg,q3c,1402,54,72,1.375,Bitmap Heap Scan+Bitmap Index Scan
+designed,filter,1deg,pgsphere,1402,256,72,0.08,Index Scan
+designed,filter,1deg,skycell,1402,77,72,0.088,Bitmap Heap Scan+Bitmap Index Scan
+designed,filter,1deg,q3c,1403,177,121,1.257,Bitmap Heap Scan+Bitmap Index Scan
+designed,filter,1deg,pgsphere,1403,256,121,0.094,Index Scan
+designed,filter,1deg,skycell,1403,118,121,0.112,Bitmap Heap Scan+Bitmap Index Scan
+designed,filter,1deg,q3c,1404,300,462,1.464,Bitmap Heap Scan+Bitmap Index Scan
+designed,filter,1deg,pgsphere,1404,256,462,0.359,Index Scan
+designed,filter,1deg,skycell,1404,402,462,0.269,Bitmap Heap Scan+Bitmap Index Scan
+designed,filter,1deg,q3c,1405,42,86,1.983,Bitmap Heap Scan+Bitmap Index Scan
+designed,filter,1deg,pgsphere,1405,256,86,0.087,Index Scan
+designed,filter,1deg,skycell,1405,108,86,0.093,Bitmap Heap Scan+Bitmap Index Scan
+designed,filter,1deg,q3c,1406,609,377,1.395,Bitmap Heap Scan+Bitmap Index Scan
+designed,filter,1deg,pgsphere,1406,256,377,0.233,Index Scan
+designed,filter,1deg,skycell,1406,485,377,0.182,Bitmap Heap Scan+Bitmap Index Scan
+designed,filter,1deg,q3c,1407,59,88,1.393,Bitmap Heap Scan+Bitmap Index Scan
+designed,filter,1deg,pgsphere,1407,256,88,0.084,Index Scan
+designed,filter,1deg,skycell,1407,95,88,0.084,Bitmap Heap Scan+Bitmap Index Scan
+designed,filter,1deg,q3c,1408,434,1349,1.718,Bitmap Heap Scan+Bitmap Index Scan
+designed,filter,1deg,pgsphere,1408,256,1349,0.68,Index Scan
+designed,filter,1deg,skycell,1408,1601,1349,0.464,Bitmap Heap Scan+Bitmap Index Scan
+designed,filter,1deg,q3c,1409,57,103,1.446,Bitmap Heap Scan+Bitmap Index Scan
+designed,filter,1deg,pgsphere,1409,256,103,0.13,Index Scan
+designed,filter,1deg,skycell,1409,95,103,0.132,Bitmap Heap Scan+Bitmap Index Scan
+designed,filter,1deg,q3c,1410,37,102,1.796,Bitmap Heap Scan+Bitmap Index Scan
+designed,filter,1deg,pgsphere,1410,256,102,0.077,Index Scan
+designed,filter,1deg,skycell,1410,92,102,0.079,Bitmap Heap Scan+Bitmap Index Scan
+designed,filter,1deg,q3c,1411,59,260,1.466,Bitmap Heap Scan+Bitmap Index Scan
+designed,filter,1deg,pgsphere,1411,256,260,0.139,Index Scan
+designed,filter,1deg,skycell,1411,305,260,0.137,Bitmap Heap Scan+Bitmap Index Scan
+designed,filter,1deg,q3c,1412,46,92,1.362,Bitmap Heap Scan+Bitmap Index Scan
+designed,filter,1deg,pgsphere,1412,256,92,0.071,Index Scan
+designed,filter,1deg,skycell,1412,105,92,0.087,Bitmap Heap Scan+Bitmap Index Scan
+designed,filter,1deg,q3c,1413,83,95,2,Bitmap Heap Scan+Bitmap Index Scan
+designed,filter,1deg,pgsphere,1413,256,95,0.092,Index Scan
+designed,filter,1deg,skycell,1413,100,95,0.083,Bitmap Heap Scan+Bitmap Index Scan
+designed,filter,1deg,q3c,1414,81,357,1.885,Bitmap Heap Scan+Bitmap Index Scan
+designed,filter,1deg,pgsphere,1414,256,357,0.287,Index Scan
+designed,filter,1deg,skycell,1414,262,357,0.266,Bitmap Heap Scan+Bitmap Index Scan
+designed,filter,1deg,q3c,1415,37,88,1.315,Bitmap Heap Scan+Bitmap Index Scan
+designed,filter,1deg,pgsphere,1415,256,88,0.088,Index Scan
+designed,filter,1deg,skycell,1415,150,88,0.076,Bitmap Heap Scan+Bitmap Index Scan
+designed,join,1deg,q3c,1401,42,31,1.645,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+designed,join,1deg,pgsphere,1401,75,31,0.309,Index Only Scan+Index Scan+Nested Loop
+designed,join,1deg,skycell,1401,58,31,0.337,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+designed,join,1deg,q3c,1402,16,22,1.618,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+designed,join,1deg,pgsphere,1402,75,22,0.449,Index Only Scan+Index Scan+Nested Loop
+designed,join,1deg,skycell,1402,23,22,0.258,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+designed,join,1deg,q3c,1403,52,23,1.527,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+designed,join,1deg,pgsphere,1403,75,23,0.344,Index Only Scan+Index Scan+Nested Loop
+designed,join,1deg,skycell,1403,35,23,0.34,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+designed,join,1deg,q3c,1404,88,132,3.667,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+designed,join,1deg,pgsphere,1404,75,132,1.34,Index Only Scan+Index Scan+Nested Loop
+designed,join,1deg,skycell,1404,119,132,1.277,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+designed,join,1deg,q3c,1405,12,27,1.638,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+designed,join,1deg,pgsphere,1405,75,27,0.276,Index Only Scan+Index Scan+Nested Loop
+designed,join,1deg,skycell,1405,32,27,0.284,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+designed,join,1deg,q3c,1406,179,110,2.462,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+designed,join,1deg,pgsphere,1406,75,110,1.092,Index Only Scan+Index Scan+Nested Loop
+designed,join,1deg,skycell,1406,143,110,1.039,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+designed,join,1deg,q3c,1407,17,21,1.628,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+designed,join,1deg,pgsphere,1407,75,21,0.282,Index Only Scan+Index Scan+Nested Loop
+designed,join,1deg,skycell,1407,28,21,0.279,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+designed,join,1deg,q3c,1408,128,444,6.154,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+designed,join,1deg,pgsphere,1408,75,444,3.665,Index Only Scan+Index Scan+Nested Loop
+designed,join,1deg,skycell,1408,472,444,3.411,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+designed,join,1deg,q3c,1409,17,27,1.686,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+designed,join,1deg,pgsphere,1409,75,27,0.335,Index Only Scan+Index Scan+Nested Loop
+designed,join,1deg,skycell,1409,28,27,0.315,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+designed,join,1deg,q3c,1410,11,27,1.595,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+designed,join,1deg,pgsphere,1410,75,27,0.281,Index Only Scan+Index Scan+Nested Loop
+designed,join,1deg,skycell,1410,27,27,0.324,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+designed,join,1deg,q3c,1411,17,91,2.133,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+designed,join,1deg,pgsphere,1411,75,91,0.714,Index Only Scan+Index Scan+Nested Loop
+designed,join,1deg,skycell,1411,90,91,0.726,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+designed,join,1deg,q3c,1412,13,21,1.597,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+designed,join,1deg,pgsphere,1412,75,21,0.26,Index Only Scan+Index Scan+Nested Loop
+designed,join,1deg,skycell,1412,31,21,0.274,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+designed,join,1deg,q3c,1413,24,31,2.013,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+designed,join,1deg,pgsphere,1413,75,31,0.3,Index Only Scan+Index Scan+Nested Loop
+designed,join,1deg,skycell,1413,29,31,0.293,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+designed,join,1deg,q3c,1414,24,113,2.349,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+designed,join,1deg,pgsphere,1414,75,113,1.127,Index Only Scan+Index Scan+Nested Loop
+designed,join,1deg,skycell,1414,77,113,1.059,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+designed,join,1deg,q3c,1415,11,19,1.557,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+designed,join,1deg,pgsphere,1415,75,19,0.272,Index Only Scan+Index Scan+Nested Loop
+designed,join,1deg,skycell,1415,44,19,0.264,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+designed,join3,1deg,q3c,1401,15,7,1.51,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+designed,join3,1deg,pgsphere,1401,26,7,0.199,Index Only Scan+Index Scan+Nested Loop
+designed,join3,1deg,skycell,1401,20,7,0.224,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+designed,join3,1deg,q3c,1402,5,4,1.492,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+designed,join3,1deg,pgsphere,1402,26,4,0.186,Index Only Scan+Index Scan+Nested Loop
+designed,join3,1deg,skycell,1402,8,4,0.194,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+designed,join3,1deg,q3c,1403,18,7,1.857,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+designed,join3,1deg,pgsphere,1403,26,7,0.264,Index Only Scan+Index Scan+Nested Loop
+designed,join3,1deg,skycell,1403,13,7,0.231,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+designed,join3,1deg,q3c,1404,30,41,1.892,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+designed,join3,1deg,pgsphere,1404,26,41,0.751,Index Only Scan+Index Scan+Nested Loop
+designed,join3,1deg,skycell,1404,42,41,0.653,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+designed,join3,1deg,q3c,1405,4,7,1.551,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+designed,join3,1deg,pgsphere,1405,26,7,0.203,Index Only Scan+Index Scan+Nested Loop
+designed,join3,1deg,skycell,1405,11,7,0.21,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+designed,join3,1deg,q3c,1406,63,40,1.786,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+designed,join3,1deg,pgsphere,1406,26,40,0.622,Index Only Scan+Index Scan+Nested Loop
+designed,join3,1deg,skycell,1406,50,40,0.565,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+designed,join3,1deg,q3c,1407,6,7,1.597,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+designed,join3,1deg,pgsphere,1407,26,7,0.203,Index Only Scan+Index Scan+Nested Loop
+designed,join3,1deg,skycell,1407,9,7,0.202,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+designed,join3,1deg,q3c,1408,45,140,2.93,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+designed,join3,1deg,pgsphere,1408,26,140,1.847,Index Only Scan+Index Scan+Nested Loop
+designed,join3,1deg,skycell,1408,164,140,1.656,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+designed,join3,1deg,q3c,1409,6,11,1.708,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+designed,join3,1deg,pgsphere,1409,26,11,0.293,Index Only Scan+Index Scan+Nested Loop
+designed,join3,1deg,skycell,1409,9,11,0.269,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+designed,join3,1deg,q3c,1410,4,10,1.668,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+designed,join3,1deg,pgsphere,1410,26,10,0.19,Index Only Scan+Index Scan+Nested Loop
+designed,join3,1deg,skycell,1410,9,10,0.213,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+designed,join3,1deg,q3c,1411,6,35,1.763,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+designed,join3,1deg,pgsphere,1411,26,35,0.411,Index Only Scan+Index Scan+Nested Loop
+designed,join3,1deg,skycell,1411,31,35,0.432,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+designed,join3,1deg,q3c,1412,5,10,1.779,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+designed,join3,1deg,pgsphere,1412,26,10,0.196,Index Only Scan+Index Scan+Nested Loop
+designed,join3,1deg,skycell,1412,10,10,0.241,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+designed,join3,1deg,q3c,1413,8,15,1.664,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+designed,join3,1deg,pgsphere,1413,26,15,0.296,Index Only Scan+Index Scan+Nested Loop
+designed,join3,1deg,skycell,1413,10,15,0.2,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+designed,join3,1deg,q3c,1414,8,33,1.746,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+designed,join3,1deg,pgsphere,1414,26,33,0.632,Index Only Scan+Index Scan+Nested Loop
+designed,join3,1deg,skycell,1414,27,33,0.534,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+designed,join3,1deg,q3c,1415,4,1,1.48,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop
+designed,join3,1deg,pgsphere,1415,26,1,0.21,Index Only Scan+Index Scan+Nested Loop
+designed,join3,1deg,skycell,1415,16,1,0.193,Bitmap Heap Scan+Bitmap Index Scan+Index Only Scan+Nested Loop

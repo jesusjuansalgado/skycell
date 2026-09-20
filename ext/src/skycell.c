@@ -77,6 +77,8 @@ static int	skycell_max_steps = 4000;
 static int	skycell_join_slots = 4;
 static bool skycell_use_stats = true;
 static bool skycell_cache_coverings = true;
+static bool skycell_exact_cells = true;
+static int	skycell_force_order = -1;
 
 void		_PG_init(void);
 
@@ -115,6 +117,16 @@ _PG_init(void)
 							 "Memoise coverings per backend (cleared when statistics change).",
 							 NULL, &skycell_cache_coverings, true,
 							 PGC_USERSET, 0, NULL, NULL, NULL);
+	DefineCustomBoolVariable("skycell.exact_cells",
+							 "Classify cells against a cone by their own corner geometry "
+							 "(off: the provable max_pixrad cap, looser but cheaper to justify).",
+							 NULL, &skycell_exact_cells, true,
+							 PGC_USERSET, 0, NULL, NULL, NULL);
+	DefineCustomIntVariable("skycell.force_order",
+							"Diagnostics only: cover cones at this HEALPix order instead of "
+							"the one the cost model chooses (-1 = let the model choose).",
+							NULL, &skycell_force_order, -1, -1, SC_MAX_ORDER,
+							PGC_USERSET, 0, NULL, NULL, NULL);
 	MarkGUCPrefixReserved("skycell");
 }
 
@@ -127,6 +139,8 @@ current_params(sc_cover_params *p, int max_ranges)
 	p->max_area_ratio = skycell_max_area_ratio;
 	p->max_ranges = max_ranges;
 	p->max_steps = skycell_max_steps;
+	p->force_order = skycell_force_order;
+	sc_exact_cells = skycell_exact_cells ? 1 : 0;
 }
 
 /* ------------------------------------------------------------------ */
@@ -1173,8 +1187,8 @@ skycell_cover_info(PG_FUNCTION_ARGS)
 	sc_cover	cov;
 	sc_cover_params p;
 	TupleDesc	td;
-	Datum		v[5];
-	bool		n[5] = {0};
+	Datum		v[7];
+	bool		n[7] = {0};
 
 	if (PG_ARGISNULL(0) || PG_ARGISNULL(1) || PG_ARGISNULL(2))
 		PG_RETURN_NULL();
@@ -1188,6 +1202,8 @@ skycell_cover_info(PG_FUNCTION_ARGS)
 	v[2] = Int32GetDatum(cov.deepest);
 	v[3] = Float8GetDatum(cov.exp_rows);
 	v[4] = Float8GetDatum(reg.area > 0 ? cov.area / reg.area : 0);
+	v[5] = Float8GetDatum(cov.rho);
+	v[6] = Int32GetDatum(cov.order);
 	PG_RETURN_DATUM(HeapTupleGetDatum(heap_form_tuple(BlessTupleDesc(td), v, n)));
 }
 

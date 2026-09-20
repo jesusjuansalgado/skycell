@@ -6,6 +6,20 @@
 #include <string.h>
 #include "cover.h"
 
+/*
+ * Numerical margin added to every OUT decision, in radians.
+ *
+ * Classifying a cell OUT removes it from the covering, so it is the only
+ * classification that can lose rows; IN and PARTIAL cannot (the exact
+ * predicate re-tests every row the index returns).  The geometry here is a
+ * handful of dot products, cross products and an asin per cell, each of which
+ * carries a relative error of a few ulp, so the accumulated error on an angle
+ * is bounded well below 1e-13 rad for any unit vectors.  2e-13 rad (40 pas)
+ * is that bound with room to spare, and is far below the 0.4 mas resolution
+ * of an order-29 cell, so it costs nothing in false positives.
+ */
+#define SC_ANG_EPS 2e-13
+
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
 #endif
@@ -73,7 +87,7 @@ sc_region_cone(sc_region *r, double ra_deg, double dec_deg, double radius_deg)
 		else if (a >= M_PI)
 			r->out_c2[k] = 5.0;		/* chord^2 <= 4: never OUT */
 		else
-			r->out_c2[k] = 4.0 * pow(sin(a / 2.0), 2);
+			r->out_c2[k] = 4.0 * pow(sin(fmin(M_PI, a + SC_ANG_EPS) / 2.0), 2);
 		r->in_c2[k] = (b < 0) ? -1.0 : 4.0 * pow(sin(b / 2.0), 2);
 	}
 	return NULL;
@@ -167,7 +181,7 @@ sc_region_poly(sc_region *r, int nv, const double *ra_deg, const double *dec_deg
 	}
 
 	for (int k = 0; k <= SC_MAX_ORDER; k++)
-		r->sin_rho[k] = sin(sc_pixrad(k));
+		r->sin_rho[k] = sin(sc_pixrad(k) + SC_ANG_EPS);
 	return NULL;
 }
 
@@ -197,8 +211,10 @@ sc_region_contains(const sc_region *r, sc_vec3 p)
 /* angular distance from p to the minor great-circle arc a-b (unit normal n) */
 static double arc_dist(sc_vec3 p, sc_vec3 a, sc_vec3 b, sc_vec3 n);
 
-/* exact cell geometry for cone classification (see cell_bulge) */
+/* exact cell geometry for cone classification (see classify_cone_exact) */
 int			sc_exact_cells = 1;
+
+
 
 static double
 arc_dist(sc_vec3 p, sc_vec3 a, sc_vec3 b, sc_vec3 n)
@@ -212,24 +228,41 @@ arc_dist(sc_vec3 p, sc_vec3 a, sc_vec3 b, sc_vec3 n)
 }
 
 /*
- * Classify a cell against a cone using the cell's own geometry: its four
- * corners bound it (test/healpix_selftest.c checks that every boundary point
- * lies within the corner distance), and the chords between them bound its
- * boundary to within the edge bulge.  Tighter than the cap of
- * sc_pixrad(order), which is the worst case over the whole sphere: fewer
- * cells come back PARTIAL, so coverings are smaller and refinement stops
- * sooner.
+ * Classify a cell against a cone using the cell's own geometry.
+ *
+ * Only OUT can lose rows -- IN and PARTIAL both keep the cell, and the exact
+ * predicate re-tests every row the index returns -- so OUT is the only
+ * decision that needs a bound rather than an estimate.  It uses
+ *
+ *     R_cell = min(sc_pixrad(order), max_i angle(centre, corner_i)),
+ *
+ * an upper bound on the distance from the cell's centre to any of its points:
+ * sc_pixrad is healpix_base's analytic worst case over the sphere, and the
+ * corner term is the cell's own extent, which test/healpix_selftest.c checks
+ * over 1.6M boundary points at every order (the extremum of distance from the
+ * centre over a cell is attained at a corner).  A cell is OUT when its whole
+ * cap lies beyond the cone.
+ *
+ * IN may use the corners and edge midpoints directly, tightly: calling a cell
+ * IN that is only partly inside costs false positives, never rows.
+ *
+ * An earlier version also decided OUT from the distance to the corner chords,
+ * inflating them by 4x the edge's departure from its chord at the midpoint.
+ * That is not a bound: where an edge crosses its chord plane near the midpoint
+ * the estimate collapses, and healpix_selftest measures the true departure at
+ * up to 64x the midpoint value (order 18).  The absolute error was ~1e-8 rad,
+ * below the 0.4 mas leaf cell, but small is not zero, so the test is gone.
  */
 static sc_class
 classify_cone_exact(const sc_region *r, int order, int64_t pix, double *f_out)
 {
 	sc_vec3		c[4],
 				mid[4],
-				norm[4];
+				centre;
 	double		dmax = 0,
-				dnear = M_PI,
 				bulge = 0,
-				dedge = M_PI;
+				rcell = 0,
+				dcentre;
 
 	if (r->radius < 0)
 	{
@@ -238,68 +271,35 @@ classify_cone_exact(const sc_region *r, int order, int64_t pix, double *f_out)
 	}
 
 	sc_pix_corners(order, pix, c);
+	centre = sc_pix2vec(order, pix);
 	for (int e = 0; e < 4; e++)
 	{
-		sc_vec3		a = c[e],
-					b = c[(e + 1) & 3],
-					n = sc_cross(a, b);
-		double		nn = sqrt(sc_dot(n, n));
-		double		dev;
-
 		mid[e] = sc_pix_edge_point(order, pix, e, 0.5);
-		if (nn < 1e-300)
-		{
-			/* degenerate edge (a cell corner at a pole): no chord to use */
-			norm[e] = n;
-			bulge = fmax(bulge, sc_angle(a, mid[e]));
-			continue;
-		}
-		n.x /= nn;
-		n.y /= nn;
-		n.z /= nn;
-		norm[e] = n;
-		/*
-		 * How far this very edge leaves its chord.  Measured per cell rather
-		 * than modelled: near the poles an edge spans a large azimuth and
-		 * departs from the chord by a fraction of the cell size, while an
-		 * equatorial edge departs by (size)^2.  The midpoint is the extremum
-		 * of a smooth arc; 4x covers asymmetric edges, and the brute-force
-		 * tests in test/cover_selftest.c are what certify the margin.
-		 */
-		dev = fabs(asin(fmin(1.0, fabs(sc_dot(n, mid[e])))));
-		bulge = fmax(bulge, 4.0 * dev);
+		rcell = fmax(rcell, sc_angle(centre, c[e]));
+		/* how far this edge's midpoint leaves the corner chord: IN only */
+		bulge = fmax(bulge, sc_angle(centre, mid[e]) - rcell);
 	}
+	rcell = fmin(rcell, sc_pixrad(order));
+	bulge = fmax(bulge, 0.0);
 
 	for (int i = 0; i < 4; i++)
-	{
 		dmax = fmax(dmax, fmax(sc_angle(r->center, c[i]), sc_angle(r->center, mid[i])));
-		dnear = fmin(dnear, fmin(sc_angle(r->center, c[i]), sc_angle(r->center, mid[i])));
-	}
 
+	/* IN: tight, and safe even if it is optimistic (the cell is kept whole) */
 	if (dmax + bulge <= r->radius)
 	{
 		*f_out = 0.0;
 		return SC_IN;
 	}
-	/* the cone's centre inside this cell: it certainly intersects */
-	if ((r->center_pix >> (2 * (SC_MAX_ORDER - order))) == pix)
-	{
-		*f_out = clamp01(1.0 - r->radius / fmax(dmax, 1e-300));
-		return SC_PARTIAL;
-	}
-	dedge = dnear;
-	for (int e = 0; e < 4; e++)
-	{
-		if (sc_dot(norm[e], norm[e]) < 0.5)
-			continue;			/* degenerate edge, already in the bulge */
-		dedge = fmin(dedge, arc_dist(r->center, c[e], c[(e + 1) & 3], norm[e]));
-	}
-	if (dedge > r->radius + bulge)
+
+	/* OUT: the cell's proven cap must clear the cone entirely */
+	dcentre = sc_angle(r->center, centre);
+	if (dcentre - rcell > r->radius + SC_ANG_EPS)
 	{
 		*f_out = 1.0;
 		return SC_OUT;
 	}
-	*f_out = clamp01(0.5 + (dedge - r->radius) / (2.0 * fmax(dmax, 1e-300)));
+	*f_out = clamp01(0.5 + (dcentre - rcell - r->radius) / (2.0 * fmax(dmax, 1e-300)));
 	return SC_PARTIAL;
 }
 
@@ -373,7 +373,7 @@ sc_region_classify_cap(const sc_region *r, int order, int64_t pix, double *f_out
 
 			for (int i = 0; i < r->nv; i++)
 				dist = fmin(dist, arc_dist(c, r->v[i], r->v[(i + 1) % r->nv], r->n[i]));
-			if (dist > rho)
+			if (dist > rho + SC_ANG_EPS)
 			{
 				*f_out = 1.0;
 				return SC_OUT;
@@ -918,6 +918,7 @@ sc_cover_params_default(sc_cover_params *p)
 	p->max_area_ratio = 64.0;
 	p->use_seed = 1;
 	p->direct = 1;
+	p->force_order = -1;
 }
 
 static inline double
@@ -959,7 +960,8 @@ potential(const sc_region *r, double e, double f_out, int order)
 #define SC_COVER_GAMMA 2.0
 
 static int
-choose_order(const sc_region *r, const sc_density *d, const sc_cover_params *p)
+choose_order(const sc_region *r, const sc_density *d, const sc_cover_params *p,
+			 double *rho_out)
 {
 	int			m,
 				best = p->max_order;
@@ -979,6 +981,11 @@ choose_order(const sc_region *r, const sc_density *d, const sc_cover_params *p)
 	rho = rows / order_area(m);
 	if (!(rho > 0))
 		rho = (d && d->ntotal > 0 ? d->ntotal : 1e6) / (4.0 * M_PI);
+	if (rho_out)
+		*rho_out = rho;
+
+	if (p->force_order >= 0)
+		return Min(p->force_order, p->max_order);
 
 	if (p->max_area_ratio > 0)
 		s_max = sqrt(p->max_area_ratio * fmax(r->area, order_area(SC_MAX_ORDER)));
@@ -1020,10 +1027,11 @@ choose_order(const sc_region *r, const sc_density *d, const sc_cover_params *p)
  */
 static int
 cover_cone_direct(const sc_region *r, const sc_density *d,
-				  const sc_cover_params *p, rlist_t *kept, int *steps)
+				  const sc_cover_params *p, rlist_t *kept, int *steps,
+				  double *rho_out)
 {
 	seed_t		sd;
-	int			target = choose_order(r, d, p);
+	int			target = choose_order(r, d, p, rho_out);
 	int			budget = 4 * Max(p->max_ranges, 4) + 16;
 	int			k,
 				ncur = 0,
@@ -1100,6 +1108,8 @@ sc_cover_compute(const sc_region *r, const sc_density *d,
 	int			nr = 0;			/* approximate number of ranges */
 	int			steps = 0;
 	int			deepest = 0;
+	int			order = -1;
+	double		rho = 0;
 	double		area_cap = (p->max_area_ratio > 0)
 		? p->max_area_ratio * fmax(r->area, order_area(SC_MAX_ORDER)) : INFINITY;
 
@@ -1108,11 +1118,12 @@ sc_cover_compute(const sc_region *r, const sc_density *d,
 	if (p->direct && r->kind == SC_REGION_CONE && r->radius >= 0 &&
 		r->radius <= 10.0 * M_PI / 180)
 	{
-		int			k = cover_cone_direct(r, d, p, &kept, &steps);
+		int			k = cover_cone_direct(r, d, p, &kept, &steps, &rho);
 
 		if (k >= 0)
 		{
 			deepest = k;
+			order = k;
 			goto finish;
 		}
 		kept.n = 0;				/* fell back: start the descent clean */
@@ -1266,6 +1277,8 @@ refine:
 finish:
 	out->steps = steps;
 	out->deepest = deepest;
+	out->rho = rho;
+	out->order = order;
 	if (kept.n == 0)
 	{
 		if (kept.a)

@@ -205,6 +205,87 @@ main(void)
 		printf("edge bulge <= %.4f * size^2; boundary point / max-corner distance <= %.4f\n",
 			   worst_ratio, worst_corner);
 		/*
+		 * The safety factor in classify_cone_exact(): it estimates an edge's
+		 * greatest departure from its chord as 4x the departure at the edge
+		 * midpoint.  Measure what that factor really has to be -- densely
+		 * sampled, over every order and including the cells that break naive
+		 * models (the polar caps, the zone boundary, base-pixel corners).
+		 * Reported so the paper can quote the headroom instead of asserting
+		 * the constant.
+		 */
+		{
+			double		worst_bulge_ratio = 0;
+			int			worst_order = -1;
+			int64_t		worst_pix = -1;
+
+			for (int order = 0; order <= SC_MAX_ORDER; order++)
+			{
+				int64_t		npix = (int64_t) 12 << (2 * order);
+				int			ncase = 220;
+
+				for (int i = 0; i < ncase; i++)
+				{
+					int64_t		pix;
+					sc_vec3		c[4];
+
+					/* random cells, plus the pathological ones by construction */
+					if (i < 12)
+						pix = (int64_t) i * (npix / 12);	/* one per base pixel */
+					else if (i < 24)
+						pix = (int64_t) (i - 11) * (npix / 12) - 1;	/* base-pixel corners */
+					else if (i < 36)
+						pix = (npix / 12) - (int64_t) (i - 23);	/* inside the polar caps */
+					else
+						pix = (int64_t) (urand() * (double) npix);
+					if (pix < 0)
+						pix = 0;
+					if (pix >= npix)
+						pix = npix - 1;
+
+					sc_pix_corners(order, pix, c);
+					for (int e = 0; e < 4; e++)
+					{
+						sc_vec3		a = c[e],
+									b = c[(e + 1) & 3];
+						sc_vec3		n = sc_cross(a, b);
+						double		nn = sqrt(sc_dot(n, n));
+						double		mid,
+									tmax = 0;
+
+						if (nn < 1e-300)
+							continue;	/* degenerate edge: handled separately */
+						n.x /= nn; n.y /= nn; n.z /= nn;
+						mid = fabs(asin(fmin(1.0,
+							fabs(sc_dot(n, sc_pix_edge_point(order, pix, e, 0.5))))));
+						for (int j = 1; j < 256; j++)
+						{
+							sc_vec3		p = sc_pix_edge_point(order, pix, e, j / 256.0);
+
+							tmax = fmax(tmax, fabs(asin(fmin(1.0, fabs(sc_dot(n, p))))));
+						}
+						/* only meaningful when the midpoint deviation is resolvable */
+						if (mid > 1e-14 && tmax / mid > worst_bulge_ratio)
+						{
+							worst_bulge_ratio = tmax / mid;
+							worst_order = order;
+							worst_pix = pix;
+						}
+					}
+				}
+			}
+			printf("edge bulge: max(true deviation / midpoint deviation) = %.1f"
+				   " (order %d, pix %lld) -- why classify_cone_exact does not\n"
+				   "            decide OUT from the corner chords\n",
+				   worst_bulge_ratio, worst_order, (long long) worst_pix);
+			/*
+			 * No CHECK on this ratio: it is unbounded by construction (an edge
+			 * that crosses its chord plane at the midpoint has a midpoint
+			 * deviation of ~0 and a larger one elsewhere), which is exactly
+			 * why the OUT test uses the proven cap bound instead.  The number
+			 * is printed so the regression is visible if the geometry changes.
+			 */
+		}
+		/*
 		 * What the covering relies on (cover.c, classify_cone_exact): a
 		 * cell's corners bound it, so no boundary point is farther from the
 		 * centre than its farthest corner. The bulge itself is measured per

@@ -75,6 +75,14 @@ typedef struct sc_cover_params
 
 	int			use_seed;		/* fast start for small cones (default on) */
 	int			direct;			/* closed-form order for cones (default on) */
+
+	/*
+	 * Diagnostics, not for production use.  force_order >= 0 covers at that
+	 * order whatever the cost model says, which is how test/bench measure the
+	 * cost of every order and check where the model's choice lands on that
+	 * curve.  -1 (the default) lets the model choose.
+	 */
+	int			force_order;
 } sc_cover_params;
 
 typedef struct sc_range
@@ -91,6 +99,8 @@ typedef struct sc_cover
 	double		area;			/* steradians covered */
 	int			steps;			/* cell classifications performed */
 	int			deepest;		/* deepest order reached */
+	double		rho;			/* density the order was chosen from, rows/sr */
+	int			order;			/* order the cost model asked for (-1: n/a) */
 } sc_cover;
 
 /* region constructors; return NULL on success or a static error message */

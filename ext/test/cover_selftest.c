@@ -172,6 +172,121 @@ main(void)
 	}
 
 	/*
+	 * Polygon sampling, the same idea as the disc sampling below but for the
+	 * convex-polygon path (which is also what box() builds): polygons placed
+	 * at the awkward places, with points drawn inside them -- most of them a
+	 * hair inside an edge or a vertex, where a covering that is even slightly
+	 * too small loses rows.  Every such point's cell must be in the covering.
+	 */
+	{
+		int			npoly = 8000,
+					bad = 0,
+					built = 0;
+		long		pts = 0;
+		sc_cover_params p;
+
+		sc_cover_params_default(&p);
+
+		for (int q = 0; q < npoly; q++)
+		{
+			double		cra,
+						cde,
+						size = pow(10, -4 + 4.3 * urand());
+			double		pra[8],
+						pde[8];
+			int			nv = 3 + q % 6;
+			sc_region	r;
+			sc_cover	c;
+			sc_vec3		cen = {0, 0, 0};
+
+			/* the places that break naive geometry */
+			switch (q % 6)
+			{
+				case 0: cra = 360 * urand(); cde = 90 - size * urand(); break;      /* pole */
+				case 1: cra = 360 * urand(); cde = -90 + size * urand(); break;
+				case 2: cra = 360 * urand(); cde = 41.8103148958; break;            /* zone boundary */
+				case 3: cra = size * (urand() - 0.5); cde = 90 * (2 * urand() - 1) * 0.98; break;  /* RA wrap */
+				case 4: cra = 90.0 * (q % 4); cde = asin(2 * urand() - 1) * 180 / M_PI; break;     /* face edge */
+				default: cra = 360 * urand(); cde = asin(2 * urand() - 1) * 180 / M_PI; break;
+			}
+			for (int v = 0; v < nv; v++)
+			{
+				double		ang = 2 * M_PI * v / nv + 0.3 * urand();
+
+				pde[v] = cde + size * sin(ang);
+				pra[v] = cra + size * cos(ang) / fmax(cos(cde * M_PI / 180), 1e-4);
+				if (pde[v] > 90) pde[v] = 90;
+				if (pde[v] < -90) pde[v] = -90;
+			}
+			if (sc_region_poly(&r, nv, pra, pde) != NULL)
+				continue;				/* degenerate or non-convex: not our case */
+			built++;
+			sc_cover_compute(&r, &dens_hist, &p, &c);
+
+			/* the centroid of a convex spherical polygon is inside it */
+			for (int v = 0; v < r.nv; v++)
+			{
+				cen.x += r.v[v].x; cen.y += r.v[v].y; cen.z += r.v[v].z;
+			}
+			{
+				double	nn = sqrt(cen.x * cen.x + cen.y * cen.y + cen.z * cen.z);
+
+				if (nn < 1e-12)
+				{
+					sc_cover_free(&c); sc_region_free(&r); continue;
+				}
+				cen.x /= nn; cen.y /= nn; cen.z /= nn;
+			}
+
+			for (int k = 0; k < 120; k++)
+			{
+				int			e = (int) (urand() * r.nv) % r.nv;
+				double		t = urand(),
+							u,
+							nn;
+				sc_vec3		a = r.v[e],
+							b = r.v[(e + 1) % r.nv],
+							edge,
+							pt;
+
+				/* a point on the edge arc, then pulled towards the interior */
+				edge.x = a.x * (1 - t) + b.x * t;
+				edge.y = a.y * (1 - t) + b.y * t;
+				edge.z = a.z * (1 - t) + b.z * t;
+				nn = sqrt(edge.x * edge.x + edge.y * edge.y + edge.z * edge.z);
+				if (nn < 1e-12)
+					continue;
+				edge.x /= nn; edge.y /= nn; edge.z /= nn;
+
+				/* half the points within a part per billion of the boundary */
+				u = (k % 2) ? 1.0 - pow(10, -9 * urand()) : urand();
+				pt.x = cen.x + u * (edge.x - cen.x);
+				pt.y = cen.y + u * (edge.y - cen.y);
+				pt.z = cen.z + u * (edge.z - cen.z);
+				nn = sqrt(pt.x * pt.x + pt.y * pt.y + pt.z * pt.z);
+				if (nn < 1e-12)
+					continue;
+				pt.x /= nn; pt.y /= nn; pt.z /= nn;
+
+				if (!sc_region_contains(&r, pt))
+					continue;			/* fell outside on rounding: not a miss */
+				pts++;
+				if (!in_ranges(&c, sc_vec2pix(SC_MAX_ORDER, pt)))
+				{
+					bad++;
+					if (bad < 10)
+						printf("POLY FALSE NEGATIVE: case %d size=%g nv=%d\n", q % 6, size, nv);
+				}
+			}
+			sc_cover_free(&c);
+			sc_region_free(&r);
+		}
+		printf("polygon sampling: %d polygons at poles/zone/wrap/face edges, %ld points inside, %d misses\n",
+			   built, pts, bad);
+		failures += bad;
+	}
+
+	/*
 	 * Disc sampling: many cones at the awkward places (poles, the z=+-2/3
 	 * zone boundary, RA wrap, face edges), 200 points sampled inside each
 	 * (half of them near the rim); every point's cell must be covered.
