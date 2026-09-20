@@ -1,0 +1,123 @@
+method,radius_arcsec,pass,n,ms,plan
+q3c,1,1,99875,3784.305,"Aggregate
+  ->  Nested Loop
+        ->  Seq Scan on probe p
+        ->  Bitmap Heap Scan on cat_q3c c
+              Recheck Cond: (((q3c_ang2ipix(ra, ""dec"") >= q3c_nearby_it(p.ra, p.""dec"", '0.0002777777777777778'::double precision, 0)) AND (q3c_ang2ipix(ra, ""dec"") <= q3c_nearby_it(p.ra, p.""dec"", '0.0002777777777777778'::double precision, 1))) OR ((q3c_ang2ipix(ra, ""dec"") >= q3c_nearby_it(p.ra, p.""dec"", '0.0002777777777777778'::double precision, 2)) AND (q3c_ang2ipix(ra, ""dec"") <= q3c_nearby_it(p.ra, p.""dec"", '0.0002777777777777778'::double precision, 3))) OR ((q3c_ang2ipix(ra, ""dec"") >= q3c_nearby_it(p.ra, p.""dec"", '0.0002777777777777778'::double precision, 4)) AND (q3c_ang2ipix(ra, ""dec"") <= q3c_nearby_it(p.ra, p.""dec"", '0.0002777777777777778'::double precision, 5))) OR ((q3c_ang2ipix(ra, ""dec"") >= q3c_nearby_it(p.ra, p.""dec"", '0.0002777777777777778'::double precision, 6)) AND (q3c_ang2ipix(ra, ""dec"") <= q3c_nearby_it(p.ra, p.""dec"", '0.0002777777777777778'::double precision, 7))))
+              Filter: ((q3c_sindist(p.ra, p.""dec"", ra, ""dec"") < '5.876107634762963e-12'::double precision) AND ('0.0002777777777777778'::double precision ==<<>>== ROW(p.ra, p.""dec"", ra, ""dec"")::q3c_type))
+              ->  BitmapOr
+                    ->  Bitmap Index Scan on cat_q3c_idx
+                          Index Cond: ((q3c_ang2ipix(ra, ""dec"") >= q3c_nearby_it(p.ra, p.""dec"", '0.0002777777777777778'::double precision, 0)) AND (q3c_ang2ipix(ra, ""dec"") <= q3c_nearby_it(p.ra, p.""dec"", '0.0002777777777777778'::double precision, 1)))
+                    ->  Bitmap Index Scan on cat_q3c_idx
+                          Index Cond: ((q3c_ang2ipix(ra, ""dec"") >= q3c_nearby_it(p.ra, p.""dec"", '0.0002777777777777778'::double precision, 2)) AND (q3c_ang2ipix(ra, ""dec"") <= q3c_nearby_it(p.ra, p.""dec"", '0.0002777777777777778'::double precision, 3)))
+                    ->  Bitmap Index Scan on cat_q3c_idx
+                          Index Cond: ((q3c_ang2ipix(ra, ""dec"") >= q3c_nearby_it(p.ra, p.""dec"", '0.0002777777777777778'::double precision, 4)) AND (q3c_ang2ipix(ra, ""dec"") <= q3c_nearby_it(p.ra, p.""dec"", '0.0002777777777777778'::double precision, 5)))
+                    ->  Bitmap Index Scan on cat_q3c_idx
+                          Index Cond: ((q3c_ang2ipix(ra, ""dec"") >= q3c_nearby_it(p.ra, p.""dec"", '0.0002777777777777778'::double precision, 6)) AND (q3c_ang2ipix(ra, ""dec"") <= q3c_nearby_it(p.ra, p.""dec"", '0.0002777777777777778'::double precision, 7)))
+"
+q3c,1,2,99875,2294.735,""
+pgsphere,1,1,99876,4750.323,"Aggregate
+  ->  Nested Loop
+        ->  Seq Scan on probe p
+        ->  Index Scan using cat_sphere_idx on cat_sphere c
+              Index Cond: (pos <@ scircle(p.pos, '4.84813681109536e-06'::double precision))
+"
+pgsphere,1,2,99876,2502.491,""
+skycell_slots,1,1,99875,5363.214,"Aggregate
+  ->  Nested Loop
+        ->  Seq Scan on probe p
+        ->  Bitmap Heap Scan on cat_cell c
+              Recheck Cond: (((cell >= skycell_cone_bound(p.ra, p.""dec"", '0.0002777777777777778'::double precision, 0, 4, '10000000'::double precision, '{...}'::bigint[])) AND (cell <= skycell_cone_bound(p.ra, p.""dec"", '0.0002777777777777778'::double precision, 1, 4, '10000000'::double precision, '{...}'::bigint[]))) OR ((cell >= skycell_cone_bound(p.ra, p.""dec"", '0.0002777777777777778'::double precision, 2, 4, '10000000'::double precision, '{...}'::bigint[])) AND (cell <= skycell_cone_bound(p.ra, p.""dec"", '0.0002777777777777778'::double precision, 3, 4, '10000000'::double precision, '{...}'::bigint[]))) OR ((cell >= skycell_cone_bound(p.ra, p.""dec"", '0.0002777777777777778'::double precision, 4, 4, '10000000'::double precision, '{...}'::bigint[])) AND (cell <= skycell_cone_bound(p.ra, p.""dec"", '0.0002777777777777778'::double precision, 5, 4, '10000000'::double precision, '{...}'::bigint[]))) OR ((cell >= skycell_cone_bound(p.ra, p.""dec"", '0.0002777777777777778'::double precision, 6, 4, '10000000'::double precision, '{...}'::bigint[])) AND (cell <= skycell_cone_bound(p.ra, p.""dec"", '0.0002777777777777778'::double precision, 7, 4, '10000000'::double precision, '{...}'::bigint[]))))
+              Filter: skycell_in_cone(ra, ""dec"", p.ra, p.""dec"", '0.0002777777777777778'::double precision, '-1'::double precision)
+              ->  BitmapOr
+                    ->  Bitmap Index Scan on cat_cell_idx
+                          Index Cond: ((cell >= skycell_cone_bound(p.ra, p.""dec"", '0.0002777777777777778'::double precision, 0, 4, '10000000'::double precision, '{...}'::bigint[])) AND (cell <= skycell_cone_bound(p.ra, p.""dec"", '0.0002777777777777778'::double precision, 1, 4, '10000000'::double precision, '{...}'::bigint[])))
+                    ->  Bitmap Index Scan on cat_cell_idx
+                          Index Cond: ((cell >= skycell_cone_bound(p.ra, p.""dec"", '0.0002777777777777778'::double precision, 2, 4, '10000000'::double precision, '{...}'::bigint[])) AND (cell <= skycell_cone_bound(p.ra, p.""dec"", '0.0002777777777777778'::double precision, 3, 4, '10000000'::double precision, '{...}'::bigint[])))
+                    ->  Bitmap Index Scan on cat_cell_idx
+                          Index Cond: ((cell >= skycell_cone_bound(p.ra, p.""dec"", '0.0002777777777777778'::double precision, 4, 4, '10000000'::double precision, '{...}'::bigint[])) AND (cell <= skycell_cone_bound(p.ra, p.""dec"", '0.0002777777777777778'::double precision, 5, 4, '10000000'::double precision, '{...}'::bigint[])))
+                    ->  Bitmap Index Scan on cat_cell_idx
+                          Index Cond: ((cell >= skycell_cone_bound(p.ra, p.""dec"", '0.0002777777777777778'::double precision, 6, 4, '10000000'::double precision, '{...}'::bigint[])) AND (cell <= skycell_cone_bound(p.ra, p.""dec"", '0.0002777777777777778'::double precision, 7, 4, '10000000'::double precision, '{...}'::bigint[])))
+"
+skycell_slots,1,2,99875,2453.346,""
+skycell_lateral,1,1,99875,674.158,"Aggregate
+  ->  Nested Loop
+        ->  Seq Scan on probe p
+        ->  Nested Loop
+              Join Filter: skycell_in_cone(c.ra, c.""dec"", p.ra, p.""dec"", '0.0002777777777777778'::double precision, '-1'::double precision)
+              ->  Function Scan on skycell_cone_ranges g
+              ->  Index Scan using cat_cell_idx on cat_cell c
+                    Index Cond: ((cell >= g.lo) AND (cell <= g.hi))
+"
+skycell_lateral,1,2,99875,583.434,""
+q3c,10,1,127606,3788.742,"Aggregate
+  ->  Nested Loop
+        ->  Seq Scan on probe p
+        ->  Bitmap Heap Scan on cat_q3c c
+              Recheck Cond: (((q3c_ang2ipix(ra, ""dec"") >= q3c_nearby_it(p.ra, p.""dec"", '0.002777777777777778'::double precision, 0)) AND (q3c_ang2ipix(ra, ""dec"") <= q3c_nearby_it(p.ra, p.""dec"", '0.002777777777777778'::double precision, 1))) OR ((q3c_ang2ipix(ra, ""dec"") >= q3c_nearby_it(p.ra, p.""dec"", '0.002777777777777778'::double precision, 2)) AND (q3c_ang2ipix(ra, ""dec"") <= q3c_nearby_it(p.ra, p.""dec"", '0.002777777777777778'::double precision, 3))) OR ((q3c_ang2ipix(ra, ""dec"") >= q3c_nearby_it(p.ra, p.""dec"", '0.002777777777777778'::double precision, 4)) AND (q3c_ang2ipix(ra, ""dec"") <= q3c_nearby_it(p.ra, p.""dec"", '0.002777777777777778'::double precision, 5))) OR ((q3c_ang2ipix(ra, ""dec"") >= q3c_nearby_it(p.ra, p.""dec"", '0.002777777777777778'::double precision, 6)) AND (q3c_ang2ipix(ra, ""dec"") <= q3c_nearby_it(p.ra, p.""dec"", '0.002777777777777778'::double precision, 7))))
+              Filter: ((q3c_sindist(p.ra, p.""dec"", ra, ""dec"") < '5.876107633623519e-10'::double precision) AND ('0.002777777777777778'::double precision ==<<>>== ROW(p.ra, p.""dec"", ra, ""dec"")::q3c_type))
+              ->  BitmapOr
+                    ->  Bitmap Index Scan on cat_q3c_idx
+                          Index Cond: ((q3c_ang2ipix(ra, ""dec"") >= q3c_nearby_it(p.ra, p.""dec"", '0.002777777777777778'::double precision, 0)) AND (q3c_ang2ipix(ra, ""dec"") <= q3c_nearby_it(p.ra, p.""dec"", '0.002777777777777778'::double precision, 1)))
+                    ->  Bitmap Index Scan on cat_q3c_idx
+                          Index Cond: ((q3c_ang2ipix(ra, ""dec"") >= q3c_nearby_it(p.ra, p.""dec"", '0.002777777777777778'::double precision, 2)) AND (q3c_ang2ipix(ra, ""dec"") <= q3c_nearby_it(p.ra, p.""dec"", '0.002777777777777778'::double precision, 3)))
+                    ->  Bitmap Index Scan on cat_q3c_idx
+                          Index Cond: ((q3c_ang2ipix(ra, ""dec"") >= q3c_nearby_it(p.ra, p.""dec"", '0.002777777777777778'::double precision, 4)) AND (q3c_ang2ipix(ra, ""dec"") <= q3c_nearby_it(p.ra, p.""dec"", '0.002777777777777778'::double precision, 5)))
+                    ->  Bitmap Index Scan on cat_q3c_idx
+                          Index Cond: ((q3c_ang2ipix(ra, ""dec"") >= q3c_nearby_it(p.ra, p.""dec"", '0.002777777777777778'::double precision, 6)) AND (q3c_ang2ipix(ra, ""dec"") <= q3c_nearby_it(p.ra, p.""dec"", '0.002777777777777778'::double precision, 7)))
+"
+q3c,10,2,127606,1817.163,""
+pgsphere,10,1,127608,5132.756,"Aggregate
+  ->  Nested Loop
+        ->  Seq Scan on probe p
+        ->  Index Scan using cat_sphere_idx on cat_sphere c
+              Index Cond: (pos <@ scircle(p.pos, '4.8481368110953604e-05'::double precision))
+"
+pgsphere,10,2,127608,3047.919,""
+skycell_slots,10,1,127606,3935.483,"Aggregate
+  ->  Nested Loop
+        ->  Seq Scan on probe p
+        ->  Bitmap Heap Scan on cat_cell c
+              Recheck Cond: (((cell >= skycell_cone_bound(p.ra, p.""dec"", '0.002777777777777778'::double precision, 0, 4, '10000000'::double precision, '{...}'::bigint[])) AND (cell <= skycell_cone_bound(p.ra, p.""dec"", '0.002777777777777778'::double precision, 1, 4, '10000000'::double precision, '{...}'::bigint[]))) OR ((cell >= skycell_cone_bound(p.ra, p.""dec"", '0.002777777777777778'::double precision, 2, 4, '10000000'::double precision, '{...}'::bigint[])) AND (cell <= skycell_cone_bound(p.ra, p.""dec"", '0.002777777777777778'::double precision, 3, 4, '10000000'::double precision, '{...}'::bigint[]))) OR ((cell >= skycell_cone_bound(p.ra, p.""dec"", '0.002777777777777778'::double precision, 4, 4, '10000000'::double precision, '{...}'::bigint[])) AND (cell <= skycell_cone_bound(p.ra, p.""dec"", '0.002777777777777778'::double precision, 5, 4, '10000000'::double precision, '{...}'::bigint[]))) OR ((cell >= skycell_cone_bound(p.ra, p.""dec"", '0.002777777777777778'::double precision, 6, 4, '10000000'::double precision, '{...}'::bigint[])) AND (cell <= skycell_cone_bound(p.ra, p.""dec"", '0.002777777777777778'::double precision, 7, 4, '10000000'::double precision, '{...}'::bigint[]))))
+              Filter: skycell_in_cone(ra, ""dec"", p.ra, p.""dec"", '0.002777777777777778'::double precision, '-1'::double precision)
+              ->  BitmapOr
+                    ->  Bitmap Index Scan on cat_cell_idx
+                          Index Cond: ((cell >= skycell_cone_bound(p.ra, p.""dec"", '0.002777777777777778'::double precision, 0, 4, '10000000'::double precision, '{...}'::bigint[])) AND (cell <= skycell_cone_bound(p.ra, p.""dec"", '0.002777777777777778'::double precision, 1, 4, '10000000'::double precision, '{...}'::bigint[])))
+                    ->  Bitmap Index Scan on cat_cell_idx
+                          Index Cond: ((cell >= skycell_cone_bound(p.ra, p.""dec"", '0.002777777777777778'::double precision, 2, 4, '10000000'::double precision, '{...}'::bigint[])) AND (cell <= skycell_cone_bound(p.ra, p.""dec"", '0.002777777777777778'::double precision, 3, 4, '10000000'::double precision, '{...}'::bigint[])))
+                    ->  Bitmap Index Scan on cat_cell_idx
+                          Index Cond: ((cell >= skycell_cone_bound(p.ra, p.""dec"", '0.002777777777777778'::double precision, 4, 4, '10000000'::double precision, '{...}'::bigint[])) AND (cell <= skycell_cone_bound(p.ra, p.""dec"", '0.002777777777777778'::double precision, 5, 4, '10000000'::double precision, '{...}'::bigint[])))
+                    ->  Bitmap Index Scan on cat_cell_idx
+                          Index Cond: ((cell >= skycell_cone_bound(p.ra, p.""dec"", '0.002777777777777778'::double precision, 6, 4, '10000000'::double precision, '{...}'::bigint[])) AND (cell <= skycell_cone_bound(p.ra, p.""dec"", '0.002777777777777778'::double precision, 7, 4, '10000000'::double precision, '{...}'::bigint[])))
+"
+skycell_slots,10,2,127606,1133.338,""
+skycell_lateral,10,1,127606,1742.774,"Aggregate
+  ->  Nested Loop
+        ->  Seq Scan on probe p
+        ->  Nested Loop
+              Join Filter: skycell_in_cone(c.ra, c.""dec"", p.ra, p.""dec"", '0.002777777777777778'::double precision, '-1'::double precision)
+              ->  Function Scan on skycell_cone_ranges g
+              ->  Index Scan using cat_cell_idx on cat_cell c
+                    Index Cond: ((cell >= g.lo) AND (cell <= g.hi))
+"
+skycell_lateral,10,2,127606,992.114,""
+skycell_lateral_ios,1,1,99875,1936.225,"Aggregate
+  ->  Nested Loop
+        ->  Seq Scan on probe p
+        ->  Nested Loop
+              Join Filter: skycell_in_cone(c.ra, c.""dec"", p.ra, p.""dec"", '0.0002777777777777778'::double precision, '-1'::double precision)
+              ->  Function Scan on skycell_cone_ranges g
+              ->  Index Only Scan using cat_cell_cov on cat_cell c
+                    Index Cond: ((cell >= g.lo) AND (cell <= g.hi))
+"
+skycell_lateral_ios,1,2,99875,555.97,""
+skycell_lateral_ios,10,1,127606,835.087,"Aggregate
+  ->  Nested Loop
+        ->  Seq Scan on probe p
+        ->  Nested Loop
+              Join Filter: skycell_in_cone(c.ra, c.""dec"", p.ra, p.""dec"", '0.002777777777777778'::double precision, '-1'::double precision)
+              ->  Function Scan on skycell_cone_ranges g
+              ->  Index Only Scan using cat_cell_cov on cat_cell c
+                    Index Cond: ((cell >= g.lo) AND (cell <= g.hi))
+"
+skycell_lateral_ios,10,2,127606,912.752,""

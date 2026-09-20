@@ -1,0 +1,296 @@
+\echo Use "CREATE EXTENSION skycell" to load this file. \quit
+
+-- ------------------------------------------------------------------
+-- keys and distances
+-- ------------------------------------------------------------------
+
+-- order-29 HEALPix NESTED cell of a position (the index key)
+CREATE FUNCTION skycell_ang2cell(ra float8, "dec" float8) RETURNS int8
+AS 'MODULE_PATHNAME' LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
+
+CREATE FUNCTION skycell_ang2pix("order" int, ra float8, "dec" float8) RETURNS int8
+AS 'MODULE_PATHNAME' LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
+
+-- angular distance in degrees
+CREATE FUNCTION skycell_dist(ra1 float8, dec1 float8, ra2 float8, dec2 float8) RETURNS float8
+AS 'MODULE_PATHNAME' LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
+
+-- ------------------------------------------------------------------
+-- exact predicates (the "refine" step); last arg is a selectivity hint
+-- ------------------------------------------------------------------
+
+CREATE FUNCTION skycell_exact_support(internal) RETURNS internal
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
+
+CREATE FUNCTION skycell_in_cone(ra float8, "dec" float8, ra0 float8, dec0 float8,
+                                radius float8, sel float8 DEFAULT -1) RETURNS bool
+AS 'MODULE_PATHNAME' LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE
+SUPPORT skycell_exact_support;
+
+CREATE FUNCTION skycell_in_poly(ra float8, "dec" float8, poly float8[],
+                                sel float8 DEFAULT -1) RETURNS bool
+AS 'MODULE_PATHNAME' LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE
+SUPPORT skycell_exact_support;
+
+-- ------------------------------------------------------------------
+-- indexable predicates: rewritten by the planner support function into
+-- B-tree range conditions on "cell" + the exact test
+-- ------------------------------------------------------------------
+
+CREATE FUNCTION skycell_support(internal) RETURNS internal
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
+
+-- cell must be skycell_ang2cell(ra, dec)
+CREATE FUNCTION skycell_cone(cell int8, ra float8, "dec" float8,
+                             ra0 float8, dec0 float8, radius float8) RETURNS bool
+AS 'MODULE_PATHNAME' LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE
+SUPPORT skycell_support;
+
+-- poly = ARRAY[ra1, dec1, ra2, dec2, ...] (convex, degrees)
+CREATE FUNCTION skycell_poly(cell int8, ra float8, "dec" float8, poly float8[]) RETURNS bool
+AS 'MODULE_PATHNAME' LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE
+SUPPORT skycell_support;
+
+-- run-time range slot i (lo = even, hi = odd) for non-constant cones (joins)
+CREATE FUNCTION skycell_cone_bound(ra0 float8, dec0 float8, radius float8, i int,
+                                   nslots int, ntotal float8, hist int8[]) RETURNS int8
+AS 'MODULE_PATHNAME' LANGUAGE C STABLE STRICT PARALLEL SAFE;
+
+-- ------------------------------------------------------------------
+-- explicit coverings (LATERAL joins, inspection)
+-- ------------------------------------------------------------------
+
+CREATE FUNCTION skycell_cone_ranges(ra0 float8, dec0 float8, radius float8,
+                                    tbl regclass DEFAULT NULL, col name DEFAULT 'cell',
+                                    OUT lo int8, OUT hi int8) RETURNS SETOF record
+AS 'MODULE_PATHNAME' LANGUAGE C STABLE CALLED ON NULL INPUT PARALLEL SAFE ROWS 3;
+
+CREATE FUNCTION skycell_poly_ranges(poly float8[], tbl regclass DEFAULT NULL, col name DEFAULT 'cell',
+                                    OUT lo int8, OUT hi int8) RETURNS SETOF record
+AS 'MODULE_PATHNAME' LANGUAGE C STABLE CALLED ON NULL INPUT PARALLEL SAFE ROWS 8;
+
+CREATE FUNCTION skycell_cover_info(ra0 float8, dec0 float8, radius float8,
+                                   tbl regclass DEFAULT NULL, col name DEFAULT 'cell',
+                                   OUT nranges int, OUT steps int, OUT deepest int,
+                                   OUT exp_rows float8, OUT area_ratio float8) RETURNS record
+AS 'MODULE_PATHNAME' LANGUAGE C STABLE CALLED ON NULL INPUT PARALLEL SAFE;
+
+-- ------------------------------------------------------------------
+-- regions as multi-order coverages (IVOA MOC NUNIQ), for indexing stored
+-- footprints in a B-tree: a point's candidate regions are those with a
+-- covering cell equal to one of the point's 30 ancestors.
+-- ------------------------------------------------------------------
+
+CREATE FUNCTION skycell_ancestors(cell int8, min_order int DEFAULT 0, max_order int DEFAULT 29) RETURNS int8[]
+AS 'MODULE_PATHNAME' LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
+
+CREATE FUNCTION skycell_nuniq_order(nuniq int8) RETURNS int
+AS 'MODULE_PATHNAME' LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
+
+CREATE FUNCTION skycell_nuniq_lo(nuniq int8) RETURNS int8
+AS 'MODULE_PATHNAME' LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
+
+CREATE FUNCTION skycell_nuniq_hi(nuniq int8) RETURNS int8
+AS 'MODULE_PATHNAME' LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
+
+CREATE FUNCTION skycell_cone_moc(ra0 float8, dec0 float8, radius float8,
+                                 max_cells int DEFAULT 8, max_order int DEFAULT 29) RETURNS int8[]
+AS 'MODULE_PATHNAME' LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
+
+CREATE FUNCTION skycell_poly_moc(poly float8[], max_cells int DEFAULT 8,
+                                 max_order int DEFAULT 29) RETURNS int8[]
+AS 'MODULE_PATHNAME' LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
+
+
+-- ------------------------------------------------------------------
+-- The ADQL surface: two types and functions named as the standard names
+-- them, so a TAP translator emits the standard's own spelling.
+--
+--   1 = CONTAINS(POINT('ICRS', s_ra, s_dec), CIRCLE('ICRS', 10, 20, 0.1))
+--     -> 1 = contains(point('ICRS', s_ra, s_dec), circle('ICRS', 10, 20, 0.1))
+--
+-- The forms carrying ADQL's coordinate-system argument never collide with
+-- PostgreSQL's built-in point/circle/box/polygon; the two-argument forms do,
+-- so put this extension's schema before pg_catalog to use them unqualified:
+--   SET search_path = skycell, public, pg_catalog;
+-- ------------------------------------------------------------------
+
+CREATE TYPE skypos;
+
+CREATE FUNCTION skypos_in(cstring) RETURNS skypos
+AS 'MODULE_PATHNAME' LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
+CREATE FUNCTION skypos_out(skypos) RETURNS cstring
+AS 'MODULE_PATHNAME' LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
+
+CREATE TYPE skypos (
+    INPUT = skypos_in, OUTPUT = skypos_out,
+    INTERNALLENGTH = 16, ALIGNMENT = double, STORAGE = plain
+);
+COMMENT ON TYPE skypos IS 'a position on the sky: (ra, dec) in degrees, ICRS';
+
+CREATE TYPE skyregion;
+
+CREATE FUNCTION skyregion_in(cstring) RETURNS skyregion
+AS 'MODULE_PATHNAME' LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
+CREATE FUNCTION skyregion_out(skyregion) RETURNS cstring
+AS 'MODULE_PATHNAME' LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
+
+CREATE TYPE skyregion (
+    INPUT = skyregion_in, OUTPUT = skyregion_out,
+    INTERNALLENGTH = VARIABLE, ALIGNMENT = double, STORAGE = extended
+);
+COMMENT ON TYPE skyregion IS 'a region on the sky: CIRCLE(ra, dec, radius) or POLYGON(ra1, dec1, ...), degrees, ICRS';
+
+-- constructors ------------------------------------------------------
+
+CREATE FUNCTION point(ra float8, "dec" float8) RETURNS skypos
+AS 'MODULE_PATHNAME', 'skycell_point' LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
+CREATE FUNCTION point(coordsys text, ra float8, "dec" float8) RETURNS skypos
+AS 'MODULE_PATHNAME', 'skycell_point_cs' LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
+
+CREATE FUNCTION circle(ra float8, "dec" float8, radius float8) RETURNS skyregion
+AS 'MODULE_PATHNAME', 'skycell_circle' LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
+CREATE FUNCTION circle(coordsys text, ra float8, "dec" float8, radius float8) RETURNS skyregion
+AS 'MODULE_PATHNAME', 'skycell_circle_cs' LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
+
+CREATE FUNCTION box(ra float8, "dec" float8, width float8, height float8) RETURNS skyregion
+AS 'MODULE_PATHNAME', 'skycell_box' LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
+CREATE FUNCTION box(coordsys text, ra float8, "dec" float8, width float8, height float8) RETURNS skyregion
+AS 'MODULE_PATHNAME', 'skycell_box_cs' LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
+
+CREATE FUNCTION polygon(VARIADIC coords float8[]) RETURNS skyregion
+AS 'MODULE_PATHNAME', 'skycell_polygon' LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
+CREATE FUNCTION polygon(coordsys text, VARIADIC coords float8[]) RETURNS skyregion
+AS 'MODULE_PATHNAME', 'skycell_polygon_cs' LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
+
+-- PostgreSQL has its own point(float8, float8); the ADQL form with the
+-- coordinate system never collides, and these aliases let a deployment that
+-- cannot reorder search_path write the two-argument ones unambiguously.
+CREATE FUNCTION skycell_point(ra float8, "dec" float8) RETURNS skypos
+AS 'MODULE_PATHNAME', 'skycell_point' LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
+CREATE FUNCTION skycell_circle(ra float8, "dec" float8, radius float8) RETURNS skyregion
+AS 'MODULE_PATHNAME', 'skycell_circle' LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
+CREATE FUNCTION skycell_box(ra float8, "dec" float8, width float8, height float8) RETURNS skyregion
+AS 'MODULE_PATHNAME', 'skycell_box' LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
+CREATE FUNCTION skycell_polygon(VARIADIC coords float8[]) RETURNS skyregion
+AS 'MODULE_PATHNAME', 'skycell_polygon' LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
+
+-- predicates and measures -------------------------------------------
+
+CREATE FUNCTION contains(p skypos, r skyregion) RETURNS int
+AS 'MODULE_PATHNAME', 'skycell_contains' LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
+CREATE FUNCTION contains(a skyregion, b skyregion) RETURNS int
+AS 'MODULE_PATHNAME', 'skycell_contains_region' LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
+
+CREATE FUNCTION intersects(p skypos, r skyregion) RETURNS int
+AS 'MODULE_PATHNAME', 'skycell_intersects_pos' LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
+CREATE FUNCTION intersects(a skyregion, b skyregion) RETURNS int
+AS 'MODULE_PATHNAME', 'skycell_intersects' LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
+
+CREATE FUNCTION distance(a skypos, b skypos) RETURNS float8
+AS 'MODULE_PATHNAME', 'skycell_distance' LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
+CREATE FUNCTION distance(ra1 float8, dec1 float8, ra2 float8, dec2 float8) RETURNS float8
+AS 'MODULE_PATHNAME', 'skycell_dist' LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
+
+CREATE FUNCTION area(r skyregion) RETURNS float8
+AS 'MODULE_PATHNAME', 'skycell_area' LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
+CREATE FUNCTION coord1(p skypos) RETURNS float8
+AS 'MODULE_PATHNAME', 'skycell_coord1' LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
+CREATE FUNCTION coord2(p skypos) RETURNS float8
+AS 'MODULE_PATHNAME', 'skycell_coord2' LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
+CREATE FUNCTION centroid(r skyregion) RETURNS skypos
+AS 'MODULE_PATHNAME', 'skycell_centroid' LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
+
+-- the index key of a position, for CREATE INDEX ... (skycell_cell(pos))
+CREATE FUNCTION skycell_cell(p skypos) RETURNS int8
+AS 'MODULE_PATHNAME' LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
+
+-- operators: the indexable spelling ---------------------------------
+
+CREATE FUNCTION skycell_region_support(internal) RETURNS internal
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
+CREATE FUNCTION skycell_region_sel_support(internal) RETURNS internal
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
+
+-- the exact test the rewrite appends (last argument is a selectivity hint)
+CREATE FUNCTION skycell_in_region(p skypos, r skyregion, sel float8 DEFAULT -1) RETURNS bool
+AS 'MODULE_PATHNAME', 'skycell_pos_in_region_sel' LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE
+SUPPORT skycell_region_sel_support;
+
+CREATE FUNCTION skycell_pos_in_region(p skypos, r skyregion) RETURNS bool
+AS 'MODULE_PATHNAME' LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE
+SUPPORT skycell_region_support;
+CREATE FUNCTION skycell_region_has_pos(r skyregion, p skypos) RETURNS bool
+AS 'MODULE_PATHNAME' LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
+CREATE FUNCTION skycell_region_overlap(a skyregion, b skyregion) RETURNS bool
+AS 'MODULE_PATHNAME' LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
+CREATE FUNCTION skycell_region_covers(a skyregion, b skyregion) RETURNS bool
+AS 'MODULE_PATHNAME' LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
+
+CREATE OPERATOR <@ (
+    LEFTARG = skypos, RIGHTARG = skyregion,
+    FUNCTION = skycell_pos_in_region, COMMUTATOR = @>,
+    RESTRICT = contsel, JOIN = contjoinsel
+);
+CREATE OPERATOR @> (
+    LEFTARG = skyregion, RIGHTARG = skypos,
+    FUNCTION = skycell_region_has_pos, COMMUTATOR = <@,
+    RESTRICT = contsel, JOIN = contjoinsel
+);
+CREATE OPERATOR && (
+    LEFTARG = skyregion, RIGHTARG = skyregion,
+    FUNCTION = skycell_region_overlap, COMMUTATOR = &&,
+    RESTRICT = areasel, JOIN = areajoinsel
+);
+CREATE OPERATOR @> (
+    LEFTARG = skyregion, RIGHTARG = skyregion,
+    FUNCTION = skycell_region_covers,
+    RESTRICT = contsel, JOIN = contjoinsel
+);
+CREATE OPERATOR <-> (
+    LEFTARG = skypos, RIGHTARG = skypos,
+    FUNCTION = distance, COMMUTATOR = <->
+);
+
+-- ------------------------------------------------------------------
+-- Astronomy: the IVOA UDF registry's names, so ADQL written for other
+-- services runs here unchanged.
+-- ------------------------------------------------------------------
+
+CREATE FUNCTION ivo_epoch_prop(ra float8, "dec" float8, parallax float8,
+                               pmra float8, pmdec float8, radial_velocity float8,
+                               ref_epoch float8, out_epoch float8) RETURNS float8[]
+AS 'MODULE_PATHNAME' LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
+COMMENT ON FUNCTION ivo_epoch_prop(float8, float8, float8, float8, float8, float8, float8, float8)
+IS 'six-parameter astrometric solution propagated to out_epoch: {ra, dec, parallax, pmra, pmdec, radial_velocity}';
+
+CREATE FUNCTION ivo_epoch_prop_pos(ra float8, "dec" float8, parallax float8,
+                                   pmra float8, pmdec float8, radial_velocity float8,
+                                   ref_epoch float8, out_epoch float8) RETURNS skypos
+AS 'MODULE_PATHNAME' LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
+CREATE FUNCTION ivo_epoch_prop_pos(ra float8, "dec" float8, pmra float8, pmdec float8,
+                                   ref_epoch float8, out_epoch float8) RETURNS skypos
+AS 'MODULE_PATHNAME', 'ivo_epoch_prop_pos_pm' LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
+CREATE FUNCTION ivo_apply_pm(ra float8, "dec" float8, pmra float8, pmdec float8,
+                             epdiff float8) RETURNS skypos
+AS 'MODULE_PATHNAME' LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
+
+-- how far a proper motion can carry a source in dt years (degrees)
+CREATE FUNCTION skycell_pm_margin(pmra float8, pmdec float8, dt float8) RETURNS float8
+AS 'MODULE_PATHNAME' LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
+
+CREATE FUNCTION icrs2gal(p skypos) RETURNS skypos
+AS 'MODULE_PATHNAME' LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
+CREATE FUNCTION gal2icrs(p skypos) RETURNS skypos
+AS 'MODULE_PATHNAME' LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
+CREATE FUNCTION icrs2ecl(p skypos) RETURNS skypos
+AS 'MODULE_PATHNAME' LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
+CREATE FUNCTION ecl2icrs(p skypos) RETURNS skypos
+AS 'MODULE_PATHNAME' LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
+
+CREATE FUNCTION ivo_healpix_index("order" int, ra float8, "dec" float8) RETURNS int8
+AS 'MODULE_PATHNAME' LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
+CREATE FUNCTION ivo_healpix_index("order" int, p skypos) RETURNS int8
+AS 'MODULE_PATHNAME', 'ivo_healpix_index_pos' LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
+CREATE FUNCTION ivo_healpix_center("order" int, hpxindex int8) RETURNS skypos
+AS 'MODULE_PATHNAME' LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;

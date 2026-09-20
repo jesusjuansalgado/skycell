@@ -1,0 +1,236 @@
+-- skycell regression tests: every indexed query must return exactly what the
+-- exact predicate returns on a sequential scan (no false negatives, no false
+-- positives), on clustered data including poles and RA wrap-around.
+CREATE EXTENSION skycell;
+SET extra_float_digits = 0;
+SELECT setseed(0.42);
+ setseed 
+---------
+ 
+(1 row)
+
+-- HEALPix basics -------------------------------------------------------
+SELECT skycell_ang2pix(0, 45, 41.8103148958) AS p0,
+       skycell_ang2pix(0, 0, 0) AS p4,
+       skycell_ang2pix(0, 315, -41.8103148958) AS p11,
+       skycell_ang2pix(12, 10, 20) = skycell_ang2cell(10, 20) >> 34 AS nested;
+ p0 | p4 | p11 | nested 
+----+----+-----+--------
+  0 |  4 |  11 | t
+(1 row)
+
+SELECT array_length(skycell_ancestors(skycell_ang2cell(10, 20)), 1) AS n_ancestors,
+       (skycell_ancestors(0))[1] AS nuniq_order0,
+       skycell_nuniq_lo(4) AS lo, skycell_nuniq_hi(4) = (1::int8 << 58) - 1 AS hi_ok;
+ n_ancestors | nuniq_order0 | lo | hi_ok 
+-------------+--------------+----+-------
+          30 |            4 |  0 | t
+(1 row)
+
+SELECT round(skycell_dist(0, 0, 90, 0)::numeric, 9) AS d90,
+       round(skycell_dist(10, 89.9999, 190, 89.9999)::numeric * 3600, 4) AS d_pole_arcsec;
+     d90      | d_pole_arcsec 
+--------------+---------------
+ 90.000000000 |        0.7200
+(1 row)
+
+SELECT skycell_ang2cell(10, 91);   -- error
+ERROR:  skycell: declination 91 out of range [-90, 90]
+-- catalogue: 40% uniform, 60% in clusters (incl. both poles and RA=0) ----
+CREATE TABLE cat AS
+WITH c(k, cra, cdec, sig) AS (
+  VALUES (0, 0.0, 89.95, 0.3), (1, 180.0, -89.98, 0.05), (2, 0.001, 10.0, 0.2),
+         (3, 45.0, 41.8103, 0.1), (4, 120.0, -30.0, 1.5), (5, 250.0, 60.0, 0.02))
+SELECT i AS id, ra, dec FROM (
+  SELECT i,
+         CASE WHEN u < 0.4 THEN 360 * random()
+              ELSE cra + sig * g1 / greatest(cos(radians(cdec)), 0.01) END AS ra0,
+         CASE WHEN u < 0.4 THEN degrees(asin(2 * random() - 1))
+              ELSE cdec + sig * g2 END AS dec0
+  FROM (SELECT i, random() AS u, (random() * 6)::int % 6 AS k,
+               sqrt(-2 * ln(random())) * cos(2 * pi() * random()) AS g1,
+               sqrt(-2 * ln(random())) * cos(2 * pi() * random()) AS g2
+        FROM generate_series(1, 100000) i) s
+  JOIN c USING (k)) s2,
+LATERAL (SELECT CASE WHEN dec0 > 90 THEN 180 - dec0 WHEN dec0 < -90 THEN -180 - dec0 ELSE dec0 END AS dec,
+                (CASE WHEN abs(dec0) > 90 THEN ra0 + 180 ELSE ra0 END + 720)::numeric % 360 AS ran) f,
+LATERAL (SELECT ran::float8 AS ra) f2;
+ALTER TABLE cat ADD COLUMN cell int8;
+UPDATE cat SET cell = skycell_ang2cell(ra, dec);
+CREATE INDEX cat_cell ON cat (cell);
+ALTER TABLE cat ALTER COLUMN cell SET STATISTICS 1000;
+ANALYZE cat;
+-- the rewrite produces an index plan
+CREATE FUNCTION plan_uses_index(q text) RETURNS bool LANGUAGE plpgsql AS $$
+DECLARE l text; found bool := false;
+BEGIN
+  FOR l IN EXECUTE 'EXPLAIN (COSTS OFF) ' || q LOOP
+    IF l ~ 'Index (Only )?Scan|Bitmap Index Scan' THEN found := true; END IF;
+  END LOOP;
+  RETURN found;
+END $$;
+SELECT plan_uses_index('SELECT * FROM cat WHERE skycell_cone(cell, ra, dec, 10, 20, 0.1)') AS cone_indexed,
+       plan_uses_index('SELECT * FROM cat WHERE skycell_poly(cell, ra, dec, ARRAY[10,10,11,10,11,11,10,11]::float8[])') AS poly_indexed;
+ cone_indexed | poly_indexed 
+--------------+--------------
+ t            | t
+(1 row)
+
+-- cones: indexed vs sequential exact --------------------------------------
+CREATE TABLE cones AS
+SELECT q, CASE WHEN q % 3 = 0 THEN (SELECT ra FROM cat WHERE id = 1 + (q * 7919) % 100000)
+               WHEN q % 3 = 1 THEN 360 * random()
+               ELSE (q % 8) * 45.0 END AS ra0,
+          CASE WHEN q % 3 = 0 THEN (SELECT dec FROM cat WHERE id = 1 + (q * 7919) % 100000)
+               WHEN q % 3 = 1 THEN degrees(asin(2 * random() - 1))
+               ELSE (ARRAY[89.9999, -89.99, 41.8103148958, 0, -41.8103148958])[1 + q % 5] END AS dec0,
+          (ARRAY[1/3600.0, 10/3600.0, 1/60.0, 0.1, 0.5, 2, 10, 45])[1 + q % 8] AS r
+FROM generate_series(0, 239) q;
+CREATE FUNCTION cone_mismatches() RETURNS TABLE(n_cones int, n_rows bigint, mismatches int)
+LANGUAGE plpgsql AS $$
+DECLARE c record; a bigint; b bigint;
+BEGIN
+  n_cones := 0; n_rows := 0; mismatches := 0;
+  FOR c IN SELECT * FROM cones ORDER BY q LOOP
+    EXECUTE format('SELECT count(*) FROM cat WHERE skycell_cone(cell, ra, dec, %s, %s, %s)', c.ra0, c.dec0, c.r) INTO a;
+    EXECUTE format('SELECT count(*) FROM cat WHERE skycell_in_cone(ra, dec, %s, %s, %s)', c.ra0, c.dec0, c.r) INTO b;
+    n_cones := n_cones + 1; n_rows := n_rows + b;
+    IF a <> b THEN mismatches := mismatches + 1; RAISE NOTICE 'cone % (%,%,%): % vs %', c.q, c.ra0, c.dec0, c.r, a, b; END IF;
+  END LOOP;
+  RETURN NEXT;
+END $$;
+SELECT n_cones, n_rows > 100000 AS many_rows, mismatches FROM cone_mismatches();
+ n_cones | many_rows | mismatches 
+---------+-----------+------------
+     240 | t         |          0
+(1 row)
+
+-- same, with the density model switched off and a tiny range budget
+SET skycell.use_stats = off;
+SET skycell.max_ranges = 2;
+SELECT n_cones, mismatches FROM cone_mismatches();
+ n_cones | mismatches 
+---------+------------
+     240 |          0
+(1 row)
+
+RESET skycell.use_stats;
+RESET skycell.max_ranges;
+-- polygons ---------------------------------------------------------------
+CREATE FUNCTION poly_mismatches() RETURNS int LANGUAGE plpgsql AS $$
+DECLARE i int; poly float8[]; a bigint; b bigint; bad int := 0; cra float8; cdec float8; s float8;
+BEGIN
+  FOR i IN 0..59 LOOP
+    cra := CASE WHEN i % 4 = 0 THEN 0.0 ELSE 360 * random() END;
+    cdec := CASE WHEN i % 5 = 0 THEN 89.9 WHEN i % 5 = 1 THEN 41.81 ELSE degrees(asin(2 * random() - 1)) END;
+    s := power(10, -2 + 3 * random());
+    poly := ARRAY[cra - s, cdec - s/2, cra + s, cdec - s/2, cra + s/2, least(cdec + s, 90), cra - s/2, least(cdec + s, 90)];
+    BEGIN
+      EXECUTE format('SELECT count(*) FROM cat WHERE skycell_poly(cell, ra, dec, %L::float8[])', poly) INTO a;
+    EXCEPTION WHEN invalid_parameter_value THEN CONTINUE;   -- degenerate/non-convex near the pole
+    END;
+    EXECUTE format('SELECT count(*) FROM cat WHERE skycell_in_poly(ra, dec, %L::float8[])', poly) INTO b;
+    IF a <> b THEN bad := bad + 1; RAISE NOTICE 'poly %: % vs %', poly, a, b; END IF;
+  END LOOP;
+  RETURN bad;
+END $$;
+SELECT poly_mismatches() AS poly_mismatches;
+ poly_mismatches 
+-----------------
+               0
+(1 row)
+
+SELECT skycell_poly(1, 0, 0, ARRAY[0,0, 10,0, 1,1, 0,10]::float8[]);  -- non-convex: error
+ERROR:  skycell: polygon must be convex and smaller than a hemisphere
+-- joins: run-time slots and LATERAL vs brute force -------------------------
+CREATE TABLE probe AS
+SELECT id, ra + 0.0003 * (random() - 0.5) AS ra, greatest(-90, least(90, dec + 0.0003 * (random() - 0.5))) AS dec
+FROM cat WHERE id % 97 = 0
+UNION ALL SELECT -q, ra0, dec0 FROM cones;
+ANALYZE probe;
+WITH brute AS (SELECT count(*) AS n FROM probe p JOIN cat c ON skycell_in_cone(c.ra, c.dec, p.ra, p.dec, 3/3600.0)),
+     slots AS (SELECT count(*) AS n FROM probe p JOIN cat c ON skycell_cone(c.cell, c.ra, c.dec, p.ra, p.dec, 3/3600.0)),
+     lat AS (SELECT count(*) AS n FROM probe p CROSS JOIN LATERAL skycell_cone_ranges(p.ra, p.dec, 3/3600.0, 'cat') r
+             JOIN cat c ON c.cell BETWEEN r.lo AND r.hi AND skycell_in_cone(c.ra, c.dec, p.ra, p.dec, 3/3600.0))
+SELECT brute.n > 1000 AS many, brute.n = slots.n AS slots_ok, brute.n = lat.n AS lateral_ok FROM brute, slots, lat;
+ many | slots_ok | lateral_ok 
+------+----------+------------
+ t    | t        | t
+(1 row)
+
+SET skycell.join_slots = 1;
+SELECT (SELECT count(*) FROM probe p JOIN cat c ON skycell_cone(c.cell, c.ra, c.dec, p.ra, p.dec, 0.05))
+     = (SELECT count(*) FROM probe p JOIN cat c ON skycell_in_cone(c.ra, c.dec, p.ra, p.dec, 0.05)) AS one_slot_ok;
+ one_slot_ok 
+-------------
+ t
+(1 row)
+
+RESET skycell.join_slots;
+-- stored regions as MOCs in a B-tree: point-in-footprint -------------------
+CREATE TABLE fp AS SELECT q AS fid, ra0, dec0, r FROM cones WHERE r <= 2;
+CREATE TABLE fp_cells AS SELECT fid, unnest(skycell_cone_moc(ra0, dec0, r, 12)) AS nuniq FROM fp;
+CREATE INDEX ON fp_cells (nuniq);
+ANALYZE fp_cells;
+WITH pts AS (SELECT * FROM cat WHERE id % 13 = 0),
+moc AS (SELECT count(*) AS n FROM pts
+        JOIN LATERAL (SELECT DISTINCT fid FROM fp_cells WHERE nuniq = ANY (skycell_ancestors(pts.cell))) m ON true
+        JOIN fp USING (fid) WHERE skycell_in_cone(pts.ra, pts.dec, fp.ra0, fp.dec0, fp.r)),
+brute AS (SELECT count(*) AS n FROM pts JOIN fp ON skycell_in_cone(pts.ra, pts.dec, fp.ra0, fp.dec0, fp.r))
+SELECT brute.n > 1000 AS many, moc.n = brute.n AS moc_ok FROM moc, brute;
+ many | moc_ok 
+------+--------
+ t    | t
+(1 row)
+
+SELECT max(cardinality(skycell_cone_moc(ra0, dec0, r, 12))) <= 12 AS moc_size_ok FROM fp;
+ moc_size_ok 
+-------------
+ t
+(1 row)
+
+-- expression index instead of a cell column (how egernia's ivoa.obscore is
+-- indexed): the rewrite must use it and read its statistics
+CREATE TABLE cat_expr AS SELECT id, ra, dec FROM cat;
+CREATE INDEX cat_expr_cell ON cat_expr (skycell_ang2cell(ra, dec));
+ALTER INDEX cat_expr_cell ALTER COLUMN 1 SET STATISTICS 1000;
+ANALYZE cat_expr;
+SELECT plan_uses_index('SELECT * FROM cat_expr WHERE skycell_cone(skycell_ang2cell(ra, dec), ra, dec, 10, 20, 0.1)') AS expr_indexed;
+ expr_indexed 
+--------------
+ t
+(1 row)
+
+SELECT (SELECT count(*) FROM cat_expr WHERE skycell_cone(skycell_ang2cell(ra, dec), ra, dec, c.ra0, c.dec0, c.r))
+     = (SELECT count(*) FROM cat_expr WHERE skycell_in_cone(ra, dec, c.ra0, c.dec0, c.r)) AS ok, count(*)
+FROM cones c WHERE c.r <= 2 GROUP BY 1;
+ ok | count 
+----+-------
+ t  |   180
+(1 row)
+
+-- NULLs and edge cases -----------------------------------------------------
+SELECT count(*) FROM cat WHERE skycell_cone(cell, ra, dec, NULL, 0, 1);
+ count 
+-------
+     0
+(1 row)
+
+SELECT count(*) FROM cat WHERE skycell_cone(cell, ra, dec, 0, 0, -1);
+ count 
+-------
+     0
+(1 row)
+
+SELECT count(*) = (SELECT count(*) FROM cat) AS all_sky FROM cat WHERE skycell_cone(cell, ra, dec, 0, 0, 180);
+ all_sky 
+---------
+ t
+(1 row)
+
+SELECT count(*) FROM skycell_cone_ranges(NULL, 0, 1);
+ count 
+-------
+     0
+(1 row)
+

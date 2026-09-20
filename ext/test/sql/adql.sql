@@ -1,0 +1,114 @@
+-- The ADQL surface: the standard's own spelling, the indexable operator
+-- form, and the astronomy functions of the IVOA UDF registry.
+CREATE EXTENSION IF NOT EXISTS skycell;
+SET extra_float_digits = 0;
+SELECT setseed(0.17);
+
+-- types -------------------------------------------------------------
+SELECT '(10.5, -30.25)'::skypos AS parsed, point('ICRS', 10.5, -30.25) AS built,
+       '(10.5, -30.25)'::skypos::text = point('ICRS', 10.5, -30.25)::text AS parses_to_the_same;
+SELECT 'CIRCLE(10, 20, 0.5)'::skyregion AS circ, 'POLYGON(10,10, 12,10, 11,12)'::skyregion AS poly;
+SELECT '(370, 10)'::skypos AS ra_wrapped;
+SELECT '(0, 91)'::skypos;                                  -- error
+SELECT 'POLYGON(0,0, 10,0, 1,1, 0,10)'::skyregion;         -- error: not convex
+SELECT box('ICRS', 10, 89.9, 1, 1);                        -- error: reaches the pole
+SELECT point('FK5', 10, 20);                               -- error: frame
+
+-- ADQL functions ----------------------------------------------------
+SELECT contains(point('ICRS', 10.1, 20.0), circle('ICRS', 10, 20, 0.5)) AS inside,
+       contains(point('ICRS', 12.0, 20.0), circle('ICRS', 10, 20, 0.5)) AS outside,
+       intersects(point('ICRS', 10.1, 20.0), circle('ICRS', 10, 20, 0.5)) AS meets,
+       contains(circle('ICRS', 10, 20, 0.1), circle('ICRS', 10, 20, 1)) AS nested,
+       contains(circle('ICRS', 10, 20, 1), circle('ICRS', 10, 20, 0.1)) AS not_nested,
+       intersects(circle('ICRS', 10, 20, 1), circle('ICRS', 11.5, 20, 0.6)) AS overlap,
+       intersects(circle('ICRS', 10, 20, 1), circle('ICRS', 13, 20, 0.6)) AS apart,
+       intersects(polygon('ICRS', 10,10, 12,10, 12,12, 10,12), circle('ICRS', 11, 13, 1.5)) AS poly_circle;
+SELECT round(area(circle('ICRS', 10, 20, 1))::numeric, 4) AS circle_sqdeg,
+       round(area(box('ICRS', 10, 20, 2, 2))::numeric, 3) AS box_sqdeg,
+       round(distance(point('ICRS', 0, 0), point('ICRS', 0, 90))::numeric, 6) AS pole_dist,
+       round(distance(10, 20, 11, 20)::numeric, 6) AS one_deg_ra,
+       round(coord1(centroid(circle('ICRS', 42, -17, 2)))::numeric, 6) AS c1,
+       round(coord2(centroid(circle('ICRS', 42, -17, 2)))::numeric, 6) AS c2;
+
+-- the operator form is answered from an index -----------------------
+CREATE TABLE acat AS
+SELECT i AS id, (360 * random())::float8 AS ra, degrees(asin(2 * random() - 1)) AS dec
+FROM generate_series(1, 50000) i;
+ALTER TABLE acat ADD COLUMN pos skypos;
+UPDATE acat SET pos = skycell_point(ra, dec);
+CREATE INDEX acat_pos_cell ON acat (skycell_cell(pos));
+CREATE INDEX acat_radec_cell ON acat (skycell_ang2cell(ra, dec));
+ANALYZE acat;
+
+CREATE FUNCTION adql_plan_uses_index(q text) RETURNS bool LANGUAGE plpgsql AS $$
+DECLARE l text; found bool := false;
+BEGIN
+  FOR l IN EXECUTE 'EXPLAIN (COSTS OFF) ' || q LOOP
+    IF l ~ 'Index (Only )?Scan|Bitmap Index Scan' THEN found := true; END IF;
+  END LOOP;
+  RETURN found;
+END $$;
+SELECT adql_plan_uses_index('SELECT * FROM acat WHERE pos <@ circle(''ICRS'', 10, 20, 0.5)') AS stored_pos,
+       adql_plan_uses_index('SELECT * FROM acat WHERE skycell_point(ra, dec) <@ circle(''ICRS'', 10, 20, 0.5)') AS from_columns,
+       adql_plan_uses_index('SELECT * FROM acat WHERE pos <@ polygon(''ICRS'', 10,10, 12,10, 12,12, 10,12)') AS poly,
+       adql_plan_uses_index('SELECT * FROM acat WHERE pos <@ box(''ICRS'', 10, 20, 2, 1)') AS bx,
+       -- a region that is not a constant cannot be rewritten, and must not be
+       adql_plan_uses_index('SELECT * FROM acat a WHERE a.pos <@ (SELECT circle(''ICRS'', b.ra, b.dec, 0.5) FROM acat b WHERE b.id = a.id)') AS not_constant;
+
+-- indexed and sequential answers must be identical
+CREATE FUNCTION op_mismatches() RETURNS TABLE(n_queries int, n_rows bigint, mismatches int)
+LANGUAGE plpgsql AS $$
+DECLARE i int; ra float8; dec float8; r float8; a bigint; b bigint; reg text;
+BEGIN
+  n_queries := 0; n_rows := 0; mismatches := 0;
+  FOR i IN 0..119 LOOP
+    ra := 360 * random(); dec := degrees(asin(2 * random() - 1));
+    r := power(10, -2 + 1.5 * random());
+    IF i % 3 = 0 THEN
+      reg := format('circle(%L, %s, %s, %s)', 'ICRS', ra, dec, r);
+    ELSIF i % 3 = 1 THEN
+      reg := format('polygon(%s, %s, %s, %s, %s, %s, %s, %s)',
+                    ra - r, dec - r, ra + r, dec - r, ra + r, dec + r, ra - r, dec + r);
+    ELSE
+      reg := format('box(%s, %s, %s, %s)', ra, greatest(-80, least(80, dec)), r, r);
+    END IF;
+    EXECUTE format('SELECT count(*) FROM acat WHERE pos <@ %s', reg) INTO a;
+    EXECUTE format('SELECT count(*) FROM acat WHERE 1 = contains(pos, %s)', reg) INTO b;
+    n_queries := n_queries + 1; n_rows := n_rows + b;
+    IF a <> b THEN mismatches := mismatches + 1; RAISE NOTICE 'mismatch on %: % vs %', reg, a, b; END IF;
+  END LOOP;
+  RETURN NEXT;
+END $$;
+SELECT n_queries, n_rows > 0 AS found_rows, mismatches FROM op_mismatches();
+
+-- epoch propagation -------------------------------------------------
+-- Barnard's star: 10.4 arcsec/yr, the largest known proper motion
+SELECT round((3600 * distance(
+         ivo_epoch_prop_pos(269.45207, 4.693364, 547.45, -802.80, 10362.54, -110.6, 2000, 2016),
+         point('ICRS', 269.45207, 4.693364)))::numeric, 1) AS moved_arcsec_16yr;
+-- propagating the whole solution back returns the starting point
+WITH fwd AS (SELECT ivo_epoch_prop(269.45207, 4.693364, 547.45, -802.80, 10362.54, -110.6, 2000, 2016) AS s)
+SELECT round((3.6e9 * distance(ivo_epoch_prop_pos(s[1], s[2], s[3], s[4], s[5], s[6], 2016, 2000),
+                               point('ICRS', 269.45207, 4.693364)))::numeric, 3) AS roundtrip_uas,
+       (s[3] > 547.45) AS parallax_grows_while_approaching,
+       round(s[6]::numeric, 2) AS radial_velocity
+FROM fwd;
+-- a star without measured motion does not move; ivo_apply_pm is the same
+-- thing without parallax or radial velocity
+SELECT ivo_epoch_prop_pos(10, 20, 0, 0, 0, 0, 2000, 2050) AS no_motion,
+       ivo_apply_pm(10, 20, 3600, 0, 10)::text = ivo_epoch_prop_pos(10, 20, 3600, 0, 2000, 2010)::text AS apply_pm_matches,
+       round(skycell_pm_margin(-802.80, 10362.54, 16)::numeric, 6) AS margin_deg;
+
+-- frames ------------------------------------------------------------
+SELECT round(coord1(icrs2gal(point('ICRS', 266.404988, -28.936178)))::numeric, 3) AS gal_l,
+       round(coord2(icrs2gal(point('ICRS', 266.404988, -28.936178)))::numeric, 3) AS gal_b,
+       round((3.6e9 * distance(gal2icrs(icrs2gal(point('ICRS', 123.4, -56.7))), point('ICRS', 123.4, -56.7)))::numeric, 3) AS gal_roundtrip_uas,
+       round((3.6e9 * distance(ecl2icrs(icrs2ecl(point('ICRS', 123.4, -56.7))), point('ICRS', 123.4, -56.7)))::numeric, 3) AS ecl_roundtrip_uas,
+       round(coord2(icrs2ecl(point('ICRS', 270, 66.5607)))::numeric, 2) AS ecliptic_pole_lat;
+
+-- the registry's HEALPix helpers ------------------------------------
+SELECT ivo_healpix_index(12, 10.0, 20.0) = skycell_ang2pix(12, 10.0, 20.0) AS same_as_native,
+       ivo_healpix_index(12, point('ICRS', 10, 20)) = skycell_ang2pix(12, 10.0, 20.0) AS from_position,
+       ivo_healpix_index(5, ivo_healpix_center(5, 1234::int8)) = 1234 AS center_roundtrip,
+       skycell_cell(point('ICRS', 10, 20)) = skycell_ang2cell(10, 20) AS cell_of_position;
+SELECT ivo_healpix_index(30, 10.0, 20.0);   -- error: order out of range

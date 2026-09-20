@@ -1,0 +1,8 @@
+*.o
+*.so
+*.bc
+ext/test/healpix_selftest
+ext/results/
+ext/regression.*
+bench/results/
+__pycache__/

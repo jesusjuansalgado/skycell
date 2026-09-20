@@ -1,0 +1,1414 @@
+/*
+ * skycell.c -- PostgreSQL glue for the skycell prototype.
+ *
+ * Points are keyed by their order-29 HEALPix NESTED cell (int8) in an
+ * ordinary B-tree.  Spatial predicates are written as plain boolean
+ * functions:
+ *
+ *     WHERE skycell_cone(cell, ra, dec, ra0, dec0, radius)
+ *
+ * and a planner support function (SupportRequestSimplify) rewrites them
+ * before path generation into
+ *
+ *     (cell BETWEEN lo1 AND hi1 OR cell BETWEEN lo2 AND hi2 ...)
+ *     AND skycell_in_cone(ra, dec, ra0, dec0, radius, <selectivity>)
+ *
+ * The ranges come from a cost-based covering (cover.c) that uses the
+ * ANALYZE histogram of the cell column as a sky density map.  Because the
+ * index conditions are plain range predicates on a plain column, the planner
+ * also gets real row estimates from the same histogram.
+ *
+ * When the cone parameters are not constants (joins, generic plans) the
+ * rewrite emits a fixed number of range "slots" computed at run time per
+ * outer row by skycell_cone_bound() -- the same trick Q3C uses -- but with a
+ * density-aware covering.  skycell_cone_ranges() offers the alternative
+ * LATERAL form with a variable number of ranges.
+ */
+#include "postgres.h"
+
+#include <math.h>
+
+#include "access/genam.h"
+#include "access/htup_details.h"
+#include "access/stratnum.h"
+#include "access/table.h"
+#include "catalog/pg_class.h"
+#include "catalog/pg_opfamily_d.h"
+#include "catalog/pg_statistic.h"
+#include "catalog/pg_type_d.h"
+#include "common/hashfn.h"
+#include "utils/catcache.h"
+#include "utils/inval.h"
+#include "utils/memutils.h"
+#include "fmgr.h"
+#include "funcapi.h"
+#include "miscadmin.h"
+#include "nodes/makefuncs.h"
+#include "nodes/nodeFuncs.h"
+#include "nodes/pathnodes.h"
+#include "nodes/supportnodes.h"
+#include "optimizer/optimizer.h"
+#include "parser/parse_func.h"
+#include "parser/parsetree.h"
+#include "rewrite/rewriteManip.h"
+#include "utils/array.h"
+#include "utils/builtins.h"
+#include "utils/guc.h"
+#include "utils/lsyscache.h"
+#include "utils/rel.h"
+#include "utils/relcache.h"
+#include "utils/syscache.h"
+#include "utils/tuplestore.h"
+
+#include "cover.h"
+#include "skycell_internal.h"
+
+PG_MODULE_MAGIC;
+
+#define DEG2RAD (M_PI / 180.0)
+#define MAX_SLOTS 16
+
+/* GUCs */
+static double skycell_range_cost = 30.0;
+static double skycell_split_cost = 1.0;
+static double skycell_max_area_ratio = 64.0;
+static int	skycell_max_ranges = 64;
+static int	skycell_max_steps = 4000;
+static int	skycell_join_slots = 4;
+static bool skycell_use_stats = true;
+static bool skycell_cache_coverings = true;
+
+void		_PG_init(void);
+
+void
+_PG_init(void)
+{
+	DefineCustomRealVariable("skycell.range_cost",
+							 "Cost of one extra index range, in rows.",
+							 NULL, &skycell_range_cost, 30.0, 0.0, 1e9,
+							 PGC_USERSET, 0, NULL, NULL, NULL);
+	DefineCustomRealVariable("skycell.split_cost",
+							 "Cost of refining one covering cell, in rows.",
+							 NULL, &skycell_split_cost, 1.0, 0.0, 1e9,
+							 PGC_USERSET, 0, NULL, NULL, NULL);
+	DefineCustomRealVariable("skycell.max_area_ratio",
+							 "Max area of a partially covered cell relative to the region (0 = unlimited).",
+							 NULL, &skycell_max_area_ratio, 64.0, 0.0, 1e12,
+							 PGC_USERSET, 0, NULL, NULL, NULL);
+	DefineCustomIntVariable("skycell.max_ranges",
+							"Maximum index ranges for a constant region.",
+							NULL, &skycell_max_ranges, 64, 1, 10000,
+							PGC_USERSET, 0, NULL, NULL, NULL);
+	DefineCustomIntVariable("skycell.max_steps",
+							"Maximum cell classifications per covering.",
+							NULL, &skycell_max_steps, 4000, 16, 10000000,
+							PGC_USERSET, 0, NULL, NULL, NULL);
+	DefineCustomIntVariable("skycell.join_slots",
+							"Number of range slots emitted for non-constant regions (joins).",
+							NULL, &skycell_join_slots, 4, 1, MAX_SLOTS,
+							PGC_USERSET, 0, NULL, NULL, NULL);
+	DefineCustomBoolVariable("skycell.use_stats",
+							 "Use the ANALYZE histogram of the cell column as a density map.",
+							 NULL, &skycell_use_stats, true,
+							 PGC_USERSET, 0, NULL, NULL, NULL);
+	DefineCustomBoolVariable("skycell.cache_coverings",
+							 "Memoise coverings per backend (cleared when statistics change).",
+							 NULL, &skycell_cache_coverings, true,
+							 PGC_USERSET, 0, NULL, NULL, NULL);
+	MarkGUCPrefixReserved("skycell");
+}
+
+void
+current_params(sc_cover_params *p, int max_ranges)
+{
+	sc_cover_params_default(p);
+	p->range_cost = skycell_range_cost;
+	p->split_cost = skycell_split_cost;
+	p->max_area_ratio = skycell_max_area_ratio;
+	p->max_ranges = max_ranges;
+	p->max_steps = skycell_max_steps;
+}
+
+/* ------------------------------------------------------------------ */
+/* helpers                                                            */
+/* ------------------------------------------------------------------ */
+
+void
+check_err(const char *err)
+{
+	if (err)
+		ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+						errmsg("skycell: %s", err)));
+}
+
+/* float8[] {ra1, dec1, ra2, dec2, ...} -> polygon region */
+static void
+poly_from_array(ArrayType *arr, sc_region *r)
+{
+	Datum	   *elems;
+	bool	   *nulls;
+	int			n;
+	double	   *ra,
+			   *dec;
+
+	if (ARR_ELEMTYPE(arr) != FLOAT8OID)
+		elog(ERROR, "skycell: polygon must be a float8[]");
+	deconstruct_array_builtin(arr, FLOAT8OID, &elems, &nulls, &n);
+	if (n % 2 != 0)
+		check_err("polygon array must contain ra,dec pairs");
+	ra = palloc(sizeof(double) * n / 2);
+	dec = palloc(sizeof(double) * n / 2);
+	for (int i = 0; i < n / 2; i++)
+	{
+		if (nulls[2 * i] || nulls[2 * i + 1])
+			check_err("polygon vertices must not be NULL");
+		ra[i] = DatumGetFloat8(elems[2 * i]);
+		dec[i] = DatumGetFloat8(elems[2 * i + 1]);
+	}
+	check_err(sc_region_poly(r, n / 2, ra, dec));
+}
+
+/* ------------------------------------------------------------------ */
+/* statistics cache                                                    */
+/* ------------------------------------------------------------------ */
+
+/*
+ * Coverings are a deterministic function of the cone, the density model and
+ * the cost settings, and computing one is the largest part of what this
+ * extension adds to planning.  A TAP service plans the same cone many times
+ * -- the same object, the same survey field, a client paging -- so the
+ * result is memoised per backend and thrown away with the statistics it was
+ * computed from.
+ */
+typedef struct cover_key
+{
+	double		ra0,
+				dec0,
+				radius,
+				range_cost,
+				split_cost,
+				area_ratio;
+	Oid			statrel;		/* whose density map this used */
+	int32		max_ranges;
+	int32		max_steps;
+} cover_key;
+
+typedef struct cover_entry
+{
+	cover_key	key;			/* must be first */
+	int			n;
+	sc_range   *r;
+	double		area;
+	double		exp_rows;
+} cover_entry;
+
+static HTAB *cover_cache = NULL;
+
+#define SKYCELL_COVER_CACHE_MAX 2048
+
+
+/*
+ * Loading the density model costs more than computing the covering: the
+ * histogram is deconstructed from pg_statistic on every plan, and finding
+ * the expression index means opening every index of the relation.  Both are
+ * cached per backend and dropped whole whenever the statistics, the
+ * relation's row count or any relcache entry changes -- ANALYZE, DDL, or a
+ * new index all invalidate, and a stale density map would silently plan
+ * coverings for data that moved.
+ */
+typedef struct dens_key
+{
+	Oid			statrel;		/* the table, or the expression index */
+	AttrNumber	attnum;
+} dens_key;
+
+typedef struct dens_entry
+{
+	dens_key	key;			/* must be first */
+	double		ntotal;
+	int			nbounds;
+	int64	   *bounds;
+} dens_entry;
+
+typedef struct idx_entry
+{
+	Oid			relid;			/* must be first: the table */
+	Oid			indexoid;		/* the matching expression index, or InvalidOid */
+	Node	   *expr;			/* its first key expression (varno 1) */
+} idx_entry;
+
+static MemoryContext skycell_cache_cxt = NULL;
+static HTAB *dens_cache = NULL;
+static HTAB *idx_cache = NULL;
+
+static void
+skycell_cache_flush(Datum arg, int cacheid, uint32 hashvalue)
+{
+	dens_cache = NULL;
+	idx_cache = NULL;
+	cover_cache = NULL;
+	if (skycell_cache_cxt)
+		MemoryContextReset(skycell_cache_cxt);
+}
+
+static void
+skycell_cache_flush_rel(Datum arg, Oid relid)
+{
+	skycell_cache_flush(arg, 0, 0);
+}
+
+static void
+skycell_cache_init(void)
+{
+	HASHCTL		ctl;
+
+	if (skycell_cache_cxt == NULL)
+	{
+		skycell_cache_cxt = AllocSetContextCreate(TopMemoryContext,
+												  "skycell statistics cache",
+												  ALLOCSET_SMALL_SIZES);
+		CacheRegisterSyscacheCallback(STATRELATTINH, skycell_cache_flush, (Datum) 0);
+		CacheRegisterSyscacheCallback(RELOID, skycell_cache_flush, (Datum) 0);
+		CacheRegisterRelcacheCallback(skycell_cache_flush_rel, (Datum) 0);
+	}
+	if (dens_cache == NULL)
+	{
+		memset(&ctl, 0, sizeof(ctl));
+		ctl.keysize = sizeof(dens_key);
+		ctl.entrysize = sizeof(dens_entry);
+		ctl.hcxt = skycell_cache_cxt;
+		dens_cache = hash_create("skycell density", 8, &ctl,
+								 HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+	}
+	if (idx_cache == NULL)
+	{
+		memset(&ctl, 0, sizeof(ctl));
+		ctl.keysize = sizeof(Oid);
+		ctl.entrysize = sizeof(idx_entry);
+		ctl.hcxt = skycell_cache_cxt;
+		idx_cache = hash_create("skycell cell index", 8, &ctl,
+								HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+	}
+	if (cover_cache == NULL)
+	{
+		memset(&ctl, 0, sizeof(ctl));
+		ctl.keysize = sizeof(cover_key);
+		ctl.entrysize = sizeof(cover_entry);
+		ctl.hcxt = skycell_cache_cxt;
+		cover_cache = hash_create("skycell coverings", 64, &ctl,
+								  HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+	}
+}
+
+/* sc_cover_compute() through the memo; the ranges stay owned by the cache */
+void
+cover_cached(const sc_region *reg, const sc_density *d, const sc_cover_params *p,
+			 Oid statrel, double ra0, double dec0, double radius, sc_cover *out)
+{
+	cover_key	key;
+	cover_entry *entry;
+	bool		found;
+
+	if (!skycell_cache_coverings)
+	{
+		sc_cover_compute(reg, d, p, out);
+		return;
+	}
+	skycell_cache_init();
+	if (hash_get_num_entries(cover_cache) >= SKYCELL_COVER_CACHE_MAX)
+		skycell_cache_flush((Datum) 0, 0, 0);	/* simplest eviction: start over */
+	skycell_cache_init();
+
+	memset(&key, 0, sizeof(key));	/* padding must be zero: hashed as bytes */
+	key.ra0 = ra0;
+	key.dec0 = dec0;
+	key.radius = radius;
+	key.range_cost = p->range_cost;
+	key.split_cost = p->split_cost;
+	key.area_ratio = p->max_area_ratio;
+	key.statrel = statrel;
+	key.max_ranges = p->max_ranges;
+	key.max_steps = p->max_steps;
+
+	entry = (cover_entry *) hash_search(cover_cache, &key, HASH_ENTER, &found);
+	if (!found)
+	{
+		sc_cover	fresh;
+		MemoryContext old = MemoryContextSwitchTo(skycell_cache_cxt);
+
+		sc_cover_compute(reg, d, p, &fresh);
+		MemoryContextSwitchTo(old);
+		entry->n = fresh.n;
+		entry->r = fresh.r;
+		entry->area = fresh.area;
+		entry->exp_rows = fresh.exp_rows;
+	}
+	memset(out, 0, sizeof(*out));
+	out->n = entry->n;
+	out->r = entry->r;
+	out->area = entry->area;
+	out->exp_rows = entry->exp_rows;
+}
+
+
+/*
+ * Density model: reltuples of the table plus the ANALYZE histogram of
+ * column attnum of statrel -- the table itself for a plain column, or an
+ * expression index on skycell_ang2cell(ra, dec), whose statistics ANALYZE
+ * keeps under the index.  Bounds are palloc'd in the current context.
+ */
+static void
+load_density_from(Oid relid, Oid statrel, AttrNumber attnum, sc_density *d)
+{
+	HeapTuple	tp;
+
+	d->ntotal = 0;
+	d->nbounds = 0;
+	d->bounds = NULL;
+
+	tp = SearchSysCache1(RELOID, ObjectIdGetDatum(relid));
+	if (HeapTupleIsValid(tp))
+	{
+		float4		reltuples = ((Form_pg_class) GETSTRUCT(tp))->reltuples;
+
+		d->ntotal = reltuples > 0 ? reltuples : 0;
+		ReleaseSysCache(tp);
+	}
+	if (!skycell_use_stats)
+		return;
+
+	for (int inh = 0; inh <= 1; inh++)
+	{
+		tp = SearchSysCache3(STATRELATTINH, ObjectIdGetDatum(statrel),
+							 Int16GetDatum(attnum), BoolGetDatum(inh));
+		if (HeapTupleIsValid(tp))
+		{
+			AttStatsSlot sslot;
+			float4		nullfrac = ((Form_pg_statistic) GETSTRUCT(tp))->stanullfrac;
+
+			if (get_attstatsslot(&sslot, tp, STATISTIC_KIND_HISTOGRAM,
+								 InvalidOid, ATTSTATSSLOT_VALUES))
+			{
+				if (sslot.nvalues >= 2 && sslot.valuetype == INT8OID)
+				{
+					int64	   *b = palloc(sizeof(int64) * sslot.nvalues);
+
+					for (int i = 0; i < sslot.nvalues; i++)
+						b[i] = DatumGetInt64(sslot.values[i]);
+					d->bounds = b;
+					d->nbounds = sslot.nvalues;
+				}
+				free_attstatsslot(&sslot);
+			}
+			d->ntotal *= (1.0 - nullfrac);
+			ReleaseSysCache(tp);
+			return;
+		}
+	}
+}
+
+/*
+ * load_density_from() through the cache.  The bounds are copied into the
+ * caller's context: the covering reads them while the planner is free to
+ * open relations, and an invalidation in between would otherwise free them
+ * under it.
+ */
+static void
+load_density_cached(Oid relid, Oid statrel, AttrNumber attnum, sc_density *d)
+{
+	dens_key	key = {statrel, attnum};
+	dens_entry *entry;
+	bool		found;
+
+	skycell_cache_init();
+	entry = (dens_entry *) hash_search(dens_cache, &key, HASH_ENTER, &found);
+	if (!found)
+	{
+		sc_density	fresh;
+		MemoryContext old = MemoryContextSwitchTo(skycell_cache_cxt);
+
+		/* load in the cache context so the bounds survive the query */
+		load_density_from(relid, statrel, attnum, &fresh);
+		MemoryContextSwitchTo(old);
+		entry->ntotal = fresh.ntotal;
+		entry->nbounds = fresh.nbounds;
+		entry->bounds = (int64 *) fresh.bounds;
+	}
+	d->ntotal = entry->ntotal;
+	d->nbounds = entry->nbounds;
+	d->bounds = NULL;
+	if (entry->nbounds > 0)
+	{
+		int64	   *copy = palloc(sizeof(int64) * entry->nbounds);
+
+		memcpy(copy, entry->bounds, sizeof(int64) * entry->nbounds);
+		d->bounds = copy;
+	}
+}
+
+static void
+load_density(Oid relid, AttrNumber attnum, sc_density *d)
+{
+	load_density_cached(relid, relid, attnum, d);
+}
+
+/*
+ * The cell argument is an expression over one base relation, e.g.
+ * skycell_ang2cell(s_ra, s_dec): use the statistics of an expression index
+ * whose first column is that same expression.  Returns false if none.
+ */
+bool
+density_for_expr(PlannerInfo *root, Node *arg, sc_density *d, Oid *statrel)
+{
+	List	   *vars = pull_var_clause(arg, 0);
+	ListCell   *lc;
+	Index		varno = 0;
+	RangeTblEntry *rte;
+	Relation	rel;
+	List	   *indexes;
+	Node	   *key;
+	Oid			matched = InvalidOid;
+	bool		found = false;
+
+	foreach(lc, vars)
+	{
+		Var		   *v = (Var *) lfirst(lc);
+
+		if (!IsA(v, Var) || v->varlevelsup != 0 || (varno != 0 && v->varno != varno))
+			return false;
+		varno = v->varno;
+	}
+	if (varno == 0 || varno > list_length(root->parse->rtable))
+		return false;
+	rte = rt_fetch(varno, root->parse->rtable);
+	if (rte->rtekind != RTE_RELATION)
+		return false;
+
+	/* index expressions are stored with varno 1 */
+	key = copyObject(arg);
+	ChangeVarNodes(key, varno, 1, 0);
+
+	/* the index this expression was matched to last time, if still valid */
+	skycell_cache_init();
+	{
+		idx_entry  *cached = (idx_entry *) hash_search(idx_cache, &rte->relid,
+													   HASH_FIND, NULL);
+
+		if (cached != NULL && equal(cached->expr, key))
+		{
+			if (!OidIsValid(cached->indexoid))
+				return false;
+			load_density_cached(rte->relid, cached->indexoid, 1, d);
+			*statrel = cached->indexoid;
+			return true;
+		}
+	}
+
+	rel = table_open(rte->relid, NoLock);	/* locked by the parser */
+	indexes = RelationGetIndexList(rel);
+	foreach(lc, indexes)
+	{
+		Oid			indexoid = lfirst_oid(lc);
+		Relation	irel = index_open(indexoid, AccessShareLock);
+
+		if (irel->rd_index->indnatts >= 1 && irel->rd_index->indkey.values[0] == 0)
+		{
+			List	   *exprs = RelationGetIndexExpressions(irel);
+
+			if (exprs != NIL && equal(linitial(exprs), key))
+			{
+				load_density_cached(rte->relid, indexoid, 1, d);
+				found = true;
+				matched = indexoid;
+				*statrel = indexoid;
+			}
+		}
+		index_close(irel, AccessShareLock);
+		if (found)
+			break;
+	}
+	list_free(indexes);
+	table_close(rel, NoLock);
+
+	/* remember the outcome, including "this relation has no cell index" */
+	{
+		idx_entry  *entry;
+		bool		hit;
+		MemoryContext old;
+
+		skycell_cache_init();
+		entry = (idx_entry *) hash_search(idx_cache, &rte->relid, HASH_ENTER, &hit);
+		old = MemoryContextSwitchTo(skycell_cache_cxt);
+		entry->indexoid = matched;
+		entry->expr = copyObject(key);
+		MemoryContextSwitchTo(old);
+	}
+	return found;
+}
+
+/* density of the relation the cell argument comes from */
+void
+density_for_var(PlannerInfo *root, Node *arg, sc_density *d, Oid *statrel)
+{
+	d->ntotal = 0;
+	d->nbounds = 0;
+	d->bounds = NULL;
+	*statrel = InvalidOid;
+
+	if (root && root->parse && !IsA(arg, Var) && !IsA(arg, Const))
+	{
+		density_for_expr(root, arg, d, statrel);
+		return;
+	}
+	if (root && root->parse && IsA(arg, Var))
+	{
+		Var		   *var = (Var *) arg;
+
+		if (var->varlevelsup == 0 && var->varattno > 0 &&
+			var->varno >= 1 && var->varno <= list_length(root->parse->rtable))
+		{
+			RangeTblEntry *rte = rt_fetch(var->varno, root->parse->rtable);
+
+			if (rte->rtekind == RTE_RELATION)
+			{
+				load_density(rte->relid, var->varattno, d);
+				*statrel = rte->relid;
+			}
+		}
+	}
+}
+
+Oid
+lookup_sibling_func(Oid funcid, const char *name, int nargs, const Oid *argtypes)
+{
+	char	   *nsp = get_namespace_name(get_func_namespace(funcid));
+
+	return LookupFuncName(list_make2(makeString(nsp), makeString(pstrdup(name))),
+						  nargs, argtypes, false);
+}
+
+Const *
+int8_const(int64 v)
+{
+	return makeConst(INT8OID, -1, InvalidOid, sizeof(int64),
+					 Int64GetDatum(v), false, true);
+}
+
+Const *
+float8_const(double v)
+{
+	return makeConst(FLOAT8OID, -1, InvalidOid, sizeof(float8),
+					 Float8GetDatum(v), false, true);
+}
+
+static Const *
+int4_const(int32 v)
+{
+	return makeConst(INT4OID, -1, InvalidOid, sizeof(int32),
+					 Int32GetDatum(v), false, true);
+}
+
+Expr *
+int8_cmp(int strategy, Node *left, Expr *right)
+{
+	Oid			opno = get_opfamily_member(INTEGER_BTREE_FAM_OID, INT8OID,
+										   INT8OID, strategy);
+	Expr	   *e = make_opclause(opno, BOOLOID, false, (Expr *) copyObject(left),
+								  right, InvalidOid, InvalidOid);
+
+	set_opfuncid((OpExpr *) e);
+	return e;
+}
+
+/* cell >= lo AND cell <= hi */
+Expr *
+range_arm(Node *cell, Expr *lo, Expr *hi)
+{
+	return makeBoolExpr(AND_EXPR,
+						list_make2(int8_cmp(BTGreaterEqualStrategyNumber, cell, lo),
+								   int8_cmp(BTLessEqualStrategyNumber, cell, hi)),
+						-1);
+}
+
+static bool
+all_const(List *args, int from, int to, bool *anynull)
+{
+	*anynull = false;
+	for (int i = from; i <= to; i++)
+	{
+		Node	   *a = list_nth(args, i);
+
+		if (!IsA(a, Const))
+			return false;
+		if (((Const *) a)->constisnull)
+			*anynull = true;
+	}
+	return true;
+}
+
+/* ------------------------------------------------------------------ */
+/* planner support: skycell_cone / skycell_poly -> ranges + exact     */
+/* ------------------------------------------------------------------ */
+
+Node *
+ranges_and_exact(sc_cover *cov, Node *cell, Expr *exact)
+{
+	List	   *arms = NIL;
+
+	if (cov->n == 0)
+		return (Node *) makeBoolConst(false, false);
+
+	for (int i = 0; i < cov->n; i++)
+		arms = lappend(arms, range_arm(cell,
+									   (Expr *) int8_const(cov->r[i].lo),
+									   (Expr *) int8_const(cov->r[i].hi)));
+	if (cov->n == 1)
+		return (Node *) makeBoolExpr(AND_EXPR,
+									 list_concat(((BoolExpr *) linitial(arms))->args,
+												 list_make1(exact)),
+									 -1);
+	return (Node *) makeBoolExpr(AND_EXPR,
+								 list_make2(makeBoolExpr(OR_EXPR, arms, -1), exact),
+								 -1);
+}
+
+static Node *
+simplify_cone(PlannerInfo *root, FuncExpr *fexpr)
+{
+	List	   *args = fexpr->args;
+	Node	   *cell = linitial(args);
+	bool		anynull;
+	Oid			exact_types[6] = {FLOAT8OID, FLOAT8OID, FLOAT8OID, FLOAT8OID, FLOAT8OID, FLOAT8OID};
+	Oid			exact_oid = lookup_sibling_func(fexpr->funcid, "skycell_in_cone", 6, exact_types);
+	sc_density	dens;
+	Oid			dens_statrel;
+
+	density_for_var(root, cell, &dens, &dens_statrel);
+
+	if (all_const(args, 3, 5, &anynull))
+	{
+		sc_region	reg;
+		sc_cover	cov;
+		sc_cover_params p;
+		double		sel;
+		Expr	   *exact;
+
+		if (anynull)
+			return (Node *) makeBoolConst(false, true);
+
+		check_err(sc_region_cone(&reg,
+								 DatumGetFloat8(((Const *) list_nth(args, 3))->constvalue),
+								 DatumGetFloat8(((Const *) list_nth(args, 4))->constvalue),
+								 DatumGetFloat8(((Const *) list_nth(args, 5))->constvalue)));
+		current_params(&p, skycell_max_ranges);
+		cover_cached(&reg, &dens, &p, dens_statrel,
+					 DatumGetFloat8(((Const *) list_nth(args, 3))->constvalue),
+					 DatumGetFloat8(((Const *) list_nth(args, 4))->constvalue),
+					 DatumGetFloat8(((Const *) list_nth(args, 5))->constvalue), &cov);
+
+		sel = (cov.area > 0) ? fmin(1.0, reg.area / cov.area) : 0.0;
+		exact = (Expr *) makeFuncExpr(exact_oid, BOOLOID,
+									  list_make5(copyObject(list_nth(args, 1)),
+												 copyObject(list_nth(args, 2)),
+												 copyObject(list_nth(args, 3)),
+												 copyObject(list_nth(args, 4)),
+												 copyObject(list_nth(args, 5))),
+									  InvalidOid, InvalidOid, COERCE_EXPLICIT_CALL);
+		((FuncExpr *) exact)->args = lappend(((FuncExpr *) exact)->args, float8_const(sel));
+		return ranges_and_exact(&cov, cell, exact);
+	}
+	else
+	{
+		/* run-time slots, one covering per distinct (ra0, dec0, radius) */
+		Oid			bound_types[7] = {FLOAT8OID, FLOAT8OID, FLOAT8OID, INT4OID, INT4OID, FLOAT8OID, INT8ARRAYOID};
+		Oid			bound_oid = lookup_sibling_func(fexpr->funcid, "skycell_cone_bound", 7, bound_types);
+		int			k = skycell_join_slots;
+		Const	   *hist;
+		List	   *arms = NIL;
+		Datum	   *hd = palloc(sizeof(Datum) * Max(dens.nbounds, 1));
+		FuncExpr   *exact;
+
+		for (int i = 0; i < dens.nbounds; i++)
+			hd[i] = Int64GetDatum(dens.bounds[i]);
+		hist = makeConst(INT8ARRAYOID, -1, InvalidOid, -1,
+						 PointerGetDatum(construct_array_builtin(hd, dens.nbounds, INT8OID)),
+						 false, false);
+
+		for (int s = 0; s < k; s++)
+		{
+			Expr	   *b[2];
+
+			for (int j = 0; j < 2; j++)
+				b[j] = (Expr *) makeFuncExpr(bound_oid, INT8OID,
+											 list_make5(copyObject(list_nth(args, 3)),
+														copyObject(list_nth(args, 4)),
+														copyObject(list_nth(args, 5)),
+														int4_const(2 * s + j),
+														int4_const(k)),
+											 InvalidOid, InvalidOid, COERCE_EXPLICIT_CALL);
+			for (int j = 0; j < 2; j++)
+				((FuncExpr *) b[j])->args = lappend(lappend(((FuncExpr *) b[j])->args,
+															float8_const(dens.ntotal)),
+													copyObject(hist));
+			arms = lappend(arms, range_arm(cell, b[0], b[1]));
+		}
+		exact = makeFuncExpr(exact_oid, BOOLOID,
+							 list_make5(copyObject(list_nth(args, 1)),
+										copyObject(list_nth(args, 2)),
+										copyObject(list_nth(args, 3)),
+										copyObject(list_nth(args, 4)),
+										copyObject(list_nth(args, 5))),
+							 InvalidOid, InvalidOid, COERCE_EXPLICIT_CALL);
+		exact->args = lappend(exact->args, float8_const(-1.0));
+		return (Node *) makeBoolExpr(AND_EXPR,
+									 list_make2(k == 1 ? linitial(arms) : makeBoolExpr(OR_EXPR, arms, -1),
+												exact),
+									 -1);
+	}
+}
+
+static Node *
+simplify_poly(PlannerInfo *root, FuncExpr *fexpr)
+{
+	List	   *args = fexpr->args;
+	Node	   *cell = linitial(args);
+	Node	   *poly = lfourth(args);
+	sc_region	reg;
+	sc_cover	cov;
+	sc_cover_params p;
+	sc_density	dens;
+	Oid			dens_statrel;
+	double		sel;
+	Oid			exact_types[4] = {FLOAT8OID, FLOAT8OID, FLOAT8ARRAYOID, FLOAT8OID};
+	FuncExpr   *exact;
+
+	if (!IsA(poly, Const))
+		return NULL;			/* not rewritten: exact test only */
+	if (((Const *) poly)->constisnull)
+		return (Node *) makeBoolConst(false, true);
+
+	poly_from_array(DatumGetArrayTypeP(((Const *) poly)->constvalue), &reg);
+	density_for_var(root, cell, &dens, &dens_statrel);
+	current_params(&p, skycell_max_ranges);
+	sc_cover_compute(&reg, &dens, &p, &cov);
+	sel = (cov.area > 0) ? fmin(1.0, reg.area / cov.area) : 0.0;
+
+	exact = makeFuncExpr(lookup_sibling_func(fexpr->funcid, "skycell_in_poly", 4, exact_types),
+						 BOOLOID,
+						 list_make4(copyObject(lsecond(args)), copyObject(lthird(args)),
+									copyObject(poly), float8_const(sel)),
+						 InvalidOid, InvalidOid, COERCE_EXPLICIT_CALL);
+	return ranges_and_exact(&cov, cell, (Expr *) exact);
+}
+
+PG_FUNCTION_INFO_V1(skycell_support);
+Datum
+skycell_support(PG_FUNCTION_ARGS)
+{
+	Node	   *rawreq = (Node *) PG_GETARG_POINTER(0);
+
+	if (IsA(rawreq, SupportRequestSimplify))
+	{
+		SupportRequestSimplify *req = (SupportRequestSimplify *) rawreq;
+		int			nargs = list_length(req->fcall->args);
+
+		if (nargs == 6)
+			PG_RETURN_POINTER(simplify_cone(req->root, req->fcall));
+		if (nargs == 4)
+			PG_RETURN_POINTER(simplify_poly(req->root, req->fcall));
+	}
+	PG_RETURN_POINTER(NULL);
+}
+
+/*
+ * Selectivity of the exact test.  The rewrite passes area(region) /
+ * area(covering) as the last argument, so that sel(ranges) * sel(exact)
+ * approximates the true fraction.  For run-time slots (-1) fall back to the
+ * uniform-sky fraction when the radius is known.
+ */
+PG_FUNCTION_INFO_V1(skycell_exact_support);
+Datum
+skycell_exact_support(PG_FUNCTION_ARGS)
+{
+	Node	   *rawreq = (Node *) PG_GETARG_POINTER(0);
+
+	if (IsA(rawreq, SupportRequestSelectivity))
+	{
+		SupportRequestSelectivity *req = (SupportRequestSelectivity *) rawreq;
+		Node	   *last = llast(req->args);
+		double		s = -1;
+
+		if (IsA(last, Const) && !((Const *) last)->constisnull)
+			s = DatumGetFloat8(((Const *) last)->constvalue);
+		if (s < 0 && list_length(req->args) == 6 && IsA(list_nth(req->args, 4), Const) &&
+			!((Const *) list_nth(req->args, 4))->constisnull)
+		{
+			double		r = DatumGetFloat8(((Const *) list_nth(req->args, 4))->constvalue) * DEG2RAD;
+
+			s = pow(sin(fmin(fmax(r, 0), M_PI) / 2.0), 2);	/* cap area / 4pi */
+		}
+		if (s < 0)
+			s = 1e-4;
+		req->selectivity = fmin(1.0, fmax(s, 1e-12));
+		PG_RETURN_POINTER(req);
+	}
+	PG_RETURN_POINTER(NULL);
+}
+
+/* ------------------------------------------------------------------ */
+/* the user-facing predicates (used as-is when not rewritten)         */
+/* ------------------------------------------------------------------ */
+
+typedef struct cone_cache
+{
+	double		dec0,
+				radius,
+				cosdec0,
+				thr;			/* sin^2(radius/2), <0 => empty, >1 => all */
+} cone_cache;
+
+static inline bool
+in_cone(FunctionCallInfo fcinfo, double ra, double dec, double ra0, double dec0, double radius)
+{
+	cone_cache *cc = (cone_cache *) fcinfo->flinfo->fn_extra;
+	double		sdd,
+				sda;
+
+	if (cc == NULL)
+	{
+		cc = MemoryContextAlloc(fcinfo->flinfo->fn_mcxt, sizeof(cone_cache));
+		cc->dec0 = NAN;
+		fcinfo->flinfo->fn_extra = cc;
+	}
+	if (cc->dec0 != dec0 || cc->radius != radius)
+	{
+		cc->dec0 = dec0;
+		cc->radius = radius;
+		cc->cosdec0 = cos(dec0 * DEG2RAD);
+		cc->thr = radius < 0 ? -1.0 : (radius >= 180.0 ? 2.0 : pow(sin(radius * DEG2RAD / 2.0), 2));
+	}
+	/* haversine */
+	sdd = sin((dec - dec0) * DEG2RAD / 2.0);
+	sda = sin((ra - ra0) * DEG2RAD / 2.0);
+	return sdd * sdd + cos(dec * DEG2RAD) * cc->cosdec0 * sda * sda <= cc->thr;
+}
+
+PG_FUNCTION_INFO_V1(skycell_in_cone);
+Datum
+skycell_in_cone(PG_FUNCTION_ARGS)
+{
+	PG_RETURN_BOOL(in_cone(fcinfo, PG_GETARG_FLOAT8(0), PG_GETARG_FLOAT8(1),
+						   PG_GETARG_FLOAT8(2), PG_GETARG_FLOAT8(3), PG_GETARG_FLOAT8(4)));
+}
+
+/* skycell_cone(cell, ra, dec, ra0, dec0, radius): exact when not rewritten */
+PG_FUNCTION_INFO_V1(skycell_cone);
+Datum
+skycell_cone(PG_FUNCTION_ARGS)
+{
+	PG_RETURN_BOOL(in_cone(fcinfo, PG_GETARG_FLOAT8(1), PG_GETARG_FLOAT8(2),
+						   PG_GETARG_FLOAT8(3), PG_GETARG_FLOAT8(4), PG_GETARG_FLOAT8(5)));
+}
+
+typedef struct poly_cache
+{
+	int			nbytes;
+	char	   *data;
+	sc_region	reg;
+} poly_cache;
+
+static bool
+in_poly(FunctionCallInfo fcinfo, double ra, double dec, ArrayType *arr)
+{
+	poly_cache *pc = (poly_cache *) fcinfo->flinfo->fn_extra;
+	int			nbytes = VARSIZE(arr);
+
+	if (pc == NULL || pc->nbytes != nbytes || memcmp(pc->data, arr, nbytes) != 0)
+	{
+		MemoryContext old = MemoryContextSwitchTo(fcinfo->flinfo->fn_mcxt);
+
+		if (pc == NULL)
+			pc = palloc0(sizeof(poly_cache));
+		else
+		{
+			pfree(pc->data);
+			sc_region_free(&pc->reg);
+		}
+		pc->nbytes = nbytes;
+		pc->data = palloc(nbytes);
+		memcpy(pc->data, arr, nbytes);
+		poly_from_array(arr, &pc->reg);
+		fcinfo->flinfo->fn_extra = pc;
+		MemoryContextSwitchTo(old);
+	}
+	return sc_region_contains(&pc->reg, sc_radec2vec(ra, dec));
+}
+
+PG_FUNCTION_INFO_V1(skycell_in_poly);
+Datum
+skycell_in_poly(PG_FUNCTION_ARGS)
+{
+	PG_RETURN_BOOL(in_poly(fcinfo, PG_GETARG_FLOAT8(0), PG_GETARG_FLOAT8(1),
+						   PG_GETARG_ARRAYTYPE_P(2)));
+}
+
+PG_FUNCTION_INFO_V1(skycell_poly);
+Datum
+skycell_poly(PG_FUNCTION_ARGS)
+{
+	PG_RETURN_BOOL(in_poly(fcinfo, PG_GETARG_FLOAT8(1), PG_GETARG_FLOAT8(2),
+						   PG_GETARG_ARRAYTYPE_P(3)));
+}
+
+/* ------------------------------------------------------------------ */
+/* run-time range slots (joins / non-constant cones)                  */
+/* ------------------------------------------------------------------ */
+
+typedef struct hist_cache
+{
+	ArrayType  *key;			/* the Const array this was parsed from */
+	uint32		hash;
+	int			n;
+	int64	   *b;
+} hist_cache;
+
+static struct
+{
+	bool		valid;
+	double		ra0,
+				dec0,
+				radius,
+				ntotal,
+				range_cost,
+				split_cost,
+				area_ratio;
+	uint32		hhash;
+	int			nslots;
+	int64		lo[MAX_SLOTS],
+				hi[MAX_SLOTS];
+}			slot_cache;
+
+PG_FUNCTION_INFO_V1(skycell_cone_bound);
+Datum
+skycell_cone_bound(PG_FUNCTION_ARGS)
+{
+	double		ra0 = PG_GETARG_FLOAT8(0),
+				dec0 = PG_GETARG_FLOAT8(1),
+				radius = PG_GETARG_FLOAT8(2);
+	int32		i = PG_GETARG_INT32(3),
+				nslots = PG_GETARG_INT32(4);
+	double		ntotal = PG_GETARG_FLOAT8(5);
+	ArrayType  *harr = PG_GETARG_ARRAYTYPE_P(6);
+	hist_cache *hc = (hist_cache *) fcinfo->flinfo->fn_extra;
+
+	if (nslots < 1 || nslots > MAX_SLOTS || i < 0 || i >= 2 * nslots)
+		elog(ERROR, "skycell: bad slot %d/%d", i, nslots);
+
+	if (hc == NULL)
+	{
+		MemoryContext old = MemoryContextSwitchTo(fcinfo->flinfo->fn_mcxt);
+		Datum	   *elems;
+		bool	   *nulls;
+
+		hc = palloc0(sizeof(hist_cache));
+		deconstruct_array(harr, INT8OID, sizeof(int64), true, TYPALIGN_DOUBLE, &elems, &nulls, &hc->n);
+		hc->b = palloc(sizeof(int64) * Max(hc->n, 1));
+		for (int j = 0; j < hc->n; j++)
+			hc->b[j] = DatumGetInt64(elems[j]);
+		hc->hash = hash_bytes((const unsigned char *) hc->b, sizeof(int64) * hc->n) ^ (uint32) hc->n;
+		fcinfo->flinfo->fn_extra = hc;
+		MemoryContextSwitchTo(old);
+	}
+
+	if (!slot_cache.valid || slot_cache.ra0 != ra0 || slot_cache.dec0 != dec0 ||
+		slot_cache.radius != radius || slot_cache.ntotal != ntotal ||
+		slot_cache.hhash != hc->hash || slot_cache.nslots != nslots ||
+		slot_cache.range_cost != skycell_range_cost ||
+		slot_cache.split_cost != skycell_split_cost ||
+		slot_cache.area_ratio != skycell_max_area_ratio)
+	{
+		sc_region	reg;
+		sc_cover	cov;
+		sc_cover_params p;
+		sc_density	d = {ntotal, hc->n, hc->b};
+		int			s;
+
+		slot_cache.valid = false;
+		check_err(sc_region_cone(&reg, ra0, dec0, radius));
+		current_params(&p, nslots);
+		sc_cover_compute(&reg, &d, &p, &cov);
+		for (s = 0; s < cov.n && s < nslots; s++)
+		{
+			slot_cache.lo[s] = cov.r[s].lo;
+			slot_cache.hi[s] = cov.r[s].hi;
+		}
+		for (; s < nslots; s++)
+		{
+			slot_cache.lo[s] = 1;	/* empty range: never matches */
+			slot_cache.hi[s] = 0;
+		}
+		sc_cover_free(&cov);
+		slot_cache.ra0 = ra0;
+		slot_cache.dec0 = dec0;
+		slot_cache.radius = radius;
+		slot_cache.ntotal = ntotal;
+		slot_cache.hhash = hc->hash;
+		slot_cache.nslots = nslots;
+		slot_cache.range_cost = skycell_range_cost;
+		slot_cache.split_cost = skycell_split_cost;
+		slot_cache.area_ratio = skycell_max_area_ratio;
+		slot_cache.valid = true;
+	}
+	PG_RETURN_INT64((i % 2 == 0) ? slot_cache.lo[i / 2] : slot_cache.hi[i / 2]);
+}
+
+/* ------------------------------------------------------------------ */
+/* explicit coverings                                                  */
+/* ------------------------------------------------------------------ */
+
+typedef struct rel_density_cache
+{
+	Oid			relid;
+	AttrNumber	attnum;
+	sc_density	d;
+} rel_density_cache;
+
+/* density for (tbl regclass, col name) arguments at positions ai, ai+1 */
+static sc_density *
+density_from_args(FunctionCallInfo fcinfo, int ai)
+{
+	rel_density_cache *rc = (rel_density_cache *) fcinfo->flinfo->fn_extra;
+	Oid			relid;
+	AttrNumber	attnum;
+
+	if (PG_NARGS() <= ai || PG_ARGISNULL(ai))
+		return NULL;
+	relid = PG_GETARG_OID(ai);
+	attnum = get_attnum(relid, (PG_NARGS() > ai + 1 && !PG_ARGISNULL(ai + 1))
+						? NameStr(*PG_GETARG_NAME(ai + 1)) : "cell");
+	if (attnum == InvalidAttrNumber)
+		ereport(ERROR, (errmsg("skycell: column not found in %s", get_rel_name(relid))));
+
+	if (rc == NULL || rc->relid != relid || rc->attnum != attnum)
+	{
+		MemoryContext old = MemoryContextSwitchTo(fcinfo->flinfo->fn_mcxt);
+
+		rc = palloc0(sizeof(rel_density_cache));
+		rc->relid = relid;
+		rc->attnum = attnum;
+		load_density(relid, attnum, &rc->d);
+		fcinfo->flinfo->fn_extra = rc;
+		MemoryContextSwitchTo(old);
+	}
+	return &rc->d;
+}
+
+static void
+emit_ranges(FunctionCallInfo fcinfo, sc_cover *cov)
+{
+	ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
+
+	InitMaterializedSRF(fcinfo, MAT_SRF_USE_EXPECTED_DESC);
+	for (int i = 0; i < cov->n; i++)
+	{
+		Datum		v[2] = {Int64GetDatum(cov->r[i].lo), Int64GetDatum(cov->r[i].hi)};
+		bool		n[2] = {false, false};
+
+		tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, v, n);
+	}
+}
+
+/* skycell_cone_ranges(ra0, dec0, radius, tbl regclass, col name) -> (lo, hi) */
+PG_FUNCTION_INFO_V1(skycell_cone_ranges);
+Datum
+skycell_cone_ranges(PG_FUNCTION_ARGS)
+{
+	sc_region	reg;
+	sc_cover	cov;
+	sc_cover_params p;
+
+	if (PG_ARGISNULL(0) || PG_ARGISNULL(1) || PG_ARGISNULL(2))
+	{
+		InitMaterializedSRF(fcinfo, MAT_SRF_USE_EXPECTED_DESC);
+		return (Datum) 0;
+	}
+	check_err(sc_region_cone(&reg, PG_GETARG_FLOAT8(0), PG_GETARG_FLOAT8(1), PG_GETARG_FLOAT8(2)));
+	current_params(&p, skycell_max_ranges);
+	sc_cover_compute(&reg, density_from_args(fcinfo, 3), &p, &cov);
+	emit_ranges(fcinfo, &cov);
+	sc_cover_free(&cov);
+	return (Datum) 0;
+}
+
+PG_FUNCTION_INFO_V1(skycell_poly_ranges);
+Datum
+skycell_poly_ranges(PG_FUNCTION_ARGS)
+{
+	sc_region	reg;
+	sc_cover	cov;
+	sc_cover_params p;
+
+	if (PG_ARGISNULL(0))
+	{
+		InitMaterializedSRF(fcinfo, MAT_SRF_USE_EXPECTED_DESC);
+		return (Datum) 0;
+	}
+	poly_from_array(PG_GETARG_ARRAYTYPE_P(0), &reg);
+	current_params(&p, skycell_max_ranges);
+	sc_cover_compute(&reg, density_from_args(fcinfo, 1), &p, &cov);
+	emit_ranges(fcinfo, &cov);
+	sc_cover_free(&cov);
+	return (Datum) 0;
+}
+
+/*
+ * skycell_cover_info(ra0, dec0, radius, tbl, col)
+ *   -> (nranges, steps, deepest, exp_rows, area_ratio)
+ */
+PG_FUNCTION_INFO_V1(skycell_cover_info);
+Datum
+skycell_cover_info(PG_FUNCTION_ARGS)
+{
+	sc_region	reg;
+	sc_cover	cov;
+	sc_cover_params p;
+	TupleDesc	td;
+	Datum		v[5];
+	bool		n[5] = {0};
+
+	if (PG_ARGISNULL(0) || PG_ARGISNULL(1) || PG_ARGISNULL(2))
+		PG_RETURN_NULL();
+	check_err(sc_region_cone(&reg, PG_GETARG_FLOAT8(0), PG_GETARG_FLOAT8(1), PG_GETARG_FLOAT8(2)));
+	current_params(&p, skycell_max_ranges);
+	sc_cover_compute(&reg, density_from_args(fcinfo, 3), &p, &cov);
+	if (get_call_result_type(fcinfo, NULL, &td) != TYPEFUNC_COMPOSITE)
+		elog(ERROR, "return type must be a row type");
+	v[0] = Int32GetDatum(cov.n);
+	v[1] = Int32GetDatum(cov.steps);
+	v[2] = Int32GetDatum(cov.deepest);
+	v[3] = Float8GetDatum(cov.exp_rows);
+	v[4] = Float8GetDatum(reg.area > 0 ? cov.area / reg.area : 0);
+	PG_RETURN_DATUM(HeapTupleGetDatum(heap_form_tuple(BlessTupleDesc(td), v, n)));
+}
+
+/* ------------------------------------------------------------------ */
+/* keys, distances, MOC helpers                                        */
+/* ------------------------------------------------------------------ */
+
+static void
+check_dec(double dec)
+{
+	if (!(dec >= -90.0 && dec <= 90.0))
+		ereport(ERROR, (errcode(ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE),
+						errmsg("skycell: declination %g out of range [-90, 90]", dec)));
+}
+
+PG_FUNCTION_INFO_V1(skycell_ang2cell);
+Datum
+skycell_ang2cell(PG_FUNCTION_ARGS)
+{
+	double		ra = PG_GETARG_FLOAT8(0),
+				dec = PG_GETARG_FLOAT8(1);
+
+	check_dec(dec);
+	if (!isfinite(ra))
+		ereport(ERROR, (errmsg("skycell: RA must be finite")));
+	PG_RETURN_INT64(sc_ang2pix(SC_MAX_ORDER, ra, dec));
+}
+
+PG_FUNCTION_INFO_V1(skycell_ang2pix);
+Datum
+skycell_ang2pix(PG_FUNCTION_ARGS)
+{
+	int32		order = PG_GETARG_INT32(0);
+	double		ra = PG_GETARG_FLOAT8(1),
+				dec = PG_GETARG_FLOAT8(2);
+
+	if (order < 0 || order > SC_MAX_ORDER)
+		ereport(ERROR, (errmsg("skycell: order must be within [0, 29]")));
+	check_dec(dec);
+	PG_RETURN_INT64(sc_ang2pix(order, ra, dec));
+}
+
+/* angular distance in degrees */
+PG_FUNCTION_INFO_V1(skycell_dist);
+Datum
+skycell_dist(PG_FUNCTION_ARGS)
+{
+	sc_vec3		a = sc_radec2vec(PG_GETARG_FLOAT8(0), PG_GETARG_FLOAT8(1));
+	sc_vec3		b = sc_radec2vec(PG_GETARG_FLOAT8(2), PG_GETARG_FLOAT8(3));
+
+	PG_RETURN_FLOAT8(sc_angle(a, b) / DEG2RAD);
+}
+
+/*
+ * NUNIQ of the cell's ancestors at orders min_order..max_order (the order-29
+ * cell itself is order 29).  Restricting the range to the orders present in
+ * a MOC table keeps the ANY() lookup to a handful of B-tree probes.
+ */
+PG_FUNCTION_INFO_V1(skycell_ancestors);
+Datum
+skycell_ancestors(PG_FUNCTION_ARGS)
+{
+	int64		cell = PG_GETARG_INT64(0);
+	int32		lo = PG_GETARG_INT32(1),
+				hi = PG_GETARG_INT32(2);
+	Datum		d[SC_MAX_ORDER + 1];
+	int			n = 0;
+
+	if (cell < 0 || cell >= SC_NPIX29)
+		ereport(ERROR, (errmsg("skycell: cell out of range")));
+	lo = Max(lo, 0);
+	hi = Min(hi, SC_MAX_ORDER);
+	for (int k = lo; k <= hi; k++)
+		d[n++] = Int64GetDatum(sc_nuniq(k, cell >> (2 * (SC_MAX_ORDER - k))));
+	PG_RETURN_ARRAYTYPE_P(construct_array_builtin(d, n, INT8OID));
+}
+
+PG_FUNCTION_INFO_V1(skycell_nuniq_order);
+Datum
+skycell_nuniq_order(PG_FUNCTION_ARGS)
+{
+	int64		pix;
+
+	PG_RETURN_INT32(sc_nuniq_decode(PG_GETARG_INT64(0), &pix));
+}
+
+/* first / last order-29 cell of a NUNIQ cell */
+PG_FUNCTION_INFO_V1(skycell_nuniq_lo);
+Datum
+skycell_nuniq_lo(PG_FUNCTION_ARGS)
+{
+	int64		pix;
+	int			order = sc_nuniq_decode(PG_GETARG_INT64(0), &pix);
+
+	PG_RETURN_INT64(sc_pix_lo(order, pix));
+}
+
+PG_FUNCTION_INFO_V1(skycell_nuniq_hi);
+Datum
+skycell_nuniq_hi(PG_FUNCTION_ARGS)
+{
+	int64		pix;
+	int			order = sc_nuniq_decode(PG_GETARG_INT64(0), &pix);
+
+	PG_RETURN_INT64(sc_pix_hi(order, pix));
+}
+
+/*
+ * Multi-order coverage (NUNIQ list) with at most max_cells cells: refine the
+ * partial cell with the most outside area first (S2 RegionCoverer style).
+ * Used to index stored regions (footprints) in a plain B-tree.
+ */
+static ArrayType *
+moc_for_region(const sc_region *r, int max_cells, int max_order)
+{
+	typedef struct
+	{
+		int64		pix;
+		int			order;
+		double		pot;
+	} mc;
+	mc		   *heap = palloc(sizeof(mc) * 64);
+	int			hn = 0,
+				hcap = 64;
+	Datum	   *out = palloc(sizeof(Datum) * 64);
+	int			on = 0,
+				ocap = 64,
+				ncells = 0;
+
+#define OUT_ADD(o, p) do { if (on == ocap) { ocap *= 2; out = repalloc(out, sizeof(Datum) * ocap); } \
+		out[on++] = Int64GetDatum(sc_nuniq((o), (p))); } while (0)
+#define HEAP_ADD(o, p, pt) do { if (hn == hcap) { hcap *= 2; heap = repalloc(heap, sizeof(mc) * hcap); } \
+		heap[hn].pix = (p); heap[hn].order = (o); heap[hn].pot = (pt); hn++; } while (0)
+
+	for (int f = 0; f < 12; f++)
+	{
+		double		fo;
+		sc_class	c = sc_region_classify(r, 0, f, &fo);
+
+		if (c == SC_OUT)
+			continue;
+		ncells++;
+		if (c == SC_IN)
+			OUT_ADD(0, f);
+		else
+			HEAP_ADD(0, f, fo * 4.0 * M_PI / 12.0);
+	}
+
+	while (hn > 0)
+	{
+		int			best = 0;
+		mc			P;
+		sc_class	cls[4];
+		double		fo[4];
+		int			nkept = 0;
+
+		/* linear scan is fine: coverings are small */
+		for (int i = 1; i < hn; i++)
+			if (heap[i].pot > heap[best].pot)
+				best = i;
+		P = heap[best];
+		heap[best] = heap[--hn];
+
+		/*
+		 * Refine only while cells are not negligibly small next to the
+		 * region; otherwise boundary cells whose siblings are all OUT keep
+		 * splitting "for free" down to order 29, and every point lookup then
+		 * has to probe that many ancestor orders.
+		 */
+		if (P.order < max_order &&
+			4.0 * M_PI / (double) ((int64) 12 << (2 * (P.order + 1))) >= r->area / (4.0 * max_cells))
+		{
+			for (int c = 0; c < 4; c++)
+			{
+				cls[c] = sc_region_classify(r, P.order + 1, 4 * P.pix + c, &fo[c]);
+				if (cls[c] != SC_OUT)
+					nkept++;
+			}
+			if (nkept == 0)
+			{
+				ncells--;
+				continue;
+			}
+			if (ncells - 1 + nkept <= max_cells)
+			{
+				double		a = 4.0 * M_PI / (double) ((int64) 12 << (2 * (P.order + 1)));
+
+				ncells += nkept - 1;
+				for (int c = 0; c < 4; c++)
+				{
+					if (cls[c] == SC_IN)
+						OUT_ADD(P.order + 1, 4 * P.pix + c);
+					else if (cls[c] == SC_PARTIAL)
+						HEAP_ADD(P.order + 1, 4 * P.pix + c, fo[c] * a);
+				}
+				continue;
+			}
+		}
+		OUT_ADD(P.order, P.pix);
+	}
+	return construct_array_builtin(out, on, INT8OID);
+}
+
+PG_FUNCTION_INFO_V1(skycell_cone_moc);
+Datum
+skycell_cone_moc(PG_FUNCTION_ARGS)
+{
+	sc_region	reg;
+
+	check_err(sc_region_cone(&reg, PG_GETARG_FLOAT8(0), PG_GETARG_FLOAT8(1), PG_GETARG_FLOAT8(2)));
+	PG_RETURN_ARRAYTYPE_P(moc_for_region(&reg, Max(PG_GETARG_INT32(3), 4),
+										 Min(Max(PG_GETARG_INT32(4), 0), SC_MAX_ORDER)));
+}
+
+PG_FUNCTION_INFO_V1(skycell_poly_moc);
+Datum
+skycell_poly_moc(PG_FUNCTION_ARGS)
+{
+	sc_region	reg;
+
+	poly_from_array(PG_GETARG_ARRAYTYPE_P(0), &reg);
+	PG_RETURN_ARRAYTYPE_P(moc_for_region(&reg, Max(PG_GETARG_INT32(1), 4),
+										 Min(Max(PG_GETARG_INT32(2), 0), SC_MAX_ORDER)));
+}
