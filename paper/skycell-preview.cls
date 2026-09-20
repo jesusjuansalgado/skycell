@@ -26,6 +26,7 @@
 \newcommand{\object}[1]{#1}
 \providecommand{\email}[1]{\texttt{#1}}
 \newcommand{\inst}[1]{\textsuperscript{#1}}
+\renewcommand{\and}{\ and\ }
 \newcommand{\titlerunning}[1]{}
 \newcommand{\authorrunning}[1]{}
 
