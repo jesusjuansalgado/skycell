@@ -130,6 +130,7 @@ sc_vec3		sc_region_centroid(const sc_region *r);
 
 /* use exact cell corners for cones (1, default) or the bounding cap (0) */
 extern int	sc_exact_cells;
+extern int	sc_order_probe;
 
 /* classify the pixel (order, pix) against the region (conservative) */
 sc_class	sc_region_classify(const sc_region *r, int order, int64_t pix, double *f_out);

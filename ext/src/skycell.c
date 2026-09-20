@@ -80,6 +80,7 @@ static bool skycell_use_stats = true;
 static bool skycell_cache_coverings = true;
 static bool skycell_exact_cells = true;
 static int	skycell_force_order = -1;
+static int	skycell_probe_orders = 0;
 
 void		_PG_init(void);
 
@@ -125,6 +126,13 @@ _PG_init(void)
 							 "(off: the provable max_pixrad cap, looser but cheaper to justify).",
 							 NULL, &skycell_exact_cells, true,
 							 PGC_USERSET, 0, NULL, NULL, NULL);
+	DefineCustomIntVariable("skycell.probe_orders",
+							"Orders past the closed-form choice to score on the covering "
+							"they actually produce (0, the default, disables: see the "
+							"comment in cover.c -- the gain the forced-order measurements "
+							"show is not yet captured by this).",
+							NULL, &skycell_probe_orders, 0, 0, 8,
+							PGC_USERSET, 0, NULL, NULL, NULL);
 	DefineCustomIntVariable("skycell.force_order",
 							"Diagnostics only: cover cones at this HEALPix order instead of "
 							"the one the cost model chooses (-1 = let the model choose).",
@@ -188,6 +196,7 @@ current_params(sc_cover_params *p, int max_ranges, const sc_density *d)
 	p->max_steps = skycell_max_steps;
 	p->force_order = skycell_force_order;
 	sc_exact_cells = skycell_exact_cells ? 1 : 0;
+	sc_order_probe = skycell_probe_orders;
 }
 
 /* ------------------------------------------------------------------ */
@@ -252,6 +261,9 @@ typedef struct cover_key
 	Oid			statrel;		/* whose density map this used */
 	int32		max_ranges;
 	int32		max_steps;
+	int32		force_order;	/* diagnostics; a covering computed at a forced
+								 * order must not be handed to a query that did
+								 * not ask for one */
 } cover_key;
 
 typedef struct cover_entry
@@ -390,6 +402,7 @@ cover_cached(const sc_region *reg, const sc_density *d, const sc_cover_params *p
 	key.statrel = statrel;
 	key.max_ranges = p->max_ranges;
 	key.max_steps = p->max_steps;
+	key.force_order = p->force_order;
 
 	entry = (cover_entry *) hash_search(cover_cache, &key, HASH_ENTER, &found);
 	if (!found)

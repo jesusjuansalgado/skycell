@@ -959,6 +959,12 @@ potential(const sc_region *r, double e, double f_out, int order)
 #define SC_COVER_BETA 0.7
 #define SC_COVER_GAMMA 2.0
 
+/* orders past the closed-form choice to score on the covering they produce */
+int			sc_order_probe = 0;
+
+/* rows a covering must hold, per cell examined, before probing one order finer */
+#define SC_PROBE_MIN 8.0
+
 static int
 choose_order(const sc_region *r, const sc_density *d, const sc_cover_params *p,
 			 double *rho_out)
@@ -1099,6 +1105,44 @@ cover_cone_direct(const sc_region *r, const sc_density *d,
 	return k;
 }
 
+
+/*
+ * Sort, merge adjacent, and score a candidate covering.
+ *
+ * score = ranges * range_cost + expected rows inside the covering
+ *       + cells examined * split_cost
+ *
+ * all three in rows.  The region's own rows are the same for every candidate,
+ * so they cancel and are not subtracted.
+ */
+static double
+rlist_score(rlist_t *l, const sc_density *d, const sc_cover_params *p, int steps,
+			double *rows_out)
+{
+	double		rows = 0;
+	int			m = 0;
+
+	if (l->n <= 0)
+		return INFINITY;
+	qsort(l->a, l->n, sizeof(sc_range), range_cmp);
+	for (int i = 1; i < l->n; i++)
+	{
+		if (l->a[i].lo <= l->a[m].hi + 1)
+		{
+			if (l->a[i].hi > l->a[m].hi)
+				l->a[m].hi = l->a[i].hi;
+		}
+		else
+			l->a[++m] = l->a[i];
+	}
+	l->n = m + 1;
+	for (int i = 0; i < l->n; i++)
+		rows += sc_density_rows(d, l->a[i].lo, l->a[i].hi);
+	if (rows_out)
+		*rows_out = rows;
+	return l->n * p->range_cost + rows + steps * p->split_cost;
+}
+
 void
 sc_cover_compute(const sc_region *r, const sc_density *d,
 				 const sc_cover_params *p, sc_cover *out)
@@ -1118,12 +1162,95 @@ sc_cover_compute(const sc_region *r, const sc_density *d,
 	if (p->direct && r->kind == SC_REGION_CONE && r->radius >= 0 &&
 		r->radius <= 10.0 * M_PI / 180)
 	{
-		int			k = cover_cone_direct(r, d, p, &kept, &steps, &rho);
+		/*
+		 * The closed form of choose_order() estimates the number of index
+		 * ranges as gamma * r / s -- ranges multiplying as the cells shrink.
+		 * They do not: once adjacent cells are merged into ranges the count is
+		 * nearly independent of the cell size (measured: 2.5 ranges for a 6'
+		 * cone whether the cells are 0.4 degrees or 0.05, where the formula
+		 * predicts twenty).  Charging for ranges that never appear stops the
+		 * covering several orders too coarse and carries the false positives
+		 * that go with it.
+		 *
+		 * So the closed form is used as a starting point and the orders from
+		 * there are scored on the covering they actually produce, stopping at
+		 * the first one that is worse.  Each probe costs an enumeration, which
+		 * is why the depth is small and why rlist_score() charges for the
+		 * cells examined as well as the ranges and the rows.
+		 *
+		 * This is OFF by default (skycell.probe_orders = 0) because it does
+		 * not yet deliver.  Forcing the order directly one to three steps finer
+		 * than the closed form is worth 30-48% at 6'-30' on the catalogue and
+		 * 32% on an ObsCore-shaped relation, with the range count unchanged --
+		 * the gain is real and measured.  Scored here, though, the finer
+		 * candidate usually loses, because rlist_score() charges split_cost
+		 * (1 row) for every cell examined and the enumeration at one order
+		 * finer examines roughly four times as many; at 6' that penalty
+		 * (~300 rows) outweighs the false positives saved (~180).  A cell
+		 * examined does not cost as much as a row fetched, so the honest fix
+		 * is to calibrate split_cost against measurement the way range_cost
+		 * now is, not to tune it until this looks good.
+		 */
+		sc_cover_params pk = *p;
+		rlist_t		best = {0};
+		double		best_cost = INFINITY;
+		double		cand_rows = 0;
+		int			best_k = -1,
+					k0;
 
-		if (k >= 0)
+		k0 = (p->force_order >= 0) ? p->force_order : choose_order(r, d, p, &rho);
+
+		for (int k = k0; k <= Min(k0 + sc_order_probe, p->max_order); k++)
 		{
-			deepest = k;
-			order = k;
+			rlist_t		cand = {0};
+			int			st = 0;
+			double		cost;
+
+			pk.force_order = k;
+			if (cover_cone_direct(r, d, &pk, &cand, &st, NULL) < 0)
+			{
+				if (cand.a)
+					SC_FREE(cand.a);
+				break;
+			}
+			steps += st;
+			cost = rlist_score(&cand, d, p, st, &cand_rows);
+			if (cost < best_cost)
+			{
+				if (best.a)
+					SC_FREE(best.a);
+				best = cand;
+				best_cost = cost;
+				best_k = k;
+			}
+			else
+			{
+				if (cand.a)
+					SC_FREE(cand.a);
+				break;			/* refining has stopped paying */
+			}
+			if (p->force_order >= 0)
+				break;			/* the caller asked for exactly this order */
+
+			/*
+			 * Each further probe costs another enumeration -- about four times
+			 * the cells of the one just done -- so it is only worth making
+			 * when the rows in this covering dwarf that.  A one-arcsecond cone
+			 * covers many times its own area but still holds a handful of
+			 * rows: there is nothing there to win back, and the probe would be
+			 * pure plan-time loss.
+			 */
+			if (cand_rows < SC_PROBE_MIN * (st + 1) * fmax(p->split_cost, 1e-3))
+				break;
+		}
+
+		if (best_k >= 0)
+		{
+			if (kept.a)
+				SC_FREE(kept.a);
+			kept = best;
+			deepest = best_k;
+			order = best_k;
 			goto finish;
 		}
 		kept.n = 0;				/* fell back: start the descent clean */

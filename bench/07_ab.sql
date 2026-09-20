@@ -38,6 +38,9 @@ BEGIN
      */
     IF methods[i] LIKE 'skycell@%' THEN
       PERFORM set_config('skycell.range_cost', split_part(methods[i], '@', 2), true);
+    ELSIF methods[i] LIKE 'skycell#%' THEN
+      PERFORM set_config('skycell.probe_orders', split_part(methods[i], '#', 2), true);
+      PERFORM set_config('skycell.range_cost', '-1', true);
     ELSIF methods[i] = 'skycell' THEN
       PERFORM set_config('skycell.range_cost', '-1', true);
     END IF;
