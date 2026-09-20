@@ -615,7 +615,7 @@ contest the measurement. Everything runs on one machine, with one core doing one
     PostgreSQL & 18.6; \texttt{shared\_buffers} 2\,GB, JIT off,
       \texttt{max\_parallel\_workers\_per\_gather} 0 \\
     Extensions & Q3C 2.0.5, pgSphere 1.5.2, skycell 0.3 \\
-    Rows & $10^7$ per corpus (Gaia corpus: $9\,999\,729$) \\
+    Rows & $10^7$ per corpus (Gaia corpus: $9\,999\,729$); the Gaia corpus also at $5\times10^7$ ($50\,027\,391$) \\
     Q3C & \texttt{cat\_q3c(id, ra, dec, mag)}, B-tree on
       \texttt{q3c\_ang2ipix(ra, dec)}, heap ordered by the same \\
     pgSphere & \texttt{cat\_sphere(id, ra, dec, mag, pos spoint)}, GiST on
@@ -824,6 +824,70 @@ cross-match is.
   \tablefoot{The planning, execution and buffer columns are medians at
     $5\times10^7$ rows, from the randomized \texttt{EXPLAIN} pass.}
 \end{table*}
+
+\subsection{Does the advantage grow with scale?}
+\label{sec:scale}
+
+Every number above is from a 10-million-row table, which is 0.55\% of Gaia DR3.
+Since the index sizes differ by a factor three, the obvious extrapolation is that at
+larger scales pgSphere's index stops fitting in memory while skycell's still does, and
+that the advantage should therefore widen. Extrapolating two orders of magnitude from a
+single scale is not evidence, so we measured a second scale: the same Gaia density
+field resampled to 50 million rows, the same protocol, the same machine. At that size
+pgSphere's GiST index is 3442\,MB and skycell's B-tree 1072\,MB, against
+\texttt{shared\_buffers} of 2048\,MB -- so one index fits and the other does not.
+
+Table~\ref{tab:scale} gives both scales side by side, and the answer divides sharply by
+radius.
+
+For regions of 30\arcmin\ and larger the advantage grows, and grows more cold than
+warm: at 1\degr\ the ratio moves from 0.85 to 0.60 warm and from 0.53 to 0.31 cold, and
+at 3\degr\ from 0.40 to 0.23 cold. The buffer counts show why: at 1\degr\ and 50 million
+rows pgSphere touches 1848 pages against skycell's 387, a ratio of 0.21 where at 10
+million rows it was 0.36. The page advantage itself widens with scale, and once the
+pages have to be read rather than hit, that is the whole query.
+
+For cones of 1\arcmin\ and smaller nothing improves, and 1\arcmin\ gets slightly worse
+(0.93 to 1.02, no longer distinguishable from pgSphere). The reason is visible in the
+same table: at those radii both methods touch five to eight pages whatever the table
+size, so there is no scan to shorten, and what remains is skycell's 0.021--0.023\,ms of
+planning against pgSphere's 0.008\,ms. Five times the density also means a finer
+covering -- $s_\star \propto \rho^{-1/2}$ from Eq.~(\ref{eq:sstar}) -- hence slightly
+more ranges to plan and, at 1\arcmin, slightly more pages touched than pgSphere
+(a ratio of 1.20).
+
+The honest summary for a large catalogue is therefore not "skycell is faster" but:
+\emph{the larger the table and the larger the region, the more it wins; for
+arcminute-scale cone searches it is a wash at any size we measured, and scale does not
+change that.}
+
+\begin{table}
+  \caption{The same Gaia density field at two scales: paired ratio of \texttt{skycell}
+    to pgSphere, with 95\% bootstrap intervals. \textbf{Bold}: interval excludes 1,
+    skycell faster. At 50 million rows pgSphere's index (3442\,MB) exceeds
+    \texttt{shared\_buffers} (2048\,MB) while skycell's (1072\,MB) does not.}
+  \label{tab:scale}
+  \centering
+  \footnotesize
+  \begin{tabular}{l cc cc}
+    \hline\hline
+    & \multicolumn{2}{c}{warm} & \multicolumn{2}{c}{cold} \\
+    \cline{2-3}\cline{4-5}
+    radius & $10^7$ rows & $5\times10^7$ & $10^7$ rows & $5\times10^7$ \\
+    \hline
+    1\arcsec  & \textbf{0.89} & \textbf{0.89} & \textbf{0.78} & \textbf{0.71} \\
+    10\arcsec & \textbf{0.90} & \textbf{0.94} & \textbf{0.80} & \textbf{0.88} \\
+    1\arcmin  & \textbf{0.93} & 1.02          & 0.95          & 0.95 \\
+    6\arcmin  & \emph{1.03}   & 1.00          & \textbf{0.90} & \textbf{0.89} \\
+    30\arcmin & \textbf{0.92} & \textbf{0.72} & \textbf{0.57} & \textbf{0.49} \\
+    1\degr    & \textbf{0.85} & \textbf{0.60} & \textbf{0.53} & \textbf{0.31} \\
+    3\degr    & \textbf{0.69} & \textbf{0.58} & \textbf{0.40} & \textbf{0.23} \\
+    \hline
+    \multicolumn{5}{l}{\emph{buffer pages, $5\times10^7$ rows (pgSphere / skycell)}}\\
+    \multicolumn{5}{l}{\quad 1\arcmin: 7 / 8 \qquad 1\degr: 1848 / 387} \\
+    \hline
+  \end{tabular}
+\end{table}
 
 \subsection{How much the protocol matters}
 \label{sec:phase}
@@ -1162,9 +1226,9 @@ a property of the archive, and we have tried to say precisely which ones they we
 The extension, its test suites, the benchmark harness and the raw results of every
 measurement quoted here are available at
 \url{https://github.com/jesusjuansalgado/skycell} under the MIT licence. Both corpora
-are generated from seeds by the scripts recorded there -- the Gaia corpus from the
-density map fetched from the ESA archive -- so they are reproducible without transferring
-data; \texttt{bench/run.sh} and the numbered scripts \texttt{07}--\texttt{10} reproduce
+are generated from seeds by the scripts recorded there -- the Gaia corpus, at both
+scales, from the density map fetched from the ESA archive -- so they are reproducible
+without transferring data; \texttt{bench/run.sh} and the numbered scripts \texttt{07}--\texttt{10} reproduce
 every table. The TAP A/B of Sect.~\ref{sec:tap} is recorded, protocol and results, in the
 same repository.
 

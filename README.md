@@ -359,6 +359,24 @@ that.
 | 200k points in 20k footprints | not supported | 0.97 s, 1.1 MB | **0.76 s**, 9.5 MB |
 | planner row-estimate error, 1° | 1.9× | 2.8× | **1.22×** |
 
+**Does it get better at scale?** Repeated at **50M rows**, where pgSphere's
+index (3442 MB) no longer fits in `shared_buffers` (2048 MB) and skycell's
+(1072 MB) still does. The answer splits by radius:
+
+| radius | 10M warm | 50M warm | 10M cold | 50M cold |
+|---|---|---|---|---|
+| 1″ | **0.89** | **0.89** | **0.78** | **0.71** |
+| 1′ | **0.93** | 1.02 | 0.95 | 0.95 |
+| 6′ | *1.03* | 1.00 | **0.90** | **0.89** |
+| 30′ | **0.92** | **0.72** | **0.57** | **0.49** |
+| 1° | **0.85** | **0.60** | **0.53** | **0.31** |
+| 3° | **0.69** | **0.58** | **0.40** | **0.23** |
+
+For regions ≥30′ the advantage roughly doubles with 5× the rows — at 1° skycell
+touches 387 pages against pgSphere's 1848. For cones ≤1′ nothing changes,
+because both methods touch 5–8 pages at any table size and what is left is
+skycell's ~0.02 ms of planning. **The rule is about pages, not rows.**
+
 **Where skycell loses.** On a 500k-row ObsCore table inside a real TAP service
 it is 1.2–1.45× *slower* per query, and all 18 end-to-end cells tie (the
 database is 1–3% of a request). Measuring the same ObsCore-shaped relation at

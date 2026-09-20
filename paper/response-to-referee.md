@@ -85,8 +85,16 @@ revision, and we say so. What we did instead:
   referee was worried about: the optimum `c_range` is the same on both, supporting our
   claim that it is a property of the machine rather than of the sky.
 
+We also added a **second scale** (§6.2): the same Gaia density field at 50 million
+rows, where pgSphere's index (3442 MB) exceeds `shared_buffers` (2048 MB) and
+skycell's (1072 MB) does not. This tests the size argument rather than asserting it,
+and it splits the answer by radius: for regions ≥30′ the advantage roughly doubles
+(1°: 0.85 → 0.60 warm, 0.53 → 0.31 cold), while for cones ≤1′ nothing changes and
+1′ becomes a wash (0.93 → 1.02), because both methods touch 5–8 pages at any table
+size. We now state the rule as being about pages rather than rows.
+
 Limitations we now state rather than imply: no real positions; no structure below
-0.11°; a single machine.
+0.11°; a single machine; two scales, not a curve.
 
 ### §4.3A Calibration of `c_range` (critical)
 
@@ -263,7 +271,7 @@ benchmarked.
 | # | Status |
 |---|---|
 | 1. Randomized ordering, repetitions, intervals | Done. Now the primary evidence (§5.3, §6.1). |
-| 2. Independent density distributions | Done for a real *density field* (Gaia DR3 counts). Not done for real catalogue positions; stated as a limitation. |
+| 2. Independent density distributions | Done for a real *density field* (Gaia DR3 counts), at two scales (10M and 50M rows). Not done for real catalogue positions; stated as a limitation. |
 | 3. Cost-model sensitivity | Done: `c_range` over four decades on both corpora; area guard and density model on/off; plus the order-by-order cost curve via the new `force_order`. Histogram resolution was not swept. |
 | 4. Query planning and joins | Done (§6.5), with a negative result. |
 | 5. Correctness boundary tests | Done, and it found a real defect (§2.4, §4). |
