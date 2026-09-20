@@ -404,12 +404,20 @@ three sizes puts the crossover between 0.5M and 2M rows for degree-scale cones �
 and **beyond 10M for small cones on field-clustered data**, where a GiST bitmap
 scan already reads exactly the pages it needs:
 
-| class | 0.5M | 2M | 10M |
-|---|---|---|---|
-| 0.15° cone | 2.74 | 1.64 | 1.81 |
-| 2° cone | 1.09 | 0.83 | **0.56** |
-| 0.5° cone + time/calib cuts | 1.26 | 1.33 | 0.96 |
-| empty cone | 1.31 | 1.14 | 1.00 |
+| class | 0.5M | 2M | 10M | buffers @10M (pgS/sky) |
+|---|---|---|---|---|
+| 0.15° cone | 1.84 | 1.81 | 2.16 † | 282 / **152** |
+| 2° cone | **0.92** | **0.87** | **0.67** | 6052 / **830** |
+| 0.5° cone + time/calib cuts | **0.84** | **0.76** | **0.71** | 712 / **182** |
+| empty cone | 1.13 | 1.07 | 1.00 | 5 / 6 |
+
+† The small-cone row is **regime-dependent and we don't claim it**: 2.16 measured
+cold with disjoint intervals, 0.94 (level) on the same relation fully warm.
+The deficit is in execution, not planning, and is *not* the exact predicate —
+removing it changes ObsCore query time by ~1%, against 63% on the catalogue.
+
+(An earlier version of this table was measured one method at a time and
+reported the 0.5° class as a loss at every size; it is a win at every size.)
 
 **The one parameter, derived not configured.** `range_cost` converts "one more
 index range" into "false-positive rows worth avoiding" — a ratio of two costs

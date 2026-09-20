@@ -63,40 +63,52 @@ LANGUAGE sql IMMUTABLE AS $$
 $$;
 
 CREATE OR REPLACE FUNCTION bench_cross_run(rows_m float8, nq int DEFAULT 40,
-                                           seed float8 DEFAULT 0.19) RETURNS void
+                                           seed float8 DEFAULT 0.19, reps int DEFAULT 3)
+RETURNS void
 LANGUAGE plpgsql AS $$
-DECLARE cls text; m text; i int; j json; p json; nn bigint;
-        ctr record; pl float8[]; ex float8[]; bu float8[]; last_n bigint;
+DECLARE cls text; ms text[]; i int; rep int; j json; p json; nn bigint; ctr record;
+        acc jsonb := '{}'::jsonb; k text;
 BEGIN
   DELETE FROM bench_cross b WHERE b.rows_m = bench_cross_run.rows_m;
 
-  -- one set of centres, drawn from the data, used by both translations
   PERFORM setseed(seed);
   DROP TABLE IF EXISTS oc_centers;
   CREATE TEMP TABLE oc_centers AS
   SELECT row_number() OVER () AS qid, s_ra AS ra, s_dec AS dec
   FROM oc ORDER BY random() LIMIT nq;
 
+  /*
+   * Randomized and paired, like the cone benchmark: within a trial the two
+   * translations answer the same query back to back in an order drawn for that
+   * trial, and each is warmed on its own query first.  Measuring one method's
+   * whole set and then the other's gives whichever went second a warmer cache
+   * -- on this workload that was worth more than the difference between them,
+   * and reversing the order reversed the verdict.
+   */
+  CREATE TEMP TABLE IF NOT EXISTS cross_raw (class text, method text, ms float8, n bigint)
+    ON COMMIT DROP;
+  DELETE FROM cross_raw;
+
   FOREACH cls IN ARRAY ARRAY['Q05', 'Q06', 'Q07', 'Q12'] LOOP
-    FOR i IN 1 .. 2 LOOP
-      m := (ARRAY['pgsphere', 'skycell'])[i];
-      pl := '{}'; ex := '{}'; bu := '{}'; last_n := NULL;
-      FOR ctr IN SELECT * FROM oc_centers ORDER BY qid LOOP
-        EXECUTE oc_sql(cls, m, ctr.ra, ctr.dec) INTO nn;          -- warm
-        EXECUTE 'EXPLAIN (ANALYZE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON) '
-                || oc_sql(cls, m, ctr.ra, ctr.dec) INTO j;
-        p := j -> 0 -> 'Plan';
-        pl := pl || (j -> 0 ->> 'Planning Time')::float8;
-        ex := ex || (j -> 0 ->> 'Execution Time')::float8;
-        bu := bu || ((p ->> 'Shared Hit Blocks')::float8 + (p ->> 'Shared Read Blocks')::float8);
-        last_n := nn;
+    FOR rep IN 1 .. reps LOOP
+      FOR ctr IN SELECT * FROM oc_centers ORDER BY random() LOOP
+        SELECT array_agg(m ORDER BY random()) INTO ms
+        FROM unnest(ARRAY['pgsphere', 'skycell']) m;
+        FOR i IN 1 .. 2 LOOP
+          EXECUTE oc_sql(cls, ms[i], ctr.ra, ctr.dec) INTO nn;     -- warm this one
+          EXECUTE 'EXPLAIN (ANALYZE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON) '
+                  || oc_sql(cls, ms[i], ctr.ra, ctr.dec) INTO j;
+          p := j -> 0 -> 'Plan';
+          INSERT INTO cross_raw VALUES (cls, ms[i],
+            (j -> 0 ->> 'Planning Time')::float8 + (j -> 0 ->> 'Execution Time')::float8,
+            (p ->> 'Actual Rows')::float8::bigint);
+          INSERT INTO bench_cross
+          SELECT rows_m, cls, ms[i], (j -> 0 ->> 'Planning Time')::float8,
+                 (j -> 0 ->> 'Execution Time')::float8,
+                 (p ->> 'Shared Hit Blocks')::float8 + (p ->> 'Shared Read Blocks')::float8,
+                 nn;
+        END LOOP;
       END LOOP;
-      INSERT INTO bench_cross
-      SELECT rows_m, cls, m,
-             (SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY x) FROM unnest(pl) x),
-             (SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY x) FROM unnest(ex) x),
-             (SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY x) FROM unnest(bu) x),
-             last_n;
     END LOOP;
   END LOOP;
 END $$;

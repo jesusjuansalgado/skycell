@@ -1217,25 +1217,42 @@ collection and field, which is what makes a GiST bitmap scan so effective on thi
 -- at three sizes, and ran the same four cone classes against both indexes
 (Table~\ref{tab:crossover}).
 
-The crossover is real, but it is not a single number. For degree-scale cones (class Q06)
-skycell passes pgSphere between 0.5 and 2 million rows and is 1.8 times faster at 10
-million, with a third of the buffer traffic. For the cone with catalogue cuts (Q07) and
-the empty cone (Q12) the two converge towards parity at 10 million without skycell
-clearly passing. For small cones on this field-clustered layout (Q05, 0.15\degr)
-pgSphere stays ahead at every size tested: 128 products at one field centre sit on a
-handful of heap pages, a GiST bitmap scan finds exactly those pages, and there is no
-scan left for a better covering to shorten.
+The crossover is real, but it is not a single number, and one of its rows is not a
+number at all.
 
-So the size of the relation is the right variable, and the sentence ``the crossover is a
-few million rows'' is true only for the queries where the scan dominates. An archive
-whose ObsCore table is clustered by field and whose users ask for small cones is better
-served by pgSphere at any size we measured.
+For the cone with catalogue cuts (Q07) and the degree-scale cone (Q06), \texttt{skycell}
+is ahead at every size and pulls further ahead as the relation grows: 0.84 to 0.71 for
+Q07 and 0.92 to 0.67 for Q06, reading a seventh of pgSphere's buffer pages at Q06 and a
+quarter at Q07. The empty cone (Q12) is level. These are the classes where the scan is
+large enough for a better covering to matter, and they behave exactly as the catalogue
+results predict.
+
+The small-cone class (Q05, 0.15\degr) is the one we cannot pin down, and we prefer to
+say so rather than quote the number the table happens to contain. Measured immediately
+after the relation is built, with both methods paired inside a trial, skycell is
+2.16 times slower and the two intervals are disjoint ([0.269, 0.469] against
+[0.146, 0.242]\,ms). Measured on the same relation once it is thoroughly warm, with the
+same pairing and five repetitions, the same class comes out at 0.94 -- level. Both are
+within-run paired measurements; they are measuring different cache regimes, and on this
+host, with 2\,GB of shared buffers and several multi-gigabyte relations present, we were
+not able to make the small-cone ObsCore comparison reproducible to better than a factor
+of two. The decomposition is at least unambiguous: the deficit is in execution
+(0.324\,ms against 0.161) and not in planning (0.034 against 0.009), and it is not the
+exact predicate -- removing that predicate entirely changes the query time by about 1\%
+on this relation, against 63\% on the catalogue at a comparable radius.
+
+An earlier version of this table was measured one method at a time rather than in
+randomized paired trials. It reported Q07 as a loss at every size (1.26, 1.33, 0.96)
+where the controlled measurement shows a win at every size, which is a larger error than
+any effect the table is meant to demonstrate.
 
 \begin{table}
-  \caption{Crossover on an ObsCore-shaped relation: total query time (planning plus
-    execution, median of 40 queries) as the ratio skycell/pgSphere, and buffer pages
-    touched at the largest size. Q05: 0.15\degr\ cone; Q06: 2\degr\ cone; Q07: 0.5\degr\
-    cone with calibration and time cuts; Q12: an empty 0.7\arcsec\ cone.}
+  \caption{Crossover on an ObsCore-shaped relation, measured in randomized paired
+    trials (30 centres, 3 repetitions, each method warmed on its own query first):
+    total query time as the ratio skycell/pgSphere, with buffer pages at the largest
+    size. Q05: 0.15\degr\ cone; Q06: 2\degr\ cone; Q07: 0.5\degr\ cone with calibration
+    and time cuts; Q12: an empty 0.7\arcsec\ cone. The Q05 row is regime-dependent and
+    should not be read as a single number (text).}
   \label{tab:crossover}
   \centering
   \footnotesize
@@ -1245,10 +1262,10 @@ served by pgSphere at any size we measured.
     \cline{2-4}\cline{5-6}
     class & $5\times10^5$ & $2\times10^6$ & $10^7$ & pgSphere & skycell \\
     \hline
-    Q05 & 2.74 & 1.64 & 1.81 &   61 &  82 \\
-    Q06 & 1.09 & 0.83 & \textbf{0.56} & 2737 & 933 \\
-    Q07 & 1.26 & 1.33 & 0.96 &  251 & 136 \\
-    Q12 & 1.31 & 1.14 & 1.00 &    5 &   6 \\
+    Q05 & 1.84 & 1.81 & 2.16 &  282 & \textbf{152} \\
+    Q06 & \textbf{0.92} & \textbf{0.87} & \textbf{0.67} & 6052 & \textbf{830} \\
+    Q07 & \textbf{0.84} & \textbf{0.76} & \textbf{0.71} &  712 & \textbf{182} \\
+    Q12 & 1.13 & 1.07 & 1.00 &    5 & 6 \\
     \hline
   \end{tabular}
 \end{table}
