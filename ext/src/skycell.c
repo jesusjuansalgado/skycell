@@ -264,6 +264,7 @@ typedef struct cover_key
 	int32		force_order;	/* diagnostics; a covering computed at a forced
 								 * order must not be handed to a query that did
 								 * not ask for one */
+	int32		probe_orders;	/* likewise: probing changes which order wins */
 } cover_key;
 
 typedef struct cover_entry
@@ -403,6 +404,7 @@ cover_cached(const sc_region *reg, const sc_density *d, const sc_cover_params *p
 	key.max_ranges = p->max_ranges;
 	key.max_steps = p->max_steps;
 	key.force_order = p->force_order;
+	key.probe_orders = sc_order_probe;
 
 	entry = (cover_entry *) hash_search(cover_cache, &key, HASH_ENTER, &found);
 	if (!found)
