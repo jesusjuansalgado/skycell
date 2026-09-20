@@ -1,0 +1,10 @@
+method,step,seconds,mb
+q3c,table,11.287097,574.5
+q3c,index,2.14641,214.2265625
+q3c,analyze,0.226008,
+pgsphere,table,9.602923,730.5
+pgsphere,index,42.269809,684.890625
+pgsphere,analyze,0.459839,
+skycell,table,5.747112,651.5
+skycell,index,1.436331,214.2265625
+skycell,analyze,0.56704,

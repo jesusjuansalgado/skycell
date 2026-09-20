@@ -15,11 +15,13 @@ ANALYZE cat;
 SELECT * FROM cat WHERE point('ICRS', ra, dec) <@ circle('ICRS', 266.4, -28.9, 0.05);
 ```
 
-On a 10-million-row synthetic catalogue with Gaia-like crowding, that query is
-faster than both established extensions, the index is a third the size of
-pgSphere's, and the planner's row estimates are 1.2× off instead of 2–3×.
-The measurements, including where skycell *loses*, are in
-[Comparison](#comparison-with-q3c-and-pgsphere).
+On 10-million-row catalogues — one synthetic, one resampled from the real Gaia
+DR3 density field — that query is 6–11% faster than pgSphere at 1″–1′ warm,
+**2–2.5× faster with cold caches at 30′ and beyond**, and indistinguishable
+between 6′ and 1°. The index is a third the size of pgSphere's, builds 30×
+faster, and the planner's row estimates are 1.2× off instead of 2–3×.
+Measured in randomized paired trials; the numbers, including where skycell
+*loses*, are in [Comparison](#comparison-with-q3c-and-pgsphere).
 
 ---
 
@@ -59,12 +61,21 @@ index range decide how finely it is worth cutting. skycell evaluates that cost
 at all 30 orders (a few flops each) and takes the cheapest, so a crowded field
 is cut finer than empty sky with no refinement loop at all.
 
-**3. Cells are tested by their own geometry.** A cell is bounded by its four
-corners, and its boundary by the chords between them, with the edge bulge
-measured per cell from the edge midpoints — near the poles an edge departs
-from its chord by a fraction of the cell size, not its square, which a global
-constant gets wrong. This is much tighter than approximating every cell by a
-cap of the worst-case pixel radius over the whole sphere.
+**3. Cells are tested by their own geometry — but only where that is sound.**
+Of the three possible verdicts on a cell, only *outside* can lose rows: inside
+and straddling both keep it, and the exact predicate re-tests every row the
+index returns. So *outside* is decided by a bound —
+`min(max_pixrad(order), max corner distance)`, plus an explicit 2e-13 rad
+margin — while *inside* may use the cell's own corners and edge midpoints
+tightly, since being optimistic there costs false positives and never rows.
+
+(An earlier version also decided *outside* from the corner chords, inflated by
+4× the edge's departure from its chord at the midpoint. That is not a bound:
+where an edge crosses its chord plane near the midpoint the estimate collapses,
+and the true departure reaches 64× it. The error was ~1e-8 rad — below a
+0.4 mas leaf cell, and invisible to every test — but it was an assumption
+standing where a guarantee was claimed. Removing it cost 2.5% more index
+ranges.)
 
 **4. The predicate is rewritten by the planner, not by the user.** A support
 function (`SupportRequestSimplify`, the mechanism PostGIS uses for
@@ -270,60 +281,74 @@ WHERE skycell_in_cone(p.ra, p.dec, f.ra0, f.dec0, f.r);
 | `skycell.use_stats` | on | use the histogram as a density map |
 | `skycell.cache_coverings` | on | memoise coverings per backend |
 | `skycell.join_slots` | 4 | range slots emitted for a non-constant region |
+| `skycell.exact_cells` | on | tight cell geometry; off falls back to the `max_pixrad` cap |
+| `skycell.force_order` | -1 | diagnostics: cover cones at this order (-1 = let the model choose) |
 | `skycell.split_cost`, `skycell.max_steps` | 1, 4000 | refinement guards for polygons and very large cones |
 
 ---
 
 ## Comparison with Q3C and pgSphere
 
-10M-source synthetic catalogue with Gaia-like crowding (uniform background, a
-Galactic disk and bulge, 200 dense clusters), PostgreSQL 18.6, warm cache, one
-core. Full tables in [`bench/results/summary.md`](bench/results/summary.md);
-reproduce with `bench/run.sh`.
+Two 10M-row corpora, PostgreSQL 18.6, one core. The first is synthetic with
+Gaia-like crowding; the second is resampled from the **real Gaia DR3 density
+field** (source counts in all 3,145,728 order-9 cells, fetched from the ESA
+archive), so the crowding structure is not one we invented.
+
+Every query is a *trial*: all three methods answer it back to back in a
+**randomized order**, repeated 5×, and the analysis is **paired** (ratio formed
+per query, so its difficulty cancels) with 95% bootstrap intervals. Full tables
+in [`bench/results-ab/`](bench/results-ab/); reproduce with `bench/run.sh` and
+`bench/07_ab.sql`.
+
+**Cone searches, skycell ÷ pgSphere** (below 1 = skycell faster; **bold** =
+interval excludes 1):
+
+| radius | designed, warm | designed, cold | Gaia, warm | Gaia, cold |
+|---|---|---|---|---|
+| 1″ | **0.90** | **0.72** | **0.89** | **0.78** |
+| 10″ | **0.93** | **0.88** | **0.90** | **0.80** |
+| 1′ | **0.94** | **0.95** | **0.93** | 0.95 |
+| 6′ | 1.00 | **0.85** | *1.03* | **0.90** |
+| 30′ | 0.98 | **0.68** | **0.92** | **0.57** |
+| 1° | 0.92 | **0.57** | **0.85** | **0.53** |
+| 3° | **0.63** | **0.39** | **0.69** | **0.40** |
+
+Warm, the advantage is real but modest at small radii and **disappears between
+6′ and 1°** (and is a 3% loss at 6′ on the Gaia field). Cold — server restarted,
+page cache dropped — skycell wins everywhere, because it reads a third of the
+pages. Against Q3C 2.0.5 skycell is 4–50× faster, mostly because that version
+expands *every* `q3c_radial_query` into 100 key ranges whatever the radius.
+
+**Everything else:**
 
 | workload | Q3C 2.0.5 | pgSphere 1.5.2 | skycell |
 |---|---|---|---|
-| index size / build | 214 MB / 1.8 s | 683 MB / 44 s | **214 MB / 2.3 s** |
-| cone 1″ / 1′, median | 1.330 / 1.366 ms | 0.035 / 0.032 ms | **0.024 / 0.024 ms** |
-| cone 30′ / 1° / 3°, median | 1.37 / 1.43 / 3.02 ms | 0.095 / 0.315 / 1.010 ms | **0.075 / 0.139 / 0.573 ms** |
+| index size / build | 214 MB / 2.2 s | 685 MB / 42 s | **214 MB / 1.4 s** |
 | buffers touched, 1° / 3° | 329 / 649 | 154 / 617 | **55 / 343** |
-| convex polygons, median | 1.53 ms | 0.63 ms | **0.14 ms** |
-| cross-match 200k probes, 1″ | 1.95 s | 2.85 s | **0.47 s** |
-| cross-match 200k probes, 10″ | 1.72 s | 3.34 s | **0.59 s** |
-| 200k points in 20k footprints | not supported | 1.10 s, 1.2 MB | **0.67 s**, 10 MB |
+| convex polygons, median | 1.86 ms | 0.77 ms | **0.28 ms** |
+| cross-match 200k probes, 1″ | 7.05 s | 5.74 s | **0.50 s** |
+| 200k points in 20k footprints | not supported | 0.97 s, 1.1 MB | **0.76 s**, 9.5 MB |
 | planner row-estimate error, 1° | 1.9× | 2.8× | **1.22×** |
 
-Measured **interleaved and warm**, alternating the two methods per query with
-skycell going first (the order that disadvantages it), cone searches come out
-at 0.85 / 1.04 / 0.92 / 0.72 / 0.61 × pgSphere's time at 1″ / 1′ / 30′ / 1° /
-3°. Read the table above as the optimistic end and these as the conservative
-one.
+**Where skycell loses.** On a 500k-row ObsCore table inside a real TAP service
+it is 1.2–1.45× *slower* per query, and all 18 end-to-end cells tie (the
+database is 1–3% of a request). Measuring the same ObsCore-shaped relation at
+three sizes puts the crossover between 0.5M and 2M rows for degree-scale cones —
+and **beyond 10M for small cones on field-clustered data**, where a GiST bitmap
+scan already reads exactly the pages it needs:
 
-What the numbers say:
+| class | 0.5M | 2M | 10M |
+|---|---|---|---|
+| 0.15° cone | 2.74 | 1.64 | 1.81 |
+| 2° cone | 1.09 | 0.83 | **0.56** |
+| 0.5° cone + time/calib cuts | 1.26 | 1.33 | 0.96 |
+| empty cone | 1.31 | 1.14 | 1.00 |
 
-- **Q3C** expands every `q3c_radial_query` into 100 B-tree ranges whatever the
-  radius — about 300 buffers and 1.2 ms of planning — which dominates small
-  cone searches. Its cross-match path (4 ranges per probe) is much better.
-- **Cross-matching** is won on plan shape rather than geometry: `q3c_join` and
-  skycell's own join form both run a BitmapOr of bitmap scans per probe, while
-  `LATERAL skycell_cone_ranges()` runs plain range scans with as many ranges as
-  the probe needs.
-- **Where skycell loses.** On a 500k-row ObsCore table inside a real TAP
-  service it is 1.2–1.45× *slower* per cone query than pgSphere: planning a
-  covering is work pgSphere does not do, and on a relation that small there is
-  no scan to win it back. The crossover in these measurements is a few million
-  rows.
-- **End to end, in a TAP server**, none of this moved the published numbers:
-  in an A/B against [egernia](https://github.com/ska-telescope/egernia) on a
-  500k-row corpus, all 18 comparison cells tied, because the database is 1–3%
-  of a request whose cost is dominated by Python. Protocol and full results:
-  [`bench/tap-ab/`](bench/tap-ab/).
-
-The method, the validation and all of these measurements are written up in
-[`paper/`](paper/) (Astronomy & Astrophysics format; `make -C paper` builds a
-readable PDF without the journal's class, `make -C paper aa` with it).
-
----
+**Calibration.** `range_cost` swept over four decades gives the same optimum on
+both corpora (~100 at 30′–1°), so it is a property of the machine, not the sky.
+The default of 30 costs 11–21% there; the curve is flat-bottomed either side.
+The order the model picks sits ~1 order coarser than the empirically fastest,
+worth 0.8–2% of query time.
 
 ## Testing
 
@@ -338,8 +363,10 @@ docker exec -w /work/ext skycell-pg su postgres -c "make installcheck"
   orders, nesting, equal area, and the corner bound the covering relies on,
   over 1.6M sampled points including poles, the zone boundary and face edges.
 - `ext/test/cover_selftest.c` — coverings against a 2M-point clustered
-  catalogue, plus 30,000 adversarial cones with 200 points sampled inside
-  each. Asserts **zero false negatives**.
+  catalogue; 30,000 adversarial cones with 200 points sampled inside each; and
+  7,266 adversarial polygons at the poles, the zone boundary, the RA wrap and
+  the face edges with 866,537 points drawn inside them, half within a part per
+  billion of an edge. Asserts **zero false negatives**.
 - `ext/test/sql/skycell.sql` — indexed and sequential-exact results must be
   identical for 240 cones in two configurations, 60 polygons, both join forms
   and MOC footprint lookups.
@@ -364,8 +391,12 @@ docker exec -w /work/ext skycell-pg su postgres -c "make installcheck"
   favour pgSphere. Removing it means not planning ranges at all: an SP-GiST
   operator class over the cell hierarchy, where one index qual is planned and
   the covering happens during the descent.
-- Tested to 10M rows on one machine. Nothing has run on real Gaia data, at
-  Gaia density, or with cold caches.
+- Tested to 10M rows on one machine, warm and with caches dropped. The Gaia
+  corpus uses the real DR3 density field but not real positions, and has no
+  structure below its 0.11° map cells.
+- Better row estimates are demonstrated; better *plans* are not. On the join
+  shapes measured, all three methods chose the same strategy — only one query
+  in sixteen at 3° crossed a threshold into a hash join.
 
 ## License
 

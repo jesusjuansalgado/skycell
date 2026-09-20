@@ -1,0 +1,22 @@
+method,pass,n,ms,build_ms,index_mb,plan
+pgsphere,0,,,34.191,1.140625,
+skycell,0,,,893.04,9.546875,
+pgsphere,1,200474,1003.629,,,"Aggregate
+  ->  Nested Loop
+        ->  Seq Scan on probe p
+        ->  Index Scan using fp_reg_idx on fp f
+              Index Cond: (reg @> p.pos)
+"
+pgsphere,2,200474,969.665,,,""
+skycell,1,200474,884.732,,,"Aggregate
+  ->  Hash Join
+        Hash Cond: (fc.fid = f.fid)
+        Join Filter: skycell_in_cone(p.ra, p.""dec"", f.ra0, f.dec0, f.r, '-1'::double precision)
+        ->  Nested Loop
+              ->  Seq Scan on probe p
+              ->  Index Scan using fp_cells_idx on fp_cells fc
+                    Index Cond: (nuniq = ANY (skycell_ancestors(p.cell, 4, 11)))
+        ->  Hash
+              ->  Seq Scan on fp f
+"
+skycell,2,200474,761.834,,,""

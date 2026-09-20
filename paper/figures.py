@@ -35,42 +35,118 @@ def psql(db, sql):
     return [line.split(",") for line in out.strip().split("\n") if line]
 
 
+RESAB = os.path.join(HERE, "..", "bench", "results-ab")
+
+
+def load_ab(name):
+    with open(os.path.join(RESAB, name + ".csv")) as f:
+        return list(csv.DictReader(f))
+
+
+def boot_ci(xs, b=4000, seed=7):
+    """Percentile bootstrap of the median, the same estimator as ab_report.py."""
+    import random
+    rnd = random.Random(seed)
+    n = len(xs)
+    if n < 2:
+        return (float("nan"), float("nan"))
+    vals = sorted(statistics.median([xs[rnd.randrange(n)] for _ in range(n)])
+                  for _ in range(b))
+    return vals[int(0.025 * b)], vals[int(0.975 * b)]
+
+
+def paired_ratios(rows, corpus, cache, rival="pgsphere"):
+    """Per query: median over repetitions, then the skycell/rival ratio."""
+    per_q = defaultdict(list)
+    for r in rows:
+        if r["corpus"] == corpus and r["cache"] == cache:
+            per_q[(r["label"], int(r["qid"]), r["method"])].append(float(r["ms"]))
+    out = {}
+    for label in ORDER:
+        rs = []
+        qids = {k[1] for k in per_q if k[0] == label}
+        for q in qids:
+            a = per_q.get((label, q, "skycell"))
+            b = per_q.get((label, q, rival))
+            if a and b:
+                mb = statistics.median(b)
+                if mb > 0:
+                    rs.append(statistics.median(a) / mb)
+        if rs:
+            lo, hi = boot_ci(rs)
+            out[label] = (statistics.median(rs), lo, hi)
+    return out
+
+
 def fig_benchmark():
-    centers = {r["qid"]: r for r in load("bench_centers")}
-    times, buffers = defaultdict(list), defaultdict(list)
-    for r in load("bench_cone"):
-        if r["pass"] == "2" and r["variant"] == "":
-            times[(r["method"], centers[r["qid"]]["label"])].append(float(r["ms"]))
-    for r in load("bench_cone_x"):
-        if r["variant"] == "":
-            buffers[(r["method"], centers[r["qid"]]["label"])].append(float(r["buffers"]))
+    """The controlled result: paired ratios with intervals, and what drives them."""
+    ab = load_ab("bench_ab")
+    abx = load_ab("bench_ab_x")
 
-    fig, axes = plt.subplots(1, 3, figsize=(10.5, 3.2))
-    x = [DEG[l] for l in ORDER]
+    fig, axes = plt.subplots(1, 3, figsize=(10.5, 3.3))
+    styles = [("designed", "warm", "#1b7f3b", "o", "-", "designed, warm"),
+              ("designed", "cold", "#1b7f3b", "s", "--", "designed, cold"),
+              ("gaia", "warm", "#1f6f8b", "o", "-", "Gaia, warm"),
+              ("gaia", "cold", "#1f6f8b", "s", "--", "Gaia, cold")]
+    for corpus, cache, color, marker, ls, lab in styles:
+        d = paired_ratios(ab, corpus, cache)
+        labels = [l for l in ORDER if l in d]
+        x = np.array([DEG[l] for l in labels])
+        y = np.array([d[l][0] for l in labels])
+        lo = np.array([d[l][1] for l in labels])
+        hi = np.array([d[l][2] for l in labels])
+        axes[0].errorbar(x, y, yerr=[y - lo, hi - y], color=color, marker=marker,
+                         ls=ls, ms=4, lw=1.2, capsize=2, label=lab,
+                         alpha=1.0 if cache == "cold" else 0.75)
+    axes[0].axhline(1.0, color="0.35", lw=1, zorder=0)
+    axes[0].set_xscale("log")
+    axes[0].set_ylim(0.2, 1.3)
+    axes[0].set_xlabel("cone radius (deg)")
+    axes[0].set_ylabel("skycell / pgSphere (paired)")
+    axes[0].legend(frameon=False, fontsize=7)
+    axes[0].text(0.98, 0.96, "pgSphere faster", fontsize=7, color="0.35",
+                 ha="right", va="top", transform=axes[0].transAxes)
+    axes[0].text(0.98, 0.04, "skycell faster", fontsize=7, color="0.35",
+                 ha="right", va="bottom", transform=axes[0].transAxes)
+
+    buffers = defaultdict(list)
+    for r in abx:
+        if r["corpus"] == "designed":
+            buffers[(r["method"], r["label"])].append(float(r["buffers"]))
     for m in ("q3c", "pgsphere", "skycell"):
-        axes[0].plot(x, [statistics.median(times[(m, l)]) for l in ORDER], "o-",
-                     color=COLOR[m], label=LABEL[m], ms=4)
-        axes[1].plot(x, [statistics.mean(buffers[(m, l)]) for l in ORDER], "o-",
-                     color=COLOR[m], ms=4)
-    for ax, ylab in ((axes[0], "median time per query (ms)"), (axes[1], "buffers per query")):
-        ax.set_xscale("log"); ax.set_yscale("log"); ax.set_xlabel("cone radius (deg)")
-        ax.set_ylabel(ylab); ax.grid(alpha=0.25, which="both")
-    axes[0].legend(frameon=False, fontsize=8)
+        labels = [l for l in ORDER if (m, l) in buffers]
+        axes[1].plot([DEG[l] for l in labels],
+                     [statistics.mean(buffers[(m, l)]) for l in labels],
+                     "o-", color=COLOR[m], label=LABEL[m], ms=4)
+    axes[1].set_xscale("log"); axes[1].set_yscale("log")
+    axes[1].set_xlabel("cone radius (deg)"); axes[1].set_ylabel("buffers per query")
+    axes[1].legend(frameon=False, fontsize=7)
+    axes[1].grid(alpha=0.25, which="both")
 
-    xm = [r for r in load("bench_xmatch") if r["pass"] == "2"]
-    names = ["q3c", "pgsphere", "skycell_slots", "skycell_lateral"]
-    pretty = ["Q3C", "pgSphere", "skycell\n(join)", "skycell\n(lateral)"]
-    w = 0.38
-    for k, rad in enumerate(["1", "10"]):
-        vals = [float(next(r for r in xm if r["method"] == n and r["radius_arcsec"] == rad)["ms"]) / 1000
-                for n in names]
-        axes[2].bar(np.arange(len(names)) + (k - 0.5) * w, vals, w,
-                    color=["#c1440e", "#1f6f8b", "#7fbf7f", "#1b7f3b"],
-                    alpha=1.0 if k else 0.55, label=f'{rad}"')
-    axes[2].set_xticks(range(len(names))); axes[2].set_xticklabels(pretty, fontsize=7)
-    axes[2].set_ylabel("cross-match, 200k probes (s)"); axes[2].grid(alpha=0.25, axis="y")
-    axes[2].legend(frameon=False, fontsize=8, title="radius", title_fontsize=8)
-    for ax, t in zip(axes, ("(a) cone searches", "(b) pages touched", "(c) cross-match")):
+    sweep = defaultdict(dict)
+    for r in load_ab("cm_sweep"):
+        if r["corpus"] in ("designed", "gaia"):
+            sweep[(r["corpus"], r["label"])][float(r["range_cost"])] = float(r["ms"])
+    for (corpus, label), series in sorted(sweep.items()):
+        if label not in ("30'", "1deg"):
+            continue
+        xs = sorted(series)
+        ys = [series[x] / min(series.values()) for x in xs]
+        axes[2].plot(xs, ys, marker="o", ms=3.5, lw=1.2,
+                     color="#1b7f3b" if corpus == "designed" else "#1f6f8b",
+                     ls="-" if label == "1deg" else "--",
+                     label=f"{corpus}, {label}")
+    axes[2].axvline(30, color="0.35", lw=1, ls=":")
+    axes[2].text(33, 1.9, "default", fontsize=7, color="0.35", rotation=90)
+    axes[2].set_xscale("log")
+    axes[2].set_xlabel(r"skycell.range_cost (rows)")
+    axes[2].set_ylabel("time / best at that radius")
+    axes[2].legend(frameon=False, fontsize=6.5)
+    axes[2].grid(alpha=0.25, which="both")
+
+    for ax, t in zip(axes, ("(a) controlled cone searches",
+                            "(b) pages touched",
+                            "(c) cost-model calibration")):
         ax.set_title(t, fontsize=9)
     fig.tight_layout()
     fig.savefig(os.path.join(HERE, "fig_benchmark.pdf"))
