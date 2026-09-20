@@ -41,8 +41,11 @@ END $$;
  * no method is systematically first; `slot` records where each one landed so
  * that the order effect can be measured rather than assumed away.
  */
+DROP FUNCTION IF EXISTS bench_ab_run(text, text, int, float8);
 CREATE OR REPLACE FUNCTION bench_ab_run(corpus text, cache text, reps int,
-                                        seed float8 DEFAULT 0.31) RETURNS void
+                                        seed float8 DEFAULT 0.31,
+                                        methods text[] DEFAULT ARRAY['q3c', 'pgsphere', 'skycell'])
+RETURNS void
 LANGUAGE plpgsql AS $$
 DECLARE c bench_centers; r int; ms text[];
 BEGIN
@@ -52,31 +55,32 @@ BEGIN
   -- warm cache: one untimed pass so every method starts from the same state
   IF cache = 'warm' THEN
     FOR c IN SELECT * FROM bench_centers ORDER BY qid LOOP
-      PERFORM ab_trial(corpus, 'discard', 0, c, ARRAY['q3c', 'pgsphere', 'skycell']);
+      PERFORM ab_trial(corpus, 'discard', 0, c, methods);
     END LOOP;
     DELETE FROM bench_ab b WHERE b.cache = 'discard';
   END IF;
 
   FOR r IN 1 .. reps LOOP
     FOR c IN SELECT * FROM bench_centers ORDER BY random() LOOP
-      SELECT array_agg(m ORDER BY random()) INTO ms
-      FROM unnest(ARRAY['q3c', 'pgsphere', 'skycell']) m;
+      SELECT array_agg(m ORDER BY random()) INTO ms FROM unnest(methods) m;
       PERFORM ab_trial(corpus, cache, r, c, ms);
     END LOOP;
   END LOOP;
 END $$;
 
 -- planning/execution split, in randomized trial order as well
-CREATE OR REPLACE FUNCTION bench_ab_explain(corpus text, seed float8 DEFAULT 0.41) RETURNS void
+DROP FUNCTION IF EXISTS bench_ab_explain(text, float8);
+CREATE OR REPLACE FUNCTION bench_ab_explain(corpus text, seed float8 DEFAULT 0.41,
+                                            methods text[] DEFAULT ARRAY['q3c', 'pgsphere', 'skycell'])
+RETURNS void
 LANGUAGE plpgsql AS $$
 DECLARE c bench_centers; ms text[]; i int; j json; p json; scan json;
 BEGIN
   DELETE FROM bench_ab_x b WHERE b.corpus = bench_ab_explain.corpus;
   PERFORM setseed(seed);
   FOR c IN SELECT * FROM bench_centers ORDER BY random() LOOP
-    SELECT array_agg(m ORDER BY random()) INTO ms
-    FROM unnest(ARRAY['q3c', 'pgsphere', 'skycell']) m;
-    FOR i IN 1 .. 3 LOOP
+    SELECT array_agg(m ORDER BY random()) INTO ms FROM unnest(methods) m;
+    FOR i IN 1 .. array_length(ms, 1) LOOP
       EXECUTE 'EXPLAIN (ANALYZE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON) '
               || cone_sql(ms[i], c) INTO j;
       p := j -> 0 -> 'Plan';

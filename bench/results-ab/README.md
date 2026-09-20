@@ -18,3 +18,16 @@ trial, repeated, warm and with caches dropped.
 
 Corpora: `designed` is the synthetic one; `gaia` is resampled from Gaia DR3
 source counts per order-9 cell.
+
+## Scale run (added after the referee round)
+
+`11_scale_corpus.sql` / `12_scale_build.sql` build a 50M-row corpus from the same
+Gaia density field and the three index layouts on it; the A/B is then the same
+`bench_ab_run('gaia50', …)`. At that size pgSphere's GiST index is 3442 MB
+against a 2 GB `shared_buffers` and skycell's B-tree is 1072 MB, which is the
+point of the size: one fits, the other does not.
+
+Result: the advantage **grows** with the catalogue for regions ≥30′ (1° cold:
+0.53 → 0.27) and **reverses** below a few arcminutes (1′ 0.93 → 1.07, 6′ 1.03 →
+1.13, warm), because skycell's planning cost grows with source density while
+pgSphere's does not. `bench_build50.csv` holds the build times and sizes.

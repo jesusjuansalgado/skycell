@@ -35,7 +35,8 @@ of catalogue points and against points drawn inside adversarial cones and polygo
 Performance is measured against Q3C 2.0.5 and pgSphere 1.5.2 on two 10-million-row
 corpora -- one synthetic, one resampled from the real Gaia DR3 density field -- in
 trials where all three methods answer the same query back to back in a randomized
-order, repeated, analysed paired, warm and with caches dropped.}
+order, repeated, analysed paired, warm and with caches dropped, and repeated again on a
+50-million-row catalogue where pgSphere's index no longer fits in memory.}
 % results
 {Warm, skycell is faster than pgSphere by 6--11\% for cone radii of 1\arcsec--1\arcmin\
 and by 31--37\% at 3\degr, and the two are indistinguishable between 6\arcmin\ and
@@ -46,16 +47,21 @@ pgSphere's buffer pages at 1\degr. It keeps an index of 214\,MB against pgSphere
 and a 200\,000-probe cross-match six to eleven times faster, and its row estimates are wrong by a
 factor 1.2 rather than 2.5--3.0. The cost model's chosen cell order sits about one
 order coarser than the empirical optimum, which costs 0.8--2\% of query time, and its
-density estimate is unbiased wherever a density is defined at all. An ObsCore-shaped
-relation measured at three sizes puts the crossover with pgSphere between 0.5 and 2
-million rows for degree-scale cones, and beyond 10 million for small cones on
-field-clustered data.}
+density estimate is unbiased wherever a density is defined at all. Raising the catalogue
+to 50 million rows separates the two halves of the result: for regions of 30\arcmin\ and
+larger the advantage grows (at 1\degr, 0.85 to 0.64 warm and 0.53 to 0.27 cold), while
+for cones of an arcsecond to a few arcminutes it shrinks and reverses, skycell becoming
+7--13\% slower warm, because its planning cost grows with source density while
+pgSphere's does not. An ObsCore-shaped relation measured at three sizes puts the
+crossover with pgSphere between 0.5 and 2 million rows for degree-scale cones, and beyond
+10 million for small cones on field-clustered data.}
 % conclusions
-{A cost-based covering over an equal-area integer key is a sound basis for a sky index
-and is the faster choice on large catalogues, on cold caches, and for polygons and
-cross-matching, while pgSphere remains preferable for small cones on small or
-field-clustered relations. The advantage is workload-dependent, and the evidence here
-does not establish general superiority.}
+{A cost-based covering over an equal-area integer key is a sound basis for a sky index,
+and the right question is not whether it is faster but for which queries. Its cost is
+paid per query and its benefit per row scanned, so it wins where enough rows are scanned
+to amortise a covering -- degree-scale regions, polygons, cross-matching, cold caches --
+and that boundary moves up in radius as the catalogue grows denser. On a Gaia-sized
+catalogue a small cone search is not the workload this index improves.}
 
 \keywords{Astronomical databases: miscellaneous -- Catalogs -- Virtual observatory tools --
   Methods: data analysis}
@@ -753,6 +759,72 @@ random, this inflates the variance of the ratios rather than biasing them.
   \end{tabular}
 \end{table}
 
+\subsection{Does the advantage grow with the catalogue?}
+\label{sec:scale}
+
+Ten million rows is 0.55\% of Gaia DR3, and the argument that an index matters most
+when it does not fit in memory is an argument about scale. We therefore repeated the
+whole protocol on a 50-million-row Gaia-density corpus, built identically. The point of
+that size is specific: pgSphere's GiST index is then 3442\,MB against a 2\,GB
+\texttt{shared\_buffers}, so it no longer fits, while \texttt{skycell}'s B-tree is
+1072\,MB and still does.
+
+The answer (Table~\ref{tab:scale}) is not uniform, and it is more interesting than the
+prediction. For regions of 30\arcmin\ and larger the advantage grows markedly with the
+catalogue: at 1\degr\ the warm ratio improves from 0.85 to 0.64, and the cold ratio from
+0.53 to 0.27 -- a factor 3.7. For cones of an arcsecond to a few arcminutes it moves the
+other way, and warm, at 50 million rows, \texttt{skycell} is \emph{slower} than pgSphere
+at 1\arcmin\ (1.07) and 6\arcmin\ (1.13).
+
+The planning column of Table~\ref{tab:scale} explains both halves. \texttt{skycell}'s
+planning time grows with source density -- 0.014 to 0.020\,ms at 1\arcmin, 0.019 to
+0.031\,ms at 6\arcmin\ -- because a denser sky makes Eq.~(\ref{eq:sstar}) cut finer and
+emit more range arms, each of which is a separate index path for the planner to cost.
+pgSphere's planning is flat at 0.009\,ms whatever the density. At 6\arcmin\ on 50 million
+rows \texttt{skycell} still executes faster (0.042 against 0.049\,ms) and loses anyway,
+because it gave up 0.022\,ms before the first row was read. At 1\degr\ the execution gap
+(0.74 against 1.26\,ms, 153 against 464 buffer pages) is an order of magnitude larger
+than the planning penalty, and grows with the catalogue, so the penalty stops mattering.
+
+This is the sharpest statement we can make about where the method belongs: its cost is
+paid per query and its benefit is paid per row scanned, so it wins exactly where enough
+rows are scanned to amortise a covering, and that boundary moves \emph{up} in radius as
+the catalogue grows denser, not down. On a Gaia-sized catalogue, a small cone search is
+not the workload this index improves; a degree-scale selection, a polygon or a
+cross-match is.
+
+\begin{table*}
+  \caption{The same protocol at two catalogue sizes on the Gaia density field: paired
+    ratio of \texttt{skycell} to pgSphere with 95\% bootstrap intervals, and the
+    planning/execution/buffer medians behind them. At $5\times10^7$ rows pgSphere's
+    index (3442\,MB) exceeds \texttt{shared\_buffers} while \texttt{skycell}'s
+    (1072\,MB) does not. Bold: interval excludes 1, \texttt{skycell} faster; italic:
+    interval excludes 1, \texttt{skycell} slower.}
+  \label{tab:scale}
+  \centering
+  \footnotesize
+  \begin{tabular}{l cc cc rr rr rr}
+    \hline\hline
+    & \multicolumn{2}{c}{warm} & \multicolumn{2}{c}{cold}
+    & \multicolumn{2}{c}{plan (ms)} & \multicolumn{2}{c}{exec (ms)}
+    & \multicolumn{2}{c}{buffers} \\
+    \cline{2-3}\cline{4-5}\cline{6-7}\cline{8-9}\cline{10-11}
+    radius & $10^7$ & $5\times10^7$ & $10^7$ & $5\times10^7$
+           & pgS & sky & pgS & sky & pgS & sky \\
+    \hline
+    1\arcsec  & \textbf{0.89} & \textbf{0.94} & \textbf{0.78} & \textbf{0.69} & 0.009 & 0.016 & 0.019 & 0.009 &    5 &   4 \\
+    10\arcsec & \textbf{0.90} & 1.00          & \textbf{0.80} & \textbf{0.90} & 0.009 & 0.016 & 0.019 & 0.011 &    5 &   5 \\
+    1\arcmin  & \textbf{0.93} & \emph{1.07}   & 0.95          & \textbf{0.92} & 0.009 & 0.020 & 0.023 & 0.017 &    6 &   6 \\
+    6\arcmin  & 1.03          & \emph{1.13}   & \textbf{0.90} & \textbf{0.81} & 0.009 & 0.031 & 0.049 & 0.042 &   14 &  19 \\
+    30\arcmin & \textbf{0.92} & \textbf{0.78} & \textbf{0.57} & \textbf{0.49} & 0.009 & 0.062 & 0.439 & 0.246 &  106 &  66 \\
+    1\degr    & \textbf{0.85} & \textbf{0.64} & \textbf{0.53} & \textbf{0.27} & 0.009 & 0.081 & 1.260 & 0.744 &  464 & 153 \\
+    3\degr    & \textbf{0.69} & \textbf{0.59} & \textbf{0.40} & \textbf{0.24} & 0.011 & 0.130 & 9.604 & 5.550 & 1078 & 634 \\
+    \hline
+  \end{tabular}
+  \tablefoot{The planning, execution and buffer columns are medians at
+    $5\times10^7$ rows, from the randomized \texttt{EXPLAIN} pass.}
+\end{table*}
+
 \subsection{How much the protocol matters}
 \label{sec:phase}
 
@@ -1008,31 +1080,38 @@ served by pgSphere at any size we measured.
 \subsection{What these measurements support}
 
 A covering sized by cost over an equal-area integer key is a sound basis for a sky
-index. On 10-million-row catalogues it is faster than pgSphere for cone searches at most
-radii warm, at every radius cold, and by the largest margins exactly where an index
-should matter most: large regions, cold caches, polygons, cross-matching. It does this
-with an index a third the size, built thirty times faster, and with row estimates twice
-as accurate. The same conclusions hold on a density field taken from the real sky and on
-one designed by us, which is the strongest evidence we have that the cost model is not
-tuned to its test data.
+index, and the measurements identify precisely which queries it improves. For regions of
+30\arcmin\ and larger it is faster than pgSphere warm and cold, at both catalogue sizes,
+and the margin grows with the catalogue -- a factor 3.7 at 1\degr\ with cold caches at
+50 million rows. For polygons and cross-matching it is faster by factors of 2.7 and 6--11.
+It does this with an index a third the size, built more than ten times faster, and with
+row estimates twice as accurate. The same conclusions hold on a density field taken from
+the real sky and on one designed by us, which is the strongest evidence we have that the
+cost model is not tuned to its test data.
 
 \subsection{What they do not}
 
-They do not establish that \texttt{skycell} is the better choice in general. On a
-500\,000-row ObsCore relation it is slower; on small cones over field-clustered
-observations it is slower at every size we measured; in a TAP service whose cost is
-dominated by protocol handling it changes nothing. Warm, between 6\arcmin\ and 1\degr,
-it is indistinguishable from pgSphere on one corpus and slightly slower at 6\arcmin\ on
-the other. Better row estimates did not, on the join shapes we wrote, produce better
+They do not establish that \texttt{skycell} is the better choice in general, and the
+50-million-row run makes one failure sharper than the 10-million-row run did: for cones
+of an arcsecond to a few arcminutes the advantage shrinks with scale and reverses, so on
+a Gaia-sized catalogue the most common query of all -- a small cone search on a warm
+index -- is one this method makes slower, by 7--13\%. On a 500\,000-row ObsCore relation
+it is slower; on small cones over field-clustered observations it is slower at every size
+we measured; in a TAP service whose cost is dominated by protocol handling it changes
+nothing. Better row estimates did not, on the join shapes we wrote, produce better
 plans. And nothing here has run on real catalogue positions at Gaia density, on more
 than one machine, or with more than one storage device.
 
 \subsection{Where the remaining cost is}
 
-Planning. A covering is computed per plan, and even cached it costs 0.015--0.12\,ms,
-against 0.006--0.008\,ms for a GiST predicate that needs no such step
-(Table~\ref{tab:explain}). That is the whole of skycell's disadvantage at 6\arcmin\ and
-the reason small relations favour pgSphere.
+Planning, and it gets worse rather than better with scale. A covering is computed per
+plan, and even cached it costs 0.015--0.13\,ms against 0.009--0.011\,ms for a GiST
+predicate that needs no such step. Worse, it is the one cost in the method that
+\emph{grows} with source density, because a denser sky makes the model cut finer and emit
+more range arms: 0.019 to 0.031\,ms at 6\arcmin\ between the two catalogue sizes, while
+pgSphere's planning does not move. That is the whole of skycell's disadvantage at small
+radii, and Sect.~\ref{sec:scale} shows it is what turns a 3\% deficit at 10 million rows
+into a 13\% deficit at 50 million.
 
 The architectural way out is to stop planning ranges. An SP-GiST operator class over the
 cell hierarchy would present a single index qualification to the planner and refine
@@ -1065,13 +1144,15 @@ Its cost model's parameter is a property of the installation rather than of the 
 chosen cell order costs 0.8--2\% against the best available order, and its density
 estimate is unbiased wherever a density is defined.
 
-It is not the better choice everywhere. Between 6\arcmin\ and 1\degr\ warm it is
-indistinguishable from pgSphere; on a small or field-clustered relation it is slower,
-because planning a covering is work pgSphere does not do and there is no scan to win it
-back; and inside a TAP server whose cost is dominated by Python it changes nothing at
-all. The crossover measured on an ObsCore-shaped relation sits between 0.5 and 2 million
-rows for degree-scale cones and beyond 10 million for small cones on field-clustered
-data.
+It is not the better choice everywhere, and scale sharpens rather than softens that.
+Raising the catalogue to 50 million rows widens the advantage for regions of
+30\arcmin\ and above -- to a factor 3.7 at 1\degr\ with cold caches -- and reverses it
+below a few arcminutes, where \texttt{skycell} becomes 7--13\% slower warm because
+planning a covering costs more in a denser sky while pgSphere's planning does not.
+On a small or field-clustered relation it is slower for the same reason, and inside a TAP
+server whose cost is dominated by Python it changes nothing at all. The crossover measured
+on an ObsCore-shaped relation sits between 0.5 and 2 million rows for degree-scale cones
+and beyond 10 million for small cones on field-clustered data.
 
 An index is worth choosing carefully when the scan dominates. Which queries those are is
 a property of the archive, and we have tried to say precisely which ones they were here.

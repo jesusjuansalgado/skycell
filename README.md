@@ -15,13 +15,15 @@ ANALYZE cat;
 SELECT * FROM cat WHERE point('ICRS', ra, dec) <@ circle('ICRS', 266.4, -28.9, 0.05);
 ```
 
-On 10-million-row catalogues — one synthetic, one resampled from the real Gaia
-DR3 density field — that query is 6–11% faster than pgSphere at 1″–1′ warm,
-**2–2.5× faster with cold caches at 30′ and beyond**, and indistinguishable
-between 6′ and 1°. The index is a third the size of pgSphere's, builds 30×
-faster, and the planner's row estimates are 1.2× off instead of 2–3×.
-Measured in randomized paired trials; the numbers, including where skycell
-*loses*, are in [Comparison](#comparison-with-q3c-and-pgsphere).
+Its cost is paid per query and its benefit per row scanned, so it wins where
+enough rows are scanned to amortise a covering: **degree-scale regions
+(1.6–3.7× faster), polygons (2.7×), cross-matches (6–11×), cold caches** — with
+an index a third the size of pgSphere's that builds more than 10× faster and
+row estimates 1.2× off instead of 2–3×. For small warm cone searches it is a
+wash at 10M rows and **7–13% slower at 50M**. Measured in randomized paired
+trials on two corpora, one of them the real Gaia DR3 density field; the numbers,
+including where skycell loses, are in
+[Comparison](#comparison-with-q3c-and-pgsphere).
 
 ---
 
@@ -319,11 +321,38 @@ page cache dropped — skycell wins everywhere, because it reads a third of the
 pages. Against Q3C 2.0.5 skycell is 4–50× faster, mostly because that version
 expands *every* `q3c_radial_query` into 100 key ranges whatever the radius.
 
+**Does it get better with catalogue size? For big regions yes, for small cones
+no.** Repeating the whole protocol at 50M rows — where pgSphere's index (3442 MB)
+no longer fits in `shared_buffers` and skycell's (1072 MB) still does:
+
+| radius | warm 10M → 50M | cold 10M → 50M |
+|---|---|---|
+| 1″ | 0.89 → 0.94 | 0.78 → **0.69** |
+| 10″ | 0.90 → 1.00 | 0.80 → 0.90 |
+| 1′ | 0.93 → *1.07* | 0.95 → 0.92 |
+| 6′ | 1.03 → *1.13* | 0.90 → 0.81 |
+| 30′ | 0.92 → **0.78** | 0.57 → **0.49** |
+| 1° | 0.85 → **0.64** | 0.53 → **0.27** |
+| 3° | 0.69 → **0.59** | 0.40 → **0.24** |
+
+The reason is in the planning column: skycell's plan time **grows with source
+density** (6′: 0.019 → 0.031 ms) because a denser sky makes the cost model cut
+finer and emit more range arms, while pgSphere's planning stays flat at
+0.009 ms. At 6′/50M skycell still *executes* faster (0.042 vs 0.049 ms) and
+loses anyway. At 1° the execution gap (0.74 vs 1.26 ms, 153 vs 464 buffers)
+dwarfs the planning penalty and widens with scale.
+
+**So: on a Gaia-sized catalogue this index improves degree-scale selections,
+polygons and cross-matches — not small cone searches.** Removing the plan-time
+cost (an SP-GiST opclass, or the `= ANY` single-scan form) is what would change
+that.
+
 **Everything else:**
 
 | workload | Q3C 2.0.5 | pgSphere 1.5.2 | skycell |
 |---|---|---|---|
-| index size / build | 214 MB / 2.2 s | 685 MB / 42 s | **214 MB / 1.4 s** |
+| index size / build, 10M | 214 MB / 2.2 s | 685 MB / 42 s | **214 MB / 1.4 s** |
+| index size / build, 50M | 1072 MB / 22 s | 3442 MB / 269 s | **1072 MB / 23 s** |
 | buffers touched, 1° / 3° | 329 / 649 | 154 / 617 | **55 / 343** |
 | convex polygons, median | 1.86 ms | 0.77 ms | **0.28 ms** |
 | cross-match 200k probes, 1″ | 7.05 s | 5.74 s | **0.50 s** |
@@ -391,7 +420,10 @@ docker exec -w /work/ext skycell-pg su postgres -c "make installcheck"
   favour pgSphere. Removing it means not planning ranges at all: an SP-GiST
   operator class over the cell hierarchy, where one index qual is planned and
   the covering happens during the descent.
-- Tested to 10M rows on one machine, warm and with caches dropped. The Gaia
+- Planning is the one cost that *grows* with source density, so the method's
+  disadvantage on small cones gets worse, not better, as a catalogue grows:
+  3% at 10M rows, 13% at 50M. An SP-GiST opclass is the fix.
+- Tested to 50M rows on one machine, warm and with caches dropped. The Gaia
   corpus uses the real DR3 density field but not real positions, and has no
   structure below its 0.11° map cells.
 - Better row estimates are demonstrated; better *plans* are not. On the join

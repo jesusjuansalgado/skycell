@@ -73,6 +73,11 @@
   \thispagestyle{plain}
 }
 
+%% A&A's table notes
+\newcommand{\tablefoot}[1]{\par\vspace{2pt}{\footnotesize #1\par}}
+\newcommand{\tablefootmark}[1]{\textsuperscript{#1}}
+\newcommand{\tablefoottext}[2]{\textsuperscript{#1}\,#2}
+
 \newenvironment{acknowledgements}%
   {\par\medskip\small\noindent\textit{Acknowledgements.} }%
   {\par\medskip}
