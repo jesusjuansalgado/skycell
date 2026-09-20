@@ -6,3 +6,10 @@ ext/results/
 ext/regression.*
 bench/results/
 __pycache__/
+
+# paper build artefacts
+paper/*.aux
+paper/*.log
+paper/*.out
+paper/preview.pdf
+paper/paper.pdf

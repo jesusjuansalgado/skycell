@@ -316,7 +316,12 @@ What the numbers say:
 - **End to end, in a TAP server**, none of this moved the published numbers:
   in an A/B against [egernia](https://github.com/ska-telescope/egernia) on a
   500k-row corpus, all 18 comparison cells tied, because the database is 1–3%
-  of a request whose cost is dominated by Python.
+  of a request whose cost is dominated by Python. Protocol and full results:
+  [`bench/tap-ab/`](bench/tap-ab/).
+
+The method, the validation and all of these measurements are written up in
+[`paper/`](paper/) (Astronomy & Astrophysics format; `make -C paper` builds a
+readable PDF without the journal's class, `make -C paper aa` with it).
 
 ---
 

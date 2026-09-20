@@ -192,3 +192,7 @@ CREATE FUNCTION ivo_healpix_index("order" int, p skypos) RETURNS int8
 AS 'MODULE_PATHNAME', 'ivo_healpix_index_pos' LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
 CREATE FUNCTION ivo_healpix_center("order" int, hpxindex int8) RETURNS skypos
 AS 'MODULE_PATHNAME' LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
+
+-- the four corners of a cell: ra, dec, ra, dec, ... (for plotting a covering)
+CREATE FUNCTION skycell_cell_corners("order" int, pix int8) RETURNS float8[]
+AS 'MODULE_PATHNAME' LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;

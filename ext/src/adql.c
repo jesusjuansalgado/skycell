@@ -593,6 +593,31 @@ skycell_pos_ra_dec(PG_FUNCTION_ARGS)
 	PG_RETURN_ARRAYTYPE_P(construct_array_builtin(d, 2, FLOAT8OID));
 }
 
+/* the four corners of a cell, as ra, dec, ra, dec, ... (degrees) */
+PG_FUNCTION_INFO_V1(skycell_cell_corners);
+Datum
+skycell_cell_corners(PG_FUNCTION_ARGS)
+{
+	int32		order = PG_GETARG_INT32(0);
+	int64		pix = PG_GETARG_INT64(1);
+	sc_vec3		c[4];
+	Datum		d[8];
+
+	if (order < 0 || order > SC_MAX_ORDER)
+		ereport(ERROR, (errcode(ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE),
+						errmsg("order must be within [0, %d]", SC_MAX_ORDER)));
+	if (pix < 0 || pix >= ((int64) 12 << (2 * order)))
+		ereport(ERROR, (errcode(ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE),
+						errmsg("cell index out of range for order %d", order)));
+	sc_pix_corners(order, pix, c);
+	for (int i = 0; i < 4; i++)
+	{
+		d[2 * i] = Float8GetDatum(atan2(c[i].y, c[i].x) * RAD2DEG);
+		d[2 * i + 1] = Float8GetDatum(asin(fmax(-1.0, fmin(1.0, c[i].z))) * RAD2DEG);
+	}
+	PG_RETURN_ARRAYTYPE_P(construct_array_builtin(d, 8, FLOAT8OID));
+}
+
 /* ------------------------------------------------------------------ */
 /* making `point(...) <@ region` an index scan                         */
 /* ------------------------------------------------------------------ */

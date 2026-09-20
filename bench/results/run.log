@@ -1,0 +1,345 @@
+restart Sun Sep 20 03:09:51 CEST 2026
+[03:09:51] data: 10000000 rows
+ setseed 
+---------
+ 
+(1 row)
+
+  kind   |  count  
+---------+---------
+ bulge   | 1200000
+ cluster |  800000
+ disk    | 4500000
+ uniform | 3500000
+(4 rows)
+
+[03:10:22] build tables and indexes
+NOTICE:  extension "q3c" already exists, skipping
+NOTICE:  extension "pg_sphere" already exists, skipping
+NOTICE:  extension "skycell" already exists, skipping
+NOTICE:  relation "bench_build" already exists, skipping
+  method  |  step   |  s   |  mb   
+----------+---------+------+-------
+ pgsphere | analyze |  0.8 |      
+ pgsphere | index   | 43.9 | 683.5
+ pgsphere | table   |  8.4 | 730.5
+ q3c      | analyze |  0.2 |      
+ q3c      | index   |  1.8 | 214.2
+ q3c      | table   |  8.0 | 574.5
+ skycell  | analyze |  1.4 |      
+ skycell  | index   |  2.3 | 214.2
+ skycell  | table   |  7.8 | 651.5
+(9 rows)
+
+[03:11:47] cone searches
+ setseed 
+---------
+ 
+(1 row)
+
+NOTICE:  drop cascades to function cone_sql(text,bench_centers)
+NOTICE:  relation "bench_cone" already exists, skipping
+NOTICE:  relation "bench_cone_x" already exists, skipping
+[03:11:48]   cone q3c
+ bench_cone_run 
+----------------
+ 
+(1 row)
+
+ bench_cone_run 
+----------------
+ 
+(1 row)
+
+ bench_cone_explain 
+--------------------
+ 
+(1 row)
+
+[03:11:59]   cone pgsphere
+ bench_cone_run 
+----------------
+ 
+(1 row)
+
+ bench_cone_run 
+----------------
+ 
+(1 row)
+
+ bench_cone_explain 
+--------------------
+ 
+(1 row)
+
+[03:12:00]   cone skycell
+ bench_cone_run 
+----------------
+ 
+(1 row)
+
+ bench_cone_run 
+----------------
+ 
+(1 row)
+
+ bench_cone_explain 
+--------------------
+ 
+(1 row)
+
+[03:12:01]   cone skycell [use_stats=off]
+ bench_cone_run 
+----------------
+ 
+(1 row)
+
+ bench_cone_run 
+----------------
+ 
+(1 row)
+
+ bench_cone_explain 
+--------------------
+ 
+(1 row)
+
+[03:12:02]   cone skycell [max_area_ratio=0]
+ bench_cone_run 
+----------------
+ 
+(1 row)
+
+ bench_cone_run 
+----------------
+ 
+(1 row)
+
+ bench_cone_explain 
+--------------------
+ 
+(1 row)
+
+[03:12:02]   cone skycell [range_cost=3]
+ bench_cone_run 
+----------------
+ 
+(1 row)
+
+ bench_cone_run 
+----------------
+ 
+(1 row)
+
+ bench_cone_explain 
+--------------------
+ 
+(1 row)
+
+[03:12:03]   cone skycell [range_cost=30]
+ bench_cone_run 
+----------------
+ 
+(1 row)
+
+ bench_cone_run 
+----------------
+ 
+(1 row)
+
+ bench_cone_explain 
+--------------------
+ 
+(1 row)
+
+[03:12:04] polygons
+ setseed 
+---------
+ 
+(1 row)
+
+NOTICE:  relation "bench_poly" already exists, skipping
+[03:12:04]   poly q3c
+ bench_poly_run 
+----------------
+ 
+(1 row)
+
+ bench_poly_run 
+----------------
+ 
+(1 row)
+
+[03:12:04]   poly pgsphere
+ bench_poly_run 
+----------------
+ 
+(1 row)
+
+ bench_poly_run 
+----------------
+ 
+(1 row)
+
+[03:12:06]   poly skycell
+ bench_poly_run 
+----------------
+ 
+(1 row)
+
+ bench_poly_run 
+----------------
+ 
+(1 row)
+
+[03:12:06] cross-match: 200000 probes
+ setseed 
+---------
+ 
+(1 row)
+
+NOTICE:  relation "bench_xmatch" already exists, skipping
+[03:12:07]   xmatch q3c r=1"
+ bench_xmatch_run 
+------------------
+ 
+(1 row)
+
+ bench_xmatch_run 
+------------------
+ 
+(1 row)
+
+[03:12:16]   xmatch pgsphere r=1"
+ bench_xmatch_run 
+------------------
+ 
+(1 row)
+
+ bench_xmatch_run 
+------------------
+ 
+(1 row)
+
+[03:12:25]   xmatch skycell_slots r=1"
+ bench_xmatch_run 
+------------------
+ 
+(1 row)
+
+ bench_xmatch_run 
+------------------
+ 
+(1 row)
+
+[03:12:31]   xmatch skycell_lateral r=1"
+ bench_xmatch_run 
+------------------
+ 
+(1 row)
+
+ bench_xmatch_run 
+------------------
+ 
+(1 row)
+
+[03:12:32]   xmatch q3c r=10"
+ bench_xmatch_run 
+------------------
+ 
+(1 row)
+
+ bench_xmatch_run 
+------------------
+ 
+(1 row)
+
+[03:12:38]   xmatch pgsphere r=10"
+ bench_xmatch_run 
+------------------
+ 
+(1 row)
+
+ bench_xmatch_run 
+------------------
+ 
+(1 row)
+
+[03:12:47]   xmatch skycell_slots r=10"
+ bench_xmatch_run 
+------------------
+ 
+(1 row)
+
+ bench_xmatch_run 
+------------------
+ 
+(1 row)
+
+[03:12:54]   xmatch skycell_lateral r=10"
+ bench_xmatch_run 
+------------------
+ 
+(1 row)
+
+ bench_xmatch_run 
+------------------
+ 
+(1 row)
+
+[03:12:56]   covering indexes (index-only cross-match)
+[03:13:01]   xmatch skycell_lateral_ios (covering) r=1"
+ bench_xmatch_run 
+------------------
+ 
+(1 row)
+
+ bench_xmatch_run 
+------------------
+ 
+(1 row)
+
+[03:13:04]   xmatch skycell_lateral_ios (covering) r=10"
+ bench_xmatch_run 
+------------------
+ 
+(1 row)
+
+ bench_xmatch_run 
+------------------
+ 
+(1 row)
+
+[03:13:06] stored footprints
+ setseed 
+---------
+ 
+(1 row)
+
+NOTICE:  relation "bench_fp" already exists, skipping
+NOTICE:  table "fp_meta" does not exist, skipping
+[03:13:08]   footprints pgsphere
+ bench_fp_run 
+--------------
+ 
+(1 row)
+
+ bench_fp_run 
+--------------
+ 
+(1 row)
+
+[03:13:10]   footprints skycell
+ bench_fp_run 
+--------------
+ 
+(1 row)
+
+ bench_fp_run 
+--------------
+ 
+(1 row)
+
+[03:13:11] export
+[03:13:14] done -> results/
+exit=0 Sun Sep 20 03:13:14 CEST 2026
