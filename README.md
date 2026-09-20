@@ -355,9 +355,29 @@ that.
 | index size / build, 50M | 1072 MB / 22 s | 3442 MB / 269 s | **1072 MB / 23 s** |
 | buffers touched, 1° / 3° | 329 / 649 | 154 / 617 | **55 / 343** |
 | convex polygons, median | 1.86 ms | 0.77 ms | **0.28 ms** |
-| cross-match 200k probes, 1″ | 7.05 s | 5.74 s | **0.50 s** |
+| cross-match 200k probes, 1″ (steady state, 50M rows) | **1.23 s** | 2.95 s | **1.08 s** |
 | 200k points in 20k footprints | not supported | 0.97 s, 1.1 MB | **0.76 s**, 9.5 MB |
 | planner row-estimate error, 1° | 1.9× | 2.8× | **1.22×** |
+
+**Cross-match — Q3C's own speciality.** 200k probes against 50M sources, each
+method warmed on its own block before timing, paired over 16 block-repetitions
+(`bench/11_xmatch_ab.sql`). Identical row counts from all four:
+
+| method | 1″ | 10″ | vs q3c_join | vs pgSphere |
+|---|---|---|---|---|
+| `q3c_join` | 1.23 s | 1.32 s | — | **0.42** |
+| pgSphere | 2.95 s | 3.22 s | *2.39* | — |
+| skycell, join form | 1.50 s | 1.85 s | 1.07 | **0.44** |
+| skycell, `LATERAL` | **1.08 s** | **1.43 s** | 0.78 [0.62, 1.00] | **0.30** |
+
+skycell is **level with `q3c_join`** (not faster — the intervals reach 1) and
+2.5–3.3× faster than pgSphere. So one index is competitive with each of the two
+established ones on the workload each was built for.
+
+Cache residency dominates this measurement and has to be controlled: the same
+block query takes 6.2 s cold and 0.32 s warm, so whichever method runs first on
+a block pays for the others. An uncontrolled run of ours reported skycell at
+2× Q3C — an artefact.
 
 **Does it get better at scale?** Repeated at **50M rows**, where pgSphere's
 index (3442 MB) no longer fits in `shared_buffers` (2048 MB) and skycell's

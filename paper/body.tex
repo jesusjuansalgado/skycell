@@ -43,8 +43,9 @@ and by 31--37\% at 3\degr, and the two are indistinguishable between 6\arcmin\ a
 1\degr; on the Gaia field skycell is 3\% slower at 6\arcmin. With caches dropped it is
 faster at every radius on both corpora (ratios 0.39--0.95), touching a third of
 pgSphere's buffer pages at 1\degr. It keeps an index of 214\,MB against pgSphere's
-685\,MB, builds it in 1.4\,s against 42\,s, answers convex polygons 2.7--4.4 times faster
-and a 200\,000-probe cross-match six to eleven times faster, and its row estimates are wrong by a
+685\,MB, builds it in 1.4\,s against 42\,s, answers convex polygons 2.7--4.4 times faster,
+matches \texttt{q3c\_join} on cross-matching -- the operation Q3C is built for -- while
+being 2.5--3.3 times faster than pgSphere at it, and its row estimates are wrong by a
 factor 1.2 rather than 2.5--3.0. The cost model's chosen cell order sits about one
 order coarser than the empirical optimum, which costs 0.8--2\% of query time, and its
 density estimate is unbiased wherever a density is defined at all. Raising the catalogue
@@ -83,6 +84,16 @@ be sorted along the same curve so that neighbours on the sky are neighbours on d
 pgSphere \citep{pgsphere} takes the other route: it adds spherical types -- points,
 circles, polygons, boxes -- and indexes them with GiST over bounding volumes, so that
 regions can be stored and queried as data, not only as query arguments.
+
+The scale this has to work at is set by archives already in operation. The ESA Gaia
+Archive \citep{gaiaarchive1, gaiaarchive2} serves a five-parameter astrometric
+catalogue of order $10^9$ sources through an extended TAP interface, and its published
+description puts cross-match -- matching a list of positions a user has uploaded
+against the catalogue -- among the server-side capabilities implemented beside the
+query interface itself, under the principle of moving the code close to the data rather
+than the data to the user. Cross-match is therefore not a synthetic benchmark
+operation: it is a service an archive of this kind is expected to provide, and
+Sect.~\ref{sec:xmatch} treats it as a first-class result rather than an afterthought.
 
 Neither idea is new to astronomy. The Hierarchical Triangular Mesh \citep{htm} had
 already keyed positions by a subdivided polyhedron, and the zones algorithm
@@ -937,14 +948,75 @@ against pgSphere's 0.767\,ms and Q3C's 1.864\,ms, and 0.142\,ms against 0.631 an
 percentile (21\,ms) are far above its median, which the per-query records trace to
 polygons whose bounding volume is a poor fit.
 
-Cross-matching 200\,000 probes at 1\arcsec\ takes 0.50\,s with the \texttt{LATERAL}
-form, against 4.81\,s for \texttt{skycell}'s own join form, 5.74\,s for pgSphere and
-7.05\,s for \texttt{q3c\_join} on the Gaia corpus; the designed corpus, measured on a
-warmer machine, gives 0.47\,s against 1.12, 2.85 and 1.95\,s. The advantage over
-pgSphere is therefore a factor 6--11 depending on corpus and cache state. The gap between the two \texttt{skycell} forms is plan
-shape, not geometry: the join form and \texttt{q3c\_join} both build a bitmap from
-several bitmap index scans for every probe, while the \texttt{LATERAL} form issues plain
-range scans, as many as that probe's covering needs.
+\subsection{Cross-matching}
+\label{sec:xmatch}
+
+Cross-matching a user's uploaded target list against the catalogue is the operation the
+Gaia archive lists among its server-side capabilities \citep{gaiaarchive1}, and it is
+Q3C's own speciality: \texttt{q3c\_join} is what most PostgreSQL archives use for it.
+It therefore deserves the same protocol as the cone searches rather than a single
+end-to-end run, and getting that protocol right turned out to matter more here than
+anywhere else in this paper.
+
+The probe table is split into eight blocks of 25\,000 probes, and a block is the unit
+of pairing: within a block all four methods run back to back in an order drawn for that
+block. Cache residency has to be controlled explicitly. At 50 million rows the three
+catalogues and their indexes are about 14\,GB against 2\,GB of \texttt{shared\_buffers},
+so a block's first touch is I/O bound -- the same \texttt{skycell} block query takes
+6.2\,s cold and 0.32\,s once its pages are resident. Whichever method runs first on a
+block therefore pays for the others, and that effect is larger than the difference
+between the methods: in a first version of this measurement, running first cost
+\texttt{skycell} a factor ten while leaving Q3C and pgSphere, whose own cost is several
+seconds, visibly unchanged. Each method is consequently warmed on its own query for its
+own block immediately before being timed, so that all four are measured in the same
+state and what is compared is the work each does.
+
+Table~\ref{tab:xmatch} gives the result at 50 million rows. All four methods return
+identical row counts in every block.
+
+\texttt{q3c\_join} is the fastest of the two established methods by a factor 2.4, which
+is what its reputation predicts. \texttt{skycell}'s \texttt{LATERAL} form is level with
+it -- 0.78 of its time at 1\arcsec\ with an interval that reaches 1.00, and 0.92 at
+10\arcsec, not distinguishable -- and 2.5 to 3.3 times faster than pgSphere. The join
+form, which emits a fixed number of range slots per outer row in the manner of
+\texttt{q3c\_join}, is level with Q3C at 1\arcsec\ and 35\% slower at 10\arcsec, where a
+fixed slot count fits the covering less well.
+
+The claim this supports is the narrow one: on the operation Q3C is built for,
+\texttt{skycell} is Q3C's equal rather than its better, while being two and a half to
+three times faster than pgSphere; and it reaches that position with the same index that
+answers the region queries of Sect.~\ref{sec:cones}, which is the point of the design.
+We note also what an uncontrolled measurement would have reported. Our own earlier run,
+one method after another with no per-method warming, gave 14\,s for \texttt{skycell}
+against 28\,s for Q3C and 41\,s for pgSphere -- a factor two over Q3C that is an
+artefact of which method paid for the first touch of each block.
+
+\begin{table}
+  \caption{Cross-matching 200\,000 probes against 50 million sources, steady state:
+    total time and the paired ratio to each rival over 16 block-repetitions.
+    \textbf{Bold}: interval excludes 1, the method in the row is faster;
+    \emph{italic}: interval excludes 1, slower. All methods return identical row
+    counts.}
+  \label{tab:xmatch}
+  \centering
+  \footnotesize
+  \begin{tabular}{l r r l l}
+    \hline\hline
+    & \multicolumn{2}{c}{total (s)} & \multicolumn{2}{c}{ratio at 1\arcsec} \\
+    \cline{2-3}\cline{4-5}
+    method & 1\arcsec & 10\arcsec & vs Q3C & vs pgS. \\
+    \hline
+    \texttt{q3c\_join}  & 1.23 & 1.32 & ---            & \textbf{0.42} \\
+                        &      &      &                & [0.36, 0.49] \\
+    pgSphere            & 2.95 & 3.22 & \emph{2.39}    & --- \\
+                        &      &      & [2.04, 2.82]   & \\
+    skycell, slots      & 1.50 & 1.85 & 1.07           & \textbf{0.44} \\
+                        &      &      & [0.89, 1.48]   & [0.38, 0.55] \\
+    skycell, lateral    & 1.08 & 1.43 & 0.78           & \textbf{0.30} \\
+                        &      &      & [0.62, 1.00]   & [0.26, 0.42] \\
+    \hline
+  \end{tabular}
+\end{table}
 
 For stored footprints, the MOC-in-a-B-tree arrangement answers the same 200\,474
 point-in-region pairs in 0.76\,s against pgSphere's 0.97\,s, with an index that is
@@ -1202,8 +1274,11 @@ state hand to whichever method is measured last, on two 10-million-row corpora -
 drawn from the real Gaia DR3 density field -- it is 6--11\% faster than pgSphere for
 cone radii of 1\arcsec--1\arcmin\ and 31--37\% faster at 3\degr\ warm, and faster at
 every radius with caches dropped, by a factor of up to 2.5. It answers convex polygons
-2.7--4.4 times faster, cross-matches six to eleven times faster, keeps an index a third the size of
-pgSphere's, builds it thirty times faster, and estimates row counts twice as accurately.
+2.7--4.4 times faster, keeps an index a third the size of pgSphere's, builds it thirty
+times faster, and estimates row counts twice as accurately. On cross-matching, the
+operation Q3C exists for, it is Q3C's equal (0.78--0.92 of its time, intervals reaching
+1) and 2.5--3.3 times faster than pgSphere -- so one index is competitive with each of
+the two established ones on the workload that each was built for.
 Its cost model's parameter is a property of the installation rather than of the sky, its
 chosen cell order costs 0.8--2\% against the best available order, and its density
 estimate is unbiased wherever a density is defined.

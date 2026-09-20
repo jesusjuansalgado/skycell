@@ -287,6 +287,28 @@ place: slower on small relations, slower on small cones over field-clustered dat
 indistinguishable at 6′–1° warm, slightly slower at 6′ on the Gaia field, no
 demonstrated plan improvement, one machine only.
 
+## Added after the first revision: the Gaia Archive references and cross-match
+
+Two further points, raised after the report:
+
+- The introduction now places the work against the **ESA Gaia Archive**
+  \citep{gaiaarchive1, gaiaarchive2}: an archive serving order 10^9 sources through an
+  extended TAP interface, whose published description puts cross-match among the
+  server-side capabilities implemented beside the query interface, under a
+  "move the code close to the data" principle. That is the motivation for treating
+  cross-match as a first-class result rather than an afterthought.
+- **Cross-match is now measured with the same protocol as the cone searches** (§6.5,
+  Table 9), and this corrected a claim. The previous number — a single end-to-end run
+  per method — reported skycell at 6–11× pgSphere and well ahead of `q3c_join`. That was
+  an artefact of cache residency: at 50M rows the catalogues do not fit in
+  `shared_buffers`, the same block query costs 6.2 s cold and 0.32 s warm, and whichever
+  method touched a block first paid for the rest. Warming each method on its own block
+  before timing it, and pairing over 16 block-repetitions, gives: `q3c_join` 1.23 s,
+  skycell `LATERAL` 1.08 s (ratio 0.78, interval reaching 1.00), skycell join form
+  1.50 s, pgSphere 2.95 s. **skycell is Q3C's equal at cross-matching, not its better**,
+  and 2.5–3.3× faster than pgSphere. We report the discarded number and why it was
+  wrong.
+
 ## Requests we did not fulfil
 
 We prefer to name these rather than leave them to be discovered:
