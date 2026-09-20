@@ -46,6 +46,7 @@
 #include "nodes/makefuncs.h"
 #include "nodes/nodeFuncs.h"
 #include "nodes/pathnodes.h"
+#include "optimizer/cost.h"
 #include "nodes/supportnodes.h"
 #include "optimizer/optimizer.h"
 #include "parser/parse_func.h"
@@ -69,7 +70,7 @@ PG_MODULE_MAGIC;
 #define MAX_SLOTS 16
 
 /* GUCs */
-static double skycell_range_cost = 30.0;
+static double skycell_range_cost = -1.0;
 static double skycell_split_cost = 1.0;
 static double skycell_max_area_ratio = 64.0;
 static int	skycell_max_ranges = 64;
@@ -86,8 +87,10 @@ void
 _PG_init(void)
 {
 	DefineCustomRealVariable("skycell.range_cost",
-							 "Cost of one extra index range, in rows.",
-							 NULL, &skycell_range_cost, 30.0, 0.0, 1e9,
+							 "Cost of one extra index range, in rows "
+							 "(-1: derive it from the relation's statistics and "
+							 "the planner's cost parameters).",
+							 NULL, &skycell_range_cost, -1.0, -1.0, 1e9,
 							 PGC_USERSET, 0, NULL, NULL, NULL);
 	DefineCustomRealVariable("skycell.split_cost",
 							 "Cost of refining one covering cell, in rows.",
@@ -130,11 +133,55 @@ _PG_init(void)
 	MarkGUCPrefixReserved("skycell");
 }
 
+/*
+ * The price of one index range, in rows, from the relation's own statistics
+ * and the planner's cost parameters.
+ *
+ * cost(s) in cover.h is in rows, so range_cost converts "one more B-tree range
+ * scan" into "the number of false-positive rows it is worth avoiding".  Both
+ * sides are things PostgreSQL already costs:
+ *
+ *   one more range  = a B-tree descent.  btcostestimate charges
+ *                     ceil(log2(N)) * 50 * cpu_operator_cost for the
+ *                     comparisons and (H + 1) * 50 * cpu_operator_cost for the
+ *                     pages of the descent.
+ *   one false row   = its index entry, its heap tuple, the exact predicate,
+ *                     and the heap page amortised over the rows that share it
+ *                     (reltuples / relpages of this very relation).
+ *
+ * The page term is what makes this per-relation rather than per-installation:
+ * a narrow catalogue row packs 120 to a page and amortises it away, while a
+ * wide observation row packs a handful and makes every false positive cost
+ * real page traffic, so the same query should be covered more finely there.
+ *
+ * random_page_cost is used unblended, which is the pessimistic end (it assumes
+ * the page is not resident).  That errs towards finer coverings; the cost
+ * curve is flat near its minimum, so the error is small either way.
+ */
+static double
+auto_range_cost(const sc_density *d)
+{
+	double		n = (d && d->ntotal > 1) ? d->ntotal : 1e6;
+	double		rpp = (d && d->relpages > 0 && d->ntotal > 0)
+		? d->ntotal / d->relpages : 100.0;
+	double		height = fmax(1.0, ceil(log(n) / log(300.0)));	/* btree fanout ~300 */
+	double		descent = (ceil(log(n) / log(2.0)) + height + 1.0)
+		* 50.0 * cpu_operator_cost;
+	double		per_row = cpu_tuple_cost + cpu_index_tuple_cost
+		+ 3.0 * cpu_operator_cost				/* the exact predicate */
+		+ random_page_cost / fmax(rpp, 1.0);
+
+	if (!(per_row > 0))
+		return 30.0;
+	return fmin(1e6, fmax(1.0, descent / per_row));
+}
+
 void
-current_params(sc_cover_params *p, int max_ranges)
+current_params(sc_cover_params *p, int max_ranges, const sc_density *d)
 {
 	sc_cover_params_default(p);
-	p->range_cost = skycell_range_cost;
+	p->range_cost = (skycell_range_cost < 0)
+		? auto_range_cost(d) : skycell_range_cost;
 	p->split_cost = skycell_split_cost;
 	p->max_area_ratio = skycell_max_area_ratio;
 	p->max_ranges = max_ranges;
@@ -377,15 +424,17 @@ load_density_from(Oid relid, Oid statrel, AttrNumber attnum, sc_density *d)
 	HeapTuple	tp;
 
 	d->ntotal = 0;
+	d->relpages = 0;
 	d->nbounds = 0;
 	d->bounds = NULL;
 
 	tp = SearchSysCache1(RELOID, ObjectIdGetDatum(relid));
 	if (HeapTupleIsValid(tp))
 	{
-		float4		reltuples = ((Form_pg_class) GETSTRUCT(tp))->reltuples;
+		Form_pg_class rd = (Form_pg_class) GETSTRUCT(tp);
 
-		d->ntotal = reltuples > 0 ? reltuples : 0;
+		d->ntotal = rd->reltuples > 0 ? rd->reltuples : 0;
+		d->relpages = rd->relpages > 0 ? rd->relpages : 0;
 		ReleaseSysCache(tp);
 	}
 	if (!skycell_use_stats)
@@ -714,7 +763,7 @@ simplify_cone(PlannerInfo *root, FuncExpr *fexpr)
 								 DatumGetFloat8(((Const *) list_nth(args, 3))->constvalue),
 								 DatumGetFloat8(((Const *) list_nth(args, 4))->constvalue),
 								 DatumGetFloat8(((Const *) list_nth(args, 5))->constvalue)));
-		current_params(&p, skycell_max_ranges);
+		current_params(&p, skycell_max_ranges, &dens);
 		cover_cached(&reg, &dens, &p, dens_statrel,
 					 DatumGetFloat8(((Const *) list_nth(args, 3))->constvalue),
 					 DatumGetFloat8(((Const *) list_nth(args, 4))->constvalue),
@@ -803,7 +852,7 @@ simplify_poly(PlannerInfo *root, FuncExpr *fexpr)
 
 	poly_from_array(DatumGetArrayTypeP(((Const *) poly)->constvalue), &reg);
 	density_for_var(root, cell, &dens, &dens_statrel);
-	current_params(&p, skycell_max_ranges);
+	current_params(&p, skycell_max_ranges, &dens);
 	sc_cover_compute(&reg, &dens, &p, &cov);
 	sel = (cov.area > 0) ? fmin(1.0, reg.area / cov.area) : 0.0;
 
@@ -1049,7 +1098,7 @@ skycell_cone_bound(PG_FUNCTION_ARGS)
 
 		slot_cache.valid = false;
 		check_err(sc_region_cone(&reg, ra0, dec0, radius));
-		current_params(&p, nslots);
+		current_params(&p, nslots, &d);
 		sc_cover_compute(&reg, &d, &p, &cov);
 		for (s = 0; s < cov.n && s < nslots; s++)
 		{
@@ -1140,6 +1189,7 @@ skycell_cone_ranges(PG_FUNCTION_ARGS)
 	sc_region	reg;
 	sc_cover	cov;
 	sc_cover_params p;
+	const sc_density *dens;
 
 	if (PG_ARGISNULL(0) || PG_ARGISNULL(1) || PG_ARGISNULL(2))
 	{
@@ -1147,8 +1197,9 @@ skycell_cone_ranges(PG_FUNCTION_ARGS)
 		return (Datum) 0;
 	}
 	check_err(sc_region_cone(&reg, PG_GETARG_FLOAT8(0), PG_GETARG_FLOAT8(1), PG_GETARG_FLOAT8(2)));
-	current_params(&p, skycell_max_ranges);
-	sc_cover_compute(&reg, density_from_args(fcinfo, 3), &p, &cov);
+	dens = density_from_args(fcinfo, 3);
+	current_params(&p, skycell_max_ranges, dens);
+	sc_cover_compute(&reg, dens, &p, &cov);
 	emit_ranges(fcinfo, &cov);
 	sc_cover_free(&cov);
 	return (Datum) 0;
@@ -1161,6 +1212,7 @@ skycell_poly_ranges(PG_FUNCTION_ARGS)
 	sc_region	reg;
 	sc_cover	cov;
 	sc_cover_params p;
+	const sc_density *dens;
 
 	if (PG_ARGISNULL(0))
 	{
@@ -1168,8 +1220,9 @@ skycell_poly_ranges(PG_FUNCTION_ARGS)
 		return (Datum) 0;
 	}
 	poly_from_array(PG_GETARG_ARRAYTYPE_P(0), &reg);
-	current_params(&p, skycell_max_ranges);
-	sc_cover_compute(&reg, density_from_args(fcinfo, 1), &p, &cov);
+	dens = density_from_args(fcinfo, 1);
+	current_params(&p, skycell_max_ranges, dens);
+	sc_cover_compute(&reg, dens, &p, &cov);
 	emit_ranges(fcinfo, &cov);
 	sc_cover_free(&cov);
 	return (Datum) 0;
@@ -1186,6 +1239,7 @@ skycell_cover_info(PG_FUNCTION_ARGS)
 	sc_region	reg;
 	sc_cover	cov;
 	sc_cover_params p;
+	const sc_density *dens;
 	TupleDesc	td;
 	Datum		v[7];
 	bool		n[7] = {0};
@@ -1193,8 +1247,9 @@ skycell_cover_info(PG_FUNCTION_ARGS)
 	if (PG_ARGISNULL(0) || PG_ARGISNULL(1) || PG_ARGISNULL(2))
 		PG_RETURN_NULL();
 	check_err(sc_region_cone(&reg, PG_GETARG_FLOAT8(0), PG_GETARG_FLOAT8(1), PG_GETARG_FLOAT8(2)));
-	current_params(&p, skycell_max_ranges);
-	sc_cover_compute(&reg, density_from_args(fcinfo, 3), &p, &cov);
+	dens = density_from_args(fcinfo, 3);
+	current_params(&p, skycell_max_ranges, dens);
+	sc_cover_compute(&reg, dens, &p, &cov);
 	if (get_call_result_type(fcinfo, NULL, &td) != TYPEFUNC_COMPOSITE)
 		elog(ERROR, "return type must be a row type");
 	v[0] = Int32GetDatum(cov.n);
@@ -1205,6 +1260,22 @@ skycell_cover_info(PG_FUNCTION_ARGS)
 	v[5] = Float8GetDatum(cov.rho);
 	v[6] = Int32GetDatum(cov.order);
 	PG_RETURN_DATUM(HeapTupleGetDatum(heap_form_tuple(BlessTupleDesc(td), v, n)));
+}
+
+/*
+ * skycell_range_cost(tbl, col) -> the price of one index range, in rows, that
+ * the cost model would use for this relation.  Exposed so that the derivation
+ * can be checked against a measured sweep rather than trusted.
+ */
+PG_FUNCTION_INFO_V1(skycell_range_cost_for);
+Datum
+skycell_range_cost_for(PG_FUNCTION_ARGS)
+{
+	const sc_density *d = density_from_args(fcinfo, 0);
+	sc_cover_params p;
+
+	current_params(&p, skycell_max_ranges, d);
+	PG_RETURN_FLOAT8(p.range_cost);
 }
 
 /* ------------------------------------------------------------------ */

@@ -29,6 +29,18 @@ LANGUAGE plpgsql AS $$
 DECLARE i int; n bigint; s float8; t0 timestamptz;
 BEGIN
   FOR i IN 1 .. array_length(methods, 1) LOOP
+    /*
+     * A method name of the form skycell@<x> is skycell with
+     * skycell.range_cost set to <x> for this query, so that two settings can
+     * be compared inside a trial rather than across runs.  Comparing them
+     * across runs measures machine drift: the cost curve is flat to ~10% over
+     * a factor 30 in this parameter, which is the same size as the drift.
+     */
+    IF methods[i] LIKE 'skycell@%' THEN
+      PERFORM set_config('skycell.range_cost', split_part(methods[i], '@', 2), true);
+    ELSIF methods[i] = 'skycell' THEN
+      PERFORM set_config('skycell.range_cost', '-1', true);
+    END IF;
     t0 := clock_timestamp();
     EXECUTE cone_sql(methods[i], c) INTO n, s;
     INSERT INTO bench_ab VALUES (corpus, cache, rep, c.qid, c.label, methods[i], i, n,

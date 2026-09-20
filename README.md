@@ -277,7 +277,7 @@ WHERE skycell_in_cone(p.ra, p.dec, f.ra0, f.dec0, f.r);
 
 | GUC | default | meaning |
 |---|---|---|
-| `skycell.range_cost` | 30 | price of one extra index range, in rows |
+| `skycell.range_cost` | -1 (derive) | price of one index range, in rows; -1 derives it from the relation's rows/page and the planner's cost factors |
 | `skycell.max_ranges` | 64 | cap on ranges per covering |
 | `skycell.max_area_ratio` | 64 | a partly covered cell may not exceed this × the region's area |
 | `skycell.use_stats` | on | use the histogram as a density map |
@@ -411,9 +411,30 @@ scan already reads exactly the pages it needs:
 | 0.5° cone + time/calib cuts | 1.26 | 1.33 | 0.96 |
 | empty cone | 1.31 | 1.14 | 1.00 |
 
-**Calibration.** `range_cost` swept over four decades gives the same optimum on
-both corpora (~100 at 30′–1°), so it is a property of the machine, not the sky.
-The default of 30 costs 11–21% there; the curve is flat-bottomed either side.
+**The one parameter, derived not configured.** `range_cost` converts "one more
+index range" into "false-positive rows worth avoiding" — a ratio of two costs
+PostgreSQL already models. Since 0.4 it defaults to `-1`, meaning:
+
+```
+          (ceil(log2 N) + H + 1) * 50 * cpu_operator_cost
+  ────────────────────────────────────────────────────────────────
+  cpu_tuple_cost + cpu_index_tuple_cost + k*cpu_operator_cost
+                 + random_page_cost / (reltuples/relpages)
+```
+
+`relpages` sits beside `reltuples` in the same catalogue tuple the density
+model already reads. It adapts per relation: **116** for these catalogues
+(120 rows/page), **93** for a wider ObsCore row (54 rows/page — each false
+positive costs more page traffic, so cut finer), **67** with the stock
+`random_page_cost` of 4.0.
+
+Measured honestly, this buys **no speed**: derived (116) against the constant
+it replaces (30), both in the same randomized trials, paired per query at 50M
+rows, gives ratios 0.93–1.08 with every interval containing 1. The cost curve
+is simply flat — at 1° every setting from 3 to 300 lies within 3%. What it
+buys is that nobody has to pick the number, and it can't be left at a value
+tuned for a different table. `skycell_range_cost('tbl')` reports it.
+
 The order the model picks sits ~1 order coarser than the empirically fastest,
 worth 0.8–2% of query time.
 

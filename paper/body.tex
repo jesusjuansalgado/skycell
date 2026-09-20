@@ -46,9 +46,11 @@ pgSphere's buffer pages at 1\degr. It keeps an index of 214\,MB against pgSphere
 685\,MB, builds it in 1.4\,s against 42\,s, answers convex polygons 2.7--4.4 times faster,
 matches \texttt{q3c\_join} on cross-matching -- the operation Q3C is built for -- while
 being 2.5--3.3 times faster than pgSphere at it, and its row estimates are wrong by a
-factor 1.2 rather than 2.5--3.0. The cost model's chosen cell order sits about one
-order coarser than the empirical optimum, which costs 0.8--2\% of query time, and its
-density estimate is unbiased wherever a density is defined at all. Raising the catalogue
+factor 1.2 rather than 2.5--3.0. The cost model's one parameter is
+derived from the relation's own statistics and the planner's cost factors rather than
+configured, its chosen cell order sits about one order coarser than the empirical
+optimum at a cost of 0.8--2\% of query time, and its density estimate is unbiased
+wherever a density is defined at all. Raising the catalogue
 to 50 million rows separates the two halves of the result: for regions of 30\arcmin\ and
 larger the advantage grows (at 1\degr, 0.85 to 0.64 warm and 0.53 to 0.27 cold), while
 for cones of an arcsecond to a few arcminutes it shrinks and reverses, skycell becoming
@@ -625,7 +627,8 @@ contest the measurement. Everything runs on one machine, with one core doing one
     Storage & NVMe SSD, through the VM's file system \\
     PostgreSQL & 18.6; \texttt{shared\_buffers} 2\,GB, JIT off,
       \texttt{max\_parallel\_workers\_per\_gather} 0 \\
-    Extensions & Q3C 2.0.5, pgSphere 1.5.2, skycell 0.3 \\
+    Extensions & Q3C 2.0.5, pgSphere 1.5.2, skycell 0.4 \\
+    \texttt{range\_cost} & derived per relation (Eq.~\ref{eq:crange}); 116 for the catalogues here \\
     Rows & $10^7$ per corpus (Gaia corpus: $9\,999\,729$); the Gaia corpus also at $5\times10^7$ ($50\,027\,391$) \\
     Q3C & \texttt{cat\_q3c(id, ra, dec, mag)}, B-tree on
       \texttt{q3c\_ang2ipix(ra, dec)}, heap ordered by the same \\
@@ -1053,56 +1056,96 @@ better join times are not. The value of an accurate estimate is insurance agains
 plan the optimiser would otherwise choose in a query we did not write; we have not shown
 that insurance paying off on a workload we did write.
 
-\subsection{Calibrating the cost model}
+\subsection{The cost model's one parameter, and how to stop setting it}
 \label{sec:calib}
 
-The one free parameter is $c_{\rm range}$. Table~\ref{tab:costmodel} sweeps it over four
-decades on both corpora. Three things follow.
+Equation~(\ref{eq:cost}) has one free parameter, $c_{\rm range}$. We first measured it,
+then removed it.
 
-The optimum is the same on both corpora -- about 10 at 1\arcsec, 3--30 at 1\arcmin\ and
-100 at 30\arcmin\ and 1\degr\ -- so it is a property of the machine, as
-Sect.~\ref{sec:cost} claims, and not of the sky.
+\paragraph{Measuring it.}
+Table~\ref{tab:costmodel} sweeps $c_{\rm range}$ over four decades at $10^7$ rows on
+both corpora. The curve is flat-bottomed: a factor of ten moves the median time by less
+than 25\% anywhere between 3 and 300, and at 1\arcsec\ four decades move it by 10\%,
+because there the covering is a single cell whatever the model says. Repeating the sweep
+at $5\times10^7$ rows flattens it further -- at 1\degr\ every setting from 3 to 300 lies
+within 3\% (0.70--0.72\,ms), and at 30\arcmin\ the minimum sits near 60 with 30 and 100
+within 12\% of it. Cold, the differences vanish into the noise of a single pass
+entirely.
 
-The default of 30 is not optimal: at 30\arcmin\ and 1\degr\ it costs 11--21\% against a
-setting of 100. A deployment that cares can calibrate in the time it takes to run this
-sweep; a deployment that does not is inside 20\% of the best available.
+\paragraph{Deriving it.}
+Because $c_{\rm range}$ is a ratio of two costs PostgreSQL already models, it need not be
+a constant at all. One more index range is a B-tree descent, which
+\texttt{btcostestimate} charges as $\lceil\log_2 N\rceil\cdot 50\cdot c_{\rm op}$ for the
+comparisons plus $(H+1)\cdot 50\cdot c_{\rm op}$ for the pages; one false-positive row
+costs its index entry, its heap tuple, the exact predicate, and the heap page amortised
+over the rows that share it:
 
-The curve is flat-bottomed. A factor of ten in $c_{\rm range}$ moves the median time by
-less than 25\% anywhere in the range 3--300, and at 1\arcsec\ four decades move it by
-10\%, because there the covering is a single cell whatever the model says. Cold, the
-differences between settings disappear into the noise of a single pass entirely
-(2.1--3.6\,ms at 30\arcmin\ with no ordering by $c_{\rm range}$), so the parameter is a
-warm-cache refinement.
+\begin{equation}
+  c_{\rm range} = \frac{(\lceil\log_2 N\rceil + H + 1)\,50\,c_{\rm op}}
+    {c_{\rm tuple} + c_{\rm itup} + k\,c_{\rm op} + c_{\rm page}/n_{\rm pp}},
+  \label{eq:crange}
+\end{equation}
+with $n_{\rm pp} = \mathrm{reltuples}/\mathrm{relpages}$ the rows per heap page.
 
-The order the model chooses can be compared directly with the best available order,
-because \texttt{skycell.force\_order} makes every order measurable for the same query.
-Averaged over 20 queries at each of four radii on the designed corpus, the model picks
-about one order coarser than the empirically fastest order, and pays 0.8--2.0\% of query
-time at the median and at most 11\% at the 90th percentile for doing so. The cost model
-does not need to be right; it needs to land in the flat region, and it does.
+Every input is already at hand: $\mathrm{relpages}$ sits beside $\mathrm{reltuples}$ in
+the \texttt{pg\_class} tuple the density model loads, and the cost factors are the
+planner's own GUCs. \texttt{skycell.range\_cost} defaults to $-1$, meaning evaluate
+Eq.~(\ref{eq:crange}).
 
-\begin{table*}
-  \caption{Median cone-search time (ms, warm) against \texttt{skycell.range\_cost},
-    40 queries per cell, on both corpora. The best setting in each row is in bold; the
-    default is 30.}
-  \label{tab:costmodel}
+The last term is what makes this per-relation rather than per-installation. On the
+10-million and 50-million-row catalogues, at 120 rows per page,
+Eq.~(\ref{eq:crange}) gives 116; on an ObsCore-shaped relation, whose wider rows pack 54
+to a page so that each false positive costs more page traffic, it gives 93, asking for a
+finer covering. With the stock \texttt{random\_page\_cost} of 4.0 instead of this host's
+1.1 it gives 67. All three lie inside the flat bottom measured above, and all are well
+above the fixed 30 we had shipped.
+
+\paragraph{What it buys.}
+Not speed. Measured in the way that can actually answer the question -- both settings
+placed in the same randomized trials, paired per query, so that no comparison crosses a
+run -- the derived value and the old fixed 30 are indistinguishable at every radius on
+the 50-million-row corpus: ratios 0.93 to 1.08, every interval containing 1
+(Table~\ref{tab:rcpaired}). What the derivation buys is that the parameter stops being a
+number someone has to choose, adapts to row width and to the storage the operator has
+described to the planner, and cannot silently be left at a value tuned for a different
+relation.
+
+We report this at some length because our own first attempt to answer it was wrong. We
+compared a run at the derived value against an earlier run at 30 and read off a 15\%
+penalty at 1\degr. Both runs were internally paired against pgSphere, but the comparison
+\emph{between} them crossed an hour of machine drift -- the same phase-ordering error
+this paper criticises in Sect.~\ref{sec:phase}, committed on our own parameter. Inside a
+single set of trials the effect disappears.
+
+\begin{table}
+  \caption{The derived $c_{\rm range}$ (116) against the previously shipped constant
+    (30), both in the same randomized trials at $5\times10^7$ rows, warm, paired per
+    query. No interval excludes 1.}
+  \label{tab:rcpaired}
   \centering
   \footnotesize
-  \begin{tabular}{l l rrrrrrrr}
+  \begin{tabular}{l c c c}
     \hline\hline
-    radius & corpus & 0.3 & 1 & 3 & 10 & 30 & 100 & 300 & 1000 \\
+    radius & derived / fixed & der.\ vs pgS. & fix.\ vs pgS. \\
     \hline
-    1\arcsec & designed & .021 & .020 & .020 & \textbf{.019} & .019 & .019 & .019 & .020 \\
-             & Gaia     & .020 & .019 & .019 & \textbf{.018} & .019 & .020 & .020 & .020 \\
-    1\arcmin & designed & .044 & .031 & .021 & .021 & \textbf{.020} & .021 & .020 & .022 \\
-             & Gaia     & .027 & .027 & \textbf{.020} & .024 & .031 & .020 & .029 & .022 \\
-    30\arcmin& designed & .166 & .156 & .100 & .083 & .069 & \textbf{.057} & .062 & .088 \\
-             & Gaia     & .187 & .175 & .142 & .094 & .080 & \textbf{.072} & .090 & .105 \\
-    1\degr   & designed & .201 & .185 & .181 & .147 & .121 & \textbf{.106} & .117 & .201 \\
-             & Gaia     & .243 & .234 & .232 & .231 & .197 & \textbf{.176} & .190 & .274 \\
+    1\arcsec  & 1.02 [0.97, 1.06] & 0.72 & 0.69 \\
+    10\arcsec & 1.00 [0.96, 1.03] & 0.74 & 0.76 \\
+    1\arcmin  & 0.97 [0.93, 1.06] & 0.80 & 0.78 \\
+    6\arcmin  & 1.07 [1.00, 1.19] & 0.89 & 0.79 \\
+    30\arcmin & 0.95 [0.86, 1.05] & 0.58 & 0.59 \\
+    1\degr    & 1.08 [0.90, 1.23] & 0.56 & 0.47 \\
+    3\degr    & 0.93 [0.78, 1.03] & 0.40 & 0.49 \\
     \hline
   \end{tabular}
-\end{table*}
+\end{table}
+
+\paragraph{The order it chooses.}
+The order the model picks can be compared directly with the best available order, because
+\texttt{skycell.force\_order} makes every order measurable for the same query. Averaged
+over 20 queries at each of four radii, the model picks about one order coarser than the
+empirically fastest, and pays 0.8--2.0\% of query time at the median and at most 11\% at
+the 90th percentile for doing so. The cost model does not need to be right; it needs to
+land in the flat region, and it does.
 
 \subsection{The density estimate against the truth}
 \label{sec:estimator}
@@ -1279,9 +1322,11 @@ times faster, and estimates row counts twice as accurately. On cross-matching, t
 operation Q3C exists for, it is Q3C's equal (0.78--0.92 of its time, intervals reaching
 1) and 2.5--3.3 times faster than pgSphere -- so one index is competitive with each of
 the two established ones on the workload that each was built for.
-Its cost model's parameter is a property of the installation rather than of the sky, its
-chosen cell order costs 0.8--2\% against the best available order, and its density
-estimate is unbiased wherever a density is defined.
+Its cost model's one parameter is derived from the relation's rows per page and the
+planner's cost factors rather than configured -- indistinguishable in speed from the
+constant it replaces, but no longer a number anyone has to choose -- its chosen cell
+order costs 0.8--2\% against the best available order, and its density estimate is
+unbiased wherever a density is defined.
 
 It is not the better choice everywhere, and scale sharpens rather than softens that.
 Raising the catalogue to 50 million rows widens the advantage for regions of

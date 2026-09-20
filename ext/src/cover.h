@@ -56,6 +56,13 @@ typedef struct sc_density
 	double		ntotal;			/* rows in the table */
 	int			nbounds;		/* histogram bounds (0 or 1 = uniform) */
 	const int64_t *bounds;		/* sorted order-29 cell ids */
+
+	/*
+	 * Pages in the table.  The covering does not use it; it is carried for the
+	 * caller's cost model (auto_range_cost() in skycell.c).  Last in the struct
+	 * so that positional initialisers elsewhere keep their meaning.
+	 */
+	double		relpages;
 } sc_density;
 
 typedef struct sc_cover_params

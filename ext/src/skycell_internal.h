@@ -11,7 +11,7 @@
 #include "cover.h"
 
 extern void check_err(const char *err);
-extern void current_params(sc_cover_params *p, int max_ranges);
+extern void current_params(sc_cover_params *p, int max_ranges, const sc_density *d);
 
 extern Const *int8_const(int64 v);
 extern Const *float8_const(double v);

@@ -704,7 +704,7 @@ skycell_region_support(PG_FUNCTION_ARGS)
 			PG_RETURN_POINTER(NULL);
 
 		skycell_region_from_datum(((Const *) rg)->constvalue, &reg);
-		current_params(&p, 64);
+		current_params(&p, 64, &dens);
 		if (reg.kind == SC_REGION_CONE)
 		{
 			ra0 = atan2(reg.center.y, reg.center.x) * RAD2DEG;

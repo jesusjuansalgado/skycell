@@ -36,6 +36,9 @@ CREATE OR REPLACE FUNCTION cone_sql(method text, c bench_centers) RETURNS text L
     WHEN 'q3c' THEN format('SELECT count(*), sum(mag) FROM cat_q3c WHERE q3c_radial_query(ra, dec, %s, %s, %s)', c.ra0, c.dec0, c.r)
     WHEN 'pgsphere' THEN format('SELECT count(*), sum(mag) FROM cat_sphere WHERE pos <@ scircle(spoint(radians(%s), radians(%s)), radians(%s))', c.ra0, c.dec0, c.r)
     WHEN 'skycell' THEN format('SELECT count(*), sum(mag) FROM cat_cell WHERE skycell_cone(cell, ra, dec, %s, %s, %s)', c.ra0, c.dec0, c.r)
+    ELSE CASE WHEN method LIKE 'skycell@%' THEN
+      format('SELECT count(*), sum(mag) FROM cat_cell WHERE skycell_cone(cell, ra, dec, %s, %s, %s)', c.ra0, c.dec0, c.r)
+    END
   END
 $$;
 
