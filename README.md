@@ -443,8 +443,18 @@ is simply flat — at 1° every setting from 3 to 300 lies within 3%. What it
 buys is that nobody has to pick the number, and it can't be left at a value
 tuned for a different table. `skycell_range_cost('tbl')` reports it.
 
-The order the model picks sits ~1 order coarser than the empirically fastest,
-worth 0.8–2% of query time.
+**Known defect — the model stops too coarse.** Forcing the covering 1–3
+orders finer than the cost model chooses is worth **15% at 1′, 48% at 6′, 30%
+at 30′** on the catalogue and **32%** on an ObsCore-shaped relation (where it
+turns a loss against pgSphere into a 37% win). The cause: the model estimates
+`n_ranges ≈ γ·r/s`, but after adjacent cells merge into ranges the count is
+nearly independent of cell size — 2.5 ranges for a 6′ cone whether cells are
+0.4° or 0.05°, where the formula predicts 20. So it charges ~10× too much for
+refining. `skycell.probe_orders` implements scoring candidate orders on the
+covering they actually produce; it is **off by default because it is
+measurably neutral** — the finer candidate loses the score to `split_cost`,
+which charges one row per cell examined and is not calibrated. That
+calibration is the open work.
 
 ## Testing
 
