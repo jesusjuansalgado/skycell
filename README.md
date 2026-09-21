@@ -618,6 +618,39 @@ positions, 100k probes, randomized method order, each method warmed, 3 reps
 on clustered targets**; the fixed-slot `skycell_join` form is flat across radius.
 Pick by radius, or use `skycell_join` if the radius varies.
 
+**Fixing it: the `skycell_cell_ops` operator class (v0.7).** The cause is a
+missing selectivity estimator, and selectivity comes from the operator, so the
+fix is skycell's own comparison operators carrying their own estimator in their
+own b-tree operator class. It is **opt-in and needs no migration** — indexes
+built the ordinary way keep working:
+
+```sql
+CREATE INDEX t_cell ON t (skycell_ang2cell(ra, dec) skycell_cell_ops);
+
+SELECT count(*) FROM probes p
+CROSS JOIN LATERAL skycell_cone_ranges(p.ra, p.dec, 1/3600.) g
+JOIN t ON skycell_ang2cell(t.ra, t.dec) #>= g.lo
+      AND skycell_ang2cell(t.ra, t.dec) #<= g.hi
+WHERE skycell_in_cone(t.ra, t.dec, p.ra, p.dec, 1/3600.);
+```
+
+On the 20.5M-row ObsCore relation, 400 probes at 1″:
+
+| | stock operators | `skycell_cell_ops` |
+|---|---|---|
+| inner scan estimate | 2,276,921 rows | **1 row** (true value) |
+| total plan cost | 617,792,278 | **74.8** |
+| plan chosen | Seq Scan on 20.5M rows | Index Scan + Memoize |
+| runtime | **>120 s (timeout)** | **50 ms** |
+
+Identical row counts against brute force. The estimator recovers the cone radius
+at plan time — from `skycell_cone_bound`'s constant argument in the join form, or
+by following the range variable to its function-scan entry in the `LATERAL` form
+— and returns √(cap fraction) per side so the pair multiplies to the cone's sky
+fraction. Where the bounds *are* constant it defers to the stock histogram
+estimator, which does better. Worth it only on wide relations: narrow catalogues
+showed no mis-planning in any of 36 cross-match measurements.
+
 > **Caveat — check the plan on wide relations.** Those numbers are from a narrow
 > 50M-row catalogue. Repeating the cross-match on the 20.5M-row *ObsCore-shaped*
 > relation (23 columns, 22 GB heap), both the `LATERAL` and the join form were

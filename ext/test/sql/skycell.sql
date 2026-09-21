@@ -72,6 +72,27 @@ SELECT (SELECT count(*) FROM cat WHERE skycell_radial_query(ra, dec, 10, 20, 0.5
 DROP TABLE probe;
 DROP INDEX cat_a2c;
 
+-- The cell-range operator class: same answers as the stock operators, and the
+-- estimator must not collapse to DEFAULT_INEQ_SEL when the bounds are not
+-- constant (which is what makes a cross-match plan a sequential scan).
+CREATE INDEX cat_sel ON cat (skycell_ang2cell(ra, dec) skycell_cell_ops);
+ANALYZE cat;
+CREATE TABLE pr2 AS SELECT ra, dec FROM cat ORDER BY id LIMIT 20;
+ANALYZE pr2;
+SELECT (SELECT count(*) FROM pr2 p
+        CROSS JOIN LATERAL skycell_cone_ranges(p.ra, p.dec, 0.05) g
+        JOIN cat c ON skycell_ang2cell(c.ra, c.dec) #>= g.lo
+                  AND skycell_ang2cell(c.ra, c.dec) #<= g.hi
+        WHERE skycell_in_cone(c.ra, c.dec, p.ra, p.dec, 0.05))
+     = (SELECT count(*) FROM pr2 p, cat c
+        WHERE skycell_in_cone(c.ra, c.dec, p.ra, p.dec, 0.05)) AS opclass_matches_brute_force,
+       plan_uses_index('SELECT count(*) FROM pr2 p
+        CROSS JOIN LATERAL skycell_cone_ranges(p.ra, p.dec, 0.05) g
+        JOIN cat c ON skycell_ang2cell(c.ra, c.dec) #>= g.lo
+                  AND skycell_ang2cell(c.ra, c.dec) #<= g.hi') AS opclass_indexed;
+DROP TABLE pr2;
+DROP INDEX cat_sel;
+
 -- cones: indexed vs sequential exact --------------------------------------
 CREATE TABLE cones AS
 SELECT q, CASE WHEN q % 3 = 0 THEN (SELECT ra FROM cat WHERE id = 1 + (q * 7919) % 100000)

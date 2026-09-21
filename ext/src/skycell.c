@@ -1091,6 +1091,105 @@ skycell_exact_support(PG_FUNCTION_ARGS)
 	PG_RETURN_POINTER(NULL);
 }
 
+/*
+ * Restriction selectivity for the cell-range quals.
+ *
+ * A covering becomes `cell >= lo AND cell <= hi`.  When lo and hi are constants
+ * the stock estimator reads the histogram and does well.  When they are not --
+ * a cross-match, where the bounds come from the probe row -- PostgreSQL has
+ * nothing to go on and returns DEFAULT_INEQ_SEL (1/3) for each side, so a pair
+ * of them estimates 1/9 of the table per probe.  On a 20-million-row relation
+ * that is 2.3 million rows where the truth is about one, the parameterised
+ * index path is costed out of existence, and the planner picks a sequential
+ * scan that we measured at more than 90 s against 145 ms for the path it
+ * rejected.
+ *
+ * The radius is recoverable in both shapes we emit, so the covering's sky
+ * fraction can be estimated instead of guessed:
+ *
+ *   join form     bound is skycell_cone_bound(ra, dec, radius, ...), radius Const
+ *   LATERAL form  bound is a Var of a function scan over
+ *                 skycell_cone_ranges(ra, dec, radius), radius Const
+ *
+ * Each of the two quals returns the square root of the cap fraction, so that
+ * their product is the fraction of the sphere the cone covers.  That ignores
+ * the covering's overshoot, so it is an under-estimate of the rows scanned by
+ * a factor of the area ratio (1.1 at a degree, up to ~100 at an arcsecond);
+ * it is wrong in the direction that favours the index path, which is the
+ * direction the measurement says is right, and it is five to six orders of
+ * magnitude closer than the default it replaces.
+ */
+static double
+radius_from_bound(PlannerInfo *root, Node *arg)
+{
+	if (arg && IsA(arg, FuncExpr))
+	{
+		FuncExpr   *f = (FuncExpr *) arg;
+
+		/* skycell_cone_bound(ra0, dec0, radius, i, nslots, ntotal, hist) */
+		if (list_length(f->args) == 7 && IsA(list_nth(f->args, 2), Const) &&
+			!((Const *) list_nth(f->args, 2))->constisnull)
+			return DatumGetFloat8(((Const *) list_nth(f->args, 2))->constvalue);
+	}
+	if (arg && IsA(arg, Var) && root && root->parse)
+	{
+		Var		   *v = (Var *) arg;
+
+		if (v->varlevelsup == 0 && v->varno >= 1 &&
+			v->varno <= list_length(root->parse->rtable))
+		{
+			RangeTblEntry *rte = rt_fetch(v->varno, root->parse->rtable);
+
+			if (rte->rtekind == RTE_FUNCTION && rte->functions)
+			{
+				RangeTblFunction *rtf = (RangeTblFunction *) linitial(rte->functions);
+
+				if (rtf->funcexpr && IsA(rtf->funcexpr, FuncExpr))
+				{
+					FuncExpr   *f = (FuncExpr *) rtf->funcexpr;
+
+					/* skycell_cone_ranges(ra0, dec0, radius [, tbl, col]) */
+					if (list_length(f->args) >= 3 && IsA(list_nth(f->args, 2), Const) &&
+						!((Const *) list_nth(f->args, 2))->constisnull)
+						return DatumGetFloat8(((Const *) list_nth(f->args, 2))->constvalue);
+				}
+			}
+		}
+	}
+	return -1;
+}
+
+PG_FUNCTION_INFO_V1(skycell_cellsel);
+Datum
+skycell_cellsel(PG_FUNCTION_ARGS)
+{
+	PlannerInfo *root = (PlannerInfo *) PG_GETARG_POINTER(0);
+	List	   *args = (List *) PG_GETARG_POINTER(2);
+	double		sel = 0.3333333333333333;	/* DEFAULT_INEQ_SEL */
+	double		r = -1;
+
+	if (list_length(args) == 2)
+	{
+		Node	   *other = (Node *) lsecond(args);
+
+		if (IsA(other, Const))
+		{
+			/* a constant cone: the histogram knows better than we do */
+			PG_RETURN_FLOAT8((float8) sel);
+		}
+		r = radius_from_bound(root, other);
+	}
+
+	if (r > 0)
+	{
+		double		rad = fmin(fmax(r * DEG2RAD, 0), M_PI);
+		double		cap = pow(sin(rad / 2.0), 2);	/* cap area / 4pi */
+
+		sel = sqrt(fmax(cap, 1e-14));
+	}
+	PG_RETURN_FLOAT8((float8) fmin(1.0, fmax(sel, 1e-8)));
+}
+
 /* ------------------------------------------------------------------ */
 /* the user-facing predicates (used as-is when not rewritten)         */
 /* ------------------------------------------------------------------ */
