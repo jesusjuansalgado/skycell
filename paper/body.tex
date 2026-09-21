@@ -52,7 +52,7 @@ being 2.5--3.3 times faster than pgSphere at it, and its row estimates are wrong
 factor 1.2 rather than 2.5--3.0. The cost model's one parameter is
 derived from the relation's own statistics and the planner's cost factors rather than
 configured, its chosen cell order costs about 3\% against the best
-available one, and its density estimate is unbiased wherever a density is defined at
+available one, and its density estimate is accurate to about 25\% on ordinary sky at
 all. Raising the catalogue
 to 50 million rows separates the two halves of the result: for regions of 30\arcmin\ and
 larger the advantage grows (at 1\degr, 0.85 to 0.60 warm and 0.53 to 0.31 cold), while
@@ -589,7 +589,7 @@ trips and frame conversions in the second.
 \section{Benchmark}
 \label{sec:bench}
 
-\subsection{Two corpora}
+\subsection{Three corpora}
 \label{sec:corpora}
 
 The first corpus is 10 million synthetic sources with a density contrast resembling a
@@ -612,6 +612,23 @@ it is locally Poisson. It is not a Gaia catalogue: no real positions are used, a
 structure finer than a map cell is absent by construction. What it tests is whether the
 cost model, which reads density at scales of a few times the query radius, behaves the
 same on a density field the authors did not invent. We call it the \emph{Gaia} corpus.
+
+The third corpus removes the remaining objection: it is made of real positions. We took
+ten million Gaia DR3 sources with \texttt{random\_index} $< 10^{7}$. Because
+\texttt{random\_index} is a precomputed random permutation of the catalogue, this is a
+uniform random \emph{thinning} of the true point process: every position is a measured
+position, and the two-point structure is preserved at every angular scale rather than
+only above a map cell. What thinning removes is absolute crowding -- a cluster core is
+still a cluster core, but at 0.55\% of its true surface density -- so we added $1.6$
+million sources forming eight \emph{complete} fields at full density: $\omega$~Cen,
+47~Tuc, M4, M13, Baade's Window, the Galactic centre, the LMC, and a control field off
+47~Tuc. We call these the \emph{real} corpus, and use it for the density-estimator and
+ablation measurements, where sub-cell structure is the whole question.
+
+The real corpus is held twice: once in cell order, and once in \texttt{random\_index}
+order, which is random on the sky. The second is an unclustered heap, and having both
+makes physical layout a variable we can measure rather than a condition we impose
+(Sect.~\ref{sec:ablation}).
 
 \subsection{Targets and layout}
 
@@ -749,6 +766,21 @@ about 300 buffer pages and 1.2\,ms of planning before any row is read
 (Table~\ref{tab:explain}). This is a property of that version's query path rather than of
 the cube quad-tree; Q3C's cross-match path, which uses four ranges per probe, does not
 pay it, and Sect.~\ref{sec:otherops} shows it performing accordingly.
+
+\label{sec:scope}
+We therefore state that result at three different strengths, because they are not
+equally supported. Against \texttt{q3c\_radial\_query} as implemented in 2.0.5, the
+factor 4--50 is a measurement we stand behind, and it is a comparison of
+\emph{implementations}. Against \texttt{q3c\_join}, which the Q3C authors intend for
+cross-matching and which does not carry the fixed expansion, the two are level
+(Sect.~\ref{sec:xmatch}); that is the comparison we regard as informative about the
+two indexing approaches. About the cube quad-tree as a \emph{method} we make no claim
+at all: a covering-aware radial query in Q3C would plausibly close most of the cone
+gap, and nothing here argues otherwise. pgSphere was used with the \texttt{spoint} and
+\texttt{spoly} types and a GiST index as its documentation prescribes, at default
+settings; we did not attempt to tune it further, and no method was given prepared
+statements or plan reuse -- which would help \texttt{skycell} most, since planning is
+the component that most differs between them.
 
 The order effect the randomization exists to control is small but real: averaged over
 all radii on the designed corpus, going first rather than last costs pgSphere 19\% and
@@ -1069,6 +1101,18 @@ covering is within a third of the region, is where it wins outright. Tightening 
 sub-arcsecond covering is an improvement independent of the planning cost, and neither
 subsumes the other.
 
+Which of \texttt{skycell}'s two forms is faster depends on the radius, and we were
+wrong to report one of them as the faster. Repeating the measurement on the real
+corpus across outer size, radius and target distribution (randomized method order
+within a cell, each warmed on its own query, three repetitions), the \texttt{LATERAL}
+form leads below about an arcsecond and loses badly above it: at $30\arcsec$ on
+clustered targets it takes 5682\,ms against the fixed-slot form's 896\,ms. The
+fixed-slot form is nearly flat in radius. Against \texttt{q3c\_join} the ratio over the
+twelve cells runs from 0.60 to 1.73 with no consistent winner, and against pgSphere
+\texttt{skycell} is 2--6 times faster throughout. The formulation is therefore a
+variable of its own, not a detail of the index, and a single cross-match number
+should not be read as a property of either method.
+
 The claim this supports is the narrow one: on the operation Q3C is built for,
 \texttt{skycell} is Q3C's equal rather than its better, while being two and a half to
 three times faster than pgSphere -- and it reaches that position with the same index
@@ -1181,19 +1225,82 @@ right -- it needs to land in the flat region, and it does.
 \subsection{The density estimate against the truth}
 \label{sec:estimator}
 
-The cost model's input is $\hat\rho$ from Eq.~(\ref{eq:rho}). Compared with the rows
-actually counted in the same footprint, it is unbiased where a density exists: the median
-ratio $\hat\rho/\rho_{\rm true}$ is 1.02 for the footprints a 1\degr\ cone reads
-(22\,548 rows in them), 1.02 at 30\arcmin\ (5452 rows), 0.89--0.91 at 6\arcmin\ (165),
-and 0.94 at 1\arcmin\ (39), with the 10th--90th percentile band widening from
-[0.92, 1.16] to [0.63, 1.34] as the footprint empties -- which is shot noise in the
-reference, not error in the estimate. Below about an arcminute the comparison stops
-meaning anything, because the footprint the model reads holds half a row on average;
-that is also the regime in which Sect.~\ref{sec:calib} shows the answer does not matter,
-since the covering is one cell whatever density is assumed. An equi-depth histogram is a
-poor two-dimensional density estimator in principle (Sect.~\ref{sec:density}); these
-measurements say that in practice it is good enough at the scales where its answer
-changes a decision.
+The cost model's input is $\hat\rho$ from Eq.~(\ref{eq:rho}). An earlier version of this
+work called it unbiased. That was a statement about the corpora we had: positions
+resampled from an order-9 density map contain no structure below $0.11\degr$, so the
+histogram cannot fail to resolve what is not there. On real Gaia DR3 positions it fails,
+and where it fails is not random.
+
+Table~\ref{tab:estimator} compares $\hat\rho$ with $\rho$ counted from the same
+relation, at six positions spanning four decades of surface density. On ordinary sky the
+estimate is good to about $\pm25\%$. In the core of a globular cluster it is \emph{low
+by a factor 8--12}, and at the Galactic centre \emph{high by a factor 3.7}. The complete,
+full-density fields show the mechanism directly: at radii $\le 0.05\degr$ the estimate is
+excellent (0.97--1.05 at $\omega$~Cen, the LMC and Baade's Window) and collapses to
+0.15--0.23 at $0.2\degr$. The histogram resolves a cluster while the query sits inside it
+and averages it away once the query is larger than it. This is the failure an equi-depth
+histogram over a space-filling key is expected to have (Sect.~\ref{sec:density}); what is
+new here is that it is measured, on real positions, rather than argued about.
+
+The consequence for the method is smaller than the size of the error suggests, and
+Sect.~\ref{sec:ablation} measures it: because $s^{*} \propto \sqrt{\rho}$, an order of
+magnitude in $\rho$ is a factor three in cell size, about one and a half orders, and the
+cost curve is flat across that. The covering the model chooses in a cluster core, where
+$\hat\rho$ is wrong by an order of magnitude, is within 1.09--1.43 of the best fixed
+order -- no worse than where the estimate is accurate. The quantity to judge the
+estimator by is the decision it produces, not the number it reports.
+
+\begin{table}
+  \caption{The density estimate against the truth, on \textbf{real Gaia DR3 positions}.
+    $\hat\rho$ is what the cost model reads; $\rho$ is counted from the same relation;
+    both in rows\,sr$^{-1}$. Six positions spanning four decades of surface density,
+    radii $0.01\degr$--$1\degr$.}
+  \label{tab:estimator}
+  \centering
+  \footnotesize
+  \begin{tabular}{l rr}
+    \hline\hline
+    field & median $\hat\rho/\rho$ & range \\
+    \hline
+    $\omega$~Cen           & \textbf{0.08} & 0.05--0.51 \\
+    47~Tuc                 & \textbf{0.12} & 0.06--0.93 \\
+    LMC                    & 0.76 & 0.25--0.93 \\
+    Baade's Window         & 0.80 & 0.68--1.01 \\
+    N galactic pole        & 0.90 & 0.53--1.28 \\
+    Galactic centre        & \textbf{3.74} & 2.53--3.95 \\
+    \hline
+  \end{tabular}
+\end{table}
+
+\subsection{What the advantage is made of}
+\label{sec:ablation}
+
+The comparison with pgSphere confounds three things: a covering whose resolution
+adapts, a compact B-tree over an integer key rather than a GiST over bounding boxes,
+and a heap laid out in the same space-filling order as the index. On the real Gaia
+corpus they separate as follows.
+
+\emph{Heap clustering} is a large absolute effect and almost no differential one. The
+same ten million rows, built once in cell order and once in \texttt{random\_index}
+order -- random on the sky -- cost 1.38, 1.66 and 2.08 times more unclustered for
+\texttt{skycell} at $10\arcsec$, $0.1\degr$ and $1\degr$, and 1.55, 1.69 and 2.22 times
+more for pgSphere. The ratio between the two methods barely moves (0.64 clustered
+against 0.60 unclustered at $1\degr$). Physically ordered tables therefore do not
+account for the comparison; they make both methods faster by about the same factor.
+
+\emph{The adaptive resolution} is worth a great deal. Measured against every fixed
+order from 4 to 13, the penalty for choosing a fixed order badly is 345, 243 and 830
+times at the three radii, and the best fixed order moves from 12--13 at $10\arcsec$ to
+7--8 at $0.5\degr$: no single resolution is defensible across the range. The cost
+model, which does not know the answer, lands within 1.02--1.58 of the best (median
+1.17) -- including in cluster cores where its density input is wrong by an order of
+magnitude, which is the evidence behind Sect.~\ref{sec:estimator}.
+
+\emph{The index representation} is isolated by comparing against Q3C rather than
+pgSphere, since both are B-trees over an \texttt{int8} key: what differs is the
+covering strategy alone. We report that comparison in Sect.~\ref{sec:cones}, with the
+caveat of Sect.~\ref{sec:scope} that it is dominated by one version's fixed expansion
+into a hundred ranges.
 
 \section{Inside a TAP service, and where the crossover is}
 \label{sec:tap}
@@ -1384,7 +1491,8 @@ Its cost model's one parameter is derived from the relation's rows per page and 
 planner's cost factors rather than configured -- indistinguishable in speed from the
 constant it replaces, but no longer a number anyone has to choose -- its chosen cell
 order costs about 3\% against the best available one, measured with the two interleaved,
-and its density estimate is unbiased wherever a density is defined.
+and its density estimate, though poor in cluster cores, is accurate enough to pick a
+covering within 1.6 of the best available one.
 
 It is not the better choice everywhere, and scale sharpens the distinction rather than
 removing it. Raising the catalogue to 50 million rows widens the advantage for regions of

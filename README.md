@@ -348,7 +348,7 @@ the cross-match, which is why there is no separate join function underneath.
 
 | Function | Returns | Notes |
 |---|---|---|
-| `skycell_cone_ranges(ra0, dec0, radius [, tbl, col])` | `SETOF (lo, hi)` | the covering as index ranges — the `LATERAL` cross-match form, the fastest one measured |
+| `skycell_cone_ranges(ra0, dec0, radius [, tbl, col])` | `SETOF (lo, hi)` | the covering as index ranges — the `LATERAL` cross-match form. Fastest at sub-arcsecond radii; **6× slower than `skycell_join` at 30″ on clustered targets** (see below) |
 | `skycell_poly_ranges(poly [, tbl, col])` | `SETOF (lo, hi)` | the same for a polygon |
 | `skycell_cone_moc(ra0, dec0, radius [, max_cells, max_order])` | `int8[]` | the covering as IVOA MOC `NUNIQ` cells — store these to index a region |
 | `skycell_poly_moc(poly [, max_cells, max_order])` | `int8[]` | likewise |
@@ -600,6 +600,23 @@ method warmed on its own block before timing, paired over 16 block-repetitions
 skycell is **level with `q3c_join`** (not faster — the intervals reach 1) and
 2.5–3.3× faster than pgSphere. So one index is competitive with each of the two
 established ones on the workload each was built for.
+
+**Which skycell form to use depends on the radius.** On 10M real Gaia DR3
+positions, 100k probes, randomized method order, each method warmed, 3 reps
+(`bench/18_xmatch_sweep.sql`):
+
+| targets | radius | `q3c_join` | skycell `LATERAL` | `skycell_join` | pgSphere |
+|---|---|---|---|---|---|
+| clustered | 0.2″ | 909 | **545** | 889 | 2790 |
+| clustered | 1″ | 540 | **452** | 917 | 2999 |
+| clustered | 30″ | 960 | *5682* | **896** | 2852 |
+| uniform | 0.2″ | 433 | **427** | 547 | 1200 |
+| uniform | 1″ | 377 | **353** | 652 | 1336 |
+| uniform | 30″ | **460** | 515 | 676 | 1654 |
+
+(ms). The `LATERAL` form wins below about an arcsecond and **loses badly at 30″
+on clustered targets**; the fixed-slot `skycell_join` form is flat across radius.
+Pick by radius, or use `skycell_join` if the radius varies.
 
 > **Caveat — check the plan on wide relations.** Those numbers are from a narrow
 > 50M-row catalogue. Repeating the cross-match on the 20.5M-row *ObsCore-shaped*

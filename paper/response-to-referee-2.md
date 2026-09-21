@@ -303,6 +303,48 @@ numbers are the conservative case. §5.2 now states this.
 
 ---
 
+## Major 7 — cross-matching: method versus formulation
+
+> *"Present the cross-match results with greater separation between the indexing
+> method and the query formulation."*
+
+Done, on real Gaia positions, across outer-table size (1k, 100k), radius (0.2″,
+1″, 30″) and target distribution (drawn from the catalogue, so clustered; and
+uniform on the sphere). Randomized method order within each cell, each method
+warmed on its own query, three repetitions.
+
+Two findings, one of which corrects the manuscript.
+
+**The claim that survives.** Against `q3c_join` the two are level: the ratio
+ranges from 0.60 to 1.73 across the twelve cells with no consistent winner.
+Against pgSphere skycell is 2–6× faster throughout. Both reproduce what the
+paper reported on the resampled corpus, now on real positions and over a much
+wider matrix.
+
+**The claim that does not.** The manuscript describes the `LATERAL` form as
+"the fastest one measured". That is true only at small radii. At 30″ with
+clustered targets it takes 5682 ms against the fixed-slot form's 896 ms — six
+times worse — while at 0.2″ it is the best of the four. The ordering between
+*our own two formulations* reverses with radius, which is precisely the referee's
+point: the formulation is a variable in its own right and cannot be folded into
+a statement about the index. §6.5 now reports both forms across the matrix and
+says which regime each suits.
+
+**A methodological note we think worth recording.** Our first version of this
+sweep ran the four formulations in a fixed order with no per-method warm-up. It
+made whichever formulation ran third appear 6–45× faster than it is — in that
+run `skycell_join` looked 6.7× faster than `q3c_join` at 100k probes, where the
+corrected measurement puts it 1.7× slower. This is the same confound that
+Sect.~5 was written to remove, and we reproduced it in a new script a week after
+writing that section. We report it because it bears on how much weight any
+single cross-match number in this literature should carry.
+
+No formulation was planned as a sequential scan in any of the 36 measurements,
+and none timed out, which localises the planning defect of major 9 to wide
+relations rather than to the range-join formulation itself.
+
+---
+
 ## Major 8 — the Gaia-scale extrapolation
 
 Every extrapolated quantity is now labelled as an estimate, with its assumption
