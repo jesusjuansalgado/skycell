@@ -130,6 +130,21 @@ docker run -d --name skycell-pg -e POSTGRES_PASSWORD=skycell -e POSTGRES_DB=skyc
 docker exec -w /work/ext skycell-pg make with_llvm=no install
 ```
 
+### Translating ADQL
+
+[`adql_parser/`](adql_parser/) holds reference translators in Python and Java
+that turn ADQL geometry into SQL — for skycell, or for the pgSphere+Q3C pair, so
+you can compare the two on your own queries:
+
+```bash
+python3 adql_parser/python/skycell_adql.py \
+  "SELECT * FROM t WHERE CONTAINS(POINT('ICRS', ra, dec), CIRCLE('ICRS', 10, 20, 0.5)) = 1"
+# SELECT * FROM t WHERE (point('ICRS', ra, dec) <@ circle('ICRS', 10, 20, 0.5))
+```
+
+Both ADQL 2.0 and 2.1 are accepted; the two implementations are checked to
+produce identical output.
+
 ### ADQL names and `search_path`
 
 The functions are named as ADQL names them. PostgreSQL has its own
@@ -147,131 +162,181 @@ Without that, the forms carrying ADQL's coordinate-system argument —
 `skycell_point`, `skycell_circle`, `skycell_box`, `skycell_polygon` are
 prefixed aliases for the rest.
 
-### Indexing a table
+### Setting up a table
 
-Either key on the coordinate columns:
+What you index depends on how the positions arrive. In all three cases the
+index is an ordinary B-tree on a 64-bit key, and `ANALYZE` afterwards is not
+optional — the covering reads that histogram as its density map.
 
-```sql
-CREATE INDEX ON cat (skycell_ang2cell(ra, dec));
-```
-
-or store positions as a `skypos` column:
-
-```sql
-ALTER TABLE cat ADD COLUMN pos skypos;
-UPDATE cat SET pos = skycell_point(ra, dec);
-CREATE INDEX ON cat (skycell_cell(pos));
-```
-
-Two things pay off and neither is required: sorting the table along the cell
-order (`CREATE TABLE … ORDER BY skycell_ang2cell(ra, dec)`, so neighbouring
-sources share heap pages), and a finer histogram on the key
-(`ALTER TABLE … ALTER COLUMN … SET STATISTICS 1000`, so the density map is
-sharper).
-
----
-
-## Operators and functions
-
-### The ADQL surface
-
-| skycell | ADQL |
-|---|---|
-| `point(ra, dec)`, `point('ICRS', ra, dec)` → `skypos` | `POINT` |
-| `circle(ra, dec, radius)`, `circle('ICRS', …)` → `skyregion` | `CIRCLE` |
-| `box(ra, dec, width, height)`, `box('ICRS', …)` | `BOX` |
-| `polygon(ra1, dec1, ra2, dec2, …)`, `polygon('ICRS', …)` | `POLYGON` |
-| `contains(skypos, skyregion) → int`, `contains(skyregion, skyregion)` | `CONTAINS` |
-| `intersects(skypos, skyregion) → int`, `intersects(skyregion, skyregion)` | `INTERSECTS` |
-| `distance(skypos, skypos) → float8`, `distance(ra1, dec1, ra2, dec2)` | `DISTANCE` |
-| `area(skyregion) → float8` (square degrees) | `AREA` |
-| `coord1(skypos)`, `coord2(skypos)`, `centroid(skyregion)` | `COORD1`, `COORD2`, `CENTROID` |
-
-All angles are degrees, ICRS. `contains` and `intersects` return 1 or 0, so
-`1 = CONTAINS(...)` translates literally.
-
-### Operators — the indexable spelling
-
-| operator | meaning |
-|---|---|
-| `skypos <@ skyregion` | position inside region (**rewritten into an index scan**) |
-| `skyregion @> skypos` | the same, commuted |
-| `skyregion && skyregion` | regions overlap |
-| `skyregion @> skyregion` | region covers region |
-| `skypos <-> skypos` | angular distance, degrees |
-
-`contains(p, r) = 1` and `p <@ r` return the same rows; the operator is the
-form the planner can answer from the index.
-
-### Astronomy
-
-Named after the IVOA UDF registry, so ADQL written for other services runs
-unchanged:
-
-| function | what it does |
-|---|---|
-| `ivo_epoch_prop(ra, dec, parallax, pmra, pmdec, rv, ref_epoch, out_epoch)` | the whole six-parameter solution propagated, as `{ra, dec, parallax, pmra, pmdec, rv}` |
-| `ivo_epoch_prop_pos(…8 args…)` → `skypos` | just the propagated position |
-| `ivo_epoch_prop_pos(ra, dec, pmra, pmdec, ref_epoch, out_epoch)` | the same without parallax or radial velocity |
-| `ivo_apply_pm(ra, dec, pmra, pmdec, epdiff)` | proper motion over `epdiff` years |
-| `skycell_pm_margin(pmra, pmdec, dt)` | how far that motion can carry a source, in degrees |
-| `icrs2gal`, `gal2icrs`, `icrs2ecl`, `ecl2icrs` | frame conversions on a `skypos` |
-| `ivo_healpix_index(order, ra, dec)`, `ivo_healpix_index(order, skypos)` | HEALPix index, nested |
-| `ivo_healpix_center(order, index)` → `skypos` | the cell's centre |
-
-Epoch propagation is the rigorous Hipparcos/Gaia formulation (ESA SP-1200
-§1.5.5): the star travels a straight line in space, so parallax, proper motion
-and radial velocity all evolve, and propagating a solution forward and back
-returns the starting position to below a µas.
-
-**Proper motion in a cone search.** An index on catalogue positions cannot
-know where a star moved to, so widen the search and filter exactly:
+**1. A catalogue with `ra`/`dec` columns.** The common case. Index the
+expression; no schema change is needed:
 
 ```sql
-SELECT * FROM cat
-WHERE pos <@ circle('ICRS', :ra, :dec, :r + skycell_pm_margin(:max_pmra, :max_pmdec, :dt))
-  AND ivo_epoch_prop_pos(ra, dec, parallax, pmra, pmdec, rv, 2016, :epoch) <@ circle('ICRS', :ra, :dec, :r);
+CREATE INDEX cat_cell_idx ON cat (skycell_ang2cell(ra, dec));
+ALTER INDEX cat_cell_idx ALTER COLUMN 1 SET STATISTICS 1000;
+ANALYZE cat;
 ```
 
-The first condition is the index scan, the second is exact.
-
-### Coverings, cross-matches and stored regions
-
-| function | purpose |
-|---|---|
-| `skycell_ang2cell(ra, dec)`, `skycell_cell(skypos)` | the order-29 key |
-| `skycell_ang2pix(order, ra, dec)` | the key at any order |
-| `skycell_cone(cell, ra, dec, ra0, dec0, radius)` | the low-level indexable cone predicate |
-| `skycell_poly(cell, ra, dec, float8[])` | the same for a convex polygon |
-| `skycell_cone_ranges(ra0, dec0, radius, tbl, col)` | a covering as rows, for `LATERAL` cross-matches |
-| `skycell_cover_info(ra0, dec0, radius, tbl, col)` | ranges, steps, depth, expected rows, area ratio |
-| `skycell_cone_moc(ra0, dec0, r, max_cells)`, `skycell_poly_moc(…)` | a region as NUNIQ cells |
-| `skycell_ancestors(cell, min_order, max_order)` | a point's ancestor cells, for footprint lookups |
-| `skycell_nuniq_lo/hi/order(nuniq)` | NUNIQ helpers |
-
-Cross-matching an uploaded table is fastest through the ranges function, which
-gives each probe its own covering and plain B-tree range scans:
+**2. A catalogue you can reorganise.** Storing the key and sorting the heap by
+it is worth it for a large table: neighbouring sky lands on neighbouring pages,
+so a cone reads fewer of them. This is what the benchmark tables use:
 
 ```sql
-SELECT p.id, c.id
-FROM probe p
-CROSS JOIN LATERAL skycell_cone_ranges(p.ra, p.dec, 1/3600.0, 'cat') g
-JOIN cat c ON c.cell BETWEEN g.lo AND g.hi
-WHERE skycell_in_cone(c.ra, c.dec, p.ra, p.dec, 1/3600.0);
+CREATE TABLE cat AS
+  SELECT id, ra, dec, mag, skycell_ang2cell(ra, dec) AS cell
+  FROM staging ORDER BY 5;                      -- heap in key order
+CREATE INDEX ON cat (cell);
+ALTER TABLE cat ALTER COLUMN cell SET STATISTICS 1000;
+ANALYZE cat;
+VACUUM (FREEZE) cat;
 ```
 
-Storing footprints:
+**3. Regions rather than positions** (observation footprints, tiles, MOCs).
+Store each region's covering as MOC cells, one row per cell, and index those:
 
 ```sql
 CREATE TABLE fp_cells AS
-SELECT fid, unnest(skycell_cone_moc(ra0, dec0, r, 8)) AS nuniq FROM footprint;
+  SELECT fid, unnest(skycell_cone_moc(ra0, dec0, radius, 8)) AS nuniq
+  FROM footprint;                               -- 8 cells per region
 CREATE INDEX ON fp_cells (nuniq);
+ANALYZE fp_cells;
+```
 
+A position's candidate regions are then those whose cell is one of its
+ancestors — a handful of equality lookups, followed by the exact test:
+
+```sql
 SELECT f.* FROM probe p
 JOIN fp_cells fc ON fc.nuniq = ANY (skycell_ancestors(p.cell, 4, 11))
 JOIN footprint f ON f.fid = fc.fid
-WHERE skycell_in_cone(p.ra, p.dec, f.ra0, f.dec0, f.r);
+WHERE skycell_in_cone(p.ra, p.dec, f.ra0, f.dec0, f.radius);
 ```
+
+**Settings worth knowing.** The statistics target governs how finely the
+density map resolves: 1000 is a good default for 10⁷ rows and above, the
+PostgreSQL default of 100 is coarse for a crowded sky. Nothing else needs
+setting — `range_cost` derives itself from the relation (see
+[Settings](#settings)).
+
+**After bulk ingestion**, re-run `ANALYZE`: the covering is computed from the
+statistics, so a table whose density structure has changed since the last one
+is covered for the sky it used to have.
+
+**Checking it worked.** The plan should show an index scan and a
+`skycell_in_*` filter:
+
+```sql
+EXPLAIN (ANALYZE, BUFFERS)
+SELECT * FROM cat WHERE point('ICRS', ra, dec) <@ circle('ICRS', 266.4, -28.9, 0.05);
+```
+
+If you get a sequential scan, the usual causes are a missing `ANALYZE`, a
+region that is not a constant (the rewrite needs constant geometry — use
+`skycell_cone_ranges()` in a `LATERAL` for per-row regions), or the index being
+on a different expression than the query's position argument.
+
+## Operators and functions
+
+Every function skycell installs, one by one. Types are `skypos` (a position) and
+`skyregion` (a cone, box or convex polygon). The `coordsys` argument is accepted
+for ADQL compatibility and must be `'ICRS'`; convert other frames first with
+`gal2icrs()` / `ecl2icrs()`.
+
+### Geometry — ADQL's own spellings
+
+| Function | Returns | Notes |
+|---|---|---|
+| `point(ra, dec)`<br>`point(coordsys, ra, dec)` | `skypos` | degrees. ADQL `POINT` |
+| `circle(ra, dec, radius)`<br>`circle(coordsys, ra, dec, radius)` | `skyregion` | radius in degrees. ADQL `CIRCLE` |
+| `box(ra, dec, width, height)`<br>`box(coordsys, …)` | `skyregion` | centre and extent, as ADQL defines it. Errors if it reaches a pole — use a polygon there. ADQL `BOX` |
+| `polygon(ra1, dec1, ra2, dec2, …)`<br>`polygon(coordsys, …)` | `skyregion` | ≥ 3 vertices, **convex**, smaller than a hemisphere. ADQL `POLYGON` |
+| `contains(p skypos, r skyregion)`<br>`contains(a skyregion, b skyregion)` | `integer` (1/0) | ADQL `CONTAINS`. For an *indexable* test use the `<@` operator below |
+| `intersects(p skypos, r skyregion)`<br>`intersects(a skyregion, b skyregion)` | `integer` (1/0) | ADQL `INTERSECTS` |
+| `distance(a skypos, b skypos)`<br>`distance(ra1, dec1, ra2, dec2)` | `float8` | degrees. ADQL `DISTANCE`, both forms |
+| `area(r skyregion)` | `float8` | square degrees. ADQL `AREA` |
+| `coord1(p)` / `coord2(p)` | `float8` | right ascension / declination, degrees |
+| `centroid(r skyregion)` | `skypos` | ADQL `CENTROID` |
+
+If a bare name collides with `pg_catalog` (`point`, `circle`, `box`, `polygon`
+all exist there), either install into a schema that precedes it in
+`search_path`, or use the prefixed aliases: `skycell_point`, `skycell_circle`,
+`skycell_box`, `skycell_polygon`.
+
+### Operators — the indexable spelling
+
+| Operator | Meaning |
+|---|---|
+| `skypos <@ skyregion` | position inside region — **this is the one the planner rewrites into index ranges** |
+| `skyregion @> skypos` | the same, reversed |
+| `skyregion @> skyregion` | region wholly contains region |
+| `skyregion && skyregion` | regions overlap |
+
+Only `<@` / `@>` against a **constant** region are rewritten. For a region that
+varies per row (a cross-match), use `skycell_cone()` or
+`skycell_cone_ranges()`.
+
+### The index key
+
+| Function | Returns | Notes |
+|---|---|---|
+| `skycell_ang2cell(ra, dec)` | `int8` | the order-29 HEALPix cell — **index this** |
+| `skycell_cell(p skypos)` | `int8` | same, from a `skypos` column |
+| `skycell_ang2pix(order, ra, dec)` | `int8` | the cell at any order |
+| `skycell_cell_corners(order, pix)` | `float8[]` | the four corners, as ra, dec, … |
+
+### Indexable predicates (what the rewrite emits, and what you write by hand)
+
+| Function | Notes |
+|---|---|
+| `skycell_cone(cell, ra, dec, ra0, dec0, radius)` | cone test; with a constant cone the planner turns it into index ranges, with a per-row cone into range slots (a cross-match) |
+| `skycell_poly(cell, ra, dec, poly float8[])` | the same for a convex polygon |
+| `skycell_in_cone(ra, dec, ra0, dec0, radius [, sel])` | the exact test alone, no index |
+| `skycell_in_poly(ra, dec, poly [, sel])` | likewise |
+| `skycell_in_region(p skypos, r skyregion [, sel])` | likewise, on the types |
+
+### Coverings, cross-matches and stored regions
+
+| Function | Returns | Notes |
+|---|---|---|
+| `skycell_cone_ranges(ra0, dec0, radius [, tbl, col])` | `SETOF (lo, hi)` | the covering as index ranges — the `LATERAL` cross-match form, the fastest one measured |
+| `skycell_poly_ranges(poly [, tbl, col])` | `SETOF (lo, hi)` | the same for a polygon |
+| `skycell_cone_moc(ra0, dec0, radius [, max_cells, max_order])` | `int8[]` | the covering as IVOA MOC `NUNIQ` cells — store these to index a region |
+| `skycell_poly_moc(poly [, max_cells, max_order])` | `int8[]` | likewise |
+| `skycell_ancestors(cell [, min_order, max_order])` | `int8[]` | a position's containing cells — join against stored MOC cells |
+| `skycell_nuniq_order/lo/hi(nuniq)` | `int`/`int8` | decode a `NUNIQ` cell |
+
+### Astrometry — IVOA UDF registry names
+
+| Function | Returns | Notes |
+|---|---|---|
+| `ivo_epoch_prop(ra, dec, parallax, pmra, pmdec, rv, ref_epoch, out_epoch)` | `float8[6]` | all six parameters propagated, rigorously (ESA SP-1200 §1.5.5): parallax and radial velocity evolve too |
+| `ivo_epoch_prop_pos(…8 args…)` | `skypos` | position only |
+| `ivo_epoch_prop_pos(ra, dec, pmra, pmdec, ref_epoch, out_epoch)` | `skypos` | without parallax or radial velocity |
+| `ivo_apply_pm(ra, dec, pmra, pmdec, epdiff)` | `skypos` | proper motion alone |
+| `ivo_healpix_index(order, ra, dec)`<br>`ivo_healpix_index(order, p)` | `int8` | HEALPix cell |
+| `ivo_healpix_center(order, hpxindex)` | `skypos` | and back |
+| `icrs2gal` / `gal2icrs` / `icrs2ecl` / `ecl2icrs` | `skypos` | frame conversion |
+
+Proper motions are in mas/yr, parallax in mas, radial velocity in km/s, epochs
+in years. An index cannot know where a star has moved to, so write a
+proper-motion-aware search as an indexable cone widened by the largest motion of
+interest, with the exact test on the propagated position:
+
+```sql
+SELECT * FROM cat
+WHERE point('ICRS', ra, dec) <@ circle('ICRS', 269.45, 4.69, 0.05 + 0.006)
+  AND 1 = contains(ivo_epoch_prop_pos(ra, dec, plx, pmra, pmdec, rv, 2016, 2026),
+                   circle('ICRS', 269.45, 4.69, 0.05));
+```
+
+### Diagnostics
+
+| Function | Notes |
+|---|---|
+| `skycell_cover_info(ra0, dec0, radius [, tbl, col])` | what the covering looks like: ranges, cells examined, deepest order, expected rows, area ratio, the density used and the order chosen |
+| `skycell_range_cost([tbl, col])` | the price of one index range the cost model derives for a relation |
+| `skycell_density_build(tbl [, col, rows_per_cell, max_order])` | build a multi-order count map for a relation (**experimental**: no measurement yet shows it helps) |
+| `skycell_density_drop(tbl [, col])` | remove it |
 
 ### Settings
 

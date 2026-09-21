@@ -374,44 +374,83 @@ An index built on catalogue positions cannot know where a star has moved to, so 
 proper-motion-aware cone search is written as an indexable cone widened by the largest
 motion of interest, intersected with an exact test on the propagated position.
 
-Table~\ref{tab:ops} lists the geometry and index surface with the evidence for each
-part. The astrometry functions are omitted from it: all are exercised by round-trip and
+Table~\ref{tab:ops} sets the three side by side: what ADQL says, what a translator must
+emit for the pgSphere-plus-Q3C pair, and what it emits for \texttt{skycell}. The
+right-hand column is mostly the identity, which is the point of adopting the standard's
+spellings; the middle column is where the work goes, and three of its rows have no
+direct form at all. The astrometry functions are omitted from the table: all are exercised by round-trip and
 published-value tests (epoch propagation returns Barnard's star to sub-microarcsecond
 over a 16-year round trip; the frame conversions put the Galactic centre at
 $l = b = 0$) and none is benchmarked, so no performance claim is made for them.
 
 \begin{table*}
-  \caption{The query surface, and the evidence for each part. ADQL spellings are used
-    unchanged; \texttt{skycell\_}-prefixed aliases exist for schemas where a name
-    collides with one in \texttt{pg\_catalog}. \emph{Benchmarked}: measured in
-    Sect.~\ref{sec:results}. \emph{Verified}: every indexed answer required to equal a
-    sequential scan with the exact predicate. \emph{Exercised}: correctness checked,
-    performance not characterised. The astrometry functions, all exercised, are in the
-    text.}
+  \caption{What a translator has to emit. For each ADQL construct: the
+    pgSphere-plus-Q3C form an archive uses today, and the \texttt{skycell} form. Q3C
+    supplies the fast cone and cross-match paths over scalar \texttt{ra}/\texttt{dec}
+    columns but has no region type; pgSphere supplies the region types but is slower at
+    cones and cross-matches (Sects.~\ref{sec:cones}, \ref{sec:xmatch}), so a translator
+    targeting the pair must choose between them per query shape, and the choice is not
+    always available. \texttt{skycell} uses ADQL's own spellings, so the translation is
+    the identity except where an indexable form is wanted.}
   \label{tab:ops}
   \centering
-  \small
-  \begin{tabular}{l l l}
+  \footnotesize
+  \begin{tabular}{@{}p{0.29\textwidth} p{0.36\textwidth} p{0.29\textwidth}@{}}
     \hline\hline
-    Signature & Meaning & Evidence \\
+    ADQL & pgSphere $+$ Q3C & skycell \\
     \hline
-    \multicolumn{3}{l}{\emph{Geometry (ADQL)}}\\
-    \texttt{point(frame, ra, dec)} & position $\rightarrow$ \texttt{skypos} & verified \\
-    \texttt{circle(frame, ra, dec, r)} & cone $\rightarrow$ \texttt{skyregion} & benchmarked \\
-    \texttt{box(frame, ra, dec, w, h)} & box $\rightarrow$ \texttt{skyregion} & verified \\
-    \texttt{polygon(frame, ra, dec, ...)} & convex polygon & benchmarked \\
-    \texttt{contains(a, b)}, \texttt{intersects(a, b)} & 1 or 0 & verified \\
-    \texttt{distance(a, b)}, \texttt{area(r)} & degrees, square degrees & exercised \\
-    \texttt{coord1/coord2/centroid} & components, centre & exercised \\
-    \texttt{pos <@ region} & indexable containment & benchmarked \\
+    \texttt{POINT('ICRS', ra, dec)} &
+      \texttt{spoint(radians(ra), radians(dec))} &
+      \texttt{point('ICRS', ra, dec)} \\[2pt]
+    \texttt{CIRCLE('ICRS', a, d, r)} &
+      \texttt{scircle(spoint(...), radians(r))} &
+      \texttt{circle('ICRS', a, d, r)} \\[2pt]
+    \texttt{BOX('ICRS', a, d, w, h)} &
+      \texttt{sbox} takes two corners, not a centre and extent: the translator converts,
+      and the result is wrong at the poles, where a box is not a rectangle in
+      ($\alpha,\delta$) &
+      \texttt{box('ICRS', a, d, w, h)} \\[2pt]
+    \texttt{POLYGON('ICRS', a$_1$, d$_1$, ...)} &
+      \texttt{spoly('\{(...),(...)\}')} &
+      \texttt{polygon('ICRS', a$_1$, d$_1$, ...)} \\[2pt]
     \hline
-    \multicolumn{3}{l}{\emph{Index and covering}}\\
-    \texttt{skycell\_ang2cell(ra, dec)} & the order-29 key & benchmarked \\
-    \texttt{skycell\_cone/poly(cell, ...)} & indexable predicates & benchmarked \\
-    \texttt{skycell\_cone\_ranges(...)} & ranges as rows (\texttt{LATERAL}) & benchmarked \\
-    \texttt{skycell\_cone\_moc(...)} & covering as \texttt{NUNIQ} cells & benchmarked \\
-    \texttt{skycell\_ancestors(cell, ...)} & a position's containing cells & benchmarked \\
-    \texttt{skycell\_cover\_info(...)} & covering diagnostics & exercised \\
+    \texttt{CONTAINS(POINT, CIRCLE) = 1} &
+      \texttt{q3c\_radial\_query(ra, dec, a, d, r)} \emph{or}
+      \texttt{pos <@ scircle(...)} -- Q3C for speed, pgSphere if the position is stored
+      as a type &
+      \texttt{point(...) <@ circle(...)} \\[2pt]
+    \texttt{CONTAINS(POINT, POLYGON) = 1} &
+      \texttt{q3c\_poly\_query(ra, dec, array)} \emph{or} \texttt{pos <@ spoly(...)} &
+      \texttt{point(...) <@ polygon(...)} \\[2pt]
+    \texttt{CONTAINS(POINT, BOX) = 1} &
+      as \texttt{BOX} above &
+      \texttt{point(...) <@ box(...)} \\[2pt]
+    \texttt{INTERSECTS(r$_1$, r$_2$)} &
+      \texttt{r$_1$ \&\& r$_2$} (pgSphere only; Q3C has no region type) &
+      \texttt{intersects(r$_1$, r$_2$)} \\[2pt]
+    \texttt{DISTANCE(p$_1$, p$_2$)} &
+      \texttt{q3c\_dist(a$_1$, d$_1$, a$_2$, d$_2$)} \emph{or}
+      \texttt{degrees(p$_1$ <-> p$_2$)} &
+      \texttt{distance(p$_1$, p$_2$)} \\[2pt]
+    \texttt{AREA(region)} &
+      \texttt{area(spoly)} returns steradians, so the translator scales by
+      $(180/\pi)^2$; no Q3C equivalent &
+      \texttt{area(region)} \\[2pt]
+    \texttt{COORD1/COORD2(p)} &
+      \texttt{degrees(long(p))}, \texttt{degrees(lat(p))} &
+      \texttt{coord1(p)}, \texttt{coord2(p)} \\[2pt]
+    \texttt{CENTROID(region)} &
+      no direct equivalent for a polygon &
+      \texttt{centroid(region)} \\[2pt]
+    \hline
+    cross-match (\texttt{CONTAINS} against an uploaded table) &
+      \texttt{q3c\_join(a$_1$, d$_1$, a$_2$, d$_2$, r)}; the pgSphere form is 2.4 times
+      slower (Sect.~\ref{sec:xmatch}) &
+      \texttt{skycell\_cone(...)}, or
+      \texttt{skycell\_cone\_ranges()} in a \texttt{LATERAL} \\[2pt]
+    \texttt{ivo\_epoch\_prop\_pos(...)} &
+      no equivalent in either &
+      same name \\
     \hline
   \end{tabular}
 \end{table*}
