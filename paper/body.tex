@@ -1175,59 +1175,47 @@ changes a decision.
 \section{Inside a TAP service, and where the crossover is}
 \label{sec:tap}
 
-A benchmark of index operations is not a benchmark of an archive. We therefore ran the
-same build inside \texttt{egernia} \citep{egernia}, a TAP 1.1 server, against its
-published 500\,096-row ObsCore corpus, in an A/B where one database held both indexes
-and two otherwise identical service processes differed only in how they translate
-\texttt{CONTAINS}: one to pgSphere, one to \texttt{skycell}. The service's own harness
-interleaved the two targets rung by rung: six query classes (a mixed workload, a
-non-spatial control, two cone classes, a cone with time and calibration cuts, and an
-empty cone) at 1, 8 and 32 concurrent clients, three repetitions each, with a tie
-declared unless the 95\% intervals are disjoint \emph{and} the difference exceeds 10\%.
+\subsection{The service-level A/B}
+
+A benchmark of index operations is not a benchmark of an archive. We ran the same build
+inside \texttt{egernia} \citep{egernia}, a TAP 1.1 server, against its published
+500\,096-row ObsCore corpus: one database holding both indexes, two otherwise identical
+service processes differing only in how they translate \texttt{CONTAINS}, and the
+service's own harness interleaving them rung by rung over six query classes at 1, 8 and 32
+concurrent clients, three repetitions each.
 
 Both targets pass the conformance gate (\texttt{taplint}, zero errors) and the
 cross-server agreement gate on all eleven portable query classes, and the 203 cone
-queries of the corpus return identical rows through both translations.
+queries of the corpus return identical rows through both translations. The performance
+result is a tie: all 18 comparison cells fall inside the tie rule, with throughput ratios
+between 0.96 and 1.06, although at the database level \texttt{skycell} is 1.2--1.45 times
+\emph{slower} per query on that corpus.
 
-The performance result is a tie: all 18 comparison cells fall inside the tie rule, with
-throughput ratios between 0.96 and 1.06. At the database level \texttt{skycell} is
-1.2--1.45 times \emph{slower} per query than pgSphere on that corpus.
+Both facts have the same cause. A cone over half a million rows returns tens to hundreds
+of rows and costs a fraction of a millisecond either way, against roughly 10\,ms of CPU
+per request spent in the service's own Python; the database is 1--3\% of a request, so a
+difference of 0.08\,ms in it cannot move the throughput of the service.
 
-Both facts have the same cause. A cone query over half a million rows returns tens to
-hundreds of rows and costs a fraction of a millisecond either way, against roughly
-10\,ms of CPU per request spent in the service's own Python; the database is 1--3\% of a
-request, so a difference of 0.08\,ms in it cannot move the throughput of the service.
+\subsection{Where the crossover is}
 
 That explanation makes a testable prediction, and an earlier version of this work
-asserted it rather than testing it. We therefore built the same ObsCore-shaped relation
--- observations in groups of 128 products sharing a field centre, clustered by
-collection and field, which is what makes a GiST bitmap scan so effective on this data
--- at three sizes, and ran the same four cone classes against both indexes
+asserted it rather than testing it. We built the same ObsCore-shaped relation --
+observations in groups of 128 products sharing a field centre, clustered by collection
+and field, which is what makes a GiST bitmap scan so effective on this data -- at three
+sizes, and ran the same four cone classes against both indexes
 (Table~\ref{tab:crossover}).
 
-The crossover is real, but it is not a single number, and one of its rows is not a
-number at all.
-
-For the cone with catalogue cuts (Q07) and the degree-scale cone (Q06), \texttt{skycell}
-is ahead at every size and pulls further ahead as the relation grows: 0.84 to 0.71 for
-Q07 and 0.92 to 0.67 for Q06, reading a seventh of pgSphere's buffer pages at Q06 and a
-quarter at Q07. The empty cone (Q12) is level. These are the classes where the scan is
-large enough for a better covering to matter, and they behave exactly as the catalogue
-results predict.
-
-The small-cone class (Q05, 0.15\degr) is the one we cannot pin down, and we prefer to
-say so rather than quote the number the table happens to contain. Measured immediately
-after the relation is built, with both methods paired inside a trial, skycell is
-2.16 times slower and the two intervals are disjoint ([0.269, 0.469] against
-[0.146, 0.242]\,ms). Measured on the same relation once it is thoroughly warm, with the
-same pairing and five repetitions, the same class comes out at 0.94 -- level. Both are
-within-run paired measurements; they are measuring different cache regimes, and on this
-host, with 2\,GB of shared buffers and several multi-gigabyte relations present, we were
-not able to make the small-cone ObsCore comparison reproducible to better than a factor
-of two. The decomposition is at least unambiguous: the deficit is in execution
-(0.324\,ms against 0.161) and not in planning (0.034 against 0.009), and it is not the
-exact predicate -- removing that predicate entirely changes the query time by about 1\%
-on this relation, against 63\% on the catalogue at a comparable radius.
+The crossover is real, but it is not a single number. For the cone with catalogue cuts
+(Q07) and the degree-scale cone (Q06), \texttt{skycell} is ahead at every size and pulls
+further ahead as the relation grows, reading a seventh of pgSphere's buffer pages at Q06
+and a quarter at Q07; the empty cone (Q12) is level. The small-cone class (Q05,
+0.15\degr) we cannot pin down: paired inside a trial it is 2.16 times slower immediately
+after the build, and level (0.94) on the same relation once thoroughly warm. Those are
+different cache regimes, and on this host we could not make that one class reproducible to
+better than a factor of two. The deficit is at least localised -- it is in execution
+(0.324\,ms against 0.161), not planning (0.034 against 0.009), and not the exact
+predicate, whose removal changes the time by about 1\% here against 63\% on the
+catalogue.
 
 \begin{table}
   \caption{Crossover on an ObsCore-shaped relation, measured in randomized paired
@@ -1249,6 +1237,65 @@ on this relation, against 63\% on the catalogue at a comparable radius.
     Q06 & \textbf{0.92} & \textbf{0.87} & \textbf{0.67} & 6052 & \textbf{830} \\
     Q07 & \textbf{0.84} & \textbf{0.76} & \textbf{0.71} &  712 & \textbf{182} \\
     Q12 & 1.13 & 1.07 & 1.00 &    5 & 6 \\
+    \hline
+  \end{tabular}
+\end{table}
+
+\subsection{When the index no longer fits in memory}
+\label{sec:pressure}
+
+Section~\ref{sec:scale-memory} argues from index size alone that a host must reach a
+point at which pgSphere's index no longer stays in memory while \texttt{skycell}'s still
+does. That is an argument about arithmetic, so we tested it. A container limited to
+3\,GiB, with 768\,MB of shared buffers, holds an ObsCore-shaped relation of
+20\,485\,632 rows whose heap is 22\,GB. The GiST index over \texttt{spoint} is 1162\,MB
+(59.5\,B/row, $1.51\times$ the buffer pool); the \texttt{skycell} expression index is
+439\,MB (22.5\,B/row, $0.57\times$).
+
+Making the cache matter at all required a query stream that sweeps the sky. Twenty
+thousand cones of 0.15\degr\ cover 3.4\% of it and read essentially nothing from disk at
+either index size: what has to fit is not the index, but the part of it the stream
+touches. We therefore used 3500 cones of 2\degr\ drawn uniformly, which cover the sphere
+about once.
+
+Each index was measured in its own phase, with the server restarted between phases so
+that the buffer pool starts empty and the index not under test occupies none of it --
+checked after every phase, where it holds 0 bytes. Each phase warms itself with an
+untimed sweep and then measures a second sweep in a fixed random order; both orderings of
+the two phases were run (Table~\ref{tab:pressure}). \texttt{skycell} answers the stream
+4.2--4.8 times faster, and the mechanism is visible in the index traffic: it serves 53\%
+of its index accesses from the pool against pgSphere's 9\%. The buffer counts reproduce
+to within one page across the two orderings, so the spread in the medians is host drift
+rather than an ordering effect.
+
+Two qualifications matter. First, this is not the clean threshold the size arithmetic
+suggests. The 22\,GB heap takes 705--734\,MB of the 768\,MB pool in every phase, so
+\emph{neither} index is resident; what is being measured is a smaller index winning a
+contested pool, not one index fitting while the other does not. Second, the effect is
+easy to measure away. Running both translations in a single pass over the same centres --
+the obvious design, and the one we tried first -- puts the gap at $1.6\times$ rather than
+$4.2$, because the two answer the same cone from the same heap pages and each leaves them
+warm for the other.
+
+\begin{table}
+  \caption{A 20.5-million-row ObsCore-shaped relation under memory pressure: 768\,MB of
+    shared buffers against a 22\,GB heap, 3500 uniformly drawn 2\degr\ cones covering the
+    sphere about once. Each index is measured alone, with the server restarted between
+    phases; the two medians are the two orderings of the phases.}
+  \label{tab:pressure}
+  \centering
+  \footnotesize
+  \begin{tabular}{l rr}
+    \hline\hline
+    & pgSphere & \texttt{skycell} \\
+    \hline
+    index size                 & 1162\,MB        & \textbf{439\,MB} \\
+    \quad per row              & 59.5\,B         & \textbf{22.5\,B} \\
+    \quad $\times$ buffer pool & 1.51            & \textbf{0.57} \\
+    median query               & 10.4 / 13.4\,ms & \textbf{2.5 / 2.8\,ms} \\
+    buffer pages per query     & 1108            & \textbf{729} \\
+    index accesses from disk   & 90.6\%          & \textbf{47.4\%} \\
+    index resident             & 61\,MB (5.2\%)  & 33\,MB (7.4\%) \\
     \hline
   \end{tabular}
 \end{table}

@@ -1,0 +1,137 @@
+############ phase A1 : pgsphere only ############
+09:46:50
+ set_config 
+------------
+ pgsphere
+(1 row)
+
+ set_config 
+------------
+ A1
+(1 row)
+
+DO
+--- timing / buffers (measured sweep) ---
+ phase |  method  | measured | median_ms | pages_cached | pages_from_disk | pct_from_disk 
+-------+----------+----------+-----------+--------------+-----------------+---------------
+ A1    | pgsphere |     1166 |      10.4 |          384 |             724 |          65.4
+(1 row)
+
+--- per-index I/O (measured sweep only) ---
+ indexrelname | idx_blks_hit | idx_blks_read | pct_from_disk 
+--------------+--------------+---------------+---------------
+ oc20_cell    |            0 |             1 |         100.0
+ oc20_gist    |        53060 |        512246 |          90.6
+(2 rows)
+
+--- shared_buffers residency at end of phase ---
+  relname  |  size   | resident | pct_resident 
+-----------+---------+----------+--------------
+ oc20      | 22 GB   | 705 MB   |          3.2
+ oc20_cell | 439 MB  | 0 bytes  |          0.0
+ oc20_gist | 1162 MB | 61 MB    |          5.2
+(3 rows)
+
+############ phase A2 : skycell only ############
+09:56:30
+ set_config 
+------------
+ skycell
+(1 row)
+
+ set_config 
+------------
+ A2
+(1 row)
+
+DO
+--- timing / buffers (measured sweep) ---
+ phase | method  | measured | median_ms | pages_cached | pages_from_disk | pct_from_disk 
+-------+---------+----------+-----------+--------------+-----------------+---------------
+ A2    | skycell |     1166 |       2.5 |           81 |             648 |          88.9
+(1 row)
+
+--- per-index I/O (measured sweep only) ---
+ indexrelname | idx_blks_hit | idx_blks_read | pct_from_disk 
+--------------+--------------+---------------+---------------
+ oc20_cell    |       213804 |        192575 |          47.4
+ oc20_gist    |            0 |             0 |              
+(2 rows)
+
+--- shared_buffers residency at end of phase ---
+  relname  |  size   | resident | pct_resident 
+-----------+---------+----------+--------------
+ oc20      | 22 GB   | 734 MB   |          3.3
+ oc20_cell | 439 MB  | 33 MB    |          7.4
+ oc20_gist | 1162 MB | 0 bytes  |          0.0
+(3 rows)
+
+############ phase B1 : skycell only ############
+09:57:59
+ set_config 
+------------
+ skycell
+(1 row)
+
+ set_config 
+------------
+ B1
+(1 row)
+
+DO
+--- timing / buffers (measured sweep) ---
+ phase | method  | measured | median_ms | pages_cached | pages_from_disk | pct_from_disk 
+-------+---------+----------+-----------+--------------+-----------------+---------------
+ B1    | skycell |     1166 |       2.8 |           82 |             647 |          88.8
+(1 row)
+
+--- per-index I/O (measured sweep only) ---
+ indexrelname | idx_blks_hit | idx_blks_read | pct_from_disk 
+--------------+--------------+---------------+---------------
+ oc20_cell    |       213805 |        192574 |          47.4
+ oc20_gist    |            0 |             0 |              
+(2 rows)
+
+--- shared_buffers residency at end of phase ---
+  relname  |  size   | resident | pct_resident 
+-----------+---------+----------+--------------
+ oc20      | 22 GB   | 734 MB   |          3.3
+ oc20_cell | 439 MB  | 33 MB    |          7.4
+ oc20_gist | 1162 MB | 0 bytes  |          0.0
+(3 rows)
+
+############ phase B2 : pgsphere only ############
+09:59:25
+ set_config 
+------------
+ pgsphere
+(1 row)
+
+ set_config 
+------------
+ B2
+(1 row)
+
+DO
+--- timing / buffers (measured sweep) ---
+ phase |  method  | measured | median_ms | pages_cached | pages_from_disk | pct_from_disk 
+-------+----------+----------+-----------+--------------+-----------------+---------------
+ B2    | pgsphere |     1166 |      13.4 |          384 |             724 |          65.4
+(1 row)
+
+--- per-index I/O (measured sweep only) ---
+ indexrelname | idx_blks_hit | idx_blks_read | pct_from_disk 
+--------------+--------------+---------------+---------------
+ oc20_cell    |            0 |             1 |         100.0
+ oc20_gist    |        53053 |        512253 |          90.6
+(2 rows)
+
+--- shared_buffers residency at end of phase ---
+  relname  |  size   | resident | pct_resident 
+-----------+---------+----------+--------------
+ oc20      | 22 GB   | 705 MB   |          3.2
+ oc20_cell | 439 MB  | 0 bytes  |          0.0
+ oc20_gist | 1162 MB | 61 MB    |          5.2
+(3 rows)
+
+ISO_ALL_DONE
