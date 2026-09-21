@@ -290,9 +290,41 @@ varies per row (a cross-match), use `skycell_cone()` or
 |---|---|
 | `skycell_cone(cell, ra, dec, ra0, dec0, radius)` | cone test; with a constant cone the planner turns it into index ranges, with a per-row cone into range slots (a cross-match) |
 | `skycell_poly(cell, ra, dec, poly float8[])` | the same for a convex polygon |
+| `skycell_radial_query(ra, dec, ra0, dec0, radius)` | Q3C's spelling of the cone test — no cell argument, the planner synthesises it |
+| `skycell_join(ra1, dec1, ra2, dec2, radius)` | Q3C's spelling of the cross-match — likewise |
 | `skycell_in_cone(ra, dec, ra0, dec0, radius [, sel])` | the exact test alone, no index |
 | `skycell_in_poly(ra, dec, poly [, sel])` | likewise |
 | `skycell_in_region(p skypos, r skyregion [, sel])` | likewise, on the types |
+
+### Coming from Q3C
+
+`skycell_join` and `skycell_radial_query` take Q3C's own argument lists, so
+migrating is a prefix replacement — you do not pass the cell expression, the
+planner synthesises it:
+
+```sql
+-- cross-match
+WHERE q3c_join(a.ra, a.dec, b.ra, b.dec, 1./3600)
+WHERE skycell_join(a.ra, a.dec, b.ra, b.dec, 1./3600)
+
+-- cone search
+WHERE q3c_radial_query(ra, dec, 266.4, -29.0, 0.5)
+WHERE skycell_radial_query(ra, dec, 266.4, -29.0, 0.5)
+```
+
+| Q3C | skycell | note |
+|---|---|---|
+| `q3c_ang2ipix(ra, dec)` | `skycell_ang2cell(ra, dec)` | the index key; build the index on this |
+| `q3c_radial_query(ra, dec, ra0, dec0, r)` | `skycell_radial_query(...)` | same arguments |
+| `q3c_join(ra1, dec1, ra2, dec2, r)` | `skycell_join(...)` | same arguments |
+| `q3c_poly_query(ra, dec, poly)` | `skycell_poly(cell, ra, dec, poly)` | no 3-arg form yet — pass the cell |
+| `q3c_dist(ra1, dec1, ra2, dec2)` | `skycell_dist(ra1, dec1, ra2, dec2)` | degrees, as in Q3C |
+
+Both need an index on `skycell_ang2cell(ra, dec)` to be rewritten into ranges,
+exactly as Q3C needs one on `q3c_ang2ipix(ra, dec)`; without it you get a
+correct sequential scan. `skycell_cone(cell, ra, dec, ra0, dec0, radius)`
+remains the canonical spelling — one predicate covers both the cone search and
+the cross-match, which is why there is no separate join function underneath.
 
 ### Coverings, cross-matches and stored regions
 

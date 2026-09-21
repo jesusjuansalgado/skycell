@@ -361,6 +361,15 @@ translator emits the standard's spelling rather than a dialect. The operator for
 \texttt{pos <@ circle(\ldots)} is the one a planner can answer from an index; the
 function form returns the same rows.
 
+For hand-written SQL migrating from Q3C rather than from ADQL, the predicates
+\texttt{skycell\_radial\_query(ra, dec, ra0, dec0, r)} and
+\texttt{skycell\_join(ra1, dec1, ra2, dec2, r)} take Q3C's own argument lists: the
+support function synthesises the index expression from the first two arguments, so
+the change is a prefix replacement. Both reduce to the canonical
+\texttt{skycell\_cone}, which serves the cone search and the cross-match with one
+predicate because the only difference between them is whether the centre is a
+constant.
+
 Beside the geometry, archives need the astrometry that decides \emph{where} a source
 is at the epoch being asked about. \texttt{skycell} implements the IVOA UDF registry's
 names -- \texttt{ivo\_epoch\_prop}, \texttt{ivo\_epoch\_prop\_pos},

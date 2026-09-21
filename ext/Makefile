@@ -1,8 +1,8 @@
 MODULE_big = skycell
 OBJS = src/skycell.o src/adql.o src/astro.o src/cover.o src/healpix.o
 EXTENSION = skycell
-DATA = sql/skycell--0.1.sql sql/skycell--0.2.sql sql/skycell--0.3.sql sql/skycell--0.4.sql sql/skycell--0.5.sql \
-       sql/skycell--0.1--0.2.sql sql/skycell--0.2--0.3.sql sql/skycell--0.3--0.4.sql sql/skycell--0.4--0.5.sql
+DATA = sql/skycell--0.1.sql sql/skycell--0.2.sql sql/skycell--0.3.sql sql/skycell--0.4.sql sql/skycell--0.5.sql sql/skycell--0.6.sql \
+       sql/skycell--0.1--0.2.sql sql/skycell--0.2--0.3.sql sql/skycell--0.3--0.4.sql sql/skycell--0.4--0.5.sql sql/skycell--0.5--0.6.sql
 PG_CPPFLAGS = -DSKYCELL_PG
 REGRESS = skycell adql
 REGRESS_OPTS = --inputdir=test --outputdir=test

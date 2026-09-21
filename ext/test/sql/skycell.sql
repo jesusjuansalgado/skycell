@@ -54,6 +54,24 @@ END $$;
 SELECT plan_uses_index('SELECT * FROM cat WHERE skycell_cone(cell, ra, dec, 10, 20, 0.1)') AS cone_indexed,
        plan_uses_index('SELECT * FROM cat WHERE skycell_poly(cell, ra, dec, ARRAY[10,10,11,10,11,11,10,11]::float8[])') AS poly_indexed;
 
+-- Q3C-shaped spellings: no cell argument, the support function synthesises
+-- skycell_ang2cell(ra, dec).  They must plan through the index and agree with
+-- both the six-argument form and the unindexed exact test.
+CREATE INDEX cat_a2c ON cat (skycell_ang2cell(ra, dec));
+ANALYZE cat;
+CREATE TABLE probe AS SELECT ra, dec FROM cat ORDER BY id LIMIT 20;
+ANALYZE probe;
+SELECT plan_uses_index('SELECT * FROM cat WHERE skycell_radial_query(ra, dec, 10, 20, 0.1)') AS radial_indexed,
+       plan_uses_index('SELECT count(*) FROM probe p, cat c WHERE skycell_join(c.ra, c.dec, p.ra, p.dec, 0.05)') AS join_indexed;
+SELECT (SELECT count(*) FROM cat WHERE skycell_radial_query(ra, dec, 10, 20, 0.5))
+         = (SELECT count(*) FROM cat WHERE skycell_cone(cell, ra, dec, 10, 20, 0.5)) AS radial_matches_cone,
+       (SELECT count(*) FROM cat WHERE skycell_radial_query(ra, dec, 10, 20, 0.5))
+         = (SELECT count(*) FROM cat WHERE skycell_in_cone(ra, dec, 10, 20, 0.5)) AS radial_matches_exact,
+       (SELECT count(*) FROM probe p, cat c WHERE skycell_join(c.ra, c.dec, p.ra, p.dec, 0.05))
+         = (SELECT count(*) FROM probe p, cat c WHERE skycell_in_cone(c.ra, c.dec, p.ra, p.dec, 0.05)) AS join_matches_exact;
+DROP TABLE probe;
+DROP INDEX cat_a2c;
+
 -- cones: indexed vs sequential exact --------------------------------------
 CREATE TABLE cones AS
 SELECT q, CASE WHEN q % 3 = 0 THEN (SELECT ra FROM cat WHERE id = 1 + (q * 7919) % 100000)

@@ -1008,6 +1008,33 @@ simplify_poly(PlannerInfo *root, FuncExpr *fexpr)
 	return ranges_and_exact(&cov, cell, (Expr *) exact);
 }
 
+/*
+ * skycell_join(ra1, dec1, ra2, dec2, radius) and
+ * skycell_radial_query(ra, dec, ra0, dec0, radius): the Q3C-shaped spellings.
+ * They do not carry the index expression, so synthesise it from the first two
+ * arguments and hand the six-argument form to simplify_cone.  The planner then
+ * matches skycell_ang2cell(ra, dec) against an expression index exactly as it
+ * does when the caller writes it out; with no such index the rewrite still
+ * yields a correct sequential plan, which is what q3c does too.
+ */
+static Node *
+simplify_cone5(PlannerInfo *root, FuncExpr *fexpr)
+{
+	Oid			a2c_types[2] = {FLOAT8OID, FLOAT8OID};
+	Oid			a2c_oid = lookup_sibling_func(fexpr->funcid, "skycell_ang2cell",
+											  2, a2c_types);
+	FuncExpr   *six = copyObject(fexpr);
+	Expr	   *cell;
+
+	cell = (Expr *) makeFuncExpr(a2c_oid, INT8OID,
+								 list_make2(copyObject(linitial(fexpr->args)),
+											copyObject(lsecond(fexpr->args))),
+								 InvalidOid, InvalidOid, COERCE_EXPLICIT_CALL);
+
+	six->args = lcons(cell, six->args);
+	return simplify_cone(root, six);
+}
+
 PG_FUNCTION_INFO_V1(skycell_support);
 Datum
 skycell_support(PG_FUNCTION_ARGS)
@@ -1021,6 +1048,8 @@ skycell_support(PG_FUNCTION_ARGS)
 
 		if (nargs == 6)
 			PG_RETURN_POINTER(simplify_cone(req->root, req->fcall));
+		if (nargs == 5)
+			PG_RETURN_POINTER(simplify_cone5(req->root, req->fcall));
 		if (nargs == 4)
 			PG_RETURN_POINTER(simplify_poly(req->root, req->fcall));
 	}
