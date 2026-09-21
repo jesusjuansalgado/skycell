@@ -452,7 +452,43 @@ cold. Measured at 50M rows (ms):
 Matched warm they are within 10%; with the residency the index sizes actually
 buy, it is one to two orders of magnitude. Treat that as an **upper bound** —
 our cold regime is a fully cold start, while a server that merely can't fit the
-index thrashes at some hit rate in between.
+index thrashes at some hit rate in between. That in-between case is measured
+below.
+
+**The in-between regime, measured.** A container limited to 3 GiB with 768 MB of
+`shared_buffers`, holding a 20,485,632-row ObsCore-shaped relation (22 GB heap).
+pgSphere's GiST index is 1162 MB (59.5 B/row, 1.51× the pool); skycell's is
+439 MB (22.5 B/row, 0.57×). Each index is measured **alone**, with the server
+restarted between phases so the pool starts empty and the index not under test
+holds zero buffers (checked every phase); both phase orderings were run
+(`bench/13_pressure.sql`, raw output in
+[`bench/results-pressure/`](bench/results-pressure/)).
+
+| | pgSphere | skycell |
+|---|---|---|
+| index size | 1162 MB | **439 MB** |
+| × buffer pool | 1.51 | **0.57** |
+| median query | 10.4 / 13.4 ms | **2.5 / 2.8 ms** |
+| buffer pages per query | 1108 | **729** |
+| index accesses from disk | 90.6% | **47.4%** |
+| index resident | 61 MB (5.2%) | 33 MB (7.4%) |
+
+**4.2–4.8× faster** — between the ~1.0 of the matched-warm case and the
+0.05–0.08 of the fully cold one, which is where it should land. Three things are
+worth knowing before you expect to reproduce it:
+
+- **The query stream has to sweep the sky before index size matters at all.**
+  The stream above is 3500 cones of 2° drawn uniformly, covering the sphere
+  about once. 20,000 cones of 0.15° cover 3.4% of it and read essentially
+  nothing from disk *at either index size*. What has to fit is not the index,
+  it is the part of it your queries touch.
+- **Neither index is actually resident here.** The 22 GB heap takes 705–734 MB
+  of the 768 MB pool in every phase. This is a smaller index winning a contested
+  pool, not one index fitting while the other does not — the clean threshold the
+  size arithmetic suggests is harder to reach than the arithmetic implies.
+- **Measuring both translations in one interleaved pass halves the gap**, to
+  1.6×. They answer the same cone from the same heap pages, so each leaves them
+  warm for the other. Run one method per phase.
 
 **Cross-match — Q3C's own speciality.** 200k probes against 50M sources, each
 method warmed on its own block before timing, paired over 16 block-repetitions
@@ -578,6 +614,13 @@ histogram was accurate all along (3701 estimated vs ~4155 scanned).
 - Tested to 50M rows on one machine, warm and with caches dropped. The Gaia
   corpus uses the real DR3 density field but not real positions, and has no
   structure below its 0.11° map cells.
+- The memory-residency advantage needs two things the index-size arithmetic
+  does not mention: a query stream that sweeps enough sky to touch most of the
+  index, and a heap small enough that it does not take the buffer pool by
+  itself. Measured at 20M ObsCore rows with 768 MB of shared buffers, the 22 GB
+  heap holds ~95% of the pool and *neither* index is resident — the 4.2–4.8×
+  is a smaller index winning a contested pool, not one index fitting while the
+  other does not.
 - Better row estimates are demonstrated; better *plans* are not. On the join
   shapes measured, all three methods chose the same strategy — only one query
   in sixteen at 3° crossed a threshold into a hash join.
