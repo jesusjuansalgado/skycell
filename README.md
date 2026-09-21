@@ -443,43 +443,23 @@ is simply flat — at 1° every setting from 3 to 300 lies within 3%. What it
 buys is that nobody has to pick the number, and it can't be left at a value
 tuned for a different table. `skycell_range_cost('tbl')` reports it.
 
-**Known defect — the model stops too coarse.** Forcing the covering 1–3
-orders finer than the cost model chooses is worth **15% at 1′, 48% at 6′, 30%
-at 30′** on the catalogue and **32%** on an ObsCore-shaped relation (where it
-turns a loss against pgSphere into a 37% win). The cause: the model estimates
-`n_ranges ≈ γ·r/s`, but after adjacent cells merge into ranges the count is
-nearly independent of cell size — 2.5 ranges for a 6′ cone whether cells are
-0.4° or 0.05°, where the formula predicts 20. So it charges ~10× too much for
-refining. `skycell.probe_orders` implements scoring candidate orders on the
-covering they actually produce; it is **off by default because it is
-measurably neutral** — the finer candidate loses the score to `split_cost`,
-which charges one row per cell examined and is not calibrated. That
-calibration is the open work.
+**The order the model picks** costs about **3%** against one order finer,
+measured with the two interleaved per query. Getting that number took three
+tries: 0.8–2% was measured through a covering-cache key that omitted the
+forced order; 30–48% came from a sweep that visited orders in ascending
+sequence, so each finer one ran on a warmer cache. Interleaving removes both.
 
-## Testing
+`skycell.probe_orders` scores candidate orders on the covering they actually
+produce instead of on the closed form. It now works — the probe does pick
+finer coverings (area ratio 11.5 → 8.9 at 6′) — and query time does not move,
+which is what 3% headroom predicts. **Off by default.**
 
-Correctness is checked by brute force, not by inspection:
-
-```bash
-make -C ext selftest       # geometry, no PostgreSQL needed
-docker exec -w /work/ext skycell-pg su postgres -c "make installcheck"
-```
-
-- `ext/test/healpix_selftest.c` — known cell centres, round trips at all 30
-  orders, nesting, equal area, and the corner bound the covering relies on,
-  over 1.6M sampled points including poles, the zone boundary and face edges.
-- `ext/test/cover_selftest.c` — coverings against a 2M-point clustered
-  catalogue; 30,000 adversarial cones with 200 points sampled inside each; and
-  7,266 adversarial polygons at the poles, the zone boundary, the RA wrap and
-  the face edges with 866,537 points drawn inside them, half within a part per
-  billion of an edge. Asserts **zero false negatives**.
-- `ext/test/sql/skycell.sql` — indexed and sequential-exact results must be
-  identical for 240 cones in two configurations, 60 polygons, both join forms
-  and MOC footprint lookups.
-- `ext/test/sql/adql.sql` — the ADQL surface: operator and function forms
-  agree over 120 random regions, the rewrite produces index plans (and does
-  *not* when the region is not constant), epoch propagation round-trips below
-  a µas, and frame conversions land the Galactic centre at l = b = 0.
+`skycell_density_build()` builds a multi-order count map (leaf cells split
+until each holds ≤ N rows) which the covering reads in preference to the
+ANALYZE histogram. Built to fix an ObsCore density underestimate that turned
+out to be my own diagnostic calling with the wrong statistics column — the
+histogram was accurate all along (3701 estimated vs ~4155 scanned).
+**Experimental: no measurement yet shows it helps.**
 
 ---
 

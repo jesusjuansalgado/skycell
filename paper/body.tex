@@ -1140,36 +1140,32 @@ single set of trials the effect disappears.
 \end{table}
 
 \paragraph{The order it chooses, and how much that costs.}
-The order the model picks can be compared directly with the best available order, because
-\texttt{skycell.force\_order} makes every order measurable for the same query. Doing so
-shows that the model stops too coarse, and by a margin that matters: forcing the covering
-one to three orders finer than the closed form chooses is worth 15\% at 1\arcmin, 48\% at
-6\arcmin\ and 30\% at 30\arcmin\ on the catalogue, and 32\% on the ObsCore-shaped relation
-of Sect.~\ref{sec:tap}, where it turns a loss against pgSphere into a 37\% win.
+The order the model picks can be compared with the best available order, because
+\texttt{skycell.force\_order} makes every order measurable for the same query. Measured
+with the two orders interleaved per query, the model's choice costs about 3\% against
+one order finer at 6\arcmin: it is close to optimal, and the flat cost curve of
+Table~\ref{tab:costmodel} is the reason.
 
-The cause is in Eq.~(\ref{eq:cost}): $n_{\rm ranges}$ is modelled as $\gamma r/s$, ranges
-multiplying as the cells shrink. They do not. Once adjacent cells are merged into ranges
-the count is nearly independent of the cell size -- 2.5 ranges for a 6\arcmin\ cone
-whether the cells are 0.4\degr\ or 0.05\degr, where the formula predicts twenty; 2.0 for
-the ObsCore cone from order 7 to order 12. The model therefore charges about ten times
-too much for refining, stops several orders coarse, and carries the false positives that
-go with it.
+We arrived at that number badly enough to be worth recording, because it bears on how
+the rest of this paper's measurements should be read. Two earlier answers were wrong in
+opposite directions. The first, 0.8--2\%, was measured through a defect in the covering
+cache, whose key did not include the forced order, so every order silently returned the
+same cached covering. With that fixed, a sweep across orders showed 30--48\% -- but the
+sweep visited the orders in ascending sequence, so each finer order ran on a cache the
+coarser ones had warmed, which is precisely the phase-ordering effect Sect.~\ref{sec:phase}
+quantifies for the method comparison. Interleaving the two orders per query removes it and
+leaves 3\%.
 
-We report this as a defect rather than a result because we have not yet converted it
-into a gain. Scoring candidate orders on the covering they actually produce, rather than
-on the formula, is implemented (\texttt{skycell.probe\_orders}) and is measurably neutral
--- paired ratios 0.96 to 1.01, every interval containing 1 -- because the finer candidate
-loses the score: the enumeration at one order finer examines about four times as many
-cells, and at 6\arcmin\ that penalty outweighs the false positives saved. The penalty is
-\texttt{split\_cost}, one row per cell examined, and a cell examined plainly does not cost
-what a row fetched and discarded costs. Calibrating \texttt{split\_cost} against
-measurement, as \texttt{range\_cost} now is, is the obvious next step and is not done
-here; the machinery ships disabled rather than tuned until it flatters.
-
-An earlier version of this paragraph reported that the model's choice costs 0.8--2.0\% of
-query time. That number was measured through a defect in the covering cache, whose key
-did not include the forced order, so every order returned the same cached covering. The
-cache is fixed; the measurement above replaces it.
+Three implementation attempts sit behind that conclusion and are worth their cost.
+Scoring candidate orders on the covering they actually produce
+(\texttt{skycell.probe\_orders}) required, in turn, putting the forced order into the
+cache key, gating the probe so it is not paid where a covering holds too few rows to
+repay it, and -- the substantive one -- merging each candidate's gaps before counting its
+ranges, since a fine covering has many separate runs before merging and scoring it on
+that count charges for ranges the final plan never contains. With all three, the probe
+does now choose finer coverings (area ratio 11.5 to 8.9 at 6\arcmin) and the query time
+does not change measurably, which is what a 3\% headroom predicts. The machinery ships
+disabled.
 
 \subsection{The density estimate against the truth}
 \label{sec:estimator}

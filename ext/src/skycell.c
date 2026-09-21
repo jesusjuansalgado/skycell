@@ -32,6 +32,11 @@
 #include "access/htup_details.h"
 #include "access/stratnum.h"
 #include "access/table.h"
+#include "access/tableam.h"
+#include "access/heapam.h"
+#include "catalog/namespace.h"
+#include "utils/fmgroids.h"
+#include "utils/snapmgr.h"
 #include "catalog/pg_class.h"
 #include "catalog/pg_opfamily_d.h"
 #include "catalog/pg_statistic.h"
@@ -302,6 +307,12 @@ typedef struct dens_entry
 	double		ntotal;
 	int			nbounds;
 	int64	   *bounds;
+	double		relpages;
+	int			nmap;			/* multi-order count map, if one was built */
+	int64	   *map_lo;
+	int64	   *map_hi;
+	double	   *map_n;
+	double		map_total;
 } dens_entry;
 
 typedef struct idx_entry
@@ -491,6 +502,114 @@ load_density_from(Oid relid, Oid statrel, AttrNumber attnum, sc_density *d)
  * open relations, and an invalidation in between would otherwise free them
  * under it.
  */
+/*
+ * Read the multi-order count map for (statrel, attnum), if
+ * skycell_density_build() has made one.  Called once per relation per backend,
+ * inside the cache context, and dropped with the rest of the cache when
+ * statistics or the relation change.
+ *
+ * The map is stored as NUNIQ cells, disjoint by construction; they are sorted
+ * here by the low end of their order-29 interval so that sc_density_rows() can
+ * binary search.  The table is found through the search path: a deployment
+ * that hides the extension's schema simply gets the histogram instead.
+ */
+typedef struct map_cell
+{
+	int64		lo,
+				hi;
+	double		n;
+} map_cell;
+
+static int
+map_cell_cmp(const void *a, const void *b)
+{
+	int64		x = ((const map_cell *) a)->lo,
+				y = ((const map_cell *) b)->lo;
+
+	return (x < y) ? -1 : (x > y) ? 1 : 0;
+}
+
+static void
+load_density_map(Oid statrel, AttrNumber attnum, dens_entry *e)
+{
+	Oid			maprel;
+	Relation	rel;
+	TableScanDesc scan;
+	HeapTuple	tup;
+	ScanKeyData skey[2];
+	TupleDesc	td;
+	map_cell   *cells = NULL;
+	int			cap = 0,
+				n = 0;
+
+	e->nmap = 0;
+	e->map_lo = e->map_hi = NULL;
+	e->map_n = NULL;
+	e->map_total = 0;
+
+	maprel = RelnameGetRelid("skycell_density_map");
+	if (!OidIsValid(maprel))
+		return;
+
+	rel = table_open(maprel, AccessShareLock);
+	td = RelationGetDescr(rel);
+	if (td->natts < 4)
+	{
+		table_close(rel, AccessShareLock);
+		return;
+	}
+	ScanKeyInit(&skey[0], 1, BTEqualStrategyNumber, F_OIDEQ, ObjectIdGetDatum(statrel));
+	ScanKeyInit(&skey[1], 2, BTEqualStrategyNumber, F_INT2EQ, Int16GetDatum(attnum));
+	scan = table_beginscan(rel, GetActiveSnapshot(), 2, skey);
+	while ((tup = heap_getnext(scan, ForwardScanDirection)) != NULL)
+	{
+		bool		isnull;
+		Datum		dn = heap_getattr(tup, 3, td, &isnull);
+		int64		nuniq,
+					cnt,
+					pix;
+		int			order;
+
+		if (isnull)
+			continue;
+		nuniq = DatumGetInt64(dn);
+		cnt = DatumGetInt64(heap_getattr(tup, 4, td, &isnull));
+		if (isnull || nuniq < 4 || cnt <= 0)
+			continue;
+		order = sc_nuniq_decode(nuniq, &pix);
+		if (order < 0 || order > SC_MAX_ORDER || pix < 0)
+			continue;
+		if (n == cap)
+		{
+			cap = cap ? cap * 2 : 1024;
+			cells = cells ? repalloc(cells, sizeof(map_cell) * cap)
+				: palloc(sizeof(map_cell) * cap);
+		}
+		cells[n].lo = sc_pix_lo(order, pix);
+		cells[n].hi = sc_pix_hi(order, pix);
+		cells[n].n = (double) cnt;
+		e->map_total += (double) cnt;
+		n++;
+	}
+	table_endscan(scan);
+	table_close(rel, AccessShareLock);
+
+	if (n <= 0)
+		return;
+	qsort(cells, n, sizeof(map_cell), map_cell_cmp);
+	e->map_lo = palloc(sizeof(int64) * n);
+	e->map_hi = palloc(sizeof(int64) * n);
+	e->map_n = palloc(sizeof(double) * n);
+	for (int i = 0; i < n; i++)
+	{
+		e->map_lo[i] = cells[i].lo;
+		e->map_hi[i] = cells[i].hi;
+		e->map_n[i] = cells[i].n;
+	}
+	pfree(cells);
+	e->nmap = n;
+}
+
 static void
 load_density_cached(Oid relid, Oid statrel, AttrNumber attnum, sc_density *d)
 {
@@ -511,9 +630,19 @@ load_density_cached(Oid relid, Oid statrel, AttrNumber attnum, sc_density *d)
 		entry->ntotal = fresh.ntotal;
 		entry->nbounds = fresh.nbounds;
 		entry->bounds = (int64 *) fresh.bounds;
+		entry->relpages = fresh.relpages;
+		old = MemoryContextSwitchTo(skycell_cache_cxt);
+		load_density_map(statrel, attnum, entry);
+		MemoryContextSwitchTo(old);
 	}
 	d->ntotal = entry->ntotal;
+	d->relpages = entry->relpages;
 	d->nbounds = entry->nbounds;
+	d->nmap = entry->nmap;
+	d->map_lo = entry->map_lo;
+	d->map_hi = entry->map_hi;
+	d->map_n = entry->map_n;
+	d->map_total = entry->map_total;
 	d->bounds = NULL;
 	if (entry->nbounds > 0)
 	{

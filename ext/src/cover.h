@@ -63,6 +63,21 @@ typedef struct sc_density
 	 * so that positional initialisers elsewhere keep their meaning.
 	 */
 	double		relpages;
+
+	/*
+	 * Optional multi-order count map: the rows actually counted in each of a
+	 * set of disjoint cells, finer where the sky is crowded.  When present it
+	 * replaces the histogram, which cannot see a cluster smaller than one of
+	 * its buckets -- an equi-depth histogram narrows its buckets in a dense
+	 * region, so interpolating inside one is scale invariant and no statistics
+	 * target fixes it.  Built by skycell_density_build(); cells are sorted by
+	 * lo and do not overlap.
+	 */
+	int			nmap;
+	const int64_t *map_lo;
+	const int64_t *map_hi;
+	const double *map_n;
+	double		map_total;		/* rows the map accounts for */
 } sc_density;
 
 typedef struct sc_cover_params

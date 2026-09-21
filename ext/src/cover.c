@@ -566,6 +566,43 @@ sc_density_rows(const sc_density *d, int64_t lo, int64_t hi)
 {
 	if (hi < lo)
 		return 0.0;
+
+	/*
+	 * The count map, when there is one.  Binary search for the first cell that
+	 * can overlap, then sum: whole cells contribute their count, the two ends
+	 * contribute the fraction of their cell that the interval covers.  Inside
+	 * one map cell this is still an assumption of uniformity, but the map is
+	 * built so that a cell holds few enough rows for that to be harmless.
+	 */
+	if (d != NULL && d->nmap > 0)
+	{
+		int			a = 0,
+					b = d->nmap - 1,
+					i;
+		double		rows = 0;
+
+		while (a < b)					/* first cell with map_hi >= lo */
+		{
+			int			m = (a + b) / 2;
+
+			if (d->map_hi[m] < lo)
+				a = m + 1;
+			else
+				b = m;
+		}
+		for (i = a; i < d->nmap && d->map_lo[i] <= hi; i++)
+		{
+			int64_t		s = (d->map_lo[i] > lo) ? d->map_lo[i] : lo;
+			int64_t		e = (d->map_hi[i] < hi) ? d->map_hi[i] : hi;
+			double		span = (double) (d->map_hi[i] - d->map_lo[i]) + 1.0;
+
+			if (e < s)
+				continue;
+			rows += d->map_n[i] * (((double) (e - s) + 1.0) / span);
+		}
+		return rows;
+	}
+
 	if (d == NULL || d->nbounds < 2)
 	{
 		double		n = (d && d->ntotal > 0) ? d->ntotal : 1e6;
@@ -1107,6 +1144,64 @@ cover_cone_direct(const sc_region *r, const sc_density *d,
 
 
 /*
+ * Merge gaps that are cheaper to scan than to skip, then the cheapest
+ * remaining gaps until the range count fits max_ranges.  Applied to every
+ * candidate covering before it is scored, not only to the winner: a fine
+ * covering has many separate runs before its gaps are merged, and scoring it
+ * on that count charges for ranges the final plan would never contain --
+ * which is what kept the probe from ever choosing one.
+ */
+static void
+merge_gaps(rlist_t *l, const sc_density *d, const sc_cover_params *p, double area_cap)
+{
+	if (l->n > 1)
+	{
+		int			ng = l->n - 1;
+		double	   *gc = SC_MALLOC(sizeof(double) * ng);
+		char	   *merge = SC_MALLOC(ng);
+		int		   *idx = SC_MALLOC(sizeof(int) * ng);
+		int			remaining = l->n,
+					nidx = 0,
+					m = 0;
+
+		for (int i = 0; i < ng; i++)
+		{
+			int64_t		glo = l->a[i].hi + 1,
+						ghi = l->a[i + 1].lo - 1;
+
+			gc[i] = sc_density_rows(d, glo, ghi);
+			merge[i] = gc[i] <= p->range_cost &&
+				((double) (ghi - glo) + 1.0) * SC_PIX29_AREA <= area_cap;
+			if (merge[i])
+				remaining--;
+			else
+				idx[nidx++] = i;
+		}
+		if (remaining > p->max_ranges)
+		{
+			gap_sort_vals = gc;
+			qsort(idx, nidx, sizeof(int), gap_idx_cmp);
+			for (int j = 0; j < nidx && remaining > p->max_ranges; j++)
+			{
+				merge[idx[j]] = 1;
+				remaining--;
+			}
+		}
+		for (int i = 0; i < ng; i++)
+		{
+			if (merge[i])
+				l->a[m].hi = l->a[i + 1].hi;
+			else
+				l->a[++m] = l->a[i + 1];
+		}
+		l->n = m + 1;
+		SC_FREE(gc);
+		SC_FREE(merge);
+		SC_FREE(idx);
+	}
+}
+
+/*
  * Sort, merge adjacent, and score a candidate covering.
  *
  * score = ranges * range_cost + expected rows inside the covering
@@ -1117,7 +1212,7 @@ cover_cone_direct(const sc_region *r, const sc_density *d,
  */
 static double
 rlist_score(rlist_t *l, const sc_density *d, const sc_cover_params *p, int steps,
-			double *rows_out)
+			double region_area, double *rows_out)
 {
 	double		rows = 0;
 	int			m = 0;
@@ -1136,6 +1231,8 @@ rlist_score(rlist_t *l, const sc_density *d, const sc_cover_params *p, int steps
 			l->a[++m] = l->a[i];
 	}
 	l->n = m + 1;
+	merge_gaps(l, d, p, (p->max_area_ratio > 0)
+			   ? p->max_area_ratio * fmax(region_area, order_area(SC_MAX_ORDER)) : INFINITY);
 	for (int i = 0; i < l->n; i++)
 		rows += sc_density_rows(d, l->a[i].lo, l->a[i].hi);
 	if (rows_out)
@@ -1214,7 +1311,7 @@ sc_cover_compute(const sc_region *r, const sc_density *d,
 				break;
 			}
 			steps += st;
-			cost = rlist_score(&cand, d, p, st, &cand_rows);
+			cost = rlist_score(&cand, d, p, st, r->area, &cand_rows);
 			if (cost < best_cost)
 			{
 				if (best.a)
@@ -1431,56 +1528,7 @@ finish:
 		kept.n = m + 1;
 	}
 
-	/*
-	 * Merge gaps that are cheaper to scan than to skip (expected rows in the
-	 * gap < range_cost), then the cheapest remaining gaps until the range
-	 * count fits max_ranges.
-	 */
-	if (kept.n > 1)
-	{
-		int			ng = kept.n - 1;
-		double	   *gc = SC_MALLOC(sizeof(double) * ng);
-		char	   *merge = SC_MALLOC(ng);
-		int		   *idx = SC_MALLOC(sizeof(int) * ng);
-		int			remaining = kept.n,
-					nidx = 0,
-					m = 0;
-
-		for (int i = 0; i < ng; i++)
-		{
-			int64_t		glo = kept.a[i].hi + 1,
-						ghi = kept.a[i + 1].lo - 1;
-
-			gc[i] = sc_density_rows(d, glo, ghi);
-			merge[i] = gc[i] <= p->range_cost &&
-				((double) (ghi - glo) + 1.0) * SC_PIX29_AREA <= area_cap;
-			if (merge[i])
-				remaining--;
-			else
-				idx[nidx++] = i;
-		}
-		if (remaining > p->max_ranges)
-		{
-			gap_sort_vals = gc;
-			qsort(idx, nidx, sizeof(int), gap_idx_cmp);
-			for (int j = 0; j < nidx && remaining > p->max_ranges; j++)
-			{
-				merge[idx[j]] = 1;
-				remaining--;
-			}
-		}
-		for (int i = 0; i < ng; i++)
-		{
-			if (merge[i])
-				kept.a[m].hi = kept.a[i + 1].hi;
-			else
-				kept.a[++m] = kept.a[i + 1];
-		}
-		kept.n = m + 1;
-		SC_FREE(gc);
-		SC_FREE(merge);
-		SC_FREE(idx);
-	}
+	merge_gaps(&kept, d, p, area_cap);
 
 	out->n = kept.n;
 	out->r = kept.a;
