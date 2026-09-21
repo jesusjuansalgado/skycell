@@ -439,10 +439,56 @@ finer and emit more range arms, while pgSphere's planning stays flat at
 loses anyway. At 1° the execution gap (0.74 vs 1.26 ms, 153 vs 464 buffers)
 dwarfs the planning penalty and widens with scale.
 
+**How tight is the covering?** Planning is only half the story; the other half
+is how much sky the covering actually scans. `skycell_cover_info()` reports it
+directly, and it is **not monotonic in the radius** — measured on the
+20.5M-row ObsCore relation at the galactic-centre density:
+
+| radius | ranges | area scanned / area asked for |
+|---|---|---|
+| 0.1″ | 1 | 20.6 |
+| **0.25–1″** | 2 | **~105** |
+| 5–10″ | 1 | 33.8 |
+| 50″ | 1 | 10.8 |
+| 6′ | 1 | 4.6 |
+| 1° | 13 | 1.34 |
+| 3° | 24 | 1.25 |
+| 30–90° | 64 | ~1.07 |
+
+The worst point is **sub-arcsecond**, where the cost model refuses to cut finer
+(the extra ranges would cost more than the area they save) and emits one or two
+very coarse cells. That is exactly the cross-match radius, and it explains a
+result further down that would otherwise look unmotivated: skycell only reaches
+*parity* with `q3c_join` at 1″ rather than beating it, despite the cheaper
+index — it is doing ~100× the area work and breaking even anyway. Above about
+1° the covering is tight (within 7% of the region) and the advantage is
+straightforward.
+
+**Elongated regions — where the gap is widest.** A space-filling curve is
+supposed to cover long thin shapes badly, and it does: a 1 deg² strip wastes 8×
+at aspect 1 and 218× at aspect 14406. But pgSphere's bounding structure for a
+long strip is looser still, so this is skycell's *best* case, not its worst.
+Boxes of constant 1 deg² area at the galactic centre, 20.5M-row ObsCore
+relation, randomized paired trials, 3 repetitions:
+
+| aspect ratio | pgSphere | skycell | ratio | pgSphere buffers | skycell buffers |
+|---|---|---|---|---|---|
+| 1 | 3.5 ms | **0.7 ms** | 0.20 | 83 | 183 |
+| 16 | 11.8 ms | **1.5 ms** | 0.12 | 354 | 533 |
+| 100 | 47.2 ms | **4.5 ms** | 0.10 | 1447 | 1488 |
+| 901 | 769 ms | **19.6 ms** | 0.03 | 21691 | **6147** |
+| 3593 | 3439 ms | **21.4 ms** | **0.01** | 93136 | **8815** |
+
+Scan tracks, slit spectra and survey stripes are the shapes this matters for.
+Note also that cones at the pole are *not* a problem — the covering stays at
+3–7 ranges at every declination from 0° to 89.9°, which is the point of an
+equal-area scheme.
+
 **So: on a Gaia-sized catalogue this index improves degree-scale selections,
 polygons and cross-matches — not small cone searches.** Removing the plan-time
 cost (an SP-GiST opclass, or the `= ANY` single-scan form) is what would change
-that.
+that; making the sub-arcsecond covering tighter is a separate, independent
+improvement.
 
 **Everything else:**
 

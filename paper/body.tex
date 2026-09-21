@@ -1055,6 +1055,20 @@ form, which emits a fixed number of range slots per outer row in the manner of
 \texttt{q3c\_join}, is level with Q3C at 1\arcsec\ and 35\% slower at 10\arcsec, where a
 fixed slot count fits the covering less well.
 
+Why level rather than better is answerable from the covering itself. The sky a
+covering scans, as a multiple of the sky asked for, is not monotonic in the radius.
+Measured on the ObsCore relation of Sect.~\ref{sec:pressure} at the density of the
+galactic centre, it is 21 at 0.1\arcsec, rises to about 105 between 0.25\arcsec\ and
+1\arcsec, and then falls steadily: 34 at 10\arcsec, 11 at 50\arcsec, 4.6 at 6\arcmin,
+1.34 at 1\degr\ and 1.07 above 30\degr. The worst point is sub-arcsecond, where the
+cost model will not cut finer because the extra ranges would cost more than the area
+they save, and so emits one or two very coarse cells. A cross-match at 1\arcsec\
+therefore does some two orders of magnitude more area work than the region requires and
+still draws level with \texttt{q3c\_join}; the same index at degree scale, where the
+covering is within a third of the region, is where it wins outright. Tightening that
+sub-arcsecond covering is an improvement independent of the planning cost, and neither
+subsumes the other.
+
 The claim this supports is the narrow one: on the operation Q3C is built for,
 \texttt{skycell} is Q3C's equal rather than its better, while being two and a half to
 three times faster than pgSphere -- and it reaches that position with the same index
