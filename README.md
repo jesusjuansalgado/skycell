@@ -121,6 +121,24 @@ make && sudo make install
 psql -c "CREATE EXTENSION skycell"
 ```
 
+### Upgrading an existing database
+
+`make install` only copies files into PostgreSQL's share directory — databases
+that already have the extension keep the version they were created with until
+they are told otherwise, so a newly installed version is invisible to them:
+
+```bash
+make upgrade                     # every database the connection can see
+make upgrade PGDATABASE=mydb     # just one
+psql -d mydb -c "ALTER EXTENSION skycell UPDATE"   # or do it by hand
+```
+
+`make upgrade` reports what it finds and skips databases that are already
+current; connection settings come from the usual `PG*` variables. It is a
+separate step on purpose — `make install` may run with no server up, and
+issuing DDL against live databases as a side effect of copying files is not
+something an install should do.
+
 With Docker, including Q3C and pgSphere for comparison:
 
 ```bash

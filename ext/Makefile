@@ -1,8 +1,9 @@
 MODULE_big = skycell
 OBJS = src/skycell.o src/adql.o src/astro.o src/cover.o src/healpix.o
 EXTENSION = skycell
-DATA = sql/skycell--0.1.sql sql/skycell--0.2.sql sql/skycell--0.3.sql sql/skycell--0.4.sql sql/skycell--0.5.sql sql/skycell--0.6.sql \
-       sql/skycell--0.1--0.2.sql sql/skycell--0.2--0.3.sql sql/skycell--0.3--0.4.sql sql/skycell--0.4--0.5.sql sql/skycell--0.5--0.6.sql
+# Every version script and every upgrade script, so that adding a version means
+# adding a file and nothing else.
+DATA = $(wildcard sql/skycell--*.sql)
 PG_CPPFLAGS = -DSKYCELL_PG
 REGRESS = skycell adql
 REGRESS_OPTS = --inputdir=test --outputdir=test
@@ -22,3 +23,36 @@ src/healpix.o: src/healpix.h
 selftest:
 	$(CC) -O2 -o test/healpix_selftest test/healpix_selftest.c src/healpix.c -lm && ./test/healpix_selftest
 	$(CC) -O2 -o test/cover_selftest test/cover_selftest.c src/cover.c src/healpix.c -lm && ./test/cover_selftest
+
+# Bring databases that already have skycell up to the version just installed.
+#
+# `make install` deliberately does not do this.  It copies files into the
+# PostgreSQL share directory, it may run with no server up at all, and issuing
+# DDL against live databases as a side effect of a file install is a surprise
+# nobody wants -- which is why no PostgreSQL extension does it.  Upgrading is a
+# separate, explicit step; this target is the convenience, not a hidden action.
+#
+#   make upgrade                 -- every database the connection can see
+#   make upgrade PGDATABASE=foo  -- just that one
+#
+# Connection settings come from the usual PG* environment variables.
+PSQL ?= psql
+.PHONY: upgrade
+upgrade:
+	@v=`sed -n "s/^default_version *= *'\(.*\)'/\1/p" skycell.control`; \
+	if [ -z "$$v" ]; then echo "cannot read default_version from skycell.control" >&2; exit 1; fi; \
+	echo "installed version: $$v"; \
+	if [ -n "$$PGDATABASE" ]; then dbs="$$PGDATABASE"; else \
+	  dbs=`$(PSQL) -X -Atq -d postgres -c "SELECT datname FROM pg_database WHERE datallowconn AND NOT datistemplate ORDER BY 1"`; \
+	fi; \
+	n=0; \
+	for db in $$dbs; do \
+	  cur=`$(PSQL) -X -Atq -d "$$db" -c "SELECT extversion FROM pg_extension WHERE extname='skycell'" 2>/dev/null`; \
+	  if [ -z "$$cur" ]; then continue; fi; \
+	  n=`expr $$n + 1`; \
+	  if [ "$$cur" = "$$v" ]; then echo "  $$db: already $$v"; else \
+	    echo "  $$db: $$cur -> $$v"; \
+	    $(PSQL) -X -q -d "$$db" -c "ALTER EXTENSION skycell UPDATE TO '$$v'" || exit 1; \
+	  fi; \
+	done; \
+	if [ $$n -eq 0 ]; then echo "  no database has skycell installed"; fi
