@@ -45,7 +45,8 @@ faster at every radius on both corpora (ratios 0.39--0.95), touching a third of
 pgSphere's buffer pages at 1\degr. It keeps an index of 214\,MB against pgSphere's
 685\,MB -- 22.5 bytes per row against 72, which at Gaia DR3's $1.8\times10^9$ sources
 is 38\,GiB against the 160\,GiB of the pgSphere-plus-Q3C pair an archive needs today to
-cover both cone searches and cross-matching -- builds it in 1.4\,s against 42\,s, answers convex polygons 2.7--4.4 times faster,
+cover both cone searches and cross-matching; on a machine that holds the first and not
+the second, warm skycell runs 10--20 times faster than cold pgSphere -- builds it in 1.4\,s against 42\,s, answers convex polygons 2.7--4.4 times faster,
 matches \texttt{q3c\_join} on cross-matching -- the operation Q3C is built for -- while
 being 2.5--3.3 times faster than pgSphere at it, and its row estimates are wrong by a
 factor 1.2 rather than 2.5--3.0. The cost model's one parameter is
@@ -999,6 +1000,44 @@ machine must have, which at these sizes is a procurement decision rather than a 
 one -- and it is exactly the regime where our cold-cache measurements put
 \texttt{skycell} furthest ahead (0.31 to 0.53 of pgSphere's time at 30\arcmin\ and
 beyond).
+
+\paragraph{The comparison a constrained machine actually faces.}
+Table~\ref{tab:gaia} invites matching regimes -- warm against warm -- but that is not
+the choice in front of an archive with, say, 64\,GiB. There, \texttt{skycell}'s index is
+resident and the pgSphere-plus-Q3C pair is not, so the honest comparison is
+\emph{warm \texttt{skycell} against cold pgSphere}. On the $5\times10^7$-row corpus,
+where we measured both regimes:
+
+\begin{center}
+\footnotesize
+\begin{tabular}{@{}l rrr r@{}}
+  \hline\hline
+  & skycell & pgSphere & pgSphere & warm skycell \\
+  radius & warm & warm & cold & / cold pgSphere \\
+  \hline
+  1\arcsec   & 0.042 & 0.047 &  0.528 & 0.08 \\
+  1\arcmin   & 0.053 & 0.052 &  0.601 & 0.09 \\
+  6\arcmin   & 0.092 & 0.085 &  1.168 & 0.08 \\
+  30\arcmin  & 0.430 & 0.568 &  5.759 & 0.07 \\
+  1\degr     & 0.875 & 1.450 & 18.401 & 0.05 \\
+  3\degr     & 7.144 & 11.63 & 79.180 & 0.09 \\
+  \hline
+\end{tabular}
+\end{center}
+
+\noindent All times in ms. Matched warm, the two are within 10\% at small radii; with
+the residency the index sizes actually buy, \texttt{skycell} is one to two orders of
+magnitude ahead. The same holds against Q3C, whose cold times are 2.1--21\,ms.
+
+This is an upper bound on the advantage, and should be read as one. Our cold regime is a
+fully cold start -- shared buffers emptied and the page cache dropped -- whereas a server
+whose index merely does not fit thrashes at some hit rate between the two columns rather
+than missing every time. The true figure depends on how much of the index fits and on the
+locality of the query stream, neither of which we have measured at that scale. What the
+measurement does establish is the direction and that the effect is large: the difference
+between the two designs stops being a matter of percent and becomes a matter of factors
+precisely when the index outgrows the machine, which is the regime a catalogue of
+$10^9$ sources puts a server in.
 
 Four caveats. The extrapolation is linear and validated only over a factor five in row
 count, though the per-row cost is constant to 0.5\% across it. These are positional

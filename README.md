@@ -372,8 +372,22 @@ and 50M rows), so it extrapolates. For 1.81×10⁹ sources:
 The last row is the honest comparison: pgSphere answers cones and stores
 regions, `q3c_join` is what archives use for cross-matching (2.4× faster than
 pgSphere at it), so covering both means carrying both indexes. skycell answers
-both from one. **That is 4× less memory** — and residency is what decides
-whether you get the warm or the cold numbers, which differ by 2–3×.
+both from one. **That is 4× less memory.**
+
+And on a machine sized between the two — holding skycell's index but not the
+pair — the regimes shouldn't be matched: skycell runs warm while pgSphere runs
+cold. Measured at 50M rows (ms):
+
+| radius | skycell warm | pgSphere warm | pgSphere cold | warm sky / cold pgS |
+|---|---|---|---|---|
+| 1″ | 0.042 | 0.047 | 0.528 | **0.08** |
+| 6′ | 0.092 | 0.085 | 1.168 | **0.08** |
+| 1° | 0.875 | 1.450 | 18.401 | **0.05** |
+
+Matched warm they are within 10%; with the residency the index sizes actually
+buy, it is one to two orders of magnitude. Treat that as an **upper bound** —
+our cold regime is a fully cold start, while a server that merely can't fit the
+index thrashes at some hit rate in between.
 
 **Cross-match — Q3C's own speciality.** 200k probes against 50M sources, each
 method warmed on its own block before timing, paired over 16 block-repetitions
