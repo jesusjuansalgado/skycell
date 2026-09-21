@@ -583,6 +583,18 @@ skycell is **level with `q3c_join`** (not faster — the intervals reach 1) and
 2.5–3.3× faster than pgSphere. So one index is competitive with each of the two
 established ones on the workload each was built for.
 
+> **Caveat — check the plan on wide relations.** Those numbers are from a narrow
+> 50M-row catalogue. Repeating the cross-match on the 20.5M-row *ObsCore-shaped*
+> relation (23 columns, 22 GB heap), both the `LATERAL` and the join form were
+> planned as a **sequential scan** and did not finish inside 90 s; with
+> `enable_seqscan = off` the same query runs in **145 ms** for 400 probes. The
+> cause is the row estimate: a range join with non-constant bounds
+> (`cell BETWEEN r.lo AND r.hi`) has no selectivity estimator, so PostgreSQL
+> falls back to ~11% per relation and predicted 2.7×10⁹ rows against a true
+> 3642. A wide heap then makes the index path look expensive. Verify with
+> `EXPLAIN` before trusting a cross-match plan on a wide table; a selectivity
+> estimator for the range-join case is not implemented yet.
+
 Cache residency dominates this measurement and has to be controlled: the same
 block query takes 6.2 s cold and 0.32 s warm, so whichever method runs first on
 a block pays for the others. An uncontrolled run of ours reported skycell at
@@ -692,6 +704,10 @@ histogram was accurate all along (3701 estimated vs ~4155 scanned).
 - Tested to 50M rows on one machine, warm and with caches dropped. The Gaia
   corpus uses the real DR3 density field but not real positions, and has no
   structure below its 0.11° map cells.
+- Cross-match plans are not robust on wide relations: the range join
+  `cell BETWEEN r.lo AND r.hi` has no selectivity estimator, so the planner can
+  pick a sequential scan that is orders of magnitude slower than the index path
+  it rejects (measured: >90 s against 145 ms). Narrow catalogues are unaffected.
 - The memory-residency advantage needs two things the index-size arithmetic
   does not mention: a query stream that sweeps enough sky to touch most of the
   index, and a heap small enough that it does not take the buffer pool by
