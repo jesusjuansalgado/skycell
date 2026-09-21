@@ -378,14 +378,47 @@ plan in all but one of the shapes we tested**. The sentence suggesting improved
 estimates act as insurance against planner error has been removed; it was
 speculation.
 
-We can offer one concrete case where estimation quality does change a plan, and
-it runs against us. On a wide ObsCore relation the cross-match range join
-(`cell BETWEEN lo AND hi` with non-constant bounds) has **no** selectivity
-estimator, so PostgreSQL falls back to a ~11% default and predicted 2.7×10⁹ rows
-against a true 3642. The planner then chose a sequential scan that did not
-finish in 90 s, over an index path that runs in 145 ms. This is a defect in our
-integration, not a success of it, and §5.4 now records it as such along with the
-workaround.
+We can, however, offer one case where estimation quality changes the plan
+decisively, and it is worth reporting in full because it began as a defect in
+our own integration rather than as evidence for it.
+
+On a wide ObsCore relation the cross-match range join (`cell BETWEEN lo AND hi`
+with non-constant bounds) has **no** selectivity estimator in PostgreSQL. Each
+side falls back to `DEFAULT_INEQ_SEL`, so the pair predicts a ninth of the
+relation per probe: 2 276 921 rows on a 20.5-million-row table where the truth
+is about one. That is not an error in the row estimate of the *query* — the
+exact test's own estimator gives the join a correct `rows=1` — but in the
+estimated cost of the inner index scan, which is what decides whether the
+parameterised index path is generated at all. The planner therefore chose a
+sequential scan that did not finish in 120 s over a path that runs in 50 ms.
+
+Selectivity for an operator comes from `pg_operator.oprrest` and `int8`'s
+cannot be changed, so the fix is skycell's own comparison operators carrying
+their own estimator in their own b-tree operator class (`skycell_cell_ops`,
+v0.7). The estimator is not a fitted constant: the cone radius is recoverable
+at plan time in both shapes we emit — from `skycell_cone_bound`'s constant
+argument in the join form, and by following the range variable to its
+function-scan entry in the `LATERAL` form — so each side returns the square
+root of the cap fraction and the pair multiplies to the cone's sky fraction.
+Where the bounds are constant it defers to the stock histogram estimator.
+
+| 400 probes, 1\arcsec | stock operators | `skycell_cell_ops` |
+|---|---|---|
+| inner scan estimate | 2 276 921 rows | **1** |
+| total plan cost | 617 792 278 | **74.8** |
+| plan | sequential scan | index scan with memoisation |
+| runtime | >120 s | **50 ms** |
+
+Row counts are identical to brute force. The facility is opt-in and requires no
+migration: an index built the ordinary way is unaffected, and the operator class
+is worth using only on wide relations — the narrow catalogue showed no
+mis-planning in any of the 36 cross-match measurements of major 7.
+
+We report this as support for a *narrow* version of the referee's point rather
+than against it: cardinality estimation mattered here not because a better
+estimate produced a better plan of the same shape, but because a missing
+estimator suppressed a plan shape entirely. §5.4 records it, and we note that
+the single 50 ms figure is one measurement rather than a paired trial.
 
 ---
 
