@@ -43,7 +43,9 @@ and by 31--37\% at 3\degr, and the two are indistinguishable between 6\arcmin\ a
 1\degr; on the Gaia field skycell is 3\% slower at 6\arcmin. With caches dropped it is
 faster at every radius on both corpora (ratios 0.39--0.95), touching a third of
 pgSphere's buffer pages at 1\degr. It keeps an index of 214\,MB against pgSphere's
-685\,MB, builds it in 1.4\,s against 42\,s, answers convex polygons 2.7--4.4 times faster,
+685\,MB -- 22.5 bytes per row against 72, which at Gaia DR3's $1.8\times10^9$ sources
+is 38\,GiB against the 160\,GiB of the pgSphere-plus-Q3C pair an archive needs today to
+cover both cone searches and cross-matching -- builds it in 1.4\,s against 42\,s, answers convex polygons 2.7--4.4 times faster,
 matches \texttt{q3c\_join} on cross-matching -- the operation Q3C is built for -- while
 being 2.5--3.3 times faster than pgSphere at it, and its row estimates are wrong by a
 factor 1.2 rather than 2.5--3.0. The cost model's one parameter is
@@ -942,6 +944,72 @@ and it is the one result here that is not sensitive to protocol.
   \end{tabular}
 \end{table}
 
+
+
+\subsection{What the index costs at Gaia's scale}
+\label{sec:scale-memory}
+
+Index size is the one result in this paper that is insensitive to protocol, and it is
+also the one that decides deployments, so it is worth carrying to the scale an archive
+actually runs at. The cost per row is flat: between $10^7$ and $5\times10^7$ rows it
+changes by 0.5\% for pgSphere and not at all for the two B-trees
+(Table~\ref{tab:gaia}), which is what the structures predict -- an 8-byte key with its
+tuple header in a B-tree, a bounding volume per entry in a GiST tree.
+
+Extrapolating to the $1.81\times10^9$ sources of Gaia DR3 gives the right-hand columns
+of Table~\ref{tab:gaia}. The comparison that matters there is not one index against
+another but one \emph{deployment} against another. pgSphere answers cone searches and
+stores regions; \texttt{q3c\_join} is what PostgreSQL archives use for cross-matching,
+and Sect.~\ref{sec:xmatch} measures it 2.4 times faster than pgSphere at that. An
+archive that wants both therefore carries both indexes today. \texttt{skycell} answers
+both from one, and that one is the smaller kind.
+
+\begin{table}
+  \caption{Index cost per row, measured at two scales, and what it implies for a
+    catalogue the size of Gaia DR3 ($1.81\times10^9$ sources). Build times scale
+    linearly from the $5\times10^7$ measurement, which is optimistic for all three
+    equally. The last column is the smallest conventional server memory that holds the
+    index resident with room left for the heap's hot pages.}
+  \label{tab:gaia}
+  \centering
+  \footnotesize
+  \begin{tabular}{@{}l rr rr r@{}}
+    \hline\hline
+    & \multicolumn{2}{c}{B/row} & \multicolumn{3}{c}{at $1.81{\times}10^9$} \\
+    \cline{2-3}\cline{4-6}
+    index & $10^7$ & $5{\times}10^7$ & GiB & build & GiB \\
+    \hline
+    skycell            & 22.5 & 22.5 & \textbf{38} & 14\,min & 64 \\
+    Q3C                & 22.5 & 22.5 & 38 & 13\,min & 64 \\
+    pgSphere           & 71.8 & 72.2 & 122 & 2.7\,h & 192 \\
+    \hline
+    pgSphere $+$ Q3C   & ---  & ---  & 160 & 2.9\,h & 256 \\
+    \hline
+  \end{tabular}
+\end{table}
+
+The memory column is the operational point. A positional index is only as fast as its
+residency: the measurements of Sect.~\ref{sec:cones} differ by a factor two to three
+between the warm and the cold regime, and which regime a server is in is decided by
+whether the index fits beside the heap's working set. At DR3 scale a 64\,GiB server
+holds \texttt{skycell}'s 38\,GiB index with room to spare; pgSphere's 122\,GiB does not
+fit in 128\,GiB once the heap is accounted for, and the pair needed to cover both cone
+searches and cross-matching wants 256\,GiB. That is a factor four in the memory the
+machine must have, which at these sizes is a procurement decision rather than a tuning
+one -- and it is exactly the regime where our cold-cache measurements put
+\texttt{skycell} furthest ahead (0.31 to 0.53 of pgSphere's time at 30\arcmin\ and
+beyond).
+
+Four caveats. The extrapolation is linear and validated only over a factor five in row
+count, though the per-row cost is constant to 0.5\% across it. These are positional
+indexes alone: a real archive's table, its other indexes and its ancillary products
+dwarf them. A partitioned deployment changes the arithmetic, since only the partitions
+in play need be resident. And the two B-trees are the same size, so the comparison is
+really one geometry index plus one integer index against one integer index -- the saving
+comes from not needing the geometry index at all, which rests on \texttt{skycell}
+answering the region queries pgSphere is kept for, as Sects.~\ref{sec:cones}
+and~\ref{sec:otherops} measure.
+
 \subsection{Polygons, cross-matches and footprints}
 \label{sec:otherops}
 
@@ -1354,7 +1422,9 @@ state hand to whichever method is measured last, on two 10-million-row corpora -
 drawn from the real Gaia DR3 density field -- it is 6--11\% faster than pgSphere for
 cone radii of 1\arcsec--1\arcmin\ and 31--37\% faster at 3\degr\ warm, and faster at
 every radius with caches dropped, by a factor of up to 2.5. It answers convex polygons
-2.7--4.4 times faster, keeps an index a third the size of pgSphere's, builds it thirty
+2.7--4.4 times faster, keeps an index a third the size of pgSphere's -- 38\,GiB against
+160\,GiB at Gaia DR3 scale for the pair of indexes that covers the same ground, which is
+the difference between a 64\,GiB server and a 256\,GiB one -- builds it thirty
 times faster, and estimates row counts twice as accurately. On cross-matching, the
 operation Q3C exists for, it is Q3C's equal (0.78--0.92 of its time, intervals reaching
 1) and 2.5--3.3 times faster than pgSphere -- so one index is competitive with each of

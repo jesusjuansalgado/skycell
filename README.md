@@ -359,6 +359,22 @@ that.
 | 200k points in 20k footprints | not supported | 0.97 s, 1.1 MB | **0.76 s**, 9.5 MB |
 | planner row-estimate error, 1° | 1.9× | 2.8× | **1.22×** |
 
+**At Gaia DR3 scale.** Per-row index cost is flat (0.5% change between 10M
+and 50M rows), so it extrapolates. For 1.81×10⁹ sources:
+
+| index | size | build | server RAM to keep it warm |
+|---|---|---|---|
+| **skycell** | **38 GiB** | 14 min | **64 GiB** |
+| Q3C | 38 GiB | 13 min | 64 GiB |
+| pgSphere | 122 GiB | 2.7 h | 192 GiB |
+| pgSphere + Q3C | 160 GiB | 2.9 h | 256 GiB |
+
+The last row is the honest comparison: pgSphere answers cones and stores
+regions, `q3c_join` is what archives use for cross-matching (2.4× faster than
+pgSphere at it), so covering both means carrying both indexes. skycell answers
+both from one. **That is 4× less memory** — and residency is what decides
+whether you get the warm or the cold numbers, which differ by 2–3×.
+
 **Cross-match — Q3C's own speciality.** 200k probes against 50M sources, each
 method warmed on its own block before timing, paired over 16 block-repetitions
 (`bench/11_xmatch_ab.sql`). Identical row counts from all four:
