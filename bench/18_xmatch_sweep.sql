@@ -1,0 +1,86 @@
+-- Cross-match across outer-table size, match radius and target distribution
+-- (referee 2, major 7).
+--
+-- The paper reported one point: 200k probes at 1" and 10" against one catalogue.
+-- The referee asks whether the ordering survives elsewhere, and separates the
+-- indexing method from the query formulation.  Both are varied here:
+--
+--   formulation  q3c_join | skycell LATERAL (ranges then index) | skycell_join
+--                (the fixed-slot predicate form) | pgSphere
+--   outer size   1k, 10k, 100k probes
+--   radius       0.2", 1", 5", 30"
+--   targets      drawn from the catalogue (clustered) or uniform on the sphere
+--
+-- The plan shape is recorded with every measurement: on a wide relation the
+-- range join can be mis-planned into a sequential scan, and a timing without
+-- the plan beside it is not interpretable.
+\set ON_ERROR_STOP 1
+
+CREATE TABLE IF NOT EXISTS xms (n int, radius_arcsec float8, targets text, method text,
+  ms float8, rows_out bigint, plan_shape text, timed_out bool);
+
+CREATE OR REPLACE PROCEDURE xms_probes(n int, kind text)
+LANGUAGE plpgsql AS $$
+BEGIN
+  DROP TABLE IF EXISTS xp;
+  IF kind = 'clustered' THEN
+    EXECUTE format('CREATE TABLE xp AS SELECT ra, dec FROM gaia_realc ORDER BY random() LIMIT %s', n);
+  ELSE
+    EXECUTE format('CREATE TABLE xp AS SELECT 360*random() AS ra,
+                    degrees(asin(2*random()-1)) AS dec FROM generate_series(1, %s)', n);
+  END IF;
+  ANALYZE xp;
+END $$;
+
+CREATE OR REPLACE FUNCTION xms_sql(method text, r_deg float8) RETURNS text
+LANGUAGE sql IMMUTABLE AS $$
+  SELECT CASE method
+    WHEN 'q3c_join' THEN format(
+      'SELECT count(*) FROM xp p, gaia_realc o WHERE q3c_join(p.ra, p.dec, o.ra, o.dec, %s)', r_deg)
+    WHEN 'skycell_lateral' THEN format(
+      'SELECT count(*) FROM xp p CROSS JOIN LATERAL skycell_cone_ranges(p.ra, p.dec, %s) r
+       JOIN gaia_realc o ON skycell_ang2cell(o.ra, o.dec) BETWEEN r.lo AND r.hi
+       WHERE skycell_in_cone(o.ra, o.dec, p.ra, p.dec, %s)', r_deg, r_deg)
+    WHEN 'skycell_join' THEN format(
+      'SELECT count(*) FROM xp p, gaia_realc o WHERE skycell_join(o.ra, o.dec, p.ra, p.dec, %s)', r_deg)
+    WHEN 'pgsphere' THEN format(
+      'SELECT count(*) FROM xp p, gaia_realc o
+       WHERE o.pos <@ scircle(spoint(radians(p.ra), radians(p.dec)), radians(%s))', r_deg)
+  END $$;
+
+CREATE OR REPLACE FUNCTION xms_run(sizes int[], radii float8[], kinds text[],
+                                   timeout_ms int DEFAULT 120000)
+RETURNS void LANGUAGE plpgsql AS $$
+DECLARE k text; n int; ra float8; m text; q text; t0 timestamptz; nn bigint;
+        shape text; plan text; ms float8; to_ bool;
+BEGIN
+  DELETE FROM xms;
+  FOREACH k IN ARRAY kinds LOOP
+   FOREACH n IN ARRAY sizes LOOP
+    CALL xms_probes(n, k);
+    FOREACH ra IN ARRAY radii LOOP
+     FOREACH m IN ARRAY ARRAY['q3c_join','skycell_lateral','skycell_join','pgsphere'] LOOP
+      q := xms_sql(m, ra / 3600.0);
+      -- record what the planner decided, before timing it
+      shape := 'unknown';
+      BEGIN
+        EXECUTE 'EXPLAIN (COSTS OFF, FORMAT JSON) ' || q INTO plan;
+        shape := CASE WHEN plan LIKE '%Seq Scan%gaia_realc%' OR plan LIKE '%"Relation Name": "gaia_realc"%Seq Scan%'
+                      THEN 'seqscan' ELSE 'index' END;
+        IF plan LIKE '%Seq Scan%' AND plan NOT LIKE '%Index Scan%' AND plan NOT LIKE '%Bitmap Index Scan%'
+          THEN shape := 'seqscan'; ELSE shape := 'index'; END IF;
+      EXCEPTION WHEN OTHERS THEN shape := 'explain_failed'; END;
+      PERFORM set_config('statement_timeout', timeout_ms::text, true);
+      to_ := false; ms := NULL; nn := NULL;
+      BEGIN
+        t0 := clock_timestamp();
+        EXECUTE q INTO nn;
+        ms := extract(epoch FROM clock_timestamp() - t0) * 1000;
+      EXCEPTION WHEN query_canceled THEN to_ := true; ms := timeout_ms; END;
+      PERFORM set_config('statement_timeout', '0', true);
+      INSERT INTO xms VALUES (n, ra, k, m, ms, nn, shape, to_);
+     END LOOP;
+    END LOOP;
+   END LOOP;
+  END LOOP;
+END $$;
