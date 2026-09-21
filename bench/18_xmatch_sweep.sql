@@ -49,17 +49,24 @@ LANGUAGE sql IMMUTABLE AS $$
   END $$;
 
 CREATE OR REPLACE FUNCTION xms_run(sizes int[], radii float8[], kinds text[],
-                                   timeout_ms int DEFAULT 120000)
+                                   timeout_ms int DEFAULT 120000, reps int DEFAULT 3)
 RETURNS void LANGUAGE plpgsql AS $$
 DECLARE k text; n int; ra float8; m text; q text; t0 timestamptz; nn bigint;
-        shape text; plan text; ms float8; to_ bool;
+        shape text; plan text; ms float8; to_ bool; rep int;
 BEGIN
   DELETE FROM xms;
   FOREACH k IN ARRAY kinds LOOP
    FOREACH n IN ARRAY sizes LOOP
     CALL xms_probes(n, k);
+    FOR rep IN 1 .. reps LOOP
     FOREACH ra IN ARRAY radii LOOP
-     FOREACH m IN ARRAY ARRAY['q3c_join','skycell_lateral','skycell_join','pgsphere'] LOOP
+     -- randomized order, per cell: a fixed order lets whichever method runs
+     -- last read the heap pages the earlier ones faulted in, and all four
+     -- answer the same cones from the same pages.  A first version of this
+     -- script ran them in a fixed order and made the method that happened to
+     -- run third look 6-45x faster than it is.
+     FOR m IN SELECT unnest FROM unnest(ARRAY['q3c_join','skycell_lateral','skycell_join','pgsphere'])
+              ORDER BY random() LOOP
       q := xms_sql(m, ra / 3600.0);
       -- record what the planner decided, before timing it
       shape := 'unknown';
@@ -73,13 +80,15 @@ BEGIN
       PERFORM set_config('statement_timeout', timeout_ms::text, true);
       to_ := false; ms := NULL; nn := NULL;
       BEGIN
+        EXECUTE q INTO nn;                       -- warm this method on this cell
         t0 := clock_timestamp();
-        EXECUTE q INTO nn;
+        EXECUTE q INTO nn;                       -- then time it
         ms := extract(epoch FROM clock_timestamp() - t0) * 1000;
       EXCEPTION WHEN query_canceled THEN to_ := true; ms := timeout_ms; END;
       PERFORM set_config('statement_timeout', '0', true);
       INSERT INTO xms VALUES (n, ra, k, m, ms, nn, shape, to_);
      END LOOP;
+    END LOOP;
     END LOOP;
    END LOOP;
   END LOOP;
