@@ -13,3 +13,9 @@ paper/*.log
 paper/*.out
 paper/preview.pdf
 paper/paper.pdf
+
+# journal class files -- EDP Sciences, not ours to redistribute.
+# Fetch from https://www.aanda.org/for-authors/latex-issues/latex-tools
+paper/aa.cls
+paper/aa.bst
+paper/linenoaa.sty
