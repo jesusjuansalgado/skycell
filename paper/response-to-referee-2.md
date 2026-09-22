@@ -322,13 +322,19 @@ paper reported on the resampled corpus, now on real positions and over a much
 wider matrix.
 
 **The claim that does not.** The manuscript describes the `LATERAL` form as
-"the fastest one measured". That is true only at small radii. At 30″ with
-clustered targets it takes 5682 ms against the fixed-slot form's 896 ms — six
-times worse — while at 0.2″ it is the best of the four. The ordering between
-*our own two formulations* reverses with radius, which is precisely the referee's
-point: the formulation is a variable in its own right and cannot be folded into
-a statement about the index. §6.5 now reports both forms across the matrix and
-says which regime each suits.
+"the fastest one measured" without qualification. The ordering between *our own
+two formulations* reverses with radius, which is the referee's point exactly:
+the formulation is a variable in its own right.
+
+We also had to correct the grid itself. Our first sweep used 0.2″, 1″ and 30″;
+of those only 1″ is standard practice, 0.2″ being below typical astrometric
+uncertainty and 30″ an association radius rather than a cross-match one. We had
+therefore drawn a general conclusion about the `LATERAL` form from a regime
+in which the operation is not performed. Re-measured over 0.5–5″ (optical
+matching uses 1–1.5″, radio up to ~5″), the `LATERAL` form is level with
+`q3c_join` at a geometric mean of 0.98 over twenty-four cells and 3.0× faster
+than pgSphere, and is the better of our two forms; the reversal appears only
+above that range. §6.5 and Table 12 now report it that way.
 
 **A methodological note we think worth recording.** Our first version of this
 sweep ran the four formulations in a fixed order with no per-method warm-up. It

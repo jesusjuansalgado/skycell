@@ -601,22 +601,30 @@ skycell is **level with `q3c_join`** (not faster — the intervals reach 1) and
 2.5–3.3× faster than pgSphere. So one index is competitive with each of the two
 established ones on the workload each was built for.
 
-**Which skycell form to use depends on the radius.** On 10M real Gaia DR3
-positions, 100k probes, randomized method order, each method warmed, 3 reps
-(`bench/18_xmatch_sweep.sql`):
+**At the radii cross-matching is actually done at, use the `LATERAL` form.**
+Optical matching uses 1–1.5″ and radio up to ~5″. On **10M real Gaia DR3
+positions**, geometric mean of the paired per-cell ratio over three upload sizes
+(10³, 10⁴, 10⁵) × two target distributions (clustered and uniform), randomized
+method order, each method warmed, 3 reps (`bench/18_xmatch_sweep.sql`):
 
-| targets | radius | `q3c_join` | skycell `LATERAL` | `skycell_join` | pgSphere |
-|---|---|---|---|---|---|
-| clustered | 0.2″ | 909 | **545** | 889 | 2790 |
-| clustered | 1″ | 540 | **452** | 917 | 2999 |
-| clustered | 30″ | 960 | *5682* | **896** | 2852 |
-| uniform | 0.2″ | 433 | **427** | 547 | 1200 |
-| uniform | 1″ | 377 | **353** | 652 | 1336 |
-| uniform | 30″ | **460** | 515 | 676 | 1654 |
+| radius | `LATERAL` vs `q3c_join` | slots vs `q3c_join` | `LATERAL` vs pgSphere |
+|---|---|---|---|
+| 0.5″ | 0.96 | 1.26 | **0.35** |
+| 1″ | **0.80** | 1.12 | **0.32** |
+| 1.5″ | 1.12 | 1.66 | **0.28** |
+| 5″ | 1.08 | 1.29 | **0.35** |
+| **all** | **0.98** | 1.32 | **0.33** |
 
-(ms). The `LATERAL` form wins below about an arcsecond and **loses badly at 30″
-on clustered targets**; the fixed-slot `skycell_join` form is flat across radius.
-Pick by radius, or use `skycell_join` if the radius varies.
+So over 0.5–5″ skycell is **level with `q3c_join`** (0.98, faster in 16 of 24
+cells) and **3× faster than pgSphere** (faster in 23 of 24). The `LATERAL` form
+is the better of skycell's two here; the fixed-slot form runs 1.32 of
+`q3c_join`.
+
+Above that range the `LATERAL` form degrades — at 30″ on clustered targets it
+takes 5682 ms against the fixed-slot form's 896 ms. That is an association
+radius rather than a cross-match one, so treat it as a bound on the `LATERAL`
+form: use the fixed-slot `skycell_join` if you are matching at tens of
+arcseconds.
 
 **Fixing it: the `skycell_cell_ops` operator class (v0.7).** The cause is a
 missing selectivity estimator, and selectivity comes from the operator, so the

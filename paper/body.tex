@@ -1101,23 +1101,56 @@ covering is within a third of the region, is where it wins outright. Tightening 
 sub-arcsecond covering is an improvement independent of the planning cost, and neither
 subsumes the other.
 
-Which of \texttt{skycell}'s two forms is faster depends on the radius, and we were
-wrong to report one of them as the faster. Repeating the measurement on the real
-corpus across outer size, radius and target distribution (randomized method order
-within a cell, each warmed on its own query, three repetitions), the \texttt{LATERAL}
-form leads below about an arcsecond and loses badly above it: at $30\arcsec$ on
-clustered targets it takes 5682\,ms against the fixed-slot form's 896\,ms. The
-fixed-slot form is nearly flat in radius. Against \texttt{q3c\_join} the ratio over the
-twelve cells runs from 0.60 to 1.73 with no consistent winner, and against pgSphere
-\texttt{skycell} is 2--6 times faster throughout. The formulation is therefore a
-variable of its own, not a detail of the index, and a single cross-match number
-should not be read as a property of either method.
+We repeated this on the real corpus over the radii cross-matching actually uses.
+Optical work matches at $1$--$1.5\arcsec$ and radio at up to about $5\arcsec$;
+our earlier grid also contained $30\arcsec$, which is an association radius rather
+than a cross-match one, and the conclusions we drew from it did not describe
+practice. Table~\ref{tab:xmreal} therefore spans $0.5$--$5\arcsec$, three upload
+sizes, and targets drawn either from the catalogue (clustered) or uniformly, with
+the method order drawn per cell, each method warmed on its own query, and three
+repetitions.
+
+Over the operational range the \texttt{LATERAL} form is level with
+\texttt{q3c\_join} -- a geometric mean ratio of 0.98 over the twenty-four cells,
+faster in sixteen of them -- and $3.0$ times faster than pgSphere, faster in
+twenty-three of twenty-four. The fixed-slot form is the weaker of our two here,
+at 1.32 of \texttt{q3c\_join}, so the \texttt{LATERAL} form is the one to use at
+these radii. It is above them that it degrades: at $30\arcsec$ on clustered
+targets it takes 5682\,ms against the fixed-slot form's 896\,ms. That reversal is
+real but lies outside the regime the operation is used in, and we report it as a
+bound on the \texttt{LATERAL} form rather than, as an earlier version of this
+section had it, a general weakness.
 
 The claim this supports is the narrow one: on the operation Q3C is built for,
 \texttt{skycell} is Q3C's equal rather than its better, while being two and a half to
 three times faster than pgSphere -- and it reaches that position with the same index
 that answers the region queries of Sect.~\ref{sec:cones}, which is the point of the
 design.
+
+\begin{table}
+  \caption{Cross-matching at the radii the operation is used at, on \textbf{real
+    Gaia DR3 positions}: geometric mean of the paired per-cell ratio over three
+    upload sizes ($10^3$, $10^4$, $10^5$) and two target distributions, method
+    order drawn per cell, each method warmed on its own query, three repetitions.
+    Below 1 means \texttt{skycell} is faster.}
+  \label{tab:xmreal}
+  \centering
+  \footnotesize
+  \begin{tabular}{l rr rr}
+    \hline\hline
+    & \multicolumn{2}{c}{vs \texttt{q3c\_join}} & \multicolumn{2}{c}{vs pgSphere} \\
+    \cline{2-3}\cline{4-5}
+    radius & \texttt{LATERAL} & slots & \texttt{LATERAL} & slots \\
+    \hline
+    $0.5\arcsec$ & 0.96 & 1.26 & \textbf{0.35} & \textbf{0.46} \\
+    $1\arcsec$   & \textbf{0.80} & 1.12 & \textbf{0.32} & \textbf{0.45} \\
+    $1.5\arcsec$ & 1.12 & 1.66 & \textbf{0.28} & \textbf{0.42} \\
+    $5\arcsec$   & 1.08 & 1.29 & \textbf{0.35} & \textbf{0.42} \\
+    \hline
+    all          & 0.98 & 1.32 & \textbf{0.33} & \textbf{0.44} \\
+    \hline
+  \end{tabular}
+\end{table}
 
 \begin{table}
   \caption{Cross-matching 200\,000 probes against 50 million sources, steady state:
