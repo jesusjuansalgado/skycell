@@ -1490,11 +1490,16 @@ say otherwise.
 What remains expensive is planning. A covering is computed per plan, and even cached it
 costs 0.015--0.12\,ms against 0.006--0.008\,ms for a GiST predicate that needs no such
 step; that is the whole of \texttt{skycell}'s disadvantage at 6\arcmin\ and the reason
-small relations favour pgSphere. An SP-GiST operator class over the cell hierarchy would
-remove it architecturally, presenting a single index qualification and refining during
-the index descent instead of planning ranges up front, where the work is proportional to
-the rows actually present rather than to the per-arm planner cost (8\,\textmu s per range)
-measured here.
+small relations favour pgSphere. We prototyped one architectural way to remove this
+rather than amortise it -- an SP-GiST operator class over the cell hierarchy, presenting
+a single index qualification and refining during the index descent instead of planning
+ranges up front -- and found it is not the clean fix it looks like on paper: the radix
+compression needed to keep the tree compact costs correctness margin elsewhere, shrinking
+the number of exact-duplicate positions the index tolerates by roughly an order of
+magnitude before an internal guard trips. That prototype is exploratory, outside this
+paper's benchmark methodology, and not part of the released extension, so we report only
+the qualitative conclusion: an index descent that avoids planning ranges remains an open
+direction, not a solved one.
 
 The density synopsis is the other limit. An equi-depth histogram cannot see a cluster
 smaller than one of its buckets, and raising the statistics target does not help, since a
