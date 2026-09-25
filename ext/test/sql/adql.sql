@@ -7,10 +7,12 @@ SELECT setseed(0.17);
 -- types -------------------------------------------------------------
 SELECT '(10.5, -30.25)'::skypos AS parsed, point('ICRS', 10.5, -30.25) AS built,
        '(10.5, -30.25)'::skypos::text = point('ICRS', 10.5, -30.25)::text AS parses_to_the_same;
-SELECT 'CIRCLE(10, 20, 0.5)'::skyregion AS circ, 'POLYGON(10,10, 12,10, 11,12)'::skyregion AS poly;
+SELECT 'CIRCLE ICRS 10 20 0.5'::skyregion AS circ, 'POLYGON ICRS 10 10 12 10 11 12'::skyregion AS poly;
+SELECT ('CIRCLE ICRS 10 20 0.5'::skyregion)::text = 'CIRCLE ICRS 10 20 0.5' AS stcs_roundtrip;
 SELECT '(370, 10)'::skypos AS ra_wrapped;
 SELECT '(0, 91)'::skypos;                                  -- error
-SELECT 'POLYGON(0,0, 10,0, 1,1, 0,10)'::skyregion;         -- error: not convex
+SELECT 'POLYGON ICRS 0 0 10 0 1 1 0 10'::skyregion;         -- error: not convex
+SELECT 'CIRCLE GALACTIC 10 20 0.5'::skyregion;              -- error: frame
 SELECT box('ICRS', 10, 89.9, 1, 1);                        -- error: reaches the pole
 SELECT point('FK5', 10, 20);                               -- error: frame
 
