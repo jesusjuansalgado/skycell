@@ -590,7 +590,7 @@ skycell_pos_ra_dec(PG_FUNCTION_ARGS)
 
 	d[0] = Float8GetDatum(p->ra);
 	d[1] = Float8GetDatum(p->dec);
-	PG_RETURN_ARRAYTYPE_P(construct_array_builtin(d, 2, FLOAT8OID));
+	PG_RETURN_ARRAYTYPE_P(construct_array(d, 2, FLOAT8OID, sizeof(float8), true, TYPALIGN_DOUBLE));
 }
 
 /* the four corners of a cell, as ra, dec, ra, dec, ... (degrees) */
@@ -615,7 +615,7 @@ skycell_cell_corners(PG_FUNCTION_ARGS)
 		d[2 * i] = Float8GetDatum(atan2(c[i].y, c[i].x) * RAD2DEG);
 		d[2 * i + 1] = Float8GetDatum(asin(fmax(-1.0, fmin(1.0, c[i].z))) * RAD2DEG);
 	}
-	PG_RETURN_ARRAYTYPE_P(construct_array_builtin(d, 8, FLOAT8OID));
+	PG_RETURN_ARRAYTYPE_P(construct_array(d, 8, FLOAT8OID, sizeof(float8), true, TYPALIGN_DOUBLE));
 }
 
 /* ------------------------------------------------------------------ */

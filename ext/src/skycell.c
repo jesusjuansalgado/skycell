@@ -230,7 +230,7 @@ poly_from_array(ArrayType *arr, sc_region *r)
 
 	if (ARR_ELEMTYPE(arr) != FLOAT8OID)
 		elog(ERROR, "skycell: polygon must be a float8[]");
-	deconstruct_array_builtin(arr, FLOAT8OID, &elems, &nulls, &n);
+	deconstruct_array(arr, FLOAT8OID, sizeof(float8), true, TYPALIGN_DOUBLE, &elems, &nulls, &n);
 	if (n % 2 != 0)
 		check_err("polygon array must contain ra,dec pairs");
 	ra = palloc(sizeof(double) * n / 2);
