@@ -158,7 +158,7 @@ ivo_epoch_prop(PG_FUNCTION_ARGS)
 			   PG_GETARG_FLOAT8(7) - PG_GETARG_FLOAT8(6), out);
 	for (int i = 0; i < 6; i++)
 		d[i] = Float8GetDatum(out[i]);
-	PG_RETURN_ARRAYTYPE_P(construct_array_builtin(d, 6, FLOAT8OID));
+	PG_RETURN_ARRAYTYPE_P(construct_array(d, 6, FLOAT8OID, sizeof(float8), true, TYPALIGN_DOUBLE));
 }
 
 PG_FUNCTION_INFO_V1(ivo_epoch_prop_pos);

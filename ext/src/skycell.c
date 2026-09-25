@@ -37,10 +37,12 @@
 #include "catalog/namespace.h"
 #include "utils/fmgroids.h"
 #include "utils/snapmgr.h"
+#include "catalog/pg_am_d.h"
 #include "catalog/pg_class.h"
 #include "catalog/pg_opfamily_d.h"
 #include "catalog/pg_statistic.h"
 #include "catalog/pg_type_d.h"
+#include "commands/defrem.h"
 #include "common/hashfn.h"
 #include "utils/catcache.h"
 #include "utils/inval.h"
@@ -228,7 +230,7 @@ poly_from_array(ArrayType *arr, sc_region *r)
 
 	if (ARR_ELEMTYPE(arr) != FLOAT8OID)
 		elog(ERROR, "skycell: polygon must be a float8[]");
-	deconstruct_array_builtin(arr, FLOAT8OID, &elems, &nulls, &n);
+	deconstruct_array(arr, FLOAT8OID, sizeof(float8), true, TYPALIGN_DOUBLE, &elems, &nulls, &n);
 	if (n % 2 != 0)
 		check_err("polygon array must contain ra,dec pairs");
 	ra = palloc(sizeof(double) * n / 2);
@@ -320,6 +322,7 @@ typedef struct idx_entry
 	Oid			relid;			/* must be first: the table */
 	Oid			indexoid;		/* the matching expression index, or InvalidOid */
 	Node	   *expr;			/* its first key expression (varno 1) */
+	bool		uses_cell_ops;	/* that index's opclass is skycell_cell_ops */
 } idx_entry;
 
 static MemoryContext skycell_cache_cxt = NULL;
@@ -660,12 +663,31 @@ load_density(Oid relid, AttrNumber attnum, sc_density *d)
 }
 
 /*
+ * OID of skycell's own btree operator family (skycell--0.7.sql), whose
+ * operators (#<, #<=, #=, #>=, #>) carry skycell_cellsel instead of the
+ * stock int8 estimators.  InvalidOid before 0.7 or if the name was changed;
+ * every caller treats that as "fall back to the stock operators".
+ */
+static Oid
+cell_ops_opfamily(void)
+{
+	List	   *name = list_make1(makeString("skycell_cell_ops"));
+
+	return get_opfamily_oid(BTREE_AM_OID, name, true);
+}
+
+/*
  * The cell argument is an expression over one base relation, e.g.
  * skycell_ang2cell(s_ra, s_dec): use the statistics of an expression index
  * whose first column is that same expression.  Returns false if none.
+ * *uses_cell_ops reports whether the matching index's opclass is
+ * skycell_cell_ops, so callers building non-constant range predicates (a
+ * cross-match) can emit its operators and get a real selectivity estimate
+ * instead of the stock DEFAULT_INEQ_SEL fallback -- see skycell_cellsel().
  */
 bool
-density_for_expr(PlannerInfo *root, Node *arg, sc_density *d, Oid *statrel)
+density_for_expr(PlannerInfo *root, Node *arg, sc_density *d, Oid *statrel,
+				  bool *uses_cell_ops)
 {
 	List	   *vars = pull_var_clause(arg, 0);
 	ListCell   *lc;
@@ -675,8 +697,11 @@ density_for_expr(PlannerInfo *root, Node *arg, sc_density *d, Oid *statrel)
 	List	   *indexes;
 	Node	   *key;
 	Oid			matched = InvalidOid;
+	Oid			cellops_oid;
 	bool		found = false;
+	bool		matched_uses_cell_ops = false;
 
+	*uses_cell_ops = false;
 	foreach(lc, vars)
 	{
 		Var		   *v = (Var *) lfirst(lc);
@@ -707,10 +732,20 @@ density_for_expr(PlannerInfo *root, Node *arg, sc_density *d, Oid *statrel)
 				return false;
 			load_density_cached(rte->relid, cached->indexoid, 1, d);
 			*statrel = cached->indexoid;
+			*uses_cell_ops = cached->uses_cell_ops;
 			return true;
 		}
 	}
 
+	/*
+	 * Several indexes can match the same expression (a plain one plus a
+	 * skycell_cell_ops one added alongside it, per the README).  Scan all of
+	 * them and prefer a cell_ops match over a plain one -- picking whichever
+	 * comes first in RelationGetIndexList() would otherwise pick the plain
+	 * index whenever it happens to sort first, silently discarding the
+	 * selectivity fix cell_ops exists for.
+	 */
+	cellops_oid = cell_ops_opfamily();
 	rel = table_open(rte->relid, NoLock);	/* locked by the parser */
 	indexes = RelationGetIndexList(rel);
 	foreach(lc, indexes)
@@ -724,18 +759,26 @@ density_for_expr(PlannerInfo *root, Node *arg, sc_density *d, Oid *statrel)
 
 			if (exprs != NIL && equal(linitial(exprs), key))
 			{
-				load_density_cached(rte->relid, indexoid, 1, d);
-				found = true;
-				matched = indexoid;
-				*statrel = indexoid;
+				bool		this_uses_cell_ops = OidIsValid(cellops_oid) &&
+					irel->rd_opfamily[0] == cellops_oid;
+
+				if (!found || (this_uses_cell_ops && !matched_uses_cell_ops))
+				{
+					load_density_cached(rte->relid, indexoid, 1, d);
+					found = true;
+					matched = indexoid;
+					*statrel = indexoid;
+					matched_uses_cell_ops = this_uses_cell_ops;
+				}
 			}
 		}
 		index_close(irel, AccessShareLock);
-		if (found)
-			break;
+		if (matched_uses_cell_ops)
+			break;					/* nothing beats a cell_ops match */
 	}
 	list_free(indexes);
 	table_close(rel, NoLock);
+	*uses_cell_ops = matched_uses_cell_ops;
 
 	/* remember the outcome, including "this relation has no cell index" */
 	{
@@ -748,23 +791,30 @@ density_for_expr(PlannerInfo *root, Node *arg, sc_density *d, Oid *statrel)
 		old = MemoryContextSwitchTo(skycell_cache_cxt);
 		entry->indexoid = matched;
 		entry->expr = copyObject(key);
+		entry->uses_cell_ops = matched_uses_cell_ops;
 		MemoryContextSwitchTo(old);
 	}
 	return found;
 }
 
-/* density of the relation the cell argument comes from */
+/*
+ * density of the relation the cell argument comes from.  *uses_cell_ops
+ * reports whether the matching index (if any) uses skycell_cell_ops -- see
+ * density_for_expr().
+ */
 void
-density_for_var(PlannerInfo *root, Node *arg, sc_density *d, Oid *statrel)
+density_for_var(PlannerInfo *root, Node *arg, sc_density *d, Oid *statrel,
+				 bool *uses_cell_ops)
 {
 	d->ntotal = 0;
 	d->nbounds = 0;
 	d->bounds = NULL;
 	*statrel = InvalidOid;
+	*uses_cell_ops = false;
 
 	if (root && root->parse && !IsA(arg, Var) && !IsA(arg, Const))
 	{
-		density_for_expr(root, arg, d, statrel);
+		density_for_expr(root, arg, d, statrel, uses_cell_ops);
 		return;
 	}
 	if (root && root->parse && IsA(arg, Var))
@@ -815,11 +865,10 @@ int4_const(int32 v)
 					 Int32GetDatum(v), false, true);
 }
 
-Expr *
-int8_cmp(int strategy, Node *left, Expr *right)
+static Expr *
+int8_cmp_family(int strategy, Node *left, Expr *right, Oid opfamily)
 {
-	Oid			opno = get_opfamily_member(INTEGER_BTREE_FAM_OID, INT8OID,
-										   INT8OID, strategy);
+	Oid			opno = get_opfamily_member(opfamily, INT8OID, INT8OID, strategy);
 	Expr	   *e = make_opclause(opno, BOOLOID, false, (Expr *) copyObject(left),
 								  right, InvalidOid, InvalidOid);
 
@@ -827,14 +876,26 @@ int8_cmp(int strategy, Node *left, Expr *right)
 	return e;
 }
 
+Expr *
+int8_cmp(int strategy, Node *left, Expr *right)
+{
+	return int8_cmp_family(strategy, left, right, INTEGER_BTREE_FAM_OID);
+}
+
 /* cell >= lo AND cell <= hi */
+static Expr *
+range_arm_family(Node *cell, Expr *lo, Expr *hi, Oid opfamily)
+{
+	return makeBoolExpr(AND_EXPR,
+						list_make2(int8_cmp_family(BTGreaterEqualStrategyNumber, cell, lo, opfamily),
+								   int8_cmp_family(BTLessEqualStrategyNumber, cell, hi, opfamily)),
+						-1);
+}
+
 Expr *
 range_arm(Node *cell, Expr *lo, Expr *hi)
 {
-	return makeBoolExpr(AND_EXPR,
-						list_make2(int8_cmp(BTGreaterEqualStrategyNumber, cell, lo),
-								   int8_cmp(BTLessEqualStrategyNumber, cell, hi)),
-						-1);
+	return range_arm_family(cell, lo, hi, INTEGER_BTREE_FAM_OID);
 }
 
 static bool
@@ -889,8 +950,9 @@ simplify_cone(PlannerInfo *root, FuncExpr *fexpr)
 	Oid			exact_oid = lookup_sibling_func(fexpr->funcid, "skycell_in_cone", 6, exact_types);
 	sc_density	dens;
 	Oid			dens_statrel;
+	bool		cell_uses_cell_ops;
 
-	density_for_var(root, cell, &dens, &dens_statrel);
+	density_for_var(root, cell, &dens, &dens_statrel, &cell_uses_cell_ops);
 
 	if (all_const(args, 3, 5, &anynull))
 	{
@@ -930,6 +992,8 @@ simplify_cone(PlannerInfo *root, FuncExpr *fexpr)
 		Oid			bound_types[7] = {FLOAT8OID, FLOAT8OID, FLOAT8OID, INT4OID, INT4OID, FLOAT8OID, INT8ARRAYOID};
 		Oid			bound_oid = lookup_sibling_func(fexpr->funcid, "skycell_cone_bound", 7, bound_types);
 		int			k = skycell_join_slots;
+		Oid			arm_opfamily = cell_uses_cell_ops
+			? cell_ops_opfamily() : INTEGER_BTREE_FAM_OID;
 		Const	   *hist;
 		List	   *arms = NIL;
 		Datum	   *hd = palloc(sizeof(Datum) * Max(dens.nbounds, 1));
@@ -957,7 +1021,7 @@ simplify_cone(PlannerInfo *root, FuncExpr *fexpr)
 				((FuncExpr *) b[j])->args = lappend(lappend(((FuncExpr *) b[j])->args,
 															float8_const(dens.ntotal)),
 													copyObject(hist));
-			arms = lappend(arms, range_arm(cell, b[0], b[1]));
+			arms = lappend(arms, range_arm_family(cell, b[0], b[1], arm_opfamily));
 		}
 		exact = makeFuncExpr(exact_oid, BOOLOID,
 							 list_make5(copyObject(list_nth(args, 1)),
@@ -988,6 +1052,7 @@ simplify_poly(PlannerInfo *root, FuncExpr *fexpr)
 	double		sel;
 	Oid			exact_types[4] = {FLOAT8OID, FLOAT8OID, FLOAT8ARRAYOID, FLOAT8OID};
 	FuncExpr   *exact;
+	bool		unused_uses_cell_ops;
 
 	if (!IsA(poly, Const))
 		return NULL;			/* not rewritten: exact test only */
@@ -995,7 +1060,7 @@ simplify_poly(PlannerInfo *root, FuncExpr *fexpr)
 		return (Node *) makeBoolConst(false, true);
 
 	poly_from_array(DatumGetArrayTypeP(((Const *) poly)->constvalue), &reg);
-	density_for_var(root, cell, &dens, &dens_statrel);
+	density_for_var(root, cell, &dens, &dens_statrel, &unused_uses_cell_ops);
 	current_params(&p, skycell_max_ranges, &dens);
 	sc_cover_compute(&reg, &dens, &p, &cov);
 	sel = (cov.area > 0) ? fmin(1.0, reg.area / cov.area) : 0.0;
@@ -1111,17 +1176,26 @@ skycell_exact_support(PG_FUNCTION_ARGS)
  *   LATERAL form  bound is a Var of a function scan over
  *                 skycell_cone_ranges(ra, dec, radius), radius Const
  *
- * Each of the two quals returns the square root of the cap fraction, so that
- * their product is the fraction of the sphere the cone covers.  That ignores
- * the covering's overshoot, so it is an under-estimate of the rows scanned by
- * a factor of the area ratio (1.1 at a degree, up to ~100 at an arcsecond);
- * it is wrong in the direction that favours the index path, which is the
- * direction the measurement says is right, and it is five to six orders of
- * magnitude closer than the default it replaces.
+ * Each of the two quals returns the square root of the cap fraction divided
+ * by the slot count, so that their product is the fraction of the sphere one
+ * slot's arm is expected to cover -- the join form OR's *nslots* such arms
+ * together (one per range of the covering), each getting its own pair of
+ * quals, so charging every arm the *whole* cone's fraction would overstate
+ * the OR's combined selectivity by about nslots (Postgres combines OR'd
+ * clauses by independence: 1-(1-s)^n =~ n*s for small s).  The LATERAL form
+ * has no slot count -- each row from skycell_cone_ranges() is its own join,
+ * not one arm of a fixed disjunction -- so it keeps the whole fraction.
+ *
+ * That still ignores the covering's overshoot, so it is an under-estimate of
+ * the rows scanned by a factor of the area ratio (1.1 at a degree, up to
+ * ~100 at an arcsecond); it is wrong in the direction that favours the index
+ * path, which is the direction the measurement says is right, and it is
+ * five to six orders of magnitude closer than the default it replaces.
  */
 static double
-radius_from_bound(PlannerInfo *root, Node *arg)
+radius_from_bound(PlannerInfo *root, Node *arg, int *nslots_out)
 {
+	*nslots_out = 1;
 	if (arg && IsA(arg, FuncExpr))
 	{
 		FuncExpr   *f = (FuncExpr *) arg;
@@ -1129,7 +1203,13 @@ radius_from_bound(PlannerInfo *root, Node *arg)
 		/* skycell_cone_bound(ra0, dec0, radius, i, nslots, ntotal, hist) */
 		if (list_length(f->args) == 7 && IsA(list_nth(f->args, 2), Const) &&
 			!((Const *) list_nth(f->args, 2))->constisnull)
+		{
+			Node	   *nslots_arg = list_nth(f->args, 4);
+
+			if (IsA(nslots_arg, Const) && !((Const *) nslots_arg)->constisnull)
+				*nslots_out = Max(1, DatumGetInt32(((Const *) nslots_arg)->constvalue));
 			return DatumGetFloat8(((Const *) list_nth(f->args, 2))->constvalue);
+		}
 	}
 	if (arg && IsA(arg, Var) && root && root->parse)
 	{
@@ -1167,6 +1247,7 @@ skycell_cellsel(PG_FUNCTION_ARGS)
 	List	   *args = (List *) PG_GETARG_POINTER(2);
 	double		sel = 0.3333333333333333;	/* DEFAULT_INEQ_SEL */
 	double		r = -1;
+	int			nslots = 1;
 
 	if (list_length(args) == 2)
 	{
@@ -1177,7 +1258,7 @@ skycell_cellsel(PG_FUNCTION_ARGS)
 			/* a constant cone: the histogram knows better than we do */
 			PG_RETURN_FLOAT8((float8) sel);
 		}
-		r = radius_from_bound(root, other);
+		r = radius_from_bound(root, other, &nslots);
 	}
 
 	if (r > 0)
@@ -1185,7 +1266,8 @@ skycell_cellsel(PG_FUNCTION_ARGS)
 		double		rad = fmin(fmax(r * DEG2RAD, 0), M_PI);
 		double		cap = pow(sin(rad / 2.0), 2);	/* cap area / 4pi */
 
-		sel = sqrt(fmax(cap, 1e-14));
+		/* nslots arms share the cone's fraction; see the comment above */
+		sel = sqrt(fmax(cap, 1e-14) / (double) nslots);
 	}
 	PG_RETURN_FLOAT8((float8) fmin(1.0, fmax(sel, 1e-8)));
 }
