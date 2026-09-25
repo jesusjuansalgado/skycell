@@ -793,19 +793,17 @@ the cube quad-tree; Q3C's cross-match path, which uses four ranges per probe, do
 pay it, and Sect.~\ref{sec:otherops} shows it performing accordingly.
 
 \label{sec:scope}
-We therefore state that result at three different strengths, because they are not
-equally supported. Against \texttt{q3c\_radial\_query} as implemented in 2.0.5, the
-factor 4--50 is a measurement we stand behind, and it is a comparison of
-\emph{implementations}. Against \texttt{q3c\_join}, which the Q3C authors intend for
+That result carries three different strengths. Against \texttt{q3c\_radial\_query} as
+implemented in 2.0.5, the factor 4--50 is a comparison of \emph{implementations}, and we
+stand behind it. Against \texttt{q3c\_join}, which the Q3C authors intend for
 cross-matching and which does not carry the fixed expansion, the two are level
-(Sect.~\ref{sec:xmatch}); that is the comparison we regard as informative about the
-two indexing approaches. About the cube quad-tree as a \emph{method} we make no claim
-at all: a covering-aware radial query in Q3C would plausibly close most of the cone
-gap, and nothing here argues otherwise. pgSphere was used with the \texttt{spoint} and
-\texttt{spoly} types and a GiST index as its documentation prescribes, at default
-settings; we did not attempt to tune it further, and no method was given prepared
-statements or plan reuse -- which would help \texttt{skycell} most, since planning is
-the component that most differs between them.
+(Sect.~\ref{sec:xmatch}); that is the comparison informative about the two indexing
+\emph{approaches}. About the cube quad-tree as a method we make no claim: a
+covering-aware radial query in Q3C would plausibly close most of the cone gap. pgSphere
+was used with its documented \texttt{spoint}/\texttt{spoly} types and a GiST index at
+default settings, untuned further; no method was given prepared statements or plan
+reuse, which would help \texttt{skycell} most, since planning is what most differs
+between them.
 
 The order effect the randomization exists to control is small but real: averaged over
 all radii on the designed corpus, going first rather than last costs pgSphere 19\% and
@@ -967,9 +965,6 @@ migration has to pay, and it is the one result here that is not sensitive to pro
 \end{table}
 
 
-
-
-
 Index size is the one result in this paper that is insensitive to protocol, and it is
 also the one that decides deployments, so it is worth carrying to the scale an archive
 actually runs at. The cost per row is flat: between $10^7$ and $5\times10^7$ rows it
@@ -1009,17 +1004,13 @@ both from one, and that one is the smaller kind.
   \end{tabular}
 \end{table}
 
-The memory column is the operational point. A positional index is only as fast as its
-residency: the measurements of Sect.~\ref{sec:cones} differ by a factor two to three
-between the warm and the cold regime, and which regime a server is in is decided by
-whether the index fits beside the heap's working set. At DR3 scale a 64\,GiB server
-holds \texttt{skycell}'s 38\,GiB index with room to spare; pgSphere's 122\,GiB does not
-fit in 128\,GiB once the heap is accounted for, and the pair needed to cover both cone
-searches and cross-matching wants 256\,GiB. That is a factor four in the memory the
-machine must have, which at these sizes is a procurement decision rather than a tuning
-one -- and it is exactly the regime where our cold-cache measurements put
-\texttt{skycell} furthest ahead (0.31 to 0.53 of pgSphere's time at 30\arcmin\ and
-beyond).
+The memory column is the operational point: a positional index is only as fast as its
+residency, and which cache regime a server is in is decided by whether the index fits
+beside the heap's working set. At DR3 scale a 64\,GiB server holds \texttt{skycell}'s
+38\,GiB index with room to spare; the pgSphere-plus-Q3C pair needed for the same
+coverage wants 256\,GiB. That factor-four gap in required memory is a procurement
+decision at these sizes, not a tuning one, and it lands exactly where our cold-cache
+measurements put \texttt{skycell} furthest ahead.
 
 \paragraph{The comparison a constrained machine actually faces.}
 Table~\ref{tab:gaia} invites matching regimes -- warm against warm -- but that is not
@@ -1049,25 +1040,21 @@ where we measured both regimes:
 the residency the index sizes actually buy, \texttt{skycell} is one to two orders of
 magnitude ahead. The same holds against Q3C, whose cold times are 2.1--21\,ms.
 
-This is an upper bound on the advantage, and should be read as one. Our cold regime is a
-fully cold start -- shared buffers emptied and the page cache dropped -- whereas a server
-whose index merely does not fit thrashes at some hit rate between the two columns rather
-than missing every time. The true figure depends on how much of the index fits and on the
-locality of the query stream, neither of which we have measured at that scale. What the
-measurement does establish is the direction and that the effect is large: the difference
-between the two designs stops being a matter of percent and becomes a matter of factors
-precisely when the index outgrows the machine, which is the regime a catalogue of
-$10^9$ sources puts a server in.
+This is an upper bound, and should be read as one: our cold regime empties the buffer
+pool and drops the page cache, whereas a server whose index merely does not fit
+thrashes at some intermediate hit rate rather than missing every time, and the true
+figure depends on locality we have not measured at that scale. What it does establish is
+direction and order of magnitude -- the difference between the two designs turns from
+percent to factors exactly when the index outgrows the machine, which is the regime a
+$10^9$-row catalogue puts a server in.
 
-Four caveats. The extrapolation is linear and validated only over a factor five in row
-count, though the per-row cost is constant to 0.5\% across it. These are positional
-indexes alone: a real archive's table, its other indexes and its ancillary products
-dwarf them. A partitioned deployment changes the arithmetic, since only the partitions
-in play need be resident. And the two B-trees are the same size, so the comparison is
-really one geometry index plus one integer index against one integer index -- the saving
-comes from not needing the geometry index at all, which rests on \texttt{skycell}
-answering the region queries pgSphere is kept for, as Sects.~\ref{sec:cones}
-and~\ref{sec:otherops} measure.
+Four further caveats temper the extrapolation: it is linear and validated only over a
+factor five in row count; it covers the positional index alone, dwarfed in a real
+archive by the table and its other indexes; a partitioned deployment needs only its
+active partitions resident, changing the arithmetic; and the two B-trees being the same
+size means the real saving is not needing the geometry index at all, which rests on
+\texttt{skycell} answering the region queries pgSphere is kept for
+(Sects.~\ref{sec:cones}, \ref{sec:otherops}).
 
 \subsection{Polygons and stored footprints}
 \label{sec:otherops}
@@ -1386,11 +1373,10 @@ difference of 0.08\,ms in it cannot move the throughput of the service.
 
 \subsection{Where the crossover is}
 
-That explanation makes a testable prediction, and an earlier version of this work
-asserted it rather than testing it. We built the same ObsCore-shaped relation --
-observations in groups of 128 products sharing a field centre, clustered by collection
-and field, which is what makes a GiST bitmap scan so effective on this data -- at three
-sizes, and ran the same four cone classes against both indexes
+That explanation makes a testable prediction. We built the same ObsCore-shaped relation
+-- observations in groups of 128 products sharing a field centre, clustered by
+collection and field, which is what makes a GiST bitmap scan so effective on this data --
+at three sizes, and ran the same four cone classes against both indexes
 (Table~\ref{tab:crossover}).
 
 The crossover is real, but it is not a single number. For the cone with catalogue cuts
@@ -1491,79 +1477,71 @@ warm for the other.
 \section{Discussion}
 \label{sec:discussion}
 
-These measurements support a bounded claim. A covering sized by cost over an equal-area
-integer key is a sound basis for a sky index: on 10- and 50-million-row catalogues it is
-faster than pgSphere for cone searches at most radii warm and at every radius cold, by
-the largest margins where an index should matter most -- large regions, cold caches,
-polygons -- and it draws level with Q3C on cross-matching, the operation Q3C exists for.
-It does this with an index a third the size, built thirty times faster, and with row
-estimates twice as accurate. The same conclusions hold on a density field taken from the
-real sky and on one designed by us, and the advantage on large regions roughly doubles
-between $10^7$ and $5\times10^7$ rows, which is the evidence that the page count, and
-not something particular to one table size, produces it.
-
-They do not establish that \texttt{skycell} is the better choice in general. Warm,
-between 6\arcmin\ and 1\degr, it is indistinguishable from pgSphere on one corpus and
-slightly slower at 6\arcmin\ on the other. On a 500\,000-row ObsCore relation it is
-slower; on the small-cone ObsCore class it is slower in one cache regime and level in
-another, and we do not claim that row. Better row estimates did not, on the join shapes
-we wrote, produce better plans. And nothing here has run on real catalogue positions, on
-more than one machine, or with more than one storage device.
+The advantage is not universal, and stating where it stops is as informative as stating
+where it holds. Warm, between 6\arcmin\ and 1\degr, \texttt{skycell} is indistinguishable
+from pgSphere on one corpus and slightly slower at 6\arcmin\ on the other. On a
+500\,000-row ObsCore relation it is slower; on the small-cone ObsCore class it is slower
+in one cache regime and level in another, and we do not claim that row. Better row
+estimates did not, on the join shapes we wrote, produce better plans. And every number
+here comes from one machine and one storage device, with a density field standing in for
+real catalogue positions except where Sects.~\ref{sec:xmatch} and~\ref{sec:estimator}
+say otherwise.
 
 What remains expensive is planning. A covering is computed per plan, and even cached it
 costs 0.015--0.12\,ms against 0.006--0.008\,ms for a GiST predicate that needs no such
 step; that is the whole of \texttt{skycell}'s disadvantage at 6\arcmin\ and the reason
-small relations favour pgSphere. The architectural way out is to stop planning ranges: an
-SP-GiST operator class over the cell hierarchy would present a single index
-qualification and refine during the index descent, where the work is proportional to the
-rows actually present, removing both the per-plan covering and the per-arm planner cost
-our measurements put at 8\,\textmu s for each range in the disjunction.
+small relations favour pgSphere. An SP-GiST operator class over the cell hierarchy would
+remove it architecturally, presenting a single index qualification and refining during
+the index descent instead of planning ranges up front, where the work is proportional to
+the rows actually present rather than to the per-arm planner cost (8\,\textmu s per range)
+measured here.
 
 The density synopsis is the other limit. An equi-depth histogram cannot see a cluster
-smaller than one of its buckets, and because it is equi-depth, raising the statistics
-target does not help -- a denser region gets narrower buckets, so interpolating inside
-one is scale invariant. The area guard bounds the damage; a custom \texttt{typanalyze}
-storing a multi-order count map would estimate what the covering actually needs. We have
-implemented such a map as an option and have no measurement showing it helps, which is
-why it is not part of the result above.
+smaller than one of its buckets, and raising the statistics target does not help, since a
+denser region gets narrower buckets and the interpolation stays scale invariant. The area
+guard bounds the damage; a custom \texttt{typanalyze} storing a multi-order count map
+would estimate what the covering actually needs. We have implemented such a map as an
+option but have no measurement showing it helps, which is why it is not part of the
+result above.
 
 \section{Conclusions}
 
 \texttt{skycell} keeps Q3C's compact integer key and B-tree while answering the region
 queries pgSphere was built for, by treating the depth of a covering as a cost question
-whose answer follows from the local source density and the price of an index range.
+whose answer follows from the local source density and the price of an index range. The
+result is a single index that holds its own against each established extension on the
+workload the other one owns. Against pgSphere it is faster for cone searches at most
+radii warm and at every radius cold, by a factor of up to 2.5, and answers convex
+polygons 2.7--4.4 times faster. Against Q3C, at the cross-match Q3C is built for, it is
+Q3C's equal and 2.5--3.3 times faster than pgSphere at the same operation. It gets there
+with an index a third the size of pgSphere's -- 38\,GiB against 160\,GiB at Gaia DR3
+scale for the pgSphere-plus-Q3C pair that covers the same ground, the difference between
+a 64\,GiB server and a 256\,GiB one -- built thirty times faster, with row estimates
+twice as accurate, and a cost model whose one parameter is derived from the relation's
+own statistics rather than configured.
 
-Under a protocol designed to remove the advantages that measurement order and cache
-state hand to whichever method is measured last, on two 10-million-row corpora -- one
-drawn from the real Gaia DR3 density field -- it is 6--11\% faster than pgSphere for
-cone radii of 1\arcsec--1\arcmin\ and 31--37\% faster at 3\degr\ warm, and faster at
-every radius with caches dropped, by a factor of up to 2.5. It answers convex polygons
-2.7--4.4 times faster, keeps an index a third the size of pgSphere's -- 38\,GiB against
-160\,GiB at Gaia DR3 scale for the pair of indexes that covers the same ground, which is
-the difference between a 64\,GiB server and a 256\,GiB one -- builds it thirty
-times faster, and estimates row counts twice as accurately. On cross-matching, the
-operation Q3C exists for, it is Q3C's equal (0.78--0.92 of its time, intervals reaching
-1) and 2.5--3.3 times faster than pgSphere -- so one index is competitive with each of
-the two established ones on the workload that each was built for.
-Its cost model's one parameter is derived from the relation's rows per page and the
-planner's cost factors rather than configured -- indistinguishable in speed from the
-constant it replaces, but no longer a number anyone has to choose -- its chosen cell
-order costs about 3\% against the best available one, measured with the two interleaved,
-and its density estimate, though poor in cluster cores, is accurate enough to pick a
-covering within 1.6 of the best available one.
+\texttt{skycell} also closes two gaps that neither established extension closes alone.
+It speaks ADQL's own vocabulary as directly as pgSphere, with an operator form a planner
+can answer from an index; and its stored regions read and write as IVOA STC-S text
+itself, so an ObsCore \texttt{s\_region} column round-trips against an archive's own
+text with no translation step. Because \texttt{skyregion} is one type tagged by kind
+rather than a family of per-shape types, a single column holds circles and polygons
+together -- exactly the case, a mixed-shape footprint column, that pgSphere cannot
+represent in one column at all. Combined with a single compact index that serves both
+point and region queries, this makes \texttt{skycell} a strong candidate for the
+geometry layer of an IVOA TAP service, where ADQL compliance, STC-S storage and
+mixed-shape footprints are what an archive already needs to provide, and where
+Sect.~\ref{sec:tap} shows it dropping into a working TAP server without changing the
+service's own behaviour.
 
-It is not the better choice everywhere, and scale sharpens the distinction rather than
-removing it. Raising the catalogue to 50 million rows widens the advantage for regions of
-30\arcmin\ and above -- to a factor 3.2 at 1\degr\ with cold caches -- and leaves cones of
-an arcminute and below where they were, level with pgSphere, because there both methods
-touch a handful of pages at any table size and what remains is planning. On a small
-relation \texttt{skycell} is slower for that reason, and inside a TAP server whose cost is
-dominated by Python it changes nothing at all. On an ObsCore-shaped relation it leads the
-degree-scale classes at every size measured while the arcminute-scale class depends on the
-cache regime by a factor of two in either direction, which we do not claim.
-
-An index is worth choosing carefully when the scan dominates. Which queries those are is
-a property of the archive, and we have tried to say precisely which ones they were here.
+The advantage is a property of the workload rather than a universal one, and scale
+sharpens it rather than erasing it: raising the catalogue to 50 million rows widens the
+lead for regions of 30\arcmin\ and above -- to a factor 3.2 at 1\degr\ cold -- while
+cones of an arcminute and below stay level with pgSphere, because both methods touch a
+handful of pages there at any table size and what is left is planning. That is also
+where a small relation, or a TAP server whose own cost is dominated by Python, favours
+pgSphere or leaves the choice immaterial. Choosing an index carefully matters when the
+scan dominates; we have tried to say precisely which queries those are.
 
 \section*{Data availability}
 
