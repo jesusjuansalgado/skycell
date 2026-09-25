@@ -23,8 +23,10 @@ extern Oid	lookup_sibling_func(Oid funcid, const char *name, int nargs, const Oi
 extern void cover_cached(const sc_region *reg, const sc_density *d,
 						 const sc_cover_params *p, Oid statrel,
 						 double ra0, double dec0, double radius, sc_cover *out);
-extern bool density_for_expr(PlannerInfo *root, Node *arg, sc_density *d, Oid *statrel);
-extern void density_for_var(PlannerInfo *root, Node *arg, sc_density *d, Oid *statrel);
+extern bool density_for_expr(PlannerInfo *root, Node *arg, sc_density *d, Oid *statrel,
+							  bool *uses_cell_ops);
+extern void density_for_var(PlannerInfo *root, Node *arg, sc_density *d, Oid *statrel,
+							 bool *uses_cell_ops);
 
 /* adql.c: the region behind a skyregion datum, as cover.c understands it */
 extern void skycell_region_from_datum(Datum d, sc_region *r);

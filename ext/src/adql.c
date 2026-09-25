@@ -689,6 +689,7 @@ skycell_region_support(PG_FUNCTION_ARGS)
 		double		ra0 = 0,
 					dec0 = 0,
 					radius = -1;
+		bool		unused_uses_cell_ops;
 
 		if (!IsA(rg, Const) || req->root == NULL)
 			PG_RETURN_POINTER(NULL);
@@ -700,7 +701,7 @@ skycell_region_support(PG_FUNCTION_ARGS)
 			PG_RETURN_POINTER(NULL);
 
 		/* only worth rewriting if an index answers that expression */
-		if (!density_for_expr(req->root, cell, &dens, &statrel))
+		if (!density_for_expr(req->root, cell, &dens, &statrel, &unused_uses_cell_ops))
 			PG_RETURN_POINTER(NULL);
 
 		skycell_region_from_datum(((Const *) rg)->constvalue, &reg);
