@@ -190,6 +190,16 @@ def _is_point_of_columns(inner: str) -> tuple[str, str] | None:
     return (parts[0], parts[1]) if len(parts) == 2 else None
 
 
+_CONST_NUM = re.compile(
+    r"[-+]?(?:\d+\.\d*(?:[eE][-+]?\d+)?|\.\d+(?:[eE][-+]?\d+)?|\d+(?:[eE][-+]?\d+)?)"
+)
+
+
+def _is_const_circle(a: list[str]) -> bool:
+    """True if a CIRCLE's centre and radius are all literal numbers, not columns."""
+    return all(_CONST_NUM.fullmatch(x.strip()) for x in a)
+
+
 def _split_args(s: str) -> list[str]:
     out, depth, start = [], 0, 0
     for i, ch in enumerate(s):
@@ -208,12 +218,25 @@ def _contains(args: list[str], d: Dialect, version: str) -> str:
     if len(args) != 2:
         raise TranslationError("CONTAINS takes two geometries")
     inner, outer = args
-    reg = translate_expr(outer, d, version)
+    cols = _is_point_of_columns(inner)
     if d is SKYCELL:
-        return f"({translate_expr(inner, d, version)} <@ {reg})"
+        # A cross-match: the position is a pair of plain columns, the region is a
+        # circle, and the circle is not a literal constant -- its centre comes
+        # from another table's row. `<@`'s rewrite (skycell_region_support) gives
+        # up outright when the region isn't a compile-time constant, so this
+        # would otherwise reach no index at all. skycell_radial_query (Q3C's own
+        # argument order) reaches simplify_cone's non-constant branch instead,
+        # which still covers with an index, if capped to skycell.join_slots
+        # ranges. A literal circle is left as `<@`, which already reaches the
+        # same, uncapped covering for that case.
+        m = re.fullmatch(r"\s*CIRCLE\s*\((.*)\)\s*", outer, re.I | re.S)
+        if cols and m:
+            a = _frame([p.strip() for p in _split_args(m.group(1))], version, "CIRCLE")
+            if len(a) == 3 and not _is_const_circle(a):
+                return f"skycell_radial_query({cols[0]}, {cols[1]}, {a[0]}, {a[1]}, {a[2]})"
+        return f"({translate_expr(inner, d, version)} <@ {translate_expr(outer, d, version)})"
     # pgSphere+Q3C: use Q3C when the position is a pair of columns and the region
     # is a circle or polygon, because that is the fast path; otherwise pgSphere.
-    cols = _is_point_of_columns(inner)
     m = re.fullmatch(r"\s*(CIRCLE|POLYGON)\s*\((.*)\)\s*", outer, re.I | re.S)
     if cols and m:
         kind = m.group(1).upper()
@@ -224,7 +247,7 @@ def _contains(args: list[str], d: Dialect, version: str) -> str:
             return f"q3c_radial_query({cols[0]}, {cols[1]}, {a[0]}, {a[1]}, {a[2]})"
         return (f"q3c_poly_query({cols[0]}, {cols[1]}, "
                 f"ARRAY[{', '.join(a)}]::float8[])")
-    return f"({translate_expr(inner, d, version)} <@ {reg})"
+    return f"({translate_expr(inner, d, version)} <@ {translate_expr(outer, d, version)})"
 
 
 def _intersects(args: list[str], d: Dialect, version: str) -> str:

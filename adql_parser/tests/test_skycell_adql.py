@@ -27,6 +27,23 @@ def test_cone_falls_back_to_pgsphere_for_a_typed_column():
     assert "q3c_" not in out
 
 
+def test_crossmatch_uses_skycell_radial_query():
+    # A circle whose centre comes from another table's row: `<@`'s rewrite
+    # gives up on a non-constant region, so this must not fall back to `<@`.
+    q = ("SELECT * FROM a, b WHERE "
+         "CONTAINS(POINT('ICRS', a.ra, a.dec), CIRCLE('ICRS', b.ra, b.dec, 0.0003)) = 1")
+    assert translate(q) == (
+        "SELECT * FROM a, b WHERE skycell_radial_query(a.ra, a.dec, b.ra, b.dec, 0.0003)")
+    # Only the radius is non-constant: still a cross-match, same rewrite.
+    q2 = ("SELECT * FROM a, b WHERE "
+          "CONTAINS(POINT('ICRS', a.ra, a.dec), CIRCLE('ICRS', 10, 20, b.radius)) = 1")
+    assert translate(q2) == (
+        "SELECT * FROM a, b WHERE skycell_radial_query(a.ra, a.dec, 10, 20, b.radius)")
+    # pgSphere+Q3C already handles this shape via q3c_radial_query; unaffected.
+    assert translate(q, "pgsphere") == (
+        "SELECT * FROM a, b WHERE q3c_radial_query(a.ra, a.dec, b.ra, b.dec, 0.0003)")
+
+
 def test_negation():
     q = "SELECT * FROM t WHERE CONTAINS(POINT('ICRS', ra, dec), CIRCLE('ICRS', 1, 2, 3)) = 0"
     assert translate(q).startswith("SELECT * FROM t WHERE NOT (")

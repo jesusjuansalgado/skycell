@@ -205,10 +205,29 @@ public final class SkycellAdql {
             case "CONTAINS": {
                 need(raw, 2, "CONTAINS takes two geometries");
                 String inner = raw.get(0), outer = raw.get(1);
+                String[] cols = pointOfColumns(inner);
                 if (dialect == Dialect.SKYCELL) {
+                    // A cross-match: the position is a pair of plain columns, the region
+                    // is a circle, and the circle is not a literal constant -- its centre
+                    // comes from another table's row. `<@`'s rewrite
+                    // (skycell_region_support) gives up outright when the region isn't a
+                    // compile-time constant, so this would otherwise reach no index at
+                    // all. skycell_radial_query (Q3C's own argument order) reaches
+                    // simplify_cone's non-constant branch instead, which still covers
+                    // with an index, if capped to skycell.join_slots ranges. A literal
+                    // circle is left as `<@`, which already reaches the same, uncapped
+                    // covering for that case.
+                    Matcher cm = Pattern.compile("\\s*CIRCLE\\s*\\((.*)\\)\\s*",
+                            Pattern.CASE_INSENSITIVE | Pattern.DOTALL).matcher(outer);
+                    if (cols != null && cm.matches()) {
+                        List<String> a = stripFrame(splitArgs(cm.group(1)), "CIRCLE");
+                        if (a.size() == 3 && !isConstCircle(a)) {
+                            return "skycell_radial_query(" + cols[0] + ", " + cols[1] + ", "
+                                    + a.get(0) + ", " + a.get(1) + ", " + a.get(2) + ")";
+                        }
+                    }
                     return "(" + translateExpression(inner) + " <@ " + translateExpression(outer) + ")";
                 }
-                String[] cols = pointOfColumns(inner);
                 Matcher m = Pattern.compile("\\s*(CIRCLE|POLYGON)\\s*\\((.*)\\)\\s*",
                         Pattern.CASE_INSENSITIVE | Pattern.DOTALL).matcher(outer);
                 if (cols != null && m.matches()) {
@@ -285,6 +304,17 @@ public final class SkycellAdql {
         List<String> a = splitArgs(m.group(1));
         if (!a.isEmpty() && a.get(0).startsWith("'")) a = a.subList(1, a.size());
         return a.size() == 2 ? new String[] {a.get(0), a.get(1)} : null;
+    }
+
+    private static final Pattern CONST_NUM = Pattern.compile(
+            "[-+]?(?:\\d+\\.\\d*(?:[eE][-+]?\\d+)?|\\.\\d+(?:[eE][-+]?\\d+)?|\\d+(?:[eE][-+]?\\d+)?)");
+
+    /** True if a CIRCLE's centre and radius are all literal numbers, not columns. */
+    private static boolean isConstCircle(List<String> a) {
+        for (String x : a) {
+            if (!CONST_NUM.matcher(x.trim()).matches()) return false;
+        }
+        return true;
     }
 
     // ------------------------------------------------------------- predicates
