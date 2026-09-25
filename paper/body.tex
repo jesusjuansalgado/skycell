@@ -351,6 +351,17 @@ candidates. Since a MOC's cells are disjoint by construction, no duplicate elimi
 is needed. Refinement of these coverings stops when cells become negligible next to the
 region, which keeps the ancestor list short.
 
+\texttt{skyregion} is one type internally tagged by kind rather than a family of
+per-shape types, so a single footprint column can hold circles and polygons together --
+an ObsCore \texttt{s\_region} column, for instance, mixes the single-pointing circles of
+simple exposures with the polygons of non-trivial instrument footprints in the same
+rows. The covering above is produced by one function, \texttt{skycell\_region\_moc},
+regardless of which kind a given row holds, so neither the covering nor any predicate
+branches on the stored shape. pgSphere has no equivalent: \texttt{scircle} and
+\texttt{spoly} are
+separate types, so a mixed-shape column needs two columns, or a view over both, in
+their place.
+
 \subsection{The query surface}
 
 The extension exposes ADQL's own vocabulary: types \texttt{skypos} and
@@ -360,6 +371,20 @@ The extension exposes ADQL's own vocabulary: types \texttt{skypos} and
 translator emits the standard's spelling rather than a dialect. The operator form
 \texttt{pos <@ circle(\ldots)} is the one a planner can answer from an index; the
 function form returns the same rows.
+
+\texttt{skyregion}'s text representation is a second point of contact with the
+standard: it is IVOA STC-S \citep{stc} -- \texttt{CIRCLE ICRS $\alpha$ $\delta$ $r$} /
+\texttt{POLYGON ICRS $\alpha_1$ $\delta_1$ \ldots}, whitespace-separated -- the same
+syntax an ObsCore \texttt{s\_region} column already carries. An
+\texttt{s\_region skyregion} column therefore casts directly from, and prints back as,
+the archive's own STC-S text, with no translation step in either direction; a stray
+flavor or reference-position token some archives emit (\texttt{TOPOCENTER}) is
+accepted and discarded, and a frame other than ICRS is refused with an error rather
+than silently mis-read. This is independent of the query-time
+translation just described: ADQL's \texttt{CIRCLE(\ldots)}/\texttt{POLYGON(\ldots)}
+syntax inside a query is translated as Table~\ref{tab:ops} shows regardless of how a
+region column is stored, and STC-S is only the text form the stored value itself
+takes on input and output.
 
 For hand-written SQL migrating from Q3C rather than from ADQL, the predicates
 \texttt{skycell\_radial\_query(ra, dec, ra0, dec0, r)} and
