@@ -43,6 +43,38 @@ constructors; 2.1 makes it optional. Pass `version="2.0"` to require it.
 **refused with an error** rather than silently mis-translated — convert with
 `gal2icrs()` / `ecl2icrs()` first. Both dialects work in ICRS.
 
+## Storing regions as text: skyregion speaks STC-S
+
+Separate from query translation, but usually needed alongside it: a TAP
+service's ObsCore table carries `s_region` as an IVOA STC-S string --
+`CIRCLE ICRS ra dec radius` / `POLYGON ICRS ra1 dec1 ra2 dec2 ...`,
+whitespace-separated, no commas or parentheses. skycell's `skyregion` type's
+text representation *is* that same STC-S syntax, so an `s_region skyregion`
+column casts straight from (and reads back as) the archive's own STC-S text,
+with no translation step:
+
+```sql
+CREATE TABLE observations (obs_id int, s_region skyregion);
+INSERT INTO observations VALUES
+  (1, 'CIRCLE ICRS 266.404994801046 -28.936173960138692 0.05');
+
+SELECT s_region FROM observations;
+-- CIRCLE ICRS 266.404994801046 -28.9361739601387 0.05
+```
+
+The frame token must be `ICRS`, matching everything else in this extension
+(and in this translator's own "Frames" note above); a stray flavor/refpos
+token some archives include (`CIRCLE ICRS TOPOCENTER ...`) is accepted and
+skipped. pgSphere has no equivalent: `scircle`/`spoly` are separate types
+with their own, non-STC-S text formats, so a mixed-shape `s_region` column
+needs two columns (or a view) instead of one.
+
+This is unrelated to what this translator does -- ADQL's `CIRCLE(...)` /
+`POLYGON(...)` *function-call* syntax inside a query is translated as
+described above regardless of how `s_region` is stored; STC-S is only the
+text form of the stored `skyregion` value itself, e.g. for loading or
+re-exporting `s_region` as-is.
+
 ## Why the two dialects differ
 
 The `pgsphere` dialect is what makes the comparison in the paper concrete. Q3C

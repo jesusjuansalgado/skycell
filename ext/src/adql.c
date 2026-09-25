@@ -19,6 +19,7 @@
  */
 #include "postgres.h"
 
+#include <ctype.h>
 #include <math.h>
 
 #include "access/stratnum.h"
@@ -186,44 +187,96 @@ skypos_out(PG_FUNCTION_ARGS)
 	PG_RETURN_CSTRING(psprintf("(%.15g,%.15g)", p->ra, p->dec));
 }
 
+/*
+ * skyregion's text form is STC-S (IVOA Space-Time Coordinate string), the
+ * same syntax ObsCore's own s_region column carries -- "CIRCLE ICRS ra dec
+ * radius" / "POLYGON ICRS ra1 dec1 ra2 dec2 ...", whitespace-separated, no
+ * commas or parentheses. That is purely a text-representation choice: every
+ * operator, predicate and covering function works on the parsed sc_region
+ * this produces, never on the text, so a table already storing STC-S
+ * s_region values casts straight into skyregion with no reshaping, and a
+ * skyregion column reads back as the STC-S the table stored (a TAP service
+ * emits ADQL's own function-call spelling instead, via circle()/polygon()
+ * and CONTAINS/INTERSECTS -- this text form is for when the value itself
+ * needs to be a string, e.g. loading or re-exporting s_region as-is).
+ *
+ * The frame token must be ICRS, matching every other coordsys argument in
+ * this extension; a small number of further whitespace-separated STC-S
+ * tokens (flavor, reference position -- e.g. "CIRCLE ICRS TOPOCENTER ...")
+ * are accepted and skipped, since real archives sometimes carry them, but
+ * are not otherwise interpreted.
+ */
+static const char *
+stcs_skip_ws(const char *s)
+{
+	while (isspace((unsigned char) *s))
+		s++;
+	return s;
+}
+
+/* match a keyword at s, case-insensitively, on a token boundary; NULL if no match */
+static const char *
+stcs_match_word(const char *s, const char *word)
+{
+	size_t		len = strlen(word);
+
+	if (pg_strncasecmp(s, word, len) != 0)
+		return NULL;
+	if (isalnum((unsigned char) s[len]))
+		return NULL;			/* "CIRCLET..." is not the keyword CIRCLE */
+	return stcs_skip_ws(s + len);
+}
+
 PG_FUNCTION_INFO_V1(skyregion_in);
 Datum
 skyregion_in(PG_FUNCTION_ARGS)
 {
 	char	   *str = PG_GETARG_CSTRING(0);
-	char	   *s = str;
+	const char *s = stcs_skip_ws(str);
+	const char *t;
 	double		vals[512];
 	int			n = 0;
 	bool		cone;
 
-	while (*s == ' ')
-		s++;
-	if (pg_strncasecmp(s, "CIRCLE", 6) == 0)
-	{
+	if ((t = stcs_match_word(s, "CIRCLE")) != NULL)
 		cone = true;
-		s += 6;
-	}
-	else if (pg_strncasecmp(s, "POLYGON", 7) == 0)
-	{
+	else if ((t = stcs_match_word(s, "POLYGON")) != NULL)
 		cone = false;
-		s += 7;
-	}
 	else
 		ereport(ERROR, (errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
 						errmsg("invalid input syntax for type skyregion: \"%s\"", str),
-						errhint("Write CIRCLE(ra, dec, radius) or POLYGON(ra1, dec1, ...), in degrees.")));
-	while (*s == ' ')
-		s++;
-	if (*s++ != '(')
+						errhint("Write STC-S: \"CIRCLE ICRS ra dec radius\" or "
+								"\"POLYGON ICRS ra1 dec1 ra2 dec2 ...\", degrees.")));
+	s = t;
+
+	if ((t = stcs_match_word(s, "ICRS")) == NULL)
 		ereport(ERROR, (errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
-						errmsg("invalid input syntax for type skyregion: \"%s\"", str)));
+						errmsg("invalid input syntax for type skyregion: \"%s\"", str),
+						errhint("The coordinate frame must be ICRS; convert with "
+								"gal2icrs() or ecl2icrs() first.")));
+	s = t;
+
+	/* skip any further non-numeric STC-S tokens (flavor, refpos, ...) */
 	for (;;)
 	{
 		char	   *end;
 
-		while (*s == ' ' || *s == ',')
+		strtod(s, &end);
+		if (end != s)
+			break;				/* a number starts here: done skipping */
+		if (!isalpha((unsigned char) *s))
+			break;				/* not a token either: let the loop below report it */
+		while (isalnum((unsigned char) *s))
 			s++;
-		if (*s == ')' || *s == '\0')
+		s = stcs_skip_ws(s);
+	}
+
+	for (;;)
+	{
+		char	   *end;
+
+		s = stcs_skip_ws(s);
+		if (*s == '\0')
 			break;
 		if (n >= (int) (sizeof(vals) / sizeof(vals[0])))
 			ereport(ERROR, (errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
@@ -257,15 +310,14 @@ skyregion_out(PG_FUNCTION_ARGS)
 
 	initStringInfo(&buf);
 	if (r->kind == SKY_CONE)
-		appendStringInfo(&buf, "CIRCLE(%.15g,%.15g,%.15g)", r->v[0], r->v[1], r->v[2]);
+		appendStringInfo(&buf, "CIRCLE ICRS %.15g %.15g %.15g", r->v[0], r->v[1], r->v[2]);
 	else
 	{
 		int			nv = SKYREGION_NVERT(r);
 
-		appendStringInfoString(&buf, "POLYGON(");
+		appendStringInfoString(&buf, "POLYGON ICRS");
 		for (int i = 0; i < nv; i++)
-			appendStringInfo(&buf, "%s%.15g,%.15g", i ? "," : "", r->v[2 * i], r->v[2 * i + 1]);
-		appendStringInfoChar(&buf, ')');
+			appendStringInfo(&buf, " %.15g %.15g", r->v[2 * i], r->v[2 * i + 1]);
 	}
 	PG_RETURN_CSTRING(buf.data);
 }

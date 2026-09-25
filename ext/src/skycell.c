@@ -1853,3 +1853,21 @@ skycell_poly_moc(PG_FUNCTION_ARGS)
 	PG_RETURN_ARRAYTYPE_P(moc_for_region(&reg, Max(PG_GETARG_INT32(1), 4),
 										 Min(Max(PG_GETARG_INT32(2), 0), SC_MAX_ORDER)));
 }
+
+/*
+ * skyregion covers both cone and polygon (its own "kind" tag, dispatched by
+ * skycell_region_from_datum -- see adql.c), so one column can hold circles
+ * and polygons together; this is that same covering for whichever one a
+ * given row holds, without the caller branching on kind itself the way
+ * skycell_cone_moc/skycell_poly_moc otherwise require.
+ */
+PG_FUNCTION_INFO_V1(skycell_region_moc);
+Datum
+skycell_region_moc(PG_FUNCTION_ARGS)
+{
+	sc_region	reg;
+
+	skycell_region_from_datum(PG_GETARG_DATUM(0), &reg);
+	PG_RETURN_ARRAYTYPE_P(moc_for_region(&reg, Max(PG_GETARG_INT32(1), 4),
+										 Min(Max(PG_GETARG_INT32(2), 0), SC_MAX_ORDER)));
+}
