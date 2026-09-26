@@ -259,11 +259,36 @@ def _crossmatch_poly(cols: tuple[str, str] | None, region: str, version: str) ->
     return None
 
 
+def _crossmatch_box(cols: tuple[str, str] | None, region: str, version: str) -> str | None:
+    """point('ICRS', ra, dec) <@ box('ICRS', ...) for a cross-match shape:
+    `cols` a point over a pair of plain columns and `region` a BOX whose
+    centre or extent is not all literal constants. Unlike CIRCLE/POLYGON,
+    this doesn't need a dedicated join function -- box(...) returns a plain
+    skyregion (it's a four-corner polygon under the hood, see box_region() in
+    adql.c), and skycell_region_support's non-constant branch already covers
+    any skyregion value, however it was built, via skycell_region_bound. So
+    the redirect target is exactly the `<@` form CONTAINS already falls back
+    to; this only matters for INTERSECTS, whose own function has no support
+    function at all. None if the shape doesn't match, or the box is a
+    literal -- the same fallback already covers that case.
+    """
+    if not cols:
+        return None
+    m = re.fullmatch(r"\s*BOX\s*\((.*)\)\s*", region, re.I | re.S)
+    if not m:
+        return None
+    a = _frame([p.strip() for p in _split_args(m.group(1))], version, "BOX")
+    if len(a) == 4 and not _all_const(a):
+        return f"(point('ICRS', {cols[0]}, {cols[1]}) <@ box('ICRS', {a[0]}, {a[1]}, {a[2]}, {a[3]}))"
+    return None
+
+
 def _crossmatch(cols: tuple[str, str] | None, region: str, version: str) -> str | None:
-    """skycell_radial_query/skycell_poly_join for whichever cross-match shape
-    `region` is, else None."""
+    """skycell_radial_query/skycell_poly_join/<@ for whichever cross-match
+    shape `region` is, else None."""
     return (_crossmatch_radial(cols, region, version)
-            or _crossmatch_poly(cols, region, version))
+            or _crossmatch_poly(cols, region, version)
+            or _crossmatch_box(cols, region, version))
 
 
 def _contains(args: list[str], d: Dialect, version: str) -> str:

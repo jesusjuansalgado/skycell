@@ -121,7 +121,15 @@ it assumes a small, fixed fallback fraction instead -- close enough to avoid
 the wildly-wrong plans (and needless JIT compilation) a naive estimate would
 cause, but not as sharp as the circle case's real number. The result is
 correct and index-backed either way; only the row-count estimate is coarser.
-`BOX` remains open.
+
+A non-constant **`BOX`** cross-match needs no dedicated join function at all:
+`box(...)` is a plain `skyregion` value -- a four-corner polygon under the
+hood, built once at construction time -- so `<@`'s own non-constant branch
+already covers it, whatever kind of region it's built from. `CONTAINS(POINT,
+BOX(...))` already fell back to `<@` before any of this, so it needed no
+change; `INTERSECTS(POINT, BOX(...))`, either argument order, did, since its
+own function has no planner support at all -- the translator now redirects it
+to the same `<@` form CONTAINS already uses. A literal `BOX` is untouched.
 
 A cross-match against a stored **`skyregion` column** -- `CONTAINS(POINT('ICRS',
 a.ra, a.dec), b.s_region) = 1`, matching points against another table's

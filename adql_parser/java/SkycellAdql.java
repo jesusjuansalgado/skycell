@@ -339,11 +339,40 @@ public final class SkycellAdql {
         return null;
     }
 
-    /** skycell_radial_query/skycell_poly_join for whichever cross-match shape
-     * {@code region} is, else null. */
+    /**
+     * point('ICRS', ra, dec) &lt;@ box('ICRS', ...) for a cross-match shape:
+     * {@code cols} a point over a pair of plain columns and {@code region} a
+     * BOX whose centre or extent is not all literal constants. Unlike
+     * CIRCLE/POLYGON, this needs no dedicated join function -- box(...)
+     * returns a plain skyregion (a four-corner polygon under the hood, see
+     * box_region() in adql.c), and skycell_region_support's non-constant
+     * branch already covers any skyregion value, however it was built, via
+     * skycell_region_bound. So the redirect target is exactly the
+     * {@code <@} form CONTAINS already falls back to; this only matters for
+     * INTERSECTS, whose own function has no support function at all. Null
+     * if the shape doesn't match, or the box is a literal -- the same
+     * fallback already covers that case.
+     */
+    private String crossmatchBox(String[] cols, String region) {
+        if (cols == null) return null;
+        Matcher bm = Pattern.compile("\\s*BOX\\s*\\((.*)\\)\\s*",
+                Pattern.CASE_INSENSITIVE | Pattern.DOTALL).matcher(region);
+        if (!bm.matches()) return null;
+        List<String> a = stripFrame(splitArgs(bm.group(1)), "BOX");
+        if (a.size() == 4 && !allConst(a)) {
+            return "(point('ICRS', " + cols[0] + ", " + cols[1] + ") <@ box('ICRS', "
+                    + a.get(0) + ", " + a.get(1) + ", " + a.get(2) + ", " + a.get(3) + "))";
+        }
+        return null;
+    }
+
+    /** skycell_radial_query/skycell_poly_join/&lt;@ for whichever cross-match
+     * shape {@code region} is, else null. */
     private String crossmatch(String[] cols, String region) {
         String xm = crossmatchRadial(cols, region);
-        return xm != null ? xm : crossmatchPoly(cols, region);
+        if (xm != null) return xm;
+        xm = crossmatchPoly(cols, region);
+        return xm != null ? xm : crossmatchBox(cols, region);
     }
 
     /** POINT('ICRS', ra, dec) over plain columns -&gt; {ra, dec}, else null. */

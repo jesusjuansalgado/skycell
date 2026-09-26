@@ -114,6 +114,20 @@ SELECT (SELECT count(*) FROM footprint f, cat c
           WHERE skycell_in_region(point('ICRS', c.ra, c.dec), f.s_region))
       AS region_join_matches_exact;
 DROP TABLE footprint;
+
+-- BOX cross-match: box(...) is a plain skyregion (a four-corner polygon
+-- under the hood, built by box_region()'s cos(dec) corner compression), so
+-- no dedicated join function is needed -- <@'s non-constant branch already
+-- covers it, whatever kind of region it happens to be built from.
+SELECT plan_uses_index(
+  $q$SELECT count(*) FROM probe p, cat c
+     WHERE point('ICRS', c.ra, c.dec) <@ box('ICRS', p.ra, least(greatest(p.dec, -85), 85), 0.1, 0.1)$q$
+) AS box_join_indexed;
+SELECT (SELECT count(*) FROM probe p, cat c
+          WHERE point('ICRS', c.ra, c.dec) <@ box('ICRS', p.ra, least(greatest(p.dec, -85), 85), 0.1, 0.1))
+      = (SELECT count(*) FROM probe p, cat c
+          WHERE skycell_in_region(point('ICRS', c.ra, c.dec), box('ICRS', p.ra, least(greatest(p.dec, -85), 85), 0.1, 0.1)))
+      AS box_join_matches_exact;
 DROP TABLE probe;
 DROP INDEX cat_a2c;
 
