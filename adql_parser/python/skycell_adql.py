@@ -195,8 +195,9 @@ _CONST_NUM = re.compile(
 )
 
 
-def _is_const_circle(a: list[str]) -> bool:
-    """True if a CIRCLE's centre and radius are all literal numbers, not columns."""
+def _all_const(a: list[str]) -> bool:
+    """True if every argument (a CIRCLE's centre/radius, a POLYGON's vertices)
+    is a literal number, not a column or expression."""
     return all(_CONST_NUM.fullmatch(x.strip()) for x in a)
 
 
@@ -232,9 +233,37 @@ def _crossmatch_radial(cols: tuple[str, str] | None, region: str, version: str) 
     if not m:
         return None
     a = _frame([p.strip() for p in _split_args(m.group(1))], version, "CIRCLE")
-    if len(a) == 3 and not _is_const_circle(a):
+    if len(a) == 3 and not _all_const(a):
         return f"skycell_radial_query({cols[0]}, {cols[1]}, {a[0]}, {a[1]}, {a[2]})"
     return None
+
+
+def _crossmatch_poly(cols: tuple[str, str] | None, region: str, version: str) -> str | None:
+    """skycell_poly_join(...) for a cross-match shape: `cols` a point over a
+    pair of plain columns and `region` a POLYGON whose vertices are not all
+    literal constants -- they come from another table's row. The polygon
+    analogue of _crossmatch_radial: `<@`'s rewrite gives up outright on a
+    non-constant region regardless of shape, and skycell_poly_join reaches
+    simplify_poly's non-constant branch instead, capped to skycell.join_slots
+    ranges. None if the shape doesn't match -- a literal polygon is left
+    alone, since `<@`/`intersects` already reach the same, uncapped covering.
+    """
+    if not cols:
+        return None
+    m = re.fullmatch(r"\s*POLYGON\s*\((.*)\)\s*", region, re.I | re.S)
+    if not m:
+        return None
+    a = _frame([p.strip() for p in _split_args(m.group(1))], version, "POLYGON")
+    if len(a) >= 6 and len(a) % 2 == 0 and not _all_const(a):
+        return f"skycell_poly_join({cols[0]}, {cols[1]}, ARRAY[{', '.join(a)}]::float8[])"
+    return None
+
+
+def _crossmatch(cols: tuple[str, str] | None, region: str, version: str) -> str | None:
+    """skycell_radial_query/skycell_poly_join for whichever cross-match shape
+    `region` is, else None."""
+    return (_crossmatch_radial(cols, region, version)
+            or _crossmatch_poly(cols, region, version))
 
 
 def _contains(args: list[str], d: Dialect, version: str) -> str:
@@ -243,7 +272,7 @@ def _contains(args: list[str], d: Dialect, version: str) -> str:
     inner, outer = args
     cols = _is_point_of_columns(inner)
     if d is SKYCELL:
-        xm = _crossmatch_radial(cols, outer, version)
+        xm = _crossmatch(cols, outer, version)
         if xm is not None:
             return xm
         return f"({translate_expr(inner, d, version)} <@ {translate_expr(outer, d, version)})"
@@ -268,11 +297,11 @@ def _intersects(args: list[str], d: Dialect, version: str) -> str:
     if d is SKYCELL:
         # A point has no area: intersecting a region is the same as being
         # contained in it (see skycell_intersects_pos's own comment). A
-        # cross-match written as INTERSECTS(POINT, CIRCLE) either way round
-        # hits the same unindexed-non-constant-region gap as CONTAINS; reuse
-        # its detection so it gets the same skycell_radial_query redirect.
+        # cross-match written as INTERSECTS(POINT, CIRCLE-or-POLYGON) either
+        # way round hits the same unindexed-non-constant-region gap as
+        # CONTAINS; reuse its detection so it gets the same redirect.
         for pos, region in (args, (args[1], args[0])):
-            xm = _crossmatch_radial(_is_point_of_columns(pos), region, version)
+            xm = _crossmatch(_is_point_of_columns(pos), region, version)
             if xm is not None:
                 return xm
         a, b = (translate_expr(x, d, version) for x in args)

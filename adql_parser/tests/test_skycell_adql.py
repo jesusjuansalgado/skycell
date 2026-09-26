@@ -44,6 +44,30 @@ def test_crossmatch_uses_skycell_radial_query():
         "SELECT * FROM a, b WHERE q3c_radial_query(a.ra, a.dec, b.ra, b.dec, 0.0003)")
 
 
+def test_crossmatch_polygon_uses_skycell_poly_join():
+    # A polygon whose vertices come from another table's row: same gap as a
+    # non-constant CIRCLE, same redirect, this time to skycell_poly_join.
+    q = ("SELECT * FROM a, b WHERE "
+         "CONTAINS(POINT('ICRS', a.ra, a.dec), "
+         "POLYGON('ICRS', b.v1x, b.v1y, b.v2x, b.v2y, b.v3x, b.v3y)) = 1")
+    assert translate(q) == (
+        "SELECT * FROM a, b WHERE skycell_poly_join(a.ra, a.dec, "
+        "ARRAY[b.v1x, b.v1y, b.v2x, b.v2y, b.v3x, b.v3y]::float8[])")
+    # INTERSECTS gets the same redirect, either argument order.
+    q2 = ("SELECT * FROM a, b WHERE "
+          "INTERSECTS(POLYGON('ICRS', b.v1x, b.v1y, b.v2x, b.v2y, b.v3x, b.v3y), "
+          "POINT('ICRS', a.ra, a.dec)) = 1")
+    assert translate(q2) == (
+        "SELECT * FROM a, b WHERE skycell_poly_join(a.ra, a.dec, "
+        "ARRAY[b.v1x, b.v1y, b.v2x, b.v2y, b.v3x, b.v3y]::float8[])")
+    # A literal polygon is untouched -- `<@` already covers it without a cap.
+    lit = ("SELECT * FROM t WHERE "
+           "CONTAINS(POINT('ICRS', ra, dec), POLYGON('ICRS', 1,2, 3,4, 5,6)) = 1")
+    assert "<@" in translate(lit)
+    # pgSphere+Q3C already handles this shape via q3c_poly_query; unaffected.
+    assert "q3c_poly_query" in translate(q, "pgsphere")
+
+
 def test_intersects_crossmatch_uses_skycell_radial_query():
     # A point has no area, so INTERSECTS(POINT, CIRCLE) is CONTAINS in disguise;
     # a cross-match written either argument order must get the same rewrite.

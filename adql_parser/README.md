@@ -108,6 +108,23 @@ without a cap. `INTERSECTS(POINT, CIRCLE)` gets the same treatment, either
 argument order -- a point has no area, so intersecting a region is exactly
 containment (skycell's own `skycell_intersects_pos` says as much).
 
+A non-constant `POLYGON` cross-match -- `CONTAINS(POINT('ICRS', a.ra, a.dec),
+POLYGON('ICRS', b.v1, b.v2, ...)) = 1`, matching points against a per-row
+footprint rather than a literal shape -- hits the same gap and gets the same
+fix: `skycell_poly_join(a.ra, a.dec, ARRAY[b.v1, b.v2, ...]::float8[])`, the
+polygon analogue of `skycell_join`, added alongside its own non-constant
+covering path in the extension (`skycell_poly_bound`, mirroring
+`skycell_cone_bound`). One caveat a `CIRCLE` cross-match doesn't share: the
+`skycell_cell_ops` selectivity estimator only recognises a circle's constant
+radius argument, so unlike `skycell_radial_query`, `skycell_poly_join`'s range
+predicates fall back to PostgreSQL's stock selectivity estimate even against a
+`skycell_cell_ops` index -- there is no equivalent scalar to recover a
+polygon's area from a non-constant, per-row shape. The result is still
+correct and index-backed either way; only the plan's row-count estimate is
+coarser than the circle case's. `BOX` and a stored `skyregion` column (an
+arbitrary per-row footprint, as opposed to a literal `POLYGON(...)` call) are
+not covered by this -- both remain open.
+
 ## Tests
 
 ```bash

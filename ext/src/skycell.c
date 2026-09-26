@@ -1046,33 +1046,120 @@ simplify_poly(PlannerInfo *root, FuncExpr *fexpr)
 	List	   *args = fexpr->args;
 	Node	   *cell = linitial(args);
 	Node	   *poly = lfourth(args);
-	sc_region	reg;
-	sc_cover	cov;
-	sc_cover_params p;
 	sc_density	dens;
 	Oid			dens_statrel;
-	double		sel;
 	Oid			exact_types[4] = {FLOAT8OID, FLOAT8OID, FLOAT8ARRAYOID, FLOAT8OID};
-	FuncExpr   *exact;
 	bool		uses_cell_ops;
 
-	if (!IsA(poly, Const))
-		return NULL;			/* not rewritten: exact test only */
-	if (((Const *) poly)->constisnull)
-		return (Node *) makeBoolConst(false, true);
-
-	poly_from_array(DatumGetArrayTypeP(((Const *) poly)->constvalue), &reg);
 	density_for_var(root, cell, &dens, &dens_statrel, &uses_cell_ops);
-	current_params(&p, skycell_max_ranges, &dens);
-	sc_cover_compute(&reg, &dens, &p, &cov);
-	sel = (cov.area > 0) ? fmin(1.0, reg.area / cov.area) : 0.0;
 
-	exact = makeFuncExpr(lookup_sibling_func(fexpr->funcid, "skycell_in_poly", 4, exact_types),
-						 BOOLOID,
-						 list_make4(copyObject(lsecond(args)), copyObject(lthird(args)),
-									copyObject(poly), float8_const(sel)),
-						 InvalidOid, InvalidOid, COERCE_EXPLICIT_CALL);
-	return ranges_and_exact(&cov, cell, (Expr *) exact, uses_cell_ops);
+	if (IsA(poly, Const))
+	{
+		sc_region	reg;
+		sc_cover	cov;
+		sc_cover_params p;
+		double		sel;
+		FuncExpr   *exact;
+
+		if (((Const *) poly)->constisnull)
+			return (Node *) makeBoolConst(false, true);
+
+		poly_from_array(DatumGetArrayTypeP(((Const *) poly)->constvalue), &reg);
+		current_params(&p, skycell_max_ranges, &dens);
+		sc_cover_compute(&reg, &dens, &p, &cov);
+		sel = (cov.area > 0) ? fmin(1.0, reg.area / cov.area) : 0.0;
+
+		exact = makeFuncExpr(lookup_sibling_func(fexpr->funcid, "skycell_in_poly", 4, exact_types),
+							 BOOLOID,
+							 list_make4(copyObject(lsecond(args)), copyObject(lthird(args)),
+										copyObject(poly), float8_const(sel)),
+							 InvalidOid, InvalidOid, COERCE_EXPLICIT_CALL);
+		return ranges_and_exact(&cov, cell, (Expr *) exact, uses_cell_ops);
+	}
+	else
+	{
+		/*
+		 * Run-time slots, one covering per distinct polygon row -- the same
+		 * mechanism simplify_cone's non-constant branch uses for a
+		 * cross-match cone, except the covering is keyed on the polygon's
+		 * own bytes (skycell_poly_bound) rather than three scalars, since a
+		 * polygon has no fixed-arity description to pass around directly.
+		 *
+		 * skycell_cellsel (the skycell_cell_ops estimator) only recognises
+		 * skycell_cone_bound's radius argument, so unlike the cone case
+		 * these range quals fall back to the stock DEFAULT_INEQ_SEL even
+		 * against a skycell_cell_ops index -- there is no equivalent
+		 * "radius" to recover a polygon's area from a non-constant, per-row
+		 * shape. The ranges are still index-backed and correct either way;
+		 * only the row-count estimate that costs the plan is coarser.
+		 */
+		Oid			bound_types[5] = {FLOAT8ARRAYOID, INT4OID, INT4OID, FLOAT8OID, INT8ARRAYOID};
+		Oid			bound_oid = lookup_sibling_func(fexpr->funcid, "skycell_poly_bound", 5, bound_types);
+		int			k = skycell_join_slots;
+		Oid			arm_opfamily = uses_cell_ops
+			? cell_ops_opfamily() : INTEGER_BTREE_FAM_OID;
+		Const	   *hist;
+		List	   *arms = NIL;
+		Datum	   *hd = palloc(sizeof(Datum) * Max(dens.nbounds, 1));
+		FuncExpr   *exact;
+
+		for (int i = 0; i < dens.nbounds; i++)
+			hd[i] = Int64GetDatum(dens.bounds[i]);
+		hist = makeConst(INT8ARRAYOID, -1, InvalidOid, -1,
+						 PointerGetDatum(construct_array_builtin(hd, dens.nbounds, INT8OID)),
+						 false, false);
+
+		for (int s = 0; s < k; s++)
+		{
+			Expr	   *b[2];
+
+			for (int j = 0; j < 2; j++)
+				b[j] = (Expr *) makeFuncExpr(bound_oid, INT8OID,
+											 list_make3(copyObject(poly),
+														int4_const(2 * s + j),
+														int4_const(k)),
+											 InvalidOid, InvalidOid, COERCE_EXPLICIT_CALL);
+			for (int j = 0; j < 2; j++)
+				((FuncExpr *) b[j])->args = lappend(lappend(((FuncExpr *) b[j])->args,
+															float8_const(dens.ntotal)),
+													copyObject(hist));
+			arms = lappend(arms, range_arm_family(cell, b[0], b[1], arm_opfamily));
+		}
+		exact = makeFuncExpr(lookup_sibling_func(fexpr->funcid, "skycell_in_poly", 4, exact_types),
+							 BOOLOID,
+							 list_make4(copyObject(lsecond(args)), copyObject(lthird(args)),
+										copyObject(poly), float8_const(-1.0)),
+							 InvalidOid, InvalidOid, COERCE_EXPLICIT_CALL);
+		return (Node *) makeBoolExpr(AND_EXPR,
+									 list_make2(k == 1 ? linitial(arms) : makeBoolExpr(OR_EXPR, arms, -1),
+												exact),
+									 -1);
+	}
+}
+
+/*
+ * skycell_poly_join(ra, dec, poly): the Q3C-poly-query-shaped spelling for a
+ * cross-match whose polygon comes from another table's row. Like
+ * simplify_cone5 for skycell_join/skycell_radial_query, it synthesises the
+ * index expression from the first two arguments and hands the four-argument
+ * form to simplify_poly.
+ */
+static Node *
+simplify_poly3(PlannerInfo *root, FuncExpr *fexpr)
+{
+	Oid			a2c_types[2] = {FLOAT8OID, FLOAT8OID};
+	Oid			a2c_oid = lookup_sibling_func(fexpr->funcid, "skycell_ang2cell",
+											  2, a2c_types);
+	FuncExpr   *four = copyObject(fexpr);
+	Expr	   *cell;
+
+	cell = (Expr *) makeFuncExpr(a2c_oid, INT8OID,
+								 list_make2(copyObject(linitial(fexpr->args)),
+											copyObject(lsecond(fexpr->args))),
+								 InvalidOid, InvalidOid, COERCE_EXPLICIT_CALL);
+
+	four->args = lcons(cell, four->args);
+	return simplify_poly(root, four);
 }
 
 /*
@@ -1115,6 +1202,8 @@ skycell_support(PG_FUNCTION_ARGS)
 
 		if (nargs == 6)
 			PG_RETURN_POINTER(simplify_cone(req->root, req->fcall));
+		if (nargs == 3)
+			PG_RETURN_POINTER(simplify_poly3(req->root, req->fcall));
 		if (nargs == 5)
 			PG_RETURN_POINTER(simplify_cone5(req->root, req->fcall));
 		if (nargs == 4)
@@ -1479,6 +1568,99 @@ skycell_cone_bound(PG_FUNCTION_ARGS)
 		slot_cache.valid = true;
 	}
 	PG_RETURN_INT64((i % 2 == 0) ? slot_cache.lo[i / 2] : slot_cache.hi[i / 2]);
+}
+
+/*
+ * The polygon analogue of skycell_cone_bound(): a polygon has no fixed-arity
+ * description to compare cheaply like (ra0, dec0, radius), so the cache key
+ * is a hash of the array's own bytes instead of three scalar fields.
+ */
+static struct
+{
+	bool		valid;
+	uint32		polyhash,
+				hhash;
+	double		ntotal,
+				range_cost,
+				split_cost,
+				area_ratio;
+	int			nslots;
+	int64		lo[MAX_SLOTS],
+				hi[MAX_SLOTS];
+}			poly_slot_cache;
+
+PG_FUNCTION_INFO_V1(skycell_poly_bound);
+Datum
+skycell_poly_bound(PG_FUNCTION_ARGS)
+{
+	ArrayType  *polyarr = PG_GETARG_ARRAYTYPE_P(0);
+	int32		i = PG_GETARG_INT32(1),
+				nslots = PG_GETARG_INT32(2);
+	double		ntotal = PG_GETARG_FLOAT8(3);
+	ArrayType  *harr = PG_GETARG_ARRAYTYPE_P(4);
+	hist_cache *hc = (hist_cache *) fcinfo->flinfo->fn_extra;
+	uint32		polyhash;
+
+	if (nslots < 1 || nslots > MAX_SLOTS || i < 0 || i >= 2 * nslots)
+		elog(ERROR, "skycell: bad slot %d/%d", i, nslots);
+
+	if (hc == NULL)
+	{
+		MemoryContext old = MemoryContextSwitchTo(fcinfo->flinfo->fn_mcxt);
+		Datum	   *elems;
+		bool	   *nulls;
+
+		hc = palloc0(sizeof(hist_cache));
+		deconstruct_array(harr, INT8OID, sizeof(int64), true, TYPALIGN_DOUBLE, &elems, &nulls, &hc->n);
+		hc->b = palloc(sizeof(int64) * Max(hc->n, 1));
+		for (int j = 0; j < hc->n; j++)
+			hc->b[j] = DatumGetInt64(elems[j]);
+		hc->hash = hash_bytes((const unsigned char *) hc->b, sizeof(int64) * hc->n) ^ (uint32) hc->n;
+		fcinfo->flinfo->fn_extra = hc;
+		MemoryContextSwitchTo(old);
+	}
+
+	polyhash = hash_bytes((const unsigned char *) polyarr, VARSIZE(polyarr));
+
+	if (!poly_slot_cache.valid || poly_slot_cache.polyhash != polyhash ||
+		poly_slot_cache.ntotal != ntotal ||
+		poly_slot_cache.hhash != hc->hash || poly_slot_cache.nslots != nslots ||
+		poly_slot_cache.range_cost != skycell_range_cost ||
+		poly_slot_cache.split_cost != skycell_split_cost ||
+		poly_slot_cache.area_ratio != skycell_max_area_ratio)
+	{
+		sc_region	reg;
+		sc_cover	cov;
+		sc_cover_params p;
+		sc_density	d = {ntotal, hc->n, hc->b};
+		int			s;
+
+		poly_slot_cache.valid = false;
+		poly_from_array(polyarr, &reg);
+		current_params(&p, nslots, &d);
+		sc_cover_compute(&reg, &d, &p, &cov);
+		for (s = 0; s < cov.n && s < nslots; s++)
+		{
+			poly_slot_cache.lo[s] = cov.r[s].lo;
+			poly_slot_cache.hi[s] = cov.r[s].hi;
+		}
+		for (; s < nslots; s++)
+		{
+			poly_slot_cache.lo[s] = 1;	/* empty range: never matches */
+			poly_slot_cache.hi[s] = 0;
+		}
+		sc_cover_free(&cov);
+		sc_region_free(&reg);
+		poly_slot_cache.polyhash = polyhash;
+		poly_slot_cache.ntotal = ntotal;
+		poly_slot_cache.hhash = hc->hash;
+		poly_slot_cache.nslots = nslots;
+		poly_slot_cache.range_cost = skycell_range_cost;
+		poly_slot_cache.split_cost = skycell_split_cost;
+		poly_slot_cache.area_ratio = skycell_max_area_ratio;
+		poly_slot_cache.valid = true;
+	}
+	PG_RETURN_INT64((i % 2 == 0) ? poly_slot_cache.lo[i / 2] : poly_slot_cache.hi[i / 2]);
 }
 
 /* ------------------------------------------------------------------ */

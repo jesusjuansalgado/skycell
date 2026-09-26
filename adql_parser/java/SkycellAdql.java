@@ -207,7 +207,7 @@ public final class SkycellAdql {
                 String inner = raw.get(0), outer = raw.get(1);
                 String[] cols = pointOfColumns(inner);
                 if (dialect == Dialect.SKYCELL) {
-                    String xm = crossmatchRadial(cols, outer);
+                    String xm = crossmatch(cols, outer);
                     if (xm != null) return xm;
                     return "(" + translateExpression(inner) + " <@ " + translateExpression(outer) + ")";
                 }
@@ -230,11 +230,11 @@ public final class SkycellAdql {
                 if (dialect == Dialect.SKYCELL) {
                     // A point has no area: intersecting a region is the same as being
                     // contained in it (see skycell_intersects_pos's own comment). A
-                    // cross-match written as INTERSECTS(POINT, CIRCLE) either way round
-                    // hits the same unindexed-non-constant-region gap as CONTAINS; reuse
-                    // its detection so it gets the same skycell_radial_query redirect.
-                    String xm = crossmatchRadial(pointOfColumns(raw.get(0)), raw.get(1));
-                    if (xm == null) xm = crossmatchRadial(pointOfColumns(raw.get(1)), raw.get(0));
+                    // cross-match written as INTERSECTS(POINT, CIRCLE-or-POLYGON) either
+                    // way round hits the same unindexed-non-constant-region gap as
+                    // CONTAINS; reuse its detection so it gets the same redirect.
+                    String xm = crossmatch(pointOfColumns(raw.get(0)), raw.get(1));
+                    if (xm == null) xm = crossmatch(pointOfColumns(raw.get(1)), raw.get(0));
                     if (xm != null) return xm;
                     return "intersects(" + translateExpression(raw.get(0)) + ", "
                             + translateExpression(raw.get(1)) + ")";
@@ -308,11 +308,42 @@ public final class SkycellAdql {
                 Pattern.CASE_INSENSITIVE | Pattern.DOTALL).matcher(region);
         if (!cm.matches()) return null;
         List<String> a = stripFrame(splitArgs(cm.group(1)), "CIRCLE");
-        if (a.size() == 3 && !isConstCircle(a)) {
+        if (a.size() == 3 && !allConst(a)) {
             return "skycell_radial_query(" + cols[0] + ", " + cols[1] + ", "
                     + a.get(0) + ", " + a.get(1) + ", " + a.get(2) + ")";
         }
         return null;
+    }
+
+    /**
+     * skycell_poly_join(...) for a cross-match shape: {@code cols} a point
+     * over a pair of plain columns and {@code region} a POLYGON whose
+     * vertices are not all literal constants -- they come from another
+     * table's row. The polygon analogue of crossmatchRadial: {@code <@}'s
+     * rewrite gives up outright on a non-constant region regardless of
+     * shape, and skycell_poly_join reaches simplify_poly's non-constant
+     * branch instead, capped to skycell.join_slots ranges. Null if the shape
+     * doesn't match -- a literal polygon is left alone, since {@code <@}/
+     * {@code intersects} already reach the same, uncapped covering.
+     */
+    private String crossmatchPoly(String[] cols, String region) {
+        if (cols == null) return null;
+        Matcher pm = Pattern.compile("\\s*POLYGON\\s*\\((.*)\\)\\s*",
+                Pattern.CASE_INSENSITIVE | Pattern.DOTALL).matcher(region);
+        if (!pm.matches()) return null;
+        List<String> a = stripFrame(splitArgs(pm.group(1)), "POLYGON");
+        if (a.size() >= 6 && a.size() % 2 == 0 && !allConst(a)) {
+            return "skycell_poly_join(" + cols[0] + ", " + cols[1] + ", ARRAY["
+                    + String.join(", ", a) + "]::float8[])";
+        }
+        return null;
+    }
+
+    /** skycell_radial_query/skycell_poly_join for whichever cross-match shape
+     * {@code region} is, else null. */
+    private String crossmatch(String[] cols, String region) {
+        String xm = crossmatchRadial(cols, region);
+        return xm != null ? xm : crossmatchPoly(cols, region);
     }
 
     /** POINT('ICRS', ra, dec) over plain columns -&gt; {ra, dec}, else null. */
@@ -328,8 +359,9 @@ public final class SkycellAdql {
     private static final Pattern CONST_NUM = Pattern.compile(
             "[-+]?(?:\\d+\\.\\d*(?:[eE][-+]?\\d+)?|\\.\\d+(?:[eE][-+]?\\d+)?|\\d+(?:[eE][-+]?\\d+)?)");
 
-    /** True if a CIRCLE's centre and radius are all literal numbers, not columns. */
-    private static boolean isConstCircle(List<String> a) {
+    /** True if every argument (a CIRCLE's centre/radius, a POLYGON's
+     * vertices) is a literal number, not a column or expression. */
+    private static boolean allConst(List<String> a) {
         for (String x : a) {
             if (!CONST_NUM.matcher(x.trim()).matches()) return false;
         }

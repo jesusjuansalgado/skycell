@@ -69,6 +69,25 @@ SELECT (SELECT count(*) FROM cat WHERE skycell_radial_query(ra, dec, 10, 20, 0.5
          = (SELECT count(*) FROM cat WHERE skycell_in_cone(ra, dec, 10, 20, 0.5)) AS radial_matches_exact,
        (SELECT count(*) FROM probe p, cat c WHERE skycell_join(c.ra, c.dec, p.ra, p.dec, 0.05))
          = (SELECT count(*) FROM probe p, cat c WHERE skycell_in_cone(c.ra, c.dec, p.ra, p.dec, 0.05)) AS join_matches_exact;
+
+-- skycell_poly_join: the polygon analogue of skycell_join/skycell_radial_query,
+-- for a cross-match whose polygon comes from another table's row rather than a
+-- compile-time constant. Dec is clamped away from the poles: a tiny quad
+-- straddling one is a separate (already-tested) edge case, not what this
+-- exercises.
+CREATE TABLE tile AS SELECT ra, least(greatest(dec, -85), 85) AS dec FROM probe;
+SELECT plan_uses_index(
+  'SELECT count(*) FROM tile t, cat c WHERE skycell_poly_join(c.ra, c.dec, ' ||
+  'ARRAY[t.ra-0.05,t.dec-0.05, t.ra+0.05,t.dec-0.05, t.ra+0.05,t.dec+0.05, t.ra-0.05,t.dec+0.05]::float8[])'
+) AS poly_join_indexed;
+SELECT (SELECT count(*) FROM tile t, cat c
+          WHERE skycell_poly_join(c.ra, c.dec,
+            ARRAY[t.ra-0.05,t.dec-0.05, t.ra+0.05,t.dec-0.05, t.ra+0.05,t.dec+0.05, t.ra-0.05,t.dec+0.05]::float8[]))
+      = (SELECT count(*) FROM tile t, cat c
+          WHERE skycell_in_poly(c.ra, c.dec,
+            ARRAY[t.ra-0.05,t.dec-0.05, t.ra+0.05,t.dec-0.05, t.ra+0.05,t.dec+0.05, t.ra-0.05,t.dec+0.05]::float8[]))
+      AS poly_join_matches_exact;
+DROP TABLE tile;
 DROP TABLE probe;
 DROP INDEX cat_a2c;
 
