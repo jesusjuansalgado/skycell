@@ -27,6 +27,95 @@ def test_cone_falls_back_to_pgsphere_for_a_typed_column():
     assert "q3c_" not in out
 
 
+def test_crossmatch_uses_skycell_radial_query():
+    # A circle whose centre comes from another table's row: `<@`'s rewrite
+    # gives up on a non-constant region, so this must not fall back to `<@`.
+    q = ("SELECT * FROM a, b WHERE "
+         "CONTAINS(POINT('ICRS', a.ra, a.dec), CIRCLE('ICRS', b.ra, b.dec, 0.0003)) = 1")
+    assert translate(q) == (
+        "SELECT * FROM a, b WHERE skycell_radial_query(a.ra, a.dec, b.ra, b.dec, 0.0003)")
+    # Only the radius is non-constant: still a cross-match, same rewrite.
+    q2 = ("SELECT * FROM a, b WHERE "
+          "CONTAINS(POINT('ICRS', a.ra, a.dec), CIRCLE('ICRS', 10, 20, b.radius)) = 1")
+    assert translate(q2) == (
+        "SELECT * FROM a, b WHERE skycell_radial_query(a.ra, a.dec, 10, 20, b.radius)")
+    # pgSphere+Q3C already handles this shape via q3c_radial_query; unaffected.
+    assert translate(q, "pgsphere") == (
+        "SELECT * FROM a, b WHERE q3c_radial_query(a.ra, a.dec, b.ra, b.dec, 0.0003)")
+
+
+def test_crossmatch_polygon_uses_skycell_poly_join():
+    # A polygon whose vertices come from another table's row: same gap as a
+    # non-constant CIRCLE, same redirect, this time to skycell_poly_join.
+    q = ("SELECT * FROM a, b WHERE "
+         "CONTAINS(POINT('ICRS', a.ra, a.dec), "
+         "POLYGON('ICRS', b.v1x, b.v1y, b.v2x, b.v2y, b.v3x, b.v3y)) = 1")
+    assert translate(q) == (
+        "SELECT * FROM a, b WHERE skycell_poly_join(a.ra, a.dec, "
+        "ARRAY[b.v1x, b.v1y, b.v2x, b.v2y, b.v3x, b.v3y]::float8[])")
+    # INTERSECTS gets the same redirect, either argument order.
+    q2 = ("SELECT * FROM a, b WHERE "
+          "INTERSECTS(POLYGON('ICRS', b.v1x, b.v1y, b.v2x, b.v2y, b.v3x, b.v3y), "
+          "POINT('ICRS', a.ra, a.dec)) = 1")
+    assert translate(q2) == (
+        "SELECT * FROM a, b WHERE skycell_poly_join(a.ra, a.dec, "
+        "ARRAY[b.v1x, b.v1y, b.v2x, b.v2y, b.v3x, b.v3y]::float8[])")
+    # A literal polygon is untouched -- `<@` already covers it without a cap.
+    lit = ("SELECT * FROM t WHERE "
+           "CONTAINS(POINT('ICRS', ra, dec), POLYGON('ICRS', 1,2, 3,4, 5,6)) = 1")
+    assert "<@" in translate(lit)
+    # pgSphere+Q3C already handles this shape via q3c_poly_query; unaffected.
+    assert "q3c_poly_query" in translate(q, "pgsphere")
+
+
+def test_crossmatch_box_uses_plain_at_sign():
+    # A BOX whose centre or extent comes from another table's row: unlike
+    # CIRCLE/POLYGON, this needs no dedicated join function -- box(...) is a
+    # plain skyregion (a four-corner polygon under the hood), and <@'s own
+    # rewrite already covers any skyregion value. Only INTERSECTS actually
+    # needs the redirect; CONTAINS already falls back to <@ on its own.
+    q = ("SELECT * FROM a, b WHERE "
+         "CONTAINS(POINT('ICRS', a.ra, a.dec), BOX('ICRS', b.ra, b.dec, b.w, b.h)) = 1")
+    assert translate(q) == (
+        "SELECT * FROM a, b WHERE (point('ICRS', a.ra, a.dec) <@ box('ICRS', b.ra, b.dec, b.w, b.h))")
+    q2 = ("SELECT * FROM a, b WHERE "
+          "INTERSECTS(POINT('ICRS', a.ra, a.dec), BOX('ICRS', b.ra, b.dec, b.w, b.h)) = 1")
+    assert translate(q2) == (
+        "SELECT * FROM a, b WHERE (point('ICRS', a.ra, a.dec) <@ box('ICRS', b.ra, b.dec, b.w, b.h))")
+    # Either argument order.
+    q3 = ("SELECT * FROM a, b WHERE "
+          "INTERSECTS(BOX('ICRS', b.ra, b.dec, b.w, b.h), POINT('ICRS', a.ra, a.dec)) = 1")
+    assert translate(q3) == (
+        "SELECT * FROM a, b WHERE (point('ICRS', a.ra, a.dec) <@ box('ICRS', b.ra, b.dec, b.w, b.h))")
+    # A literal box: INTERSECTS(POINT, region) delegates fully to CONTAINS's
+    # own logic now, literal or not, so this also reaches <@ (already
+    # index-backed for a constant region) instead of the generic, genuinely
+    # unindexed intersects().
+    lit = "SELECT * FROM t WHERE INTERSECTS(POINT('ICRS', ra, dec), BOX('ICRS', 10, 20, 1, 2)) = 1"
+    assert translate(lit) == "SELECT * FROM t WHERE (point('ICRS', ra, dec) <@ box('ICRS', 10, 20, 1, 2))"
+
+
+def test_intersects_crossmatch_uses_skycell_radial_query():
+    # A point has no area, so INTERSECTS(POINT, CIRCLE) is CONTAINS in disguise;
+    # a cross-match written either argument order must get the same rewrite.
+    q = ("SELECT * FROM a, b WHERE "
+         "INTERSECTS(POINT('ICRS', a.ra, a.dec), CIRCLE('ICRS', b.ra, b.dec, 0.0003)) = 1")
+    assert translate(q) == (
+        "SELECT * FROM a, b WHERE skycell_radial_query(a.ra, a.dec, b.ra, b.dec, 0.0003)")
+    q2 = ("SELECT * FROM a, b WHERE "
+          "INTERSECTS(CIRCLE('ICRS', b.ra, b.dec, 0.0003), POINT('ICRS', a.ra, a.dec)) = 1")
+    assert translate(q2) == (
+        "SELECT * FROM a, b WHERE skycell_radial_query(a.ra, a.dec, b.ra, b.dec, 0.0003)")
+    # A literal circle now reaches <@ too (INTERSECTS(POINT, region) delegates
+    # fully to CONTAINS's own logic, not just its cross-match detection) --
+    # only "two regions, no point at all" is genuinely unindexable and stays
+    # as the generic intersects().
+    lit = "SELECT * FROM t WHERE INTERSECTS(POINT('ICRS', ra, dec), CIRCLE('ICRS', 10, 20, 0.5)) = 1"
+    assert translate(lit) == "SELECT * FROM t WHERE (point('ICRS', ra, dec) <@ circle('ICRS', 10, 20, 0.5))"
+    rr = "SELECT * FROM t WHERE INTERSECTS(CIRCLE('ICRS', 1, 2, 3), CIRCLE('ICRS', 4, 5, 6)) = 1"
+    assert "intersects(" in translate(rr)
+
+
 def test_negation():
     q = "SELECT * FROM t WHERE CONTAINS(POINT('ICRS', ra, dec), CIRCLE('ICRS', 1, 2, 3)) = 0"
     assert translate(q).startswith("SELECT * FROM t WHERE NOT (")

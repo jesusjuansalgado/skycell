@@ -69,6 +69,65 @@ SELECT (SELECT count(*) FROM cat WHERE skycell_radial_query(ra, dec, 10, 20, 0.5
          = (SELECT count(*) FROM cat WHERE skycell_in_cone(ra, dec, 10, 20, 0.5)) AS radial_matches_exact,
        (SELECT count(*) FROM probe p, cat c WHERE skycell_join(c.ra, c.dec, p.ra, p.dec, 0.05))
          = (SELECT count(*) FROM probe p, cat c WHERE skycell_in_cone(c.ra, c.dec, p.ra, p.dec, 0.05)) AS join_matches_exact;
+
+-- skycell_poly_join: the polygon analogue of skycell_join/skycell_radial_query,
+-- for a cross-match whose polygon comes from another table's row rather than a
+-- compile-time constant. Dec is clamped away from the poles: a tiny quad
+-- straddling one is a separate (already-tested) edge case, not what this
+-- exercises.
+CREATE TABLE tile AS SELECT ra, least(greatest(dec, -85), 85) AS dec FROM probe;
+SELECT plan_uses_index(
+  'SELECT count(*) FROM tile t, cat c WHERE skycell_poly_join(c.ra, c.dec, ' ||
+  'ARRAY[t.ra-0.05,t.dec-0.05, t.ra+0.05,t.dec-0.05, t.ra+0.05,t.dec+0.05, t.ra-0.05,t.dec+0.05]::float8[])'
+) AS poly_join_indexed;
+SELECT (SELECT count(*) FROM tile t, cat c
+          WHERE skycell_poly_join(c.ra, c.dec,
+            ARRAY[t.ra-0.05,t.dec-0.05, t.ra+0.05,t.dec-0.05, t.ra+0.05,t.dec+0.05, t.ra-0.05,t.dec+0.05]::float8[]))
+      = (SELECT count(*) FROM tile t, cat c
+          WHERE skycell_in_poly(c.ra, c.dec,
+            ARRAY[t.ra-0.05,t.dec-0.05, t.ra+0.05,t.dec-0.05, t.ra+0.05,t.dec+0.05, t.ra-0.05,t.dec+0.05]::float8[]))
+      AS poly_join_matches_exact;
+DROP TABLE tile;
+
+-- skycell_region_bound / <@ against a non-constant skyregion column: the
+-- generic-region analogue of skycell_poly_join, dispatching on each row's own
+-- kind tag the same way skycell_region_from_datum already does for a
+-- constant region. Covers a cross-match against another table's per-row
+-- footprint column (e.g. an archive's s_region), whichever kind it holds.
+CREATE TABLE footprint AS
+  SELECT ra, least(greatest(dec, -85), 85) AS dec,
+         CASE WHEN row_number() OVER () % 2 = 0
+              THEN circle('ICRS', ra, least(greatest(dec, -85), 85), 0.05)
+              ELSE polygon('ICRS', ra-0.05, least(greatest(dec, -85), 85)-0.05,
+                                   ra+0.05, least(greatest(dec, -85), 85)-0.05,
+                                   ra+0.05, least(greatest(dec, -85), 85)+0.05,
+                                   ra-0.05, least(greatest(dec, -85), 85)+0.05)
+         END AS s_region
+  FROM probe;
+SELECT plan_uses_index(
+  $q$SELECT count(*) FROM footprint f, cat c
+     WHERE point('ICRS', c.ra, c.dec) <@ f.s_region$q$
+) AS region_join_indexed;
+SELECT (SELECT count(*) FROM footprint f, cat c
+          WHERE point('ICRS', c.ra, c.dec) <@ f.s_region)
+      = (SELECT count(*) FROM footprint f, cat c
+          WHERE skycell_in_region(point('ICRS', c.ra, c.dec), f.s_region))
+      AS region_join_matches_exact;
+DROP TABLE footprint;
+
+-- BOX cross-match: box(...) is a plain skyregion (a four-corner polygon
+-- under the hood, built by box_region()'s cos(dec) corner compression), so
+-- no dedicated join function is needed -- <@'s non-constant branch already
+-- covers it, whatever kind of region it happens to be built from.
+SELECT plan_uses_index(
+  $q$SELECT count(*) FROM probe p, cat c
+     WHERE point('ICRS', c.ra, c.dec) <@ box('ICRS', p.ra, least(greatest(p.dec, -85), 85), 0.1, 0.1)$q$
+) AS box_join_indexed;
+SELECT (SELECT count(*) FROM probe p, cat c
+          WHERE point('ICRS', c.ra, c.dec) <@ box('ICRS', p.ra, least(greatest(p.dec, -85), 85), 0.1, 0.1))
+      = (SELECT count(*) FROM probe p, cat c
+          WHERE skycell_in_region(point('ICRS', c.ra, c.dec), box('ICRS', p.ra, least(greatest(p.dec, -85), 85), 0.1, 0.1)))
+      AS box_join_matches_exact;
 DROP TABLE probe;
 DROP INDEX cat_a2c;
 
@@ -147,6 +206,27 @@ END $$;
 SELECT poly_mismatches() AS poly_mismatches;
 SELECT skycell_poly(1, 0, 0, ARRAY[0,0, 10,0, 1,1, 0,10]::float8[]);  -- non-convex: error
 
+-- sc_region_contains's polygon branch used a strict "< 0" test on a vertex's
+-- dot product against each edge's plane, so a vertex sitting exactly ON that
+-- plane (up to independent floating-point rounding, not identically 0) could
+-- read as outside -- every vertex of a polygon is exactly on its own two
+-- adjacent edges, so this made a polygon fail to contain, or overlap, an
+-- identical or boundary-touching copy of itself.  A -1e-12 tolerance (already
+-- used for the same kind of dot product in poly_setup's convexity check)
+-- fixes it; the circle branch was already boundary-inclusive (<=).
+SELECT skycell_region_covers(p, p) AS self_covers,
+       skycell_region_overlap(p, p) AS self_overlaps,
+       intersects(p, p) = 1 AS self_intersects,
+       (p && p) AS self_op
+FROM (SELECT polygon('ICRS', 229.54244884307008-0.05, -48.37916509457751-0.05,
+                              229.54244884307008+0.05, -48.37916509457751-0.05,
+                              229.54244884307008+0.05, -48.37916509457751+0.05,
+                              229.54244884307008-0.05, -48.37916509457751+0.05) AS p) s;
+-- two neighbouring polygons sharing an edge (no gap, no overlap in area) must
+-- still be reported as touching/overlapping (a shared boundary is not empty).
+SELECT skycell_region_overlap(polygon('ICRS', 0,0, 1,0, 1,1, 0,1),
+                               polygon('ICRS', 1,0, 2,0, 2,1, 1,1)) AS shared_edge_ok;
+
 -- joins: run-time slots and LATERAL vs brute force -------------------------
 CREATE TABLE probe AS
 SELECT id, ra + 0.0003 * (random() - 0.5) AS ra, greatest(-90, least(90, dec + 0.0003 * (random() - 0.5))) AS dec
@@ -175,6 +255,51 @@ moc AS (SELECT count(*) AS n FROM pts
 brute AS (SELECT count(*) AS n FROM pts JOIN fp ON skycell_in_cone(pts.ra, pts.dec, fp.ra0, fp.dec0, fp.r))
 SELECT brute.n > 1000 AS many, moc.n = brute.n AS moc_ok FROM moc, brute;
 SELECT max(cardinality(skycell_cone_moc(ra0, dec0, r, 12))) <= 12 AS moc_size_ok FROM fp;
+
+-- skycell_region_moc_ranges: the region-region recipe's own convenience
+-- wrapper (skycell_region_moc() unnested and reduced to nuniq_lo/hi ranges
+-- in one call) must return exactly as many rows as skycell_region_moc()
+-- itself, capped the same way.
+SELECT count(*) <= 8 AS ranges_capped,
+       count(*) = cardinality(skycell_region_moc(circle('ICRS', 10, 20, 1), 8)) AS ranges_match_moc
+FROM skycell_region_moc_ranges(circle('ICRS', 10, 20, 1), 8);
+
+-- region-region INTERSECTS via MOC ranges: neither side of the join is a
+-- point, so none of the per-row coverings above apply and skyregion has no
+-- GiST opclass of its own -- but the same MOC decomposition, applied to
+-- *both* sides and reduced to skycell_nuniq_lo/hi's native [lo,hi] cell-id
+-- ranges, turns "do these two regions overlap" into a plain interval overlap
+-- test that PostgreSQL's built-in int8range GiST opclass already indexes.
+CREATE TABLE rr_a AS
+  SELECT fid AS aid, CASE WHEN fid % 2 = 0 THEN circle('ICRS', ra0, dec0, r)
+                          ELSE polygon('ICRS', ra0-r, dec0-r, ra0+r, dec0-r, ra0+r, dec0+r, ra0-r, dec0+r)
+                     END AS region
+  FROM fp WHERE abs(dec0) < 85;
+CREATE TABLE rr_b AS
+  SELECT fid AS bid, CASE WHEN fid % 2 = 1 THEN circle('ICRS', ra0 + r, dec0, r * 1.5)
+                          ELSE polygon('ICRS', ra0-r*1.5, dec0-r, ra0+r*1.5, dec0-r, ra0+r*1.5, dec0+r, ra0-r*1.5, dec0+r)
+                     END AS region
+  FROM fp WHERE abs(dec0) < 85;
+CREATE TABLE rr_b_moc AS
+  SELECT bid, rng FROM rr_b, skycell_region_moc_ranges(region, 8);
+CREATE INDEX ON rr_b_moc USING gist (rng);
+ANALYZE rr_b_moc;
+SELECT plan_uses_index(
+  $q$SELECT DISTINCT a.aid FROM rr_a a
+     JOIN LATERAL skycell_region_moc_ranges(a.region, 8) am ON true
+     JOIN rr_b_moc b ON b.rng && am.rng$q$
+) AS region_overlap_indexed;
+WITH cand AS (
+  SELECT DISTINCT a.aid, b.bid FROM rr_a a
+  JOIN LATERAL skycell_region_moc_ranges(a.region, 8) am ON true
+  JOIN rr_b_moc b ON b.rng && am.rng
+),
+moc AS (SELECT count(*) AS n FROM cand c
+        JOIN rr_a a ON a.aid = c.aid JOIN rr_b b ON b.bid = c.bid
+        WHERE intersects(a.region, b.region) = 1),
+brute AS (SELECT count(*) AS n FROM rr_a a, rr_b b WHERE intersects(a.region, b.region) = 1)
+SELECT brute.n > 50 AS many, moc.n = brute.n AS region_overlap_matches_exact FROM moc, brute;
+DROP TABLE rr_a, rr_b, rr_b_moc;
 
 -- expression index instead of a cell column (how egernia's ivoa.obscore is
 -- indexed): the rewrite must use it and read its statistics

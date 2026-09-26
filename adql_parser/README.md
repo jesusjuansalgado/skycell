@@ -85,7 +85,7 @@ query shape**, and three constructs have no direct form at all:
 
 | ADQL | pgSphere + Q3C | skycell |
 |---|---|---|
-| `CONTAINS(POINT, CIRCLE)` | `q3c_radial_query(...)` if the position is two columns, else `pos <@ scircle(...)` | `point(...) <@ circle(...)` |
+| `CONTAINS(POINT, CIRCLE)` | `q3c_radial_query(...)` if the position is two columns, else `pos <@ scircle(...)` | `point(...) <@ circle(...)`, or `skycell_radial_query(...)` for a cross-match (below) |
 | `BOX('ICRS', a, d, w, h)` | `sbox` takes two **corners**, not a centre and extent — converted, and wrong at the poles | `box('ICRS', a, d, w, h)` |
 | `AREA(region)` | `area()` returns **steradians**, scaled by (180/π)² | `area(region)` |
 | `INTERSECTS(r1, r2)` | pgSphere only; Q3C has no region type | `intersects(r1, r2)` |
@@ -93,6 +93,88 @@ query shape**, and three constructs have no direct form at all:
 
 For skycell the translation is the identity except where an indexable form is
 wanted, because the extension uses ADQL's own spellings.
+
+**Cross-matches.** `pos <@ circle(...)`'s planner rewrite only fires when the
+circle is a compile-time constant; a `CIRCLE` whose centre (or radius) comes
+from another table's row -- `CONTAINS(POINT('ICRS', a.ra, a.dec), CIRCLE('ICRS',
+b.ra, b.dec, r)) = 1`, a cross-match written the ADQL way -- would otherwise
+translate to `<@` over a non-constant circle and reach no index at all. The
+translator detects that shape (position over plain columns, circle not all
+literal numbers) and emits `skycell_radial_query(a.ra, a.dec, b.ra, b.dec, r)`
+instead: Q3C's own argument order, which reaches skycell's non-constant
+covering path and stays index-backed, capped to `skycell.join_slots` ranges
+per probe. A literal `CIRCLE` is untouched -- `<@` already covers that case
+without a cap.
+
+`INTERSECTS(POINT, CIRCLE)`, either argument order, is translated as if it
+had been written `CONTAINS` -- a point has no area, so intersecting a region
+is exactly containment (skycell's own `skycell_intersects_pos` says as much)
+-- for a literal circle just as much as a non-constant one. `intersects()`
+itself carries no planner support at all, constant argument or not, so
+without this a literal `INTERSECTS(POINT, CIRCLE('ICRS', 10, 20, 0.5))` would
+be just as unindexed as the cross-match case; redirecting it to the same
+`<@`/`skycell_radial_query` forms `CONTAINS` already produces reaches the
+index either way. Only `INTERSECTS` between two regions with no point at all
+-- `INTERSECTS(CIRCLE(...), CIRCLE(...))` and the like -- has no such
+rewrite and stays as the (unindexed) `intersects(...)` call: that's a
+genuinely different, harder problem (no `&&`/`skycell_region_overlap`
+planner support exists for it today), not something a point-vs-region
+redirect can help with.
+
+A non-constant `POLYGON` cross-match -- `CONTAINS(POINT('ICRS', a.ra, a.dec),
+POLYGON('ICRS', b.v1, b.v2, ...)) = 1`, matching points against a per-row
+footprint rather than a literal shape -- hits the same gap and gets the same
+fix: `skycell_poly_join(a.ra, a.dec, ARRAY[b.v1, b.v2, ...]::float8[])`, the
+polygon analogue of `skycell_join`, added alongside its own non-constant
+covering path in the extension (`skycell_poly_bound`, mirroring
+`skycell_cone_bound`). One caveat a `CIRCLE` cross-match doesn't share: the
+`skycell_cell_ops` selectivity estimator can't recover a polygon's true area
+from a non-constant, per-row shape the way it recovers a circle's radius, so
+it assumes a small, fixed fallback fraction instead -- close enough to avoid
+the wildly-wrong plans (and needless JIT compilation) a naive estimate would
+cause, but not as sharp as the circle case's real number. The result is
+correct and index-backed either way; only the row-count estimate is coarser.
+
+A non-constant **`BOX`** cross-match needs no dedicated join function at all:
+`box(...)` is a plain `skyregion` value -- a four-corner polygon under the
+hood, built once at construction time -- so `<@`'s own non-constant branch
+already covers it, whatever kind of region it's built from. `CONTAINS(POINT,
+BOX(...))` already fell back to `<@` before any of this, so it needed no
+change; `INTERSECTS(POINT, BOX(...))`, either argument order, did, since its
+own function has no planner support at all, literal argument or not -- the
+translator now redirects it to the same `<@` form `CONTAINS` already uses,
+same as `CIRCLE` and `POLYGON` above.
+
+A cross-match against a stored **`skyregion` column** -- `CONTAINS(POINT('ICRS',
+a.ra, a.dec), b.s_region) = 1`, matching points against another table's
+per-row footprint of either kind, circle or polygon, mixed in the same column
+-- gets the same fix at the C extension level, and needs **no translator
+change at all**: a bare column reference doesn't match the `CIRCLE(...)`/
+`POLYGON(...)` literal-call shapes above, so it was already passed through as
+plain `<@`. What changed is `<@`'s own planner support
+(`skycell_region_support`), which now has a non-constant branch generalising
+`skycell_poly_bound` over either region kind (`skycell_region_bound`,
+dispatching on each row's own kind tag) -- the same gap, the same fix, one
+level down where it covers every ADQL spelling that reaches `<@` at once,
+translator included. The same selectivity caveat as `POLYGON` applies (a
+fixed fallback fraction, not a real scalar), and the same "literal region is
+untouched" rule applies too.
+
+**What none of this covers**, because it is a different problem entirely:
+searching a large table of stored footprints for the ones matching a *given*
+point or shape (rather than matching many points against them) needs an index
+*on* the region column itself, not a per-row covering -- there's no single
+outer row to compute one covering from. skycell already has the pieces for
+this (`skycell_region_moc`/`skycell_cone_moc`/`skycell_poly_moc`,
+`skycell_ancestors`), used as: decompose each stored region into an IVOA MOC,
+unnest it into a `(row_id, nuniq)` side table with a plain B-tree index on
+`nuniq`, then join a point's `skycell_ancestors(cell)` against it. This is
+tested (`ext/test/sql/skycell.sql`, "stored regions as MOCs in a B-tree:
+point-in-footprint") but is a genuine multi-table JOIN restructuring, not a
+function-call substitution -- something this translator, by design, cannot
+do (see "What it is, and is not" above): it never sees or introduces tables,
+so it cannot add the unnested side table a query would need. Building that
+side table, and writing the join, is up to the application for now.
 
 ## Tests
 

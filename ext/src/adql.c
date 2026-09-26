@@ -23,6 +23,7 @@
 #include <math.h>
 
 #include "access/stratnum.h"
+#include "catalog/pg_opfamily_d.h"
 #include "catalog/pg_type_d.h"
 #include "fmgr.h"
 #include "libpq/pqformat.h"
@@ -730,53 +731,115 @@ skycell_region_support(PG_FUNCTION_ARGS)
 		Node	   *pt = linitial(fexpr->args);
 		Node	   *rg = lsecond(fexpr->args);
 		Node	   *cell;
-		sc_region	reg;
-		sc_cover	cov;
-		sc_cover_params p;
 		sc_density	dens;
 		Oid			statrel = InvalidOid;
-		double		sel;
 		Oid			exact_types[3];
-		FuncExpr   *exact;
-		double		ra0 = 0,
-					dec0 = 0,
-					radius = -1;
-		bool		unused_uses_cell_ops;
+		bool		uses_cell_ops;
 
-		if (!IsA(rg, Const) || req->root == NULL)
+		if (req->root == NULL)
 			PG_RETURN_POINTER(NULL);
-		if (((Const *) rg)->constisnull)
-			PG_RETURN_POINTER(makeBoolConst(false, true));
 
 		cell = cell_expr_for_point(fexpr->funcid, pt);
 		if (cell == NULL)
 			PG_RETURN_POINTER(NULL);
 
 		/* only worth rewriting if an index answers that expression */
-		if (!density_for_expr(req->root, cell, &dens, &statrel, &unused_uses_cell_ops))
+		if (!density_for_expr(req->root, cell, &dens, &statrel, &uses_cell_ops))
 			PG_RETURN_POINTER(NULL);
-
-		skycell_region_from_datum(((Const *) rg)->constvalue, &reg);
-		current_params(&p, 64, &dens);
-		if (reg.kind == SC_REGION_CONE)
-		{
-			ra0 = atan2(reg.center.y, reg.center.x) * RAD2DEG;
-			dec0 = asin(fmax(-1.0, fmin(1.0, reg.center.z))) * RAD2DEG;
-			radius = reg.radius * RAD2DEG;
-			cover_cached(&reg, &dens, &p, statrel, ra0, dec0, radius, &cov);
-		}
-		else
-			sc_cover_compute(&reg, &dens, &p, &cov);
-		sel = (cov.area > 0) ? fmin(1.0, reg.area / cov.area) : 0.0;
 
 		exact_types[0] = exprType(pt);
 		exact_types[1] = exprType(rg);
 		exact_types[2] = FLOAT8OID;
-		exact = makeFuncExpr(lookup_sibling_func(fexpr->funcid, "skycell_in_region", 3, exact_types),
-							 BOOLOID,
-							 list_make3(copyObject(pt), copyObject(rg), float8_const(sel)),
-							 InvalidOid, InvalidOid, COERCE_EXPLICIT_CALL);
-		PG_RETURN_POINTER(ranges_and_exact(&cov, cell, (Expr *) exact));
+
+		if (IsA(rg, Const))
+		{
+			sc_region	reg;
+			sc_cover	cov;
+			sc_cover_params p;
+			double		sel;
+			FuncExpr   *exact;
+			double		ra0 = 0,
+						dec0 = 0,
+						radius = -1;
+
+			if (((Const *) rg)->constisnull)
+				PG_RETURN_POINTER(makeBoolConst(false, true));
+
+			skycell_region_from_datum(((Const *) rg)->constvalue, &reg);
+			current_params(&p, 64, &dens);
+			if (reg.kind == SC_REGION_CONE)
+			{
+				ra0 = atan2(reg.center.y, reg.center.x) * RAD2DEG;
+				dec0 = asin(fmax(-1.0, fmin(1.0, reg.center.z))) * RAD2DEG;
+				radius = reg.radius * RAD2DEG;
+				cover_cached(&reg, &dens, &p, statrel, ra0, dec0, radius, &cov);
+			}
+			else
+				sc_cover_compute(&reg, &dens, &p, &cov);
+			sel = (cov.area > 0) ? fmin(1.0, reg.area / cov.area) : 0.0;
+
+			exact = makeFuncExpr(lookup_sibling_func(fexpr->funcid, "skycell_in_region", 3, exact_types),
+								 BOOLOID,
+								 list_make3(copyObject(pt), copyObject(rg), float8_const(sel)),
+								 InvalidOid, InvalidOid, COERCE_EXPLICIT_CALL);
+			PG_RETURN_POINTER(ranges_and_exact(&cov, cell, (Expr *) exact, uses_cell_ops));
+		}
+		else
+		{
+			/*
+			 * Run-time slots, one covering per distinct region row -- the
+			 * generic-region analogue of simplify_cone's/simplify_poly's own
+			 * non-constant branch, via skycell_region_bound (which
+			 * dispatches on the stored value's own kind tag, same as
+			 * skycell_region_from_datum above). A cross-match against
+			 * another table's per-row skyregion column (e.g. an archive's
+			 * s_region footprint) reaches an index this way instead of the
+			 * sequential scan it fell back to before.
+			 */
+			Oid			bound_types[5] = {InvalidOid, INT4OID, INT4OID, FLOAT8OID, INT8ARRAYOID};
+			Oid			bound_oid;
+			int			k = skycell_join_slots;
+			Oid			arm_opfamily = uses_cell_ops
+				? cell_ops_opfamily() : INTEGER_BTREE_FAM_OID;
+			Const	   *hist;
+			List	   *arms = NIL;
+			Datum	   *hd = palloc(sizeof(Datum) * Max(dens.nbounds, 1));
+			FuncExpr   *exact;
+
+			bound_types[0] = exact_types[1];
+			bound_oid = lookup_sibling_func(fexpr->funcid, "skycell_region_bound", 5, bound_types);
+
+			for (int i = 0; i < dens.nbounds; i++)
+				hd[i] = Int64GetDatum(dens.bounds[i]);
+			hist = makeConst(INT8ARRAYOID, -1, InvalidOid, -1,
+							 PointerGetDatum(construct_array_builtin(hd, dens.nbounds, INT8OID)),
+							 false, false);
+
+			for (int s = 0; s < k; s++)
+			{
+				Expr	   *b[2];
+
+				for (int j = 0; j < 2; j++)
+					b[j] = (Expr *) makeFuncExpr(bound_oid, INT8OID,
+												 list_make3(copyObject(rg),
+															int4_const(2 * s + j),
+															int4_const(k)),
+												 InvalidOid, InvalidOid, COERCE_EXPLICIT_CALL);
+				for (int j = 0; j < 2; j++)
+					((FuncExpr *) b[j])->args = lappend(lappend(((FuncExpr *) b[j])->args,
+																float8_const(dens.ntotal)),
+														copyObject(hist));
+				arms = lappend(arms, range_arm_family(cell, b[0], b[1], arm_opfamily));
+			}
+			exact = makeFuncExpr(lookup_sibling_func(fexpr->funcid, "skycell_in_region", 3, exact_types),
+								 BOOLOID,
+								 list_make3(copyObject(pt), copyObject(rg), float8_const(-1.0)),
+								 InvalidOid, InvalidOid, COERCE_EXPLICIT_CALL);
+			PG_RETURN_POINTER(makeBoolExpr(AND_EXPR,
+										   list_make2(k == 1 ? linitial(arms) : makeBoolExpr(OR_EXPR, arms, -1),
+													  exact),
+										   -1));
+		}
 	}
 	PG_RETURN_POINTER(NULL);
 }
