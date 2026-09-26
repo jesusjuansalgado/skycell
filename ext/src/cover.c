@@ -202,8 +202,18 @@ sc_region_contains(const sc_region *r, sc_vec3 p)
 		return r->radius >= 0 &&
 			sc_chord2(p, r->center) <= 4.0 * pow(sin(r->radius / 2.0), 2);
 
+	/*
+	 * -1e-12, not 0: p and r->n[] are typically computed independently (e.g.
+	 * the two sides of a region-region overlap test on identical or
+	 * boundary-touching polygons), so a point exactly on the boundary can
+	 * come out a hair negative by construction rounding alone.  The cone
+	 * branch above is already boundary-inclusive (<=); without this slack
+	 * the polygon branch is not, and a polygon fails to contain its own
+	 * vertices -- see poly_setup's identical tolerance on the same kind of
+	 * dot product, a few lines up in this file.
+	 */
 	for (int i = 0; i < r->nv; i++)
-		if (sc_dot(r->n[i], p) < 0)
+		if (sc_dot(r->n[i], p) < -1e-12)
 			return 0;
 	return 1;
 }

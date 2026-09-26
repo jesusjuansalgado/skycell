@@ -280,6 +280,36 @@ SELECT poly_mismatches() AS poly_mismatches;
 
 SELECT skycell_poly(1, 0, 0, ARRAY[0,0, 10,0, 1,1, 0,10]::float8[]);  -- non-convex: error
 ERROR:  skycell: polygon must be convex and smaller than a hemisphere
+-- sc_region_contains's polygon branch used a strict "< 0" test on a vertex's
+-- dot product against each edge's plane, so a vertex sitting exactly ON that
+-- plane (up to independent floating-point rounding, not identically 0) could
+-- read as outside -- every vertex of a polygon is exactly on its own two
+-- adjacent edges, so this made a polygon fail to contain, or overlap, an
+-- identical or boundary-touching copy of itself.  A -1e-12 tolerance (already
+-- used for the same kind of dot product in poly_setup's convexity check)
+-- fixes it; the circle branch was already boundary-inclusive (<=).
+SELECT skycell_region_covers(p, p) AS self_covers,
+       skycell_region_overlap(p, p) AS self_overlaps,
+       intersects(p, p) = 1 AS self_intersects,
+       (p && p) AS self_op
+FROM (SELECT polygon('ICRS', 229.54244884307008-0.05, -48.37916509457751-0.05,
+                              229.54244884307008+0.05, -48.37916509457751-0.05,
+                              229.54244884307008+0.05, -48.37916509457751+0.05,
+                              229.54244884307008-0.05, -48.37916509457751+0.05) AS p) s;
+ self_covers | self_overlaps | self_intersects | self_op 
+-------------+---------------+-----------------+---------
+ t           | t             | t               | t
+(1 row)
+
+-- two neighbouring polygons sharing an edge (no gap, no overlap in area) must
+-- still be reported as touching/overlapping (a shared boundary is not empty).
+SELECT skycell_region_overlap(polygon('ICRS', 0,0, 1,0, 1,1, 0,1),
+                               polygon('ICRS', 1,0, 2,0, 2,1, 1,1)) AS shared_edge_ok;
+ shared_edge_ok 
+----------------
+ t
+(1 row)
+
 -- joins: run-time slots and LATERAL vs brute force -------------------------
 CREATE TABLE probe AS
 SELECT id, ra + 0.0003 * (random() - 0.5) AS ra, greatest(-90, least(90, dec + 0.0003 * (random() - 0.5))) AS dec

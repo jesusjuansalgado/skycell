@@ -18,10 +18,9 @@
 \endif
 
 -- Probes are nearby, overlapping variants of a sampled footprint (offset by
--- 0.3*r, scaled by 1.2x) rather than the exact same shape: an *identical*
--- convex polygon pair is a real, separate bug in sc_region_overlaps (a
--- boundary/self-overlap edge case unrelated to this indexing recipe -- see
--- the PR discussion) that would otherwise contaminate this comparison.
+-- 0.3*r, scaled by 1.2x) rather than the exact same shape: this exercises
+-- genuine cross-region overlap rather than every probe trivially matching
+-- its own footprint row.
 SELECT setseed(0.11);
 DROP TABLE IF EXISTS rox_probe;
 CREATE TABLE rox_probe AS
