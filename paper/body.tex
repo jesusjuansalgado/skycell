@@ -38,8 +38,10 @@ paired, warm and with caches dropped, and repeated on a 50-million-row catalogue
 pgSphere's index no longer fits in memory.}
 % results
 {Warm, skycell is faster than pgSphere by 6--11\% for cone radii of 1\arcsec--1\arcmin\
-and by 31--37\% at 3\degr, indistinguishable between 6\arcmin\ and 1\degr; cold it is
-faster at every radius on both corpora (ratios 0.39--0.95). It keeps an index of
+and by 31--37\% at 3\degr; between 6\arcmin\ and 1\degr it is indistinguishable on the
+designed corpus, and on the Gaia corpus 3\% slower at 6\arcmin\ but 8--15\% faster at
+30\arcmin--1\degr; cold it is faster at every radius on both corpora (ratios 0.39--0.95).
+It keeps an index of
 214\,MB against pgSphere's 685\,MB -- 22.5 bytes per row against 72, which at Gaia
 DR3's $1.8\times10^9$ sources is 38\,GiB against the 160\,GiB the pgSphere-plus-Q3C pair
 needs to cover both cone searches and cross-matching, builds in 1.4\,s against 42\,s,
@@ -126,7 +128,7 @@ Sect.~\ref{sec:discussion} states plainly what these measurements do not establi
 \label{sec:key}
 
 A position is keyed by the index of the HEALPix cell containing it at order 29 in the
-nested scheme \citep{healpix} ($12\cdot4^{29}\approx1.4\times10^{19}$ cells of about
+nested scheme \citep{healpix} ($12\cdot4^{29}\approx3.5\times10^{18}$ cells of about
 0.4\,mas), computed by the standard \texttt{ang2pix\_nest} arithmetic and stored as a
 signed 64-bit integer -- the plain nested index at a fixed order, not a multi-order
 key, so a key is directly comparable with another and a B-tree orders them along the
@@ -883,7 +885,7 @@ the same joined to an observation table, and a three-way join -- through each me
 recording the estimate, the plan strategy and the time separately: skycell's estimate
 advantage carries over (median error 1.15--1.88 at 30\arcmin--1\degr\ against 1.63--2.33
 for Q3C and 2.50--3.00 for pgSphere), but the plans are the same. Across 135 queries at
-1\arcmin--1\degr\ all three methods chose the same strategy for every query except one at
+1\arcmin--3\degr\ all three methods chose the same strategy for every query except one at
 3\degr, where skycell's estimate produced a hash join 1.29 times faster than pgSphere's
 nested loop; execution times are otherwise within noise. The honest summary: better
 estimates are demonstrated, better plans and better join times are not -- an accurate
@@ -1041,7 +1043,8 @@ shared heap pages warm for the other) puts the gap at $1.6\times$ rather than $4
 
 The advantage is not universal, and stating where it stops is as informative as stating
 where it holds. Warm, between 6\arcmin\ and 1\degr, \texttt{skycell} is indistinguishable
-from pgSphere on one corpus and slightly slower at 6\arcmin\ on the other. On a
+from pgSphere on the designed corpus; on the Gaia corpus it is 3\% slower at 6\arcmin\
+but 8--15\% faster at 30\arcmin--1\degr. On a
 500\,000-row ObsCore relation it is slower; on the small-cone ObsCore class it is slower
 in one cache regime and level in another, and we do not claim that row. Better row
 estimates did not, on the join shapes we wrote, produce better plans. And every number
