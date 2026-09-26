@@ -1260,8 +1260,8 @@ skycell_exact_support(PG_FUNCTION_ARGS)
  * scan that we measured at more than 90 s against 145 ms for the path it
  * rejected.
  *
- * The radius is recoverable in both shapes we emit, so the covering's sky
- * fraction can be estimated instead of guessed:
+ * The radius is recoverable in the cone shapes we emit, so the covering's
+ * sky fraction can be estimated instead of guessed:
  *
  *   join form     bound is skycell_cone_bound(ra, dec, radius, ...), radius Const
  *   LATERAL form  bound is a Var of a function scan over
@@ -1282,6 +1282,20 @@ skycell_exact_support(PG_FUNCTION_ARGS)
  * ~100 at an arcsecond); it is wrong in the direction that favours the index
  * path, which is the direction the measurement says is right, and it is
  * five to six orders of magnitude closer than the default it replaces.
+ *
+ * skycell_poly_bound/skycell_region_bound (non-constant polygon/region
+ * cross-matches) have no such scalar to recover: the shape is a per-row
+ * argument, and its area isn't known until it's actually evaluated. Still
+ * recognising the call -- for nslots, and to tell skycell_cellsel this is a
+ * bound it understands rather than an arbitrary expression -- matters even
+ * without a real fraction: measured with EXPLAIN ANALYZE, leaving it
+ * unrecognised (falling through to DEFAULT_INEQ_SEL below) inflates a
+ * probe's estimated cost by about four orders of magnitude, which reliably
+ * pushes small, sub-millisecond-per-probe cross-matches over jit_above_cost
+ * and pays for JIT compilation nothing here is big enough to earn back --
+ * roughly doubling wall-clock time in one measured case. Returning 0 (never
+ * a legal radius) tells the caller "recognised, size unknown" so it can use
+ * a flat, deliberately small fallback instead.
  */
 static double
 radius_from_bound(PlannerInfo *root, Node *arg, int *nslots_out)
@@ -1290,6 +1304,7 @@ radius_from_bound(PlannerInfo *root, Node *arg, int *nslots_out)
 	if (arg && IsA(arg, FuncExpr))
 	{
 		FuncExpr   *f = (FuncExpr *) arg;
+		char	   *name = get_func_name(f->funcid);
 
 		/* skycell_cone_bound(ra0, dec0, radius, i, nslots, ntotal, hist) */
 		if (list_length(f->args) == 7 && IsA(list_nth(f->args, 2), Const) &&
@@ -1300,6 +1315,17 @@ radius_from_bound(PlannerInfo *root, Node *arg, int *nslots_out)
 			if (IsA(nslots_arg, Const) && !((Const *) nslots_arg)->constisnull)
 				*nslots_out = Max(1, DatumGetInt32(((Const *) nslots_arg)->constvalue));
 			return DatumGetFloat8(((Const *) list_nth(f->args, 2))->constvalue);
+		}
+
+		/* skycell_poly_bound(poly, i, nslots, ntotal, hist) / skycell_region_bound(region, i, nslots, ntotal, hist) */
+		if (list_length(f->args) == 5 && name != NULL &&
+			(strcmp(name, "skycell_poly_bound") == 0 || strcmp(name, "skycell_region_bound") == 0))
+		{
+			Node	   *nslots_arg = list_nth(f->args, 2);
+
+			if (IsA(nslots_arg, Const) && !((Const *) nslots_arg)->constisnull)
+				*nslots_out = Max(1, DatumGetInt32(((Const *) nslots_arg)->constvalue));
+			return 0.0;			/* recognised, but no size to estimate from */
 		}
 	}
 	if (arg && IsA(arg, Var) && root && root->parse)
@@ -1359,6 +1385,17 @@ skycell_cellsel(PG_FUNCTION_ARGS)
 
 		/* nslots arms share the cone's fraction; see the comment above */
 		sel = sqrt(fmax(cap, 1e-14) / (double) nslots);
+	}
+	else if (r == 0)
+	{
+		/*
+		 * A recognised skycell_poly_bound/skycell_region_bound: no radius to
+		 * compute a real fraction from, so assume the same small, unknown
+		 * footprint skycell_exact_support assumes for the identical
+		 * situation (see its own comment), split across nslots arms the
+		 * same way a cone's cap fraction is above.
+		 */
+		sel = sqrt(1e-4 / (double) nslots);
 	}
 	PG_RETURN_FLOAT8((float8) fmin(1.0, fmax(sel, 1e-8)));
 }

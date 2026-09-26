@@ -115,13 +115,13 @@ fix: `skycell_poly_join(a.ra, a.dec, ARRAY[b.v1, b.v2, ...]::float8[])`, the
 polygon analogue of `skycell_join`, added alongside its own non-constant
 covering path in the extension (`skycell_poly_bound`, mirroring
 `skycell_cone_bound`). One caveat a `CIRCLE` cross-match doesn't share: the
-`skycell_cell_ops` selectivity estimator only recognises a circle's constant
-radius argument, so unlike `skycell_radial_query`, `skycell_poly_join`'s range
-predicates fall back to PostgreSQL's stock selectivity estimate even against a
-`skycell_cell_ops` index -- there is no equivalent scalar to recover a
-polygon's area from a non-constant, per-row shape. The result is still
-correct and index-backed either way; only the plan's row-count estimate is
-coarser than the circle case's. `BOX` remains open.
+`skycell_cell_ops` selectivity estimator can't recover a polygon's true area
+from a non-constant, per-row shape the way it recovers a circle's radius, so
+it assumes a small, fixed fallback fraction instead -- close enough to avoid
+the wildly-wrong plans (and needless JIT compilation) a naive estimate would
+cause, but not as sharp as the circle case's real number. The result is
+correct and index-backed either way; only the row-count estimate is coarser.
+`BOX` remains open.
 
 A cross-match against a stored **`skyregion` column** -- `CONTAINS(POINT('ICRS',
 a.ra, a.dec), b.s_region) = 1`, matching points against another table's
@@ -134,9 +134,9 @@ plain `<@`. What changed is `<@`'s own planner support
 `skycell_poly_bound` over either region kind (`skycell_region_bound`,
 dispatching on each row's own kind tag) -- the same gap, the same fix, one
 level down where it covers every ADQL spelling that reaches `<@` at once,
-translator included. The same selectivity caveat as `POLYGON` applies (no
-constant scalar to estimate from), and the same "literal region is untouched"
-rule applies too.
+translator included. The same selectivity caveat as `POLYGON` applies (a
+fixed fallback fraction, not a real scalar), and the same "literal region is
+untouched" rule applies too.
 
 **What none of this covers**, because it is a different problem entirely:
 searching a large table of stored footprints for the ones matching a *given*
