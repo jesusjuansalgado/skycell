@@ -256,6 +256,14 @@ brute AS (SELECT count(*) AS n FROM pts JOIN fp ON skycell_in_cone(pts.ra, pts.d
 SELECT brute.n > 1000 AS many, moc.n = brute.n AS moc_ok FROM moc, brute;
 SELECT max(cardinality(skycell_cone_moc(ra0, dec0, r, 12))) <= 12 AS moc_size_ok FROM fp;
 
+-- skycell_region_moc_ranges: the region-region recipe's own convenience
+-- wrapper (skycell_region_moc() unnested and reduced to nuniq_lo/hi ranges
+-- in one call) must return exactly as many rows as skycell_region_moc()
+-- itself, capped the same way.
+SELECT count(*) <= 8 AS ranges_capped,
+       count(*) = cardinality(skycell_region_moc(circle('ICRS', 10, 20, 1), 8)) AS ranges_match_moc
+FROM skycell_region_moc_ranges(circle('ICRS', 10, 20, 1), 8);
+
 -- region-region INTERSECTS via MOC ranges: neither side of the join is a
 -- point, so none of the per-row coverings above apply and skyregion has no
 -- GiST opclass of its own -- but the same MOC decomposition, applied to
@@ -273,20 +281,17 @@ CREATE TABLE rr_b AS
                      END AS region
   FROM fp WHERE abs(dec0) < 85;
 CREATE TABLE rr_b_moc AS
-  SELECT bid, int8range(skycell_nuniq_lo(n), skycell_nuniq_hi(n), '[]') AS rng
-  FROM rr_b, unnest(skycell_region_moc(region, 8)) AS n;
+  SELECT bid, rng FROM rr_b, skycell_region_moc_ranges(region, 8);
 CREATE INDEX ON rr_b_moc USING gist (rng);
 ANALYZE rr_b_moc;
 SELECT plan_uses_index(
   $q$SELECT DISTINCT a.aid FROM rr_a a
-     JOIN LATERAL (SELECT int8range(skycell_nuniq_lo(n), skycell_nuniq_hi(n), '[]') AS rng
-                   FROM unnest(skycell_region_moc(a.region, 8)) AS n) am ON true
+     JOIN LATERAL skycell_region_moc_ranges(a.region, 8) am ON true
      JOIN rr_b_moc b ON b.rng && am.rng$q$
 ) AS region_overlap_indexed;
 WITH cand AS (
   SELECT DISTINCT a.aid, b.bid FROM rr_a a
-  JOIN LATERAL (SELECT int8range(skycell_nuniq_lo(n), skycell_nuniq_hi(n), '[]') AS rng
-                FROM unnest(skycell_region_moc(a.region, 8)) AS n) am ON true
+  JOIN LATERAL skycell_region_moc_ranges(a.region, 8) am ON true
   JOIN rr_b_moc b ON b.rng && am.rng
 ),
 moc AS (SELECT count(*) AS n FROM cand c

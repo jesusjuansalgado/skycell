@@ -2,12 +2,12 @@
 -- footprints, not point-in-region. skyregion has no GiST opclass, so unlike
 -- the skyregion-column CONTAINS/INTERSECTS cross-match in 20_region_xmatch.sql
 -- this has no indexed skycell form at all *unless* both sides are decomposed
--- into MOC-derived [lo,hi] cell-id ranges (skycell_region_moc +
--- skycell_nuniq_lo/hi) and joined on PostgreSQL's own built-in int8range
--- GiST opclass -- see the worked example next to skycell_region_moc in
--- skycell--0.9.sql and the "region-region INTERSECTS via MOC ranges" test in
--- ext/test/sql/skycell.sql. This script measures that recipe against pgSphere,
--- whose scircle/spoly *do* carry a native && GiST strategy.
+-- into MOC-derived [lo,hi] cell-id ranges (skycell_region_moc_ranges) and
+-- joined on PostgreSQL's own built-in int8range GiST opclass -- see the
+-- worked example next to skycell_region_moc in skycell--0.9.sql and the
+-- "region-region INTERSECTS via MOC ranges" test in ext/test/sql/skycell.sql.
+-- This script measures that recipe against pgSphere, whose scircle/spoly *do*
+-- carry a native && GiST strategy.
 --
 -- Depends on `fpr` from 20_region_xmatch.sql (2500 circle + 2500 polygon
 -- footprints): run that script first.
@@ -41,8 +41,7 @@ LIMIT :nprobe;
 -- skycell: MOC-range side table + GiST index on the (larger) footprint side.
 DROP TABLE IF EXISTS rox_fpr_moc;
 CREATE TABLE rox_fpr_moc AS
-SELECT f.fid, int8range(skycell_nuniq_lo(n), skycell_nuniq_hi(n), '[]') AS rng
-FROM fpr f, unnest(skycell_region_moc(f.s_region, 8)) AS n;
+SELECT f.fid, rng FROM fpr f, skycell_region_moc_ranges(f.s_region, 8);
 CREATE INDEX rox_fpr_moc_gist ON rox_fpr_moc USING gist (rng);
 ANALYZE rox_fpr_moc;
 ANALYZE rox_probe;
@@ -61,8 +60,7 @@ CREATE OR REPLACE FUNCTION region_overlap_sql(method text) RETURNS text LANGUAGE
     WHEN 'skycell' THEN
       $q$SELECT count(*) FROM (
            SELECT DISTINCT p.pid, f.fid FROM rox_probe p
-           JOIN LATERAL (SELECT int8range(skycell_nuniq_lo(n), skycell_nuniq_hi(n), '[]') AS rng
-                         FROM unnest(skycell_region_moc(p.s_region, 8)) AS n) pm ON true
+           JOIN LATERAL skycell_region_moc_ranges(p.s_region, 8) pm ON true
            JOIN rox_fpr_moc f ON f.rng && pm.rng
            JOIN fpr fr ON fr.fid = f.fid
            WHERE intersects(p.s_region, fr.s_region) = 1

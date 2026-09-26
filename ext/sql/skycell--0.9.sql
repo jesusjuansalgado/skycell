@@ -120,23 +120,20 @@ AS 'MODULE_PATHNAME' LANGUAGE C STABLE CALLED ON NULL INPUT PARALLEL SAFE;
 -- its own.
 --
 -- The same MOC decomposition still helps, applied to *both* sides instead of
--- one: skycell_region_moc()/skycell_(cone|poly)_moc() break a region into a
--- handful of NUNIQ cells, and skycell_nuniq_lo()/skycell_nuniq_hi() turn each
--- cell back into the native [lo,hi] cell-id range the cross-match coverings
--- above already use. Because a MOC is a strict hierarchical partition, two
--- regions can only truly overlap if one pair of their cell ranges overlaps as
--- plain integer intervals -- so explode each side into (row_id, int8range),
--- index one side with PostgreSQL's own built-in GiST support for int8range
--- (no custom opclass needed), and join on `&&`:
+-- one: skycell_region_moc_ranges() (below, next to skycell_region_moc's own
+-- definition) breaks a region into a handful of NUNIQ cells and turns each
+-- back into the native [lo,hi] cell-id range the cross-match coverings above
+-- already use, as a ready int8range. Because a MOC is a strict hierarchical
+-- partition, two regions can only truly overlap if one pair of their cell
+-- ranges overlaps as plain integer intervals -- so explode each side into
+-- (row_id, int8range), index one side with PostgreSQL's own built-in GiST
+-- support for int8range (no custom opclass needed), and join on `&&`:
 --
---   CREATE TABLE b_moc AS
---     SELECT bid, int8range(skycell_nuniq_lo(n), skycell_nuniq_hi(n), '[]') AS rng
---     FROM b, unnest(skycell_region_moc(b.s_region, 8)) AS n;
+--   CREATE TABLE b_moc AS SELECT bid, rng FROM b, skycell_region_moc_ranges(b.s_region, 8);
 --   CREATE INDEX ON b_moc USING gist (rng);
 --
 --   SELECT DISTINCT a.aid, b.bid FROM a
---   JOIN LATERAL (SELECT int8range(skycell_nuniq_lo(n), skycell_nuniq_hi(n), '[]') AS rng
---                 FROM unnest(skycell_region_moc(a.s_region, 8)) AS n) am ON true
+--   JOIN LATERAL skycell_region_moc_ranges(a.s_region, 8) am ON true
 --   JOIN b_moc bm ON bm.rng && am.rng
 --   JOIN b ON b.bid = bm.bid  -- refine: the MOC covering overshoots, same as the point case
 --   WHERE intersects(a.s_region, b.s_region) = 1;
@@ -567,3 +564,18 @@ CREATE OPERATOR CLASS skycell_cell_ops FOR TYPE int8 USING btree AS
 CREATE FUNCTION skycell_region_moc(region skyregion, max_cells int DEFAULT 8,
                                    max_order int DEFAULT 29) RETURNS int8[]
 AS 'MODULE_PATHNAME' LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
+
+-- Convenience wrapper for the region-region INTERSECTS recipe above (see the
+-- worked example next to skycell_region_moc's own comment block, near the top
+-- of this file): turns a region straight into its MOC cells' native [lo,hi]
+-- cell-id ranges as int8range values, ready for PostgreSQL's own built-in
+-- GiST opclass -- skips the unnest(skycell_region_moc(...)) +
+-- skycell_nuniq_lo/skycell_nuniq_hi + int8range(...) boilerplate every use of
+-- that recipe would otherwise repeat, on both the side-table build and the
+-- per-query side.
+CREATE FUNCTION skycell_region_moc_ranges(region skyregion, max_cells int DEFAULT 8,
+                                          max_order int DEFAULT 29,
+                                          OUT nuniq int8, OUT rng int8range) RETURNS SETOF record
+AS $$ SELECT n, int8range(skycell_nuniq_lo(n), skycell_nuniq_hi(n), '[]')
+      FROM unnest(skycell_region_moc(region, max_cells, max_order)) AS n $$
+LANGUAGE SQL IMMUTABLE STRICT PARALLEL SAFE ROWS 8;
