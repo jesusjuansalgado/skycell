@@ -35,7 +35,8 @@ extern bool density_for_expr(PlannerInfo *root, Node *arg, sc_density *d, Oid *s
 extern void density_for_var(PlannerInfo *root, Node *arg, sc_density *d, Oid *statrel,
 							 bool *uses_cell_ops);
 
-/* adql.c: the region behind a skyregion datum, as cover.c understands it */
+/* adql.c: a skypos/skyregion datum, as cover.c understands it */
+extern sc_vec3 skycell_pos_from_datum(Datum d);
 extern void skycell_region_from_datum(Datum d, sc_region *r);
 
 #endif

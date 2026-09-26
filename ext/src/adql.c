@@ -133,6 +133,15 @@ region_poly(int nv, const double *coords)
 	return r;
 }
 
+/* a skypos datum as the covering code understands it: a unit vector */
+sc_vec3
+skycell_pos_from_datum(Datum d)
+{
+	SkyPos	   *p = DatumGetSkyPos(d);
+
+	return sc_radec2vec(p->ra, p->dec);
+}
+
 /* a skyregion datum as the covering code understands it */
 void
 skycell_region_from_datum(Datum d, sc_region *out)

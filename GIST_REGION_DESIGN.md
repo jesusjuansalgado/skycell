@@ -286,6 +286,107 @@ the same MAX_SUBCAPS=4 cap could in principle need to grow for far larger
 or far more oddly-shaped polygon-heavy tables, but there is no evidence yet
 that it does.
 
+## Round four: a second strategy, region @> point ("contains")
+
+Round three closed the at-scale gap for `&&`. The natural next question:
+does the same multi-cap key generalize to containment -- specifically
+`skyregion @> skypos` (its commutator `skypos <@ skyregion` is the more
+common spelling), the "which stored footprint(s) cover this sky position"
+query? This is a genuinely different use case from `20_region_xmatch.sql`'s
+existing point-in-footprint recipe, not a competitor to it: that recipe
+needs the *point* side to be the large, cell-indexed table (its planner
+rewrite turns the join into B-tree ranges over that table's own per-row
+cell id, found from its indexes -- it has nothing to do with an index on
+the region column, and only works in that one direction). Asking "which of
+these thousands of stored regions contains this one point" is the opposite
+direction, and nothing in skycell answered it efficiently before this: the
+honest existing baseline is a plain sequential scan filtering with
+`skycell_in_region()`.
+
+**The design change is small, as expected.** A point can only be inside a
+region if it's inside at least one of the region's sub-caps -- true by the
+same covering guarantee `&&`'s pruning already relies on (`moc_for_region`'s
+decomposition always covers the region, never leaves gaps) -- so the
+pruning test is `multicap_contains_point()`: treat the query point as a
+zero-radius cap and reuse the exact same `cap_overlaps()` check `&&` already
+had, with the same overall-cap short-circuit reject first. No new geometry,
+matching the "likely a small addition" prediction from round three's file
+header. The one real wrinkle, caught immediately by testing rather than
+found the hard way: `consistent()` unconditionally read the query argument
+as a `bytea` (`DatumGetByteaP` + `VARSIZE`) *before* dispatching on strategy
+number, left over from when `&&` was the only strategy. For the new
+strategy the query is a `skypos` -- a fixed-size by-reference struct with no
+varlena header at all -- so that unconditional read was misinterpreting raw
+struct bytes as a (possibly toasted) varlena, which surfaced immediately as
+`ERROR: compressed lz4 data is corrupt` the moment a correctness test
+actually exercised strategy 2. Fixed by moving that read inside the `&&`
+case, where it belongs. Caught before it ever reached a benchmark number,
+unlike the two bugs in earlier rounds -- the value of writing the
+correctness test *before* trusting any performance result held again here.
+
+Registration mirrors exactly how pgSphere's own `scircle_ops` opclass
+registers `scircle @> spoint` alongside `scircle && scircle` in one GiST
+opclass with cross-type strategies -- `OPERATOR 2 @> (skyregion, skypos)`
+added to `skyregion_gist_ops`, no new opclass needed. PostgreSQL's own
+commutator resolution means both spellings, `f.region @> point(...)` and
+`point(...) <@ f.region`, plan through the index automatically.
+
+**Correctness.** A fresh 2923-row mixed circle/polygon table against 4000
+query points: 59,342/59,342 matches against `skycell_in_region()`, 0 false
+positives, 0 false negatives. Re-confirmed at both benchmark scales below
+(202/202/202 at 5,000 rows/200 probes; 538/538/538 at 50,000/500).
+
+**Performance**, same probe construction as `&&`'s benchmarks, brute force
+(`skycell_in_region()`, seq scan) as the honest baseline since no indexed
+alternative existed in this direction before:
+
+| approach | 200 probes x 5,000 regions | 500 probes x 50,000 regions |
+|---|---|---|
+| brute force (`skycell_in_region`) | ~630-670 ms | ~16.2-17.0 s |
+| pgSphere native `<@` | ~2.7-2.9 ms | ~17.6-19.1 ms |
+| **this opclass, `<@`/`@>`** | **~5.7-5.9 ms** | **~99-104 ms** |
+
+Against the only baseline that actually existed for this direction, this is
+an unambiguous win: **~110x faster than brute force at 5,000 rows, ~160x at
+50,000** -- exactly the "index vs. no index" gap indexing is supposed to
+deliver, and the gap *widens* with scale, the right direction. Against
+pgSphere, though, the relative gap widens too, from ~2x at 5,000 rows to
+~5.5x at 50,000 -- worth being precise about why, because it is not a
+repeat of round two's problem: `EXPLAIN (ANALYZE, BUFFERS)` on the 50,000-row
+case shows ~33,600 buffers for 500 probes (~67 per probe to find ~1 match
+each, `Rows Removed by Index Recheck: 0`), and this opclass's own *absolute*
+time here (~100ms) is essentially the same as `&&`'s at the identical scale
+(~110ms, from "Round three") -- the tree-traversal cost per probe hasn't
+gotten worse for a point query, it's the same bottleneck round two already
+diagnosed, still not fully closed by the multi-cap key at 50,000+ rows. What
+changed is the *baseline*: pgSphere's own native point-in-shape test is
+cheaper than its native shape-shape overlap test (exact containment is
+simpler geometry than exact overlap), so pgSphere's `<@` benefits more from
+being a native, exact primitive than its `&&` did -- while this opclass's
+sub-cap test (an angle-and-radius comparison) costs about the same whether
+the "other side" is a point or an extended shape, so it doesn't get the same
+proportional speedup pgSphere's `<@` gets over pgSphere's `&&`. The
+multi-cap key's remaining headroom (from "Round three": still not proven
+past 50,000 rows) is the same headroom limiting this strategy too, not a
+new, separate problem.
+
+**Operational gotcha, not a design flaw:** verifying this against the
+project's long-lived `skytest` benchmark database directly hit the exact
+kind of catalog-versioning trap this file warns about elsewhere -- `skytest`
+already had skycell installed at version 0.10 from *before* this change, so
+editing `skycell--0.10.sql`/`skycell--0.9--0.10.sql` in place (correct,
+since 0.10 is this whole PR's unreleased target version) did not reach that
+already-created installation; `ALTER EXTENSION ... UPDATE` has nothing to
+do since the version string didn't change, and `pg_amop` confirmed the new
+operator was simply absent from the live catalog. The fix for an
+already-open database is a real extension reinstall (drop and recreate,
+which cascades through any `skyregion`/`skypos`-typed columns and needs
+rebuilding), not something resolvable by re-running SQL files in place;
+this benchmark's numbers above come from a database that ran a fresh
+`CREATE EXTENSION` against the already-updated files instead, which needs
+no such step. Noted in `bench/23_region_contains.sql`'s own header for
+whoever hits this next.
+
 ## Spike scope
 
 Built and measured:

@@ -84,7 +84,37 @@
  * pgSphere's ~90ms at 500 x 50,000 (round one was ~470ms there, ~5.3x
  * slower than pgSphere -- this is ~1.2x). See GIST_REGION_DESIGN.md's
  * "Round three" for the full numbers and what's still untested (>50,000
- * rows, <@/@>, concurrent writes).
+ * rows, concurrent writes).
+ *
+ * A second strategy, @>(skyregion,skypos) (round four: "does this region
+ * contain this point", the commutator of the existing <@(skypos,skyregion)
+ * operator), was added the same way pgSphere's own scircle_ops registers
+ * scircle @> spoint alongside scircle && scircle in one opclass: the query
+ * argument is a skypos, not a skyregion, so consistent() dispatches on
+ * strategy number to tell which type it's holding. The pruning test reuses
+ * the same sub-caps as OVERLAP: a point can only be in the region if it's in
+ * at least one sub-cap, since the sub-caps cover the region by construction
+ * (moc_for_region's decomposition, built to bound a region for indexing, is
+ * never a gappy approximation). No new geometry needed, as expected -- but
+ * one real bug: consistent() used to read the query argument as a bytea
+ * unconditionally, before dispatching on strategy, left over from when &&
+ * was the only one; a skypos has no varlena header at all, so that surfaced
+ * immediately as "compressed lz4 data is corrupt" the moment a correctness
+ * test exercised this strategy. Fixed by moving that read into the &&
+ * case where it belongs -- caught before any benchmark number was trusted,
+ * unlike the two bugs in earlier rounds.
+ *
+ * STATUS (round four): correctness-verified (59,342/59,342 against a fresh
+ * 2923-row/4000-point stress test, 0 false positives/negatives) and a clear
+ * win over the only baseline that existed for this direction before it
+ * (brute-force skycell_in_region): ~110x faster at 200 probes x 5,000
+ * regions, ~160x at 500 x 50,000. Against pgSphere's native containment the
+ * gap widens with scale (~2x -> ~5.5x) for a specific, checked reason (not
+ * a new pruning regression -- see GIST_REGION_DESIGN.md's "Round four"):
+ * this opclass's own absolute time barely differs from OVERLAP's at the
+ * same scale, but pgSphere's native point-in-shape test is cheaper than its
+ * native shape-shape overlap test, so pgSphere's <@ pulls further ahead of
+ * its own && than this opclass's <@ does of its own &&.
  */
 #include "postgres.h"
 
@@ -103,6 +133,7 @@
 #include "skycell_internal.h"
 
 #define GIST_REGION_STRATEGY_OVERLAP 1	/* && (skyregion, skyregion) */
+#define GIST_REGION_STRATEGY_CONTAINS_POINT 2	/* @> (skyregion, skypos) */
 #define MAX_SUBCAPS 4
 
 typedef struct
@@ -323,6 +354,31 @@ multicap_overlaps(const GistMultiCap *a, const GistMultiCap *b)
 			if (cap_overlaps(a->sub[i], b->sub[j]))
 				return true;
 		}
+	}
+	return false;
+}
+
+/*
+ * A point can only lie inside the region if it lies inside at least one of
+ * the region's sub-caps -- the sub-caps cover the region by construction
+ * (moc_for_region()'s decomposition is always a covering, never an
+ * approximation that leaves gaps, since it exists elsewhere to bound a
+ * region for indexing, not to draw it), so "in no sub-cap" is a sound
+ * rejection. Same overall-cap short-circuit as multicap_overlaps().
+ */
+static bool
+multicap_contains_point(const GistMultiCap *m, sc_vec3 p)
+{
+	GistCap		pc = cap_make(p, 0.0);
+
+	if (!cap_overlaps(m->overall, pc))
+		return false;
+	for (int i = 0; i < MAX_SUBCAPS; i++)
+	{
+		if (m->sub[i].radius < 0)
+			continue;
+		if (cap_overlaps(m->sub[i], pc))
+			return true;
 	}
 	return false;
 }
@@ -748,8 +804,6 @@ skyregion_gist_consistent(PG_FUNCTION_ARGS)
 	StrategyNumber strategy = (StrategyNumber) PG_GETARG_UINT16(2);
 	bool	   *recheck = (bool *) PG_GETARG_POINTER(4);
 	region_gist_query_cache *qcache = (region_gist_query_cache *) fcinfo->flinfo->fn_extra;
-	bytea	   *qb = DatumGetByteaP(queryDatum);
-	Size		qsz = VARSIZE(qb);
 	GistMultiCap em;
 	bool		result;
 
@@ -758,31 +812,54 @@ skyregion_gist_consistent(PG_FUNCTION_ARGS)
 	switch (strategy)
 	{
 		case GIST_REGION_STRATEGY_OVERLAP:
-			if (qcache == NULL)
 			{
-				qcache = MemoryContextAllocZero(fcinfo->flinfo->fn_mcxt, sizeof(region_gist_query_cache));
-				fcinfo->flinfo->fn_extra = qcache;
-			}
-			if (qcache->last_query == NULL || qcache->last_query_size != qsz ||
-				memcmp(qcache->last_query, qb, qsz) != 0)
-			{
-				sc_region	qreg;
+				/* the query is a skyregion (bytea-backed) only for this
+				 * strategy -- STRATEGY_CONTAINS_POINT's query is a skypos
+				 * instead, a fixed-size by-reference struct with no varlena
+				 * header at all, so DatumGetByteaP/VARSIZE on it would
+				 * misread its raw bytes as a (possibly toasted) varlena,
+				 * corrupting whatever that garbage "pointer" happens to
+				 * land on. Computed here, not above the switch, so it only
+				 * ever runs for the strategy it's valid for. */
+				bytea	   *qb = DatumGetByteaP(queryDatum);
+				Size		qsz = VARSIZE(qb);
 
-				skycell_region_from_datum(queryDatum, &qreg);
-				region_to_multicap(&qreg, &qcache->qmc);
-				sc_region_free(&qreg);
-
-				if (qcache->last_query == NULL || qcache->last_query_size < qsz)
+				if (qcache == NULL)
 				{
-					if (qcache->last_query != NULL)
-						pfree(qcache->last_query);
-					qcache->last_query = MemoryContextAlloc(fcinfo->flinfo->fn_mcxt, qsz);
+					qcache = MemoryContextAllocZero(fcinfo->flinfo->fn_mcxt, sizeof(region_gist_query_cache));
+					fcinfo->flinfo->fn_extra = qcache;
 				}
-				memcpy(qcache->last_query, qb, qsz);
-				qcache->last_query_size = qsz;
+				if (qcache->last_query == NULL || qcache->last_query_size != qsz ||
+					memcmp(qcache->last_query, qb, qsz) != 0)
+				{
+					sc_region	qreg;
+
+					skycell_region_from_datum(queryDatum, &qreg);
+					region_to_multicap(&qreg, &qcache->qmc);
+					sc_region_free(&qreg);
+
+					if (qcache->last_query == NULL || qcache->last_query_size < qsz)
+					{
+						if (qcache->last_query != NULL)
+							pfree(qcache->last_query);
+						qcache->last_query = MemoryContextAlloc(fcinfo->flinfo->fn_mcxt, qsz);
+					}
+					memcpy(qcache->last_query, qb, qsz);
+					qcache->last_query_size = qsz;
+				}
+				result = multicap_overlaps(&em, &qcache->qmc);
+				*recheck = true;	/* the cap test is lossy either way */
 			}
-			result = multicap_overlaps(&em, &qcache->qmc);
-			*recheck = true;	/* the cap test is lossy either way */
+			break;
+		case GIST_REGION_STRATEGY_CONTAINS_POINT:
+			/* a skypos is a fixed-size by-reference Datum, not a region --
+			 * no fn_extra caching needed here (unlike the OVERLAP case
+			 * above): extracting its unit vector is two doubles and a bit
+			 * of trig, far cheaper than the region-parsing + MOC
+			 * decomposition that OVERLAP's cache exists to avoid repeating. */
+			result = multicap_contains_point(&em, skycell_pos_from_datum(queryDatum));
+			*recheck = true;	/* sub-caps cover the region; recheck confirms
+								 * the point is actually inside its true shape */
 			break;
 		default:
 			elog(ERROR, "skyregion_gist_consistent: unsupported strategy %d", strategy);
