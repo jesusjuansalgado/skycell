@@ -235,6 +235,46 @@ brute AS (SELECT count(*) AS n FROM pts JOIN fp ON skycell_in_cone(pts.ra, pts.d
 SELECT brute.n > 1000 AS many, moc.n = brute.n AS moc_ok FROM moc, brute;
 SELECT max(cardinality(skycell_cone_moc(ra0, dec0, r, 12))) <= 12 AS moc_size_ok FROM fp;
 
+-- region-region INTERSECTS via MOC ranges: neither side of the join is a
+-- point, so none of the per-row coverings above apply and skyregion has no
+-- GiST opclass of its own -- but the same MOC decomposition, applied to
+-- *both* sides and reduced to skycell_nuniq_lo/hi's native [lo,hi] cell-id
+-- ranges, turns "do these two regions overlap" into a plain interval overlap
+-- test that PostgreSQL's built-in int8range GiST opclass already indexes.
+CREATE TABLE rr_a AS
+  SELECT fid AS aid, CASE WHEN fid % 2 = 0 THEN circle('ICRS', ra0, dec0, r)
+                          ELSE polygon('ICRS', ra0-r, dec0-r, ra0+r, dec0-r, ra0+r, dec0+r, ra0-r, dec0+r)
+                     END AS region
+  FROM fp WHERE abs(dec0) < 85;
+CREATE TABLE rr_b AS
+  SELECT fid AS bid, CASE WHEN fid % 2 = 1 THEN circle('ICRS', ra0 + r, dec0, r * 1.5)
+                          ELSE polygon('ICRS', ra0-r*1.5, dec0-r, ra0+r*1.5, dec0-r, ra0+r*1.5, dec0+r, ra0-r*1.5, dec0+r)
+                     END AS region
+  FROM fp WHERE abs(dec0) < 85;
+CREATE TABLE rr_b_moc AS
+  SELECT bid, int8range(skycell_nuniq_lo(n), skycell_nuniq_hi(n), '[]') AS rng
+  FROM rr_b, unnest(skycell_region_moc(region, 8)) AS n;
+CREATE INDEX ON rr_b_moc USING gist (rng);
+ANALYZE rr_b_moc;
+SELECT plan_uses_index(
+  $q$SELECT DISTINCT a.aid FROM rr_a a
+     JOIN LATERAL (SELECT int8range(skycell_nuniq_lo(n), skycell_nuniq_hi(n), '[]') AS rng
+                   FROM unnest(skycell_region_moc(a.region, 8)) AS n) am ON true
+     JOIN rr_b_moc b ON b.rng && am.rng$q$
+) AS region_overlap_indexed;
+WITH cand AS (
+  SELECT DISTINCT a.aid, b.bid FROM rr_a a
+  JOIN LATERAL (SELECT int8range(skycell_nuniq_lo(n), skycell_nuniq_hi(n), '[]') AS rng
+                FROM unnest(skycell_region_moc(a.region, 8)) AS n) am ON true
+  JOIN rr_b_moc b ON b.rng && am.rng
+),
+moc AS (SELECT count(*) AS n FROM cand c
+        JOIN rr_a a ON a.aid = c.aid JOIN rr_b b ON b.bid = c.bid
+        WHERE intersects(a.region, b.region) = 1),
+brute AS (SELECT count(*) AS n FROM rr_a a, rr_b b WHERE intersects(a.region, b.region) = 1)
+SELECT brute.n > 50 AS many, moc.n = brute.n AS region_overlap_matches_exact FROM moc, brute;
+DROP TABLE rr_a, rr_b, rr_b_moc;
+
 -- expression index instead of a cell column (how egernia's ivoa.obscore is
 -- indexed): the rewrite must use it and read its statistics
 CREATE TABLE cat_expr AS SELECT id, ra, dec FROM cat;

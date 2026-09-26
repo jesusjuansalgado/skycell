@@ -112,6 +112,46 @@ AS 'MODULE_PATHNAME' LANGUAGE C STABLE CALLED ON NULL INPUT PARALLEL SAFE;
 -- in a B-tree" for a complete, tested example.
 -- ------------------------------------------------------------------
 
+-- ------------------------------------------------------------------
+-- region-region INTERSECTS (INTERSECTS(region, region), skyregion's own &&):
+-- neither side is a point, so there is no per-row covering to compute and no
+-- point-in-footprint MOC join above to reuse as-is -- skyregion has no GiST
+-- opclass, so unlike pgSphere's scircle/spoly this is genuinely unindexed on
+-- its own.
+--
+-- The same MOC decomposition still helps, applied to *both* sides instead of
+-- one: skycell_region_moc()/skycell_(cone|poly)_moc() break a region into a
+-- handful of NUNIQ cells, and skycell_nuniq_lo()/skycell_nuniq_hi() turn each
+-- cell back into the native [lo,hi] cell-id range the cross-match coverings
+-- above already use. Because a MOC is a strict hierarchical partition, two
+-- regions can only truly overlap if one pair of their cell ranges overlaps as
+-- plain integer intervals -- so explode each side into (row_id, int8range),
+-- index one side with PostgreSQL's own built-in GiST support for int8range
+-- (no custom opclass needed), and join on `&&`:
+--
+--   CREATE TABLE b_moc AS
+--     SELECT bid, int8range(skycell_nuniq_lo(n), skycell_nuniq_hi(n), '[]') AS rng
+--     FROM b, unnest(skycell_region_moc(b.s_region, 8)) AS n;
+--   CREATE INDEX ON b_moc USING gist (rng);
+--
+--   SELECT DISTINCT a.aid, b.bid FROM a
+--   JOIN LATERAL (SELECT int8range(skycell_nuniq_lo(n), skycell_nuniq_hi(n), '[]') AS rng
+--                 FROM unnest(skycell_region_moc(a.s_region, 8)) AS n) am ON true
+--   JOIN b_moc bm ON bm.rng && am.rng
+--   JOIN b ON b.bid = bm.bid  -- refine: the MOC covering overshoots, same as the point case
+--   WHERE intersects(a.s_region, b.s_region) = 1;
+--
+-- Like the point-in-footprint recipe above, this needs a side table and a
+-- join no query rewrite can introduce, so it has no automatic form either --
+-- build b_moc once, keep it in sync with b, and write the join by hand. It is
+-- also an approximation twice over (the MOC covering, then the interval
+-- overlap test), so the exact intersects() recheck at the end is required,
+-- not optional, exactly as for point-in-footprint. See ext/test/sql/
+-- skycell.sql's "region-region INTERSECTS via MOC ranges" for a complete,
+-- tested example, and bench/21_region_overlap.sql for how this compares to
+-- pgSphere's natively GiST-indexed && on scircle/spoly.
+-- ------------------------------------------------------------------
+
 CREATE FUNCTION skycell_ancestors(cell int8, min_order int DEFAULT 0, max_order int DEFAULT 29) RETURNS int8[]
 AS 'MODULE_PATHNAME' LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
 
