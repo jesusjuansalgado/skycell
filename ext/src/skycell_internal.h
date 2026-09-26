@@ -8,10 +8,12 @@
 
 #include "nodes/pathnodes.h"
 #include "nodes/primnodes.h"
+#include "utils/array.h"
 #include "cover.h"
 
 extern void check_err(const char *err);
 extern void current_params(sc_cover_params *p, int max_ranges, const sc_density *d);
+extern ArrayType *moc_for_region(const sc_region *r, int max_cells, int max_order);
 
 extern int	skycell_join_slots;
 

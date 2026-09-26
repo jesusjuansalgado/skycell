@@ -7,60 +7,84 @@
  * shapes, so there is no single outer row to build a covering from.  The
  * MOC-ranges recipe (skycell_region_moc_ranges, see skycell--0.9.sql) works
  * around that with a hand-maintained side table.  This file instead gives
- * skyregion a real index: a GiST opclass whose key is a cheap, fixed-size
- * bounding spherical cap (unit-vector centre + angular radius), the same
- * kind of bound PostGIS's box2df or pg_sphere's spherekey use for their own
- * geometry types.  A cap is:
+ * skyregion a real index: a GiST opclass over &&, with no side table and no
+ * hand-written join.
  *
- *   - exact for a cone (it already is one: sc_region_bounding_cap just
- *     returns its own centre and radius);
- *   - a cheap over-approximation for a polygon (centroid + farthest vertex,
- *     via the existing sc_region_centroid -- not the minimal enclosing cap,
- *     but valid, and reuses machinery cover.c already has for other
- *     purposes).
+ * KEY DESIGN, round two (see GIST_REGION_DESIGN.md's "Picksplit, round two"
+ * for the round-one story: a single bounding cap per region, tuned with two
+ * successive split algorithms, found to scale badly -- 5x slower than
+ * pgSphere's native && at 50,000 rows despite being competitive at 5,000,
+ * with EXPLAIN (ANALYZE, BUFFERS) showing the tree itself being walked too
+ * much, not a recheck-stage problem). A single cap is too coarse a key once
+ * enough same-scale regions accumulate: this file replaces it with up to
+ * MAX_SUBCAPS (4) sub-caps per region, mirroring how the MOC-ranges recipe
+ * gets its own precision from several `[lo,hi]` ranges per region rather
+ * than one:
  *
- * Two caps overlap iff the angle between their centres is at most the sum
- * of their radii -- exactly sc_region_overlaps's own cone-cone formula,
- * lifted to bound *any* region kind uniformly.  That makes the cap test a
- * correct (if lossy) pruning condition for &&: every genuinely overlapping
- * pair of regions has overlapping bounding caps, so a leaf whose cap does
- * not overlap the query's cap can be skipped outright, and a leaf whose cap
- * does overlap needs the real intersects() check (GiST's "recheck") to rule
- * out false positives from the two shapes overlapping in bounding-cap space
- * but not in reality.
+ *   - a cone still gets exactly one sub-cap (itself -- already exact, a
+ *     second cap would add nothing);
+ *   - a polygon is decomposed via the extension's own MOC builder
+ *     (moc_for_region(), shared with skycell_region_moc()) into up to
+ *     MAX_SUBCAPS HEALPix cells, each converted to its own (centre, radius)
+ *     cap via sc_pix2vec()/sc_pixrad() -- an adaptive, boundary-aware
+ *     decomposition already built for a different purpose (indexing stored
+ *     footprints in a B-tree), reused here instead of reinvented.
  *
- * Support functions: standard GiST (compress/decompress/union/penalty/
- * picksplit/same/consistent), storage type plain bytea -- a packed
- * {cx,cy,cz,radius} struct, no custom SQL type needed.  Modelled on
- * pg_sphere's own spherekey convention (verified compatible with this
- * PostgreSQL version: pg_sphere's GiST indexes are exercised throughout this
- * project's own benchmarks), not on PostgreSQL's textbook point/box
- * example, since a unit-sphere cap has no direct textbook analogue.
+ * Each key also keeps one "overall" cap -- the plain union of its sub-caps,
+ * the same single-cap key round one used throughout -- purely as a cheap
+ * summary for picksplit's axis-sort heuristic; it plays no part in
+ * consistent()'s actual pruning decision, which uses the sub-caps only.
  *
- * STATUS: correctness-verified (see GIST_REGION_DESIGN.md for the full
- * history: an initial Linear split, then Guttman's Quadratic split, then the
- * current R*-tree-style margin/overlap split below), but the performance
- * verdict is scale-dependent and not a clean win: competitive with pgSphere's
- * native opclass at a 5000-row footprint table, ~5x slower at 50,000 rows,
- * where even the MOC-ranges recipe this opclass was meant to replace pulls
- * ahead of it. Two split algorithms (Quadratic, R*-tree-style) bracket the
- * likely cause as the bounding-cap key itself being too coarse at scale, not
- * the tree-balancing on top of it -- see GIST_REGION_DESIGN.md's "Picksplit,
- * round two" before trying a third split algorithm. Not concurrent-write-
- * tested. cap_union's near-antipodal case (centres almost pi radians apart)
- * is approximated rather than handled exactly; skyregion itself already
- * forbids a cone larger than a hemisphere and a polygon spanning one, so a
- * single region's own cap cannot be near-antipodal internally, but a union
- * of two widely-separated small regions' caps could approach it.
+ * consistent(): two multi-cap keys "overlap" iff any sub-cap of one overlaps
+ * any sub-cap of the other (an O(MAX_SUBCAPS^2) check, with the overall caps
+ * checked first as a cheap short-circuit reject, valid because every
+ * sub-cap lies within its region's own overall cap by construction). Still
+ * lossy (recheck stays true), but a tighter lossy than one big cap.
  *
- * picksplit's loop bounds below are OffsetNumber/FirstOffsetNumber, not
- * plain 0-based indices, on purpose: an earlier version treated
+ * Storage type is plain bytea, a fixed-size packed struct (~164 bytes: an
+ * overall cap plus MAX_SUBCAPS sub-caps, empty slots marked with a negative
+ * radius) -- bigger than round one's single-cap key (36 bytes), which lowers
+ * per-page fanout; whether the pruning improvement is worth that trade is
+ * exactly what this redesign has to answer empirically (see
+ * GIST_REGION_DESIGN.md).
+ *
+ * union() and penalty() merge sub-caps from multiple keys down to at most
+ * MAX_SUBCAPS via greedy nearest-cluster absorption (merge_caps_greedy): the
+ * first MAX_SUBCAPS input caps seed one cluster each, then every further cap
+ * joins whichever existing cluster it would enlarge least. Not a globally
+ * optimal clustering, but O(n * MAX_SUBCAPS), cheap enough to run on every
+ * union/penalty call the way a full agglomerative merge would not be.
+ *
+ * picksplit is unchanged in spirit from round one (R*-tree-style: choose the
+ * axis -- among the overall cap centre's x/y/z coordinate -- with the
+ * smallest total margin, then the split point on it minimising overlap), but
+ * now operates on each entry's *overall* cap for the axis-sort/margin/
+ * overlap heuristic (a deliberate simplification: split quality is a
+ * node-level partitioning question, not the same thing consistent()'s
+ * per-sub-cap precision is for), while the final left/right keys are built
+ * from the *full* multi-cap union of whichever entries land on each side --
+ * this is what lets the tighter representation propagate through internal
+ * nodes, not just leaves, which is where round one's actual bottleneck was
+ * (too many internal pages visited, not too many false leaf candidates).
+ *
+ * picksplit's loop bounds are OffsetNumber/FirstOffsetNumber, not plain
+ * 0-based indices, on purpose: an earlier version treated
  * entryvec->vector[0] as a real entry there (it is not -- that slot is
  * reserved, unlike in union(), which really is 0-based) and crashed the
  * server building an index over as few as ~160 rows, the first row count
  * that forces a page split. See GIST_REGION_DESIGN.md for how that was
  * diagnosed; a correctness test too small to force a split will not catch a
  * regression here.
+ *
+ * STATUS: correctness-verified (a fresh 2923-row/104,215-pair mixed circle/
+ * polygon self-join stress test, 0 false positives/negatives, plus both
+ * benchmark scales below agreeing exactly with brute force) and the
+ * redesign paid off: ~6.8ms vs pgSphere's ~25ms at 200 probes x 5,000
+ * footprints (faster than pgSphere, not just competitive), and ~110ms vs
+ * pgSphere's ~90ms at 500 x 50,000 (round one was ~470ms there, ~5.3x
+ * slower than pgSphere -- this is ~1.2x). See GIST_REGION_DESIGN.md's
+ * "Round three" for the full numbers and what's still untested (>50,000
+ * rows, <@/@>, concurrent writes).
  */
 #include "postgres.h"
 
@@ -70,6 +94,7 @@
 #include "access/gist.h"
 #include "access/stratnum.h"
 #include "fmgr.h"
+#include "utils/array.h"
 #include "utils/builtins.h"
 #include "varatt.h"
 
@@ -78,54 +103,43 @@
 #include "skycell_internal.h"
 
 #define GIST_REGION_STRATEGY_OVERLAP 1	/* && (skyregion, skyregion) */
+#define MAX_SUBCAPS 4
 
 typedef struct
 {
 	double		cx,
 				cy,
 				cz;
-	double		radius;			/* radians; negative marks the empty cap */
+	double		radius;			/* radians; negative marks the empty/unused cap */
 } GistCap;
 
-/*
- * VARDATA(out) is only 4-byte aligned (right after a short varlena header),
- * not the 8-byte alignment a GistCap's doubles want -- a direct struct
- * pointer dereference there can fault under vectorised load/store codegen.
- * memcpy sidesteps the alignment requirement entirely.
- */
-static bytea *
-cap_to_bytea(sc_vec3 c, double radius)
+typedef struct
 {
-	Size		sz = VARHDRSZ + sizeof(GistCap);
-	bytea	   *out = (bytea *) palloc(sz);
+	GistCap		overall;		/* union of sub[]; picksplit's axis-sort heuristic only */
+	GistCap		sub[MAX_SUBCAPS];
+} GistMultiCap;
+
+static inline GistCap
+cap_make(sc_vec3 c, double r)
+{
 	GistCap		k;
 
-	SET_VARSIZE(out, sz);
 	k.cx = c.x;
 	k.cy = c.y;
 	k.cz = c.z;
-	k.radius = radius;
-	memcpy(VARDATA(out), &k, sizeof(GistCap));
-	return out;
+	k.radius = r;
+	return k;
 }
 
-static void
-bytea_to_cap(bytea *b, sc_vec3 *c, double *radius)
+static inline sc_vec3
+cap_center(GistCap k)
 {
-	GistCap		k;
+	sc_vec3		c;
 
-	/*
-	 * VARDATA_ANY, not VARDATA: an index tuple GiST hands back here may have
-	 * been repacked with a 1-byte varlena header (it easily fits under the
-	 * short-header limit), and VARDATA alone assumes the 4-byte form we
-	 * ourselves palloc'd it with -- reading through the wrong offset there
-	 * is exactly the kind of thing that segfaults deep in a page split.
-	 */
-	memcpy(&k, VARDATA_ANY(b), sizeof(GistCap));
-	c->x = k.cx;
-	c->y = k.cy;
-	c->z = k.cz;
-	*radius = k.radius;
+	c.x = k.cx;
+	c.y = k.cy;
+	c.z = k.cz;
+	return c;
 }
 
 /*
@@ -134,7 +148,7 @@ bytea_to_cap(bytea *b, sc_vec3 *c, double *radius)
  * region's own cap cannot violate that (skyregion forbids a hemisphere-or-
  * larger cone and a polygon spanning one), but repeated unions of far-apart
  * small regions could in principle approach it -- clamped rather than
- * exactly handled, a known limitation of this spike (see file header).
+ * exactly handled, a known limitation (see file header).
  */
 static void
 cap_union2(sc_vec3 c1, double r1, sc_vec3 c2, double r2, sc_vec3 *co, double *ro)
@@ -202,8 +216,18 @@ cap_union2(sc_vec3 c1, double r1, sc_vec3 c2, double r2, sc_vec3 *co, double *ro
 	}
 }
 
+static inline GistCap
+cap_union_caps(GistCap a, GistCap b)
+{
+	sc_vec3		c;
+	double		r;
+
+	cap_union2(cap_center(a), a.radius, cap_center(b), b.radius, &c, &r);
+	return cap_make(c, r);
+}
+
 /* monotonic in the cap's true area (2*pi*(1-cos(r))); the constant does not
- * matter since penalty only compares differences. */
+ * matter since penalty/margin only compare differences. */
 static double
 cap_area_proxy(double radius)
 {
@@ -213,11 +237,11 @@ cap_area_proxy(double radius)
 }
 
 static bool
-cap_overlaps(sc_vec3 c1, double r1, sc_vec3 c2, double r2)
+cap_overlaps(GistCap a, GistCap b)
 {
-	if (r1 < 0 || r2 < 0)
+	if (a.radius < 0 || b.radius < 0)
 		return false;
-	return sc_angle(c1, c2) <= r1 + r2;
+	return sc_angle(cap_center(a), cap_center(b)) <= a.radius + b.radius;
 }
 
 /* how much two caps overlap, not just whether they do: 0 when disjoint (or
@@ -225,11 +249,201 @@ cap_overlaps(sc_vec3 c1, double r1, sc_vec3 c2, double r2)
  * centre distance -- a cheap angular proxy, not a real lens-shaped overlap
  * area, in the same spirit as cap_area_proxy() above. */
 static double
-cap_overlap_amount(sc_vec3 c1, double r1, sc_vec3 c2, double r2)
+cap_overlap_amount(GistCap a, GistCap b)
 {
-	if (r1 < 0 || r2 < 0)
+	if (a.radius < 0 || b.radius < 0)
 		return 0.0;
-	return fmax(0.0, r1 + r2 - sc_angle(c1, c2));
+	return fmax(0.0, a.radius + b.radius - sc_angle(cap_center(a), cap_center(b)));
+}
+
+/*
+ * Greedy nearest-cluster merge: reduce an arbitrary list of (non-empty) caps
+ * down to at most MAX_SUBCAPS, by seeding one cluster per input cap up to
+ * MAX_SUBCAPS, then absorbing every further cap into whichever existing
+ * cluster it would enlarge least (smallest area(union) - area(cluster) -
+ * area(cap) "waste", the same metric Guttman's Quadratic split used for
+ * seed selection in the single-cap round one). O(n * MAX_SUBCAPS), not a
+ * globally optimal clustering, but cheap enough to run on every union()/
+ * penalty() call.
+ */
+static void
+merge_caps_greedy(const GistCap *caps, int n, GistCap *out, int *nout)
+{
+	int			k = Min(n, MAX_SUBCAPS);
+
+	for (int i = 0; i < k; i++)
+		out[i] = caps[i];
+	for (int i = k; i < n; i++)
+	{
+		int			best = 0;
+		double		bestWaste = HUGE_VAL;
+
+		for (int j = 0; j < k; j++)
+		{
+			GistCap		u = cap_union_caps(out[j], caps[i]);
+			double		waste = cap_area_proxy(u.radius) - cap_area_proxy(out[j].radius) - cap_area_proxy(caps[i].radius);
+
+			if (waste < bestWaste)
+			{
+				bestWaste = waste;
+				best = j;
+			}
+		}
+		out[best] = cap_union_caps(out[best], caps[i]);
+	}
+	*nout = k;
+	for (int i = k; i < MAX_SUBCAPS; i++)
+		out[i].radius = -1;
+}
+
+static double
+multicap_total_area(const GistMultiCap *m)
+{
+	double		a = 0;
+
+	for (int i = 0; i < MAX_SUBCAPS; i++)
+		if (m->sub[i].radius >= 0)
+			a += cap_area_proxy(m->sub[i].radius);
+	return a;
+}
+
+static bool
+multicap_overlaps(const GistMultiCap *a, const GistMultiCap *b)
+{
+	if (!cap_overlaps(a->overall, b->overall))
+		return false;			/* every sub-cap lies within its own overall cap */
+	for (int i = 0; i < MAX_SUBCAPS; i++)
+	{
+		if (a->sub[i].radius < 0)
+			continue;
+		for (int j = 0; j < MAX_SUBCAPS; j++)
+		{
+			if (b->sub[j].radius < 0)
+				continue;
+			if (cap_overlaps(a->sub[i], b->sub[j]))
+				return true;
+		}
+	}
+	return false;
+}
+
+/* union of N multi-cap keys: overall caps reduce pairwise as before; sub-caps
+ * flatten into one list and merge_caps_greedy back down to MAX_SUBCAPS. */
+static void
+multicap_union_many(const GistMultiCap **entries, int n, GistMultiCap *out)
+{
+	GistCap		flat[MAX_SUBCAPS * 64];		/* bounded by caller's fanout; see Assert below */
+	int			nflat = 0;
+	int			nout;
+
+	Assert(n <= 64);
+	out->overall = entries[0]->overall;
+	for (int i = 0; i < n; i++)
+	{
+		if (i > 0)
+			out->overall = cap_union_caps(out->overall, entries[i]->overall);
+		for (int j = 0; j < MAX_SUBCAPS; j++)
+			if (entries[i]->sub[j].radius >= 0 && nflat < (int) lengthof(flat))
+				flat[nflat++] = entries[i]->sub[j];
+	}
+	merge_caps_greedy(flat, nflat, out->sub, &nout);
+}
+
+static double
+multicap_penalty(const GistMultiCap *orig, const GistMultiCap *newc)
+{
+	GistCap		flat[2 * MAX_SUBCAPS];
+	GistCap		merged[MAX_SUBCAPS];
+	int			nflat = 0,
+				nmerged;
+
+	for (int i = 0; i < MAX_SUBCAPS; i++)
+		if (orig->sub[i].radius >= 0)
+			flat[nflat++] = orig->sub[i];
+	for (int i = 0; i < MAX_SUBCAPS; i++)
+		if (newc->sub[i].radius >= 0)
+			flat[nflat++] = newc->sub[i];
+	merge_caps_greedy(flat, nflat, merged, &nmerged);
+
+	{
+		double		mergedArea = 0,
+					origArea = multicap_total_area(orig);
+
+		for (int i = 0; i < nmerged; i++)
+			mergedArea += cap_area_proxy(merged[i].radius);
+		return mergedArea - origArea;
+	}
+}
+
+/*
+ * VARDATA_ANY, not VARDATA: an index tuple GiST hands back here may have
+ * been repacked with a 1-byte varlena header (it easily fits under the
+ * short-header limit), and VARDATA alone assumes the 4-byte form we
+ * ourselves palloc'd it with -- reading through the wrong offset there is
+ * exactly the kind of thing that segfaults deep in a page split. memcpy
+ * sidesteps any alignment assumption on top of that.
+ */
+static bytea *
+multicap_to_bytea(const GistMultiCap *m)
+{
+	Size		sz = VARHDRSZ + sizeof(GistMultiCap);
+	bytea	   *out = (bytea *) palloc(sz);
+
+	SET_VARSIZE(out, sz);
+	memcpy(VARDATA(out), m, sizeof(GistMultiCap));
+	return out;
+}
+
+static void
+bytea_to_multicap(bytea *b, GistMultiCap *m)
+{
+	memcpy(m, VARDATA_ANY(b), sizeof(GistMultiCap));
+}
+
+/*
+ * Decompose a region into its GiST key: a cone is already exactly one cap,
+ * a polygon is decomposed via the extension's own MOC builder (shared with
+ * skycell_region_moc()) into up to MAX_SUBCAPS HEALPix cells.
+ */
+static void
+region_to_multicap(sc_region *r, GistMultiCap *out)
+{
+	sc_vec3		oc;
+	double		orad;
+
+	sc_region_bounding_cap(r, &oc, &orad);
+	out->overall = cap_make(oc, orad);
+
+	if (r->kind == SC_REGION_CONE)
+	{
+		out->sub[0] = out->overall;
+		for (int i = 1; i < MAX_SUBCAPS; i++)
+			out->sub[i].radius = -1;
+	}
+	else
+	{
+		ArrayType  *moc = moc_for_region(r, MAX_SUBCAPS, 20);
+		Datum	   *elems;
+		bool	   *nulls;
+		int			n;
+
+		deconstruct_array(moc, INT8OID, sizeof(int64), true, TYPALIGN_DOUBLE, &elems, &nulls, &n);
+		for (int i = 0; i < MAX_SUBCAPS; i++)
+		{
+			if (i < n)
+			{
+				int64		pix;
+				int			order = sc_nuniq_decode(DatumGetInt64(elems[i]), &pix);
+
+				out->sub[i] = cap_make(sc_pix2vec(order, pix), sc_pixrad(order));
+			}
+			else
+				out->sub[i].radius = -1;
+		}
+		pfree(elems);
+		pfree(nulls);
+		pfree(moc);
+	}
 }
 
 PG_FUNCTION_INFO_V1(skyregion_gist_compress);
@@ -242,14 +456,13 @@ skyregion_gist_compress(PG_FUNCTION_ARGS)
 	if (entry->leafkey)
 	{
 		sc_region	r;
-		sc_vec3		c;
-		double		radius;
+		GistMultiCap m;
 		bytea	   *k;
 
 		skycell_region_from_datum(entry->key, &r);
-		sc_region_bounding_cap(&r, &c, &radius);
+		region_to_multicap(&r, &m);
 		sc_region_free(&r);
-		k = cap_to_bytea(c, radius);
+		k = multicap_to_bytea(&m);
 
 		retval = (GISTENTRY *) palloc(sizeof(GISTENTRY));
 		gistentryinit(*retval, PointerGetDatum(k), entry->rel, entry->page, entry->offset, false);
@@ -272,22 +485,23 @@ skyregion_gist_union(PG_FUNCTION_ARGS)
 {
 	GistEntryVector *entryvec = (GistEntryVector *) PG_GETARG_POINTER(0);
 	int		   *sizep = (int *) PG_GETARG_POINTER(1);
-	sc_vec3		c;
-	double		radius;
-	bytea	   *out;
+	int			n = Min(entryvec->n, 64);	/* matches multicap_union_many's own cap */
+	GistMultiCap *mc = palloc(sizeof(GistMultiCap) * n);
+	const GistMultiCap **ptrs = palloc(sizeof(GistMultiCap *) * n);
+	GistMultiCap out;
+	bytea	   *outb;
 
-	bytea_to_cap(DatumGetByteaP(entryvec->vector[0].key), &c, &radius);
-	for (int i = 1; i < entryvec->n; i++)
+	for (int i = 0; i < n; i++)
 	{
-		sc_vec3		c2;
-		double		r2;
-
-		bytea_to_cap(DatumGetByteaP(entryvec->vector[i].key), &c2, &r2);
-		cap_union2(c, radius, c2, r2, &c, &radius);
+		bytea_to_multicap(DatumGetByteaP(entryvec->vector[i].key), &mc[i]);
+		ptrs[i] = &mc[i];
 	}
-	out = cap_to_bytea(c, radius);
-	*sizep = VARSIZE(out);
-	PG_RETURN_POINTER(out);
+	multicap_union_many(ptrs, n, &out);
+	outb = multicap_to_bytea(&out);
+	*sizep = VARSIZE(outb);
+	pfree(mc);
+	pfree(ptrs);
+	PG_RETURN_POINTER(outb);
 }
 
 PG_FUNCTION_INFO_V1(skyregion_gist_penalty);
@@ -297,23 +511,18 @@ skyregion_gist_penalty(PG_FUNCTION_ARGS)
 	GISTENTRY  *origentry = (GISTENTRY *) PG_GETARG_POINTER(0);
 	GISTENTRY  *newentry = (GISTENTRY *) PG_GETARG_POINTER(1);
 	float	   *result = (float *) PG_GETARG_POINTER(2);
-	sc_vec3		c1,
-				c2,
-				cu;
-	double		r1,
-				r2,
-				ru;
+	GistMultiCap morig,
+				mnew;
 
-	bytea_to_cap(DatumGetByteaP(origentry->key), &c1, &r1);
-	bytea_to_cap(DatumGetByteaP(newentry->key), &c2, &r2);
-	cap_union2(c1, r1, c2, r2, &cu, &ru);
-	*result = (float) (cap_area_proxy(ru) - cap_area_proxy(r1));
+	bytea_to_multicap(DatumGetByteaP(origentry->key), &morig);
+	bytea_to_multicap(DatumGetByteaP(newentry->key), &mnew);
+	*result = (float) multicap_penalty(&morig, &mnew);
 	PG_RETURN_POINTER(result);
 }
 
 typedef struct
 {
-	double		key;			/* cap centre's coordinate along the axis being tried */
+	double		key;			/* overall cap centre's coordinate along the axis being tried */
 	OffsetNumber idx;
 }			axis_sort_entry;
 
@@ -327,30 +536,21 @@ axis_sort_cmp(const void *a, const void *b)
 }
 
 /*
- * R*-tree-style split (Beckmann et al. 1990), adapted from axis-aligned
- * boxes to spherical caps -- replaced Guttman's Quadratic split (see git
- * history / GIST_REGION_DESIGN.md for that version and why it was tried
- * first) once benchmarking showed room past it:
+ * R*-tree-style split (Beckmann et al. 1990), adapted to spherical caps, and
+ * driven by each entry's *overall* cap only (see file header for why): try
+ * sorting by the overall cap centre's x, y, and z coordinate in turn,
+ * measure each axis's total margin (radius, as a size proxy) summed over
+ * every valid split point, keep the axis with the smallest sum, then on
+ * that axis pick the split point minimising overlap between the two
+ * resulting overall caps (ties broken by combined area). O(n log n) per
+ * axis (sort once, then a forward and backward cumulative-union sweep).
  *
- *   ChooseSplitAxis: try sorting the entries by their cap centre's x, y, and
- *   z coordinate in turn (three candidate axes -- a cap has no natural
- *   per-axis bounding box the way a box does, so the centre's own
- *   coordinate stands in for it); for each axis, sum the "margin" (here,
- *   cap radius as a size proxy) of every valid left/right split along it;
- *   the axis with the smallest total margin sum is the one along which the
- *   entries are most naturally separable.
- *
- *   ChooseSplitIndex: along the chosen axis, pick the split point that
- *   minimises the *overlap* between the resulting left and right caps
- *   (cap_overlap_amount, not just whether they overlap), breaking ties by
- *   minimising their combined area -- overlap is what actually costs a GiST
- *   scan extra work later (a query cap intersecting both children's caps
- *   has to descend into both), not raw size.
- *
- * O(n log n) per axis (sort once, then a single forward and backward
- * cumulative-union sweep), so three axes is still O(n log n) overall --
- * cheaper to compute than Quadratic split's O(n^2) seed search, as well as
- * a better split by the numbers (see GIST_REGION_DESIGN.md).
+ * The actual spl_ldatum/spl_rdatum written out are the *full* multi-cap
+ * union (multicap_union_many) of whichever entries the overall-cap-driven
+ * split above assigned to each side, not just their overall caps -- this is
+ * what lets the tighter sub-cap representation propagate into internal
+ * nodes rather than collapsing back to one cap per node immediately above
+ * the leaves.
  */
 PG_FUNCTION_INFO_V1(skyregion_gist_picksplit);
 Datum
@@ -365,19 +565,18 @@ skyregion_gist_picksplit(PG_FUNCTION_ARGS)
 	 * +1/-1 conversion). */
 	OffsetNumber maxoff = (OffsetNumber) (entryvec->n - 1);
 	int			n = maxoff - FirstOffsetNumber + 1;
-	sc_vec3    *c = palloc(sizeof(sc_vec3) * (maxoff + 1));
-	double	   *r = palloc(sizeof(double) * (maxoff + 1));
+	GistMultiCap *mc = palloc(sizeof(GistMultiCap) * (maxoff + 1));
 	int			minfill = Max(1, n * 3 / 10);
 	axis_sort_entry *sorted = palloc(sizeof(axis_sort_entry) * n);
-	sc_vec3    *fwdC = palloc(sizeof(sc_vec3) * n);	/* fwdC[k]/fwdR[k]: union of sorted[0..k] */
+	sc_vec3    *fwdC = palloc(sizeof(sc_vec3) * n);	/* fwdC[k]/fwdR[k]: overall union of sorted[0..k] */
 	double	   *fwdR = palloc(sizeof(double) * n);
-	sc_vec3    *bwdC = palloc(sizeof(sc_vec3) * n);	/* bwdC[k]/bwdR[k]: union of sorted[k..n-1] */
+	sc_vec3    *bwdC = palloc(sizeof(sc_vec3) * n);	/* bwdC[k]/bwdR[k]: overall union of sorted[k..n-1] */
 	double	   *bwdR = palloc(sizeof(double) * n);
 	int			bestAxis = 0;
 	double		bestAxisMargin = HUGE_VAL;
 
 	for (OffsetNumber i = FirstOffsetNumber; i <= maxoff; i++)
-		bytea_to_cap(DatumGetByteaP(entryvec->vector[i].key), &c[i], &r[i]);
+		bytea_to_multicap(DatumGetByteaP(entryvec->vector[i].key), &mc[i]);
 
 	for (int axis = 0; axis < 3; axis++)
 	{
@@ -386,20 +585,23 @@ skyregion_gist_picksplit(PG_FUNCTION_ARGS)
 		for (int k = 0; k < n; k++)
 		{
 			OffsetNumber idx = (OffsetNumber) (k + FirstOffsetNumber);
+			sc_vec3		c = cap_center(mc[idx].overall);
 
 			sorted[k].idx = idx;
-			sorted[k].key = (axis == 0) ? c[idx].x : (axis == 1) ? c[idx].y : c[idx].z;
+			sorted[k].key = (axis == 0) ? c.x : (axis == 1) ? c.y : c.z;
 		}
 		qsort(sorted, n, sizeof(axis_sort_entry), axis_sort_cmp);
 
-		fwdC[0] = c[sorted[0].idx];
-		fwdR[0] = r[sorted[0].idx];
+		fwdC[0] = cap_center(mc[sorted[0].idx].overall);
+		fwdR[0] = mc[sorted[0].idx].overall.radius;
 		for (int k = 1; k < n; k++)
-			cap_union2(fwdC[k - 1], fwdR[k - 1], c[sorted[k].idx], r[sorted[k].idx], &fwdC[k], &fwdR[k]);
-		bwdC[n - 1] = c[sorted[n - 1].idx];
-		bwdR[n - 1] = r[sorted[n - 1].idx];
+			cap_union2(fwdC[k - 1], fwdR[k - 1], cap_center(mc[sorted[k].idx].overall),
+					   mc[sorted[k].idx].overall.radius, &fwdC[k], &fwdR[k]);
+		bwdC[n - 1] = cap_center(mc[sorted[n - 1].idx].overall);
+		bwdR[n - 1] = mc[sorted[n - 1].idx].overall.radius;
 		for (int k = n - 2; k >= 0; k--)
-			cap_union2(bwdC[k + 1], bwdR[k + 1], c[sorted[k].idx], r[sorted[k].idx], &bwdC[k], &bwdR[k]);
+			cap_union2(bwdC[k + 1], bwdR[k + 1], cap_center(mc[sorted[k].idx].overall),
+					   mc[sorted[k].idx].overall.radius, &bwdC[k], &bwdR[k]);
 
 		for (int m = minfill; m <= n - minfill; m++)
 			marginSum += fwdR[m - 1] + bwdR[m];
@@ -416,19 +618,22 @@ skyregion_gist_picksplit(PG_FUNCTION_ARGS)
 	for (int k = 0; k < n; k++)
 	{
 		OffsetNumber idx = (OffsetNumber) (k + FirstOffsetNumber);
+		sc_vec3		c = cap_center(mc[idx].overall);
 
 		sorted[k].idx = idx;
-		sorted[k].key = (bestAxis == 0) ? c[idx].x : (bestAxis == 1) ? c[idx].y : c[idx].z;
+		sorted[k].key = (bestAxis == 0) ? c.x : (bestAxis == 1) ? c.y : c.z;
 	}
 	qsort(sorted, n, sizeof(axis_sort_entry), axis_sort_cmp);
-	fwdC[0] = c[sorted[0].idx];
-	fwdR[0] = r[sorted[0].idx];
+	fwdC[0] = cap_center(mc[sorted[0].idx].overall);
+	fwdR[0] = mc[sorted[0].idx].overall.radius;
 	for (int k = 1; k < n; k++)
-		cap_union2(fwdC[k - 1], fwdR[k - 1], c[sorted[k].idx], r[sorted[k].idx], &fwdC[k], &fwdR[k]);
-	bwdC[n - 1] = c[sorted[n - 1].idx];
-	bwdR[n - 1] = r[sorted[n - 1].idx];
+		cap_union2(fwdC[k - 1], fwdR[k - 1], cap_center(mc[sorted[k].idx].overall),
+				   mc[sorted[k].idx].overall.radius, &fwdC[k], &fwdR[k]);
+	bwdC[n - 1] = cap_center(mc[sorted[n - 1].idx].overall);
+	bwdR[n - 1] = mc[sorted[n - 1].idx].overall.radius;
 	for (int k = n - 2; k >= 0; k--)
-		cap_union2(bwdC[k + 1], bwdR[k + 1], c[sorted[k].idx], r[sorted[k].idx], &bwdC[k], &bwdR[k]);
+		cap_union2(bwdC[k + 1], bwdR[k + 1], cap_center(mc[sorted[k].idx].overall),
+				   mc[sorted[k].idx].overall.radius, &bwdC[k], &bwdR[k]);
 
 	{
 		int			bestM = minfill;
@@ -437,7 +642,9 @@ skyregion_gist_picksplit(PG_FUNCTION_ARGS)
 
 		for (int m = minfill; m <= n - minfill; m++)
 		{
-			double		overlap = cap_overlap_amount(fwdC[m - 1], fwdR[m - 1], bwdC[m], bwdR[m]);
+			GistCap		lc = cap_make(fwdC[m - 1], fwdR[m - 1]);
+			GistCap		rc = cap_make(bwdC[m], bwdR[m]);
+			double		overlap = cap_overlap_amount(lc, rc);
 			double		area = cap_area_proxy(fwdR[m - 1]) + cap_area_proxy(bwdR[m]);
 
 			if (overlap < bestOverlap || (overlap == bestOverlap && area < bestArea))
@@ -456,12 +663,26 @@ skyregion_gist_picksplit(PG_FUNCTION_ARGS)
 		for (int k = bestM; k < n; k++)
 			v->spl_right[v->spl_nright++] = sorted[k].idx;
 
-		v->spl_ldatum = PointerGetDatum(cap_to_bytea(fwdC[bestM - 1], fwdR[bestM - 1]));
-		v->spl_rdatum = PointerGetDatum(cap_to_bytea(bwdC[bestM], bwdR[bestM]));
+		{
+			const GistMultiCap **lptrs = palloc(sizeof(GistMultiCap *) * bestM);
+			const GistMultiCap **rptrs = palloc(sizeof(GistMultiCap *) * (n - bestM));
+			GistMultiCap lout,
+						rout;
+
+			for (int k = 0; k < bestM; k++)
+				lptrs[k] = &mc[sorted[k].idx];
+			for (int k = bestM; k < n; k++)
+				rptrs[k - bestM] = &mc[sorted[k].idx];
+			multicap_union_many(lptrs, bestM, &lout);
+			multicap_union_many(rptrs, n - bestM, &rout);
+			v->spl_ldatum = PointerGetDatum(multicap_to_bytea(&lout));
+			v->spl_rdatum = PointerGetDatum(multicap_to_bytea(&rout));
+			pfree(lptrs);
+			pfree(rptrs);
+		}
 	}
 
-	pfree(c);
-	pfree(r);
+	pfree(mc);
 	pfree(sorted);
 	pfree(fwdC);
 	pfree(fwdR);
@@ -477,14 +698,15 @@ skyregion_gist_same(PG_FUNCTION_ARGS)
 	bytea	   *a = PG_GETARG_BYTEA_P(0);
 	bytea	   *b = PG_GETARG_BYTEA_P(1);
 	bool	   *result = (bool *) PG_GETARG_POINTER(2);
-	sc_vec3		ca,
-				cb;
-	double		ra,
-				rb;
+	GistMultiCap ma,
+				mb;
 
-	bytea_to_cap(a, &ca, &ra);
-	bytea_to_cap(b, &cb, &rb);
-	*result = (fabs(ra - rb) < 1e-12 && sc_angle(ca, cb) < 1e-12);
+	/* a full-byte comparison of the (fixed-size, deterministically packed)
+	 * key is the safe choice: a false "not same" just misses a rare
+	 * optimisation, a false "same" would be a real bug. */
+	bytea_to_multicap(a, &ma);
+	bytea_to_multicap(b, &mb);
+	*result = (memcmp(&ma, &mb, sizeof(GistMultiCap)) == 0);
 	PG_RETURN_POINTER(result);
 }
 
@@ -493,7 +715,7 @@ skyregion_gist_same(PG_FUNCTION_ARGS)
  * one probe row's index scan that can easily be dozens of internal-page
  * entries plus every matching leaf, all with the *same* query argument (the
  * one outer row's region, unchanged for the scan's lifetime). Re-parsing
- * that region and recomputing its bounding cap on every single call is
+ * that region and recomputing its multi-cap key on every single call is
  * wasted work worth caching in fn_extra, the same pattern skycell.c's
  * cone/poly/hist caches already use elsewhere in this extension -- but
  * keyed on the query Datum's own *bytes*, not its pointer: in a join (this
@@ -501,19 +723,20 @@ skyregion_gist_same(PG_FUNCTION_ARGS)
  * context that is reset and reused for the next row, so two genuinely
  * different rows' region values can legitimately land at the same address.
  * A pointer-identity cache took that as "same value, skip recomputing" and
- * silently reused a stale, wrong cap -- consistent() returning a false
- * "no overlap" from it prunes a subtree outright, with no recheck to catch
- * it afterwards (unlike a false positive, which recheck still filters).
+ * silently reused a stale, wrong key -- consistent() returning a false "no
+ * overlap" from it prunes a subtree outright, with no recheck to catch it
+ * afterwards (unlike a false positive, which recheck still filters).
  * Caught by the large self-join correctness test after this cache first
- * went in: 61 of 64 true matches missing, 0 spurious ones -- exactly what a
- * stale cache causing false pruning looks like, not a geometry bug.
+ * went in (round one of this opclass, before the multi-cap redesign): 61 of
+ * 64 true matches missing, 0 spurious ones -- exactly what a stale cache
+ * causing false pruning looks like, not a geometry bug. See
+ * GIST_REGION_DESIGN.md for the full story.
  */
 typedef struct
 {
 	bytea	   *last_query;		/* palloc'd copy in fn_mcxt, or NULL */
 	Size		last_query_size;
-	sc_vec3		qc;
-	double		qr;
+	GistMultiCap qmc;
 }			region_gist_query_cache;
 
 PG_FUNCTION_INFO_V1(skyregion_gist_consistent);
@@ -527,11 +750,10 @@ skyregion_gist_consistent(PG_FUNCTION_ARGS)
 	region_gist_query_cache *qcache = (region_gist_query_cache *) fcinfo->flinfo->fn_extra;
 	bytea	   *qb = DatumGetByteaP(queryDatum);
 	Size		qsz = VARSIZE(qb);
-	sc_vec3		ec;
-	double		er;
+	GistMultiCap em;
 	bool		result;
 
-	bytea_to_cap(DatumGetByteaP(entry->key), &ec, &er);
+	bytea_to_multicap(DatumGetByteaP(entry->key), &em);
 
 	switch (strategy)
 	{
@@ -547,7 +769,7 @@ skyregion_gist_consistent(PG_FUNCTION_ARGS)
 				sc_region	qreg;
 
 				skycell_region_from_datum(queryDatum, &qreg);
-				sc_region_bounding_cap(&qreg, &qcache->qc, &qcache->qr);
+				region_to_multicap(&qreg, &qcache->qmc);
 				sc_region_free(&qreg);
 
 				if (qcache->last_query == NULL || qcache->last_query_size < qsz)
@@ -559,7 +781,7 @@ skyregion_gist_consistent(PG_FUNCTION_ARGS)
 				memcpy(qcache->last_query, qb, qsz);
 				qcache->last_query_size = qsz;
 			}
-			result = cap_overlaps(ec, er, qcache->qc, qcache->qr);
+			result = multicap_overlaps(&em, &qcache->qmc);
 			*recheck = true;	/* the cap test is lossy either way */
 			break;
 		default:

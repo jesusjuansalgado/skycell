@@ -1,11 +1,13 @@
 # A GiST opclass for skyregion: design notes
 
 Branch: `claude/zealous-cerf-mkda2j`. Status: a working, correctness-verified
-opclass for one strategy (`&&`, region-region `INTERSECTS`), tuned once past
-the initial spike (Quadratic split + a value-cached `consistent`) to close
-most of the gap to pgSphere's native opclass. Still not exercised under
-concurrent writes, and `<@`/`@>` aren't wired up. See "Spike scope" and
-"Performance" below for exactly what is and isn't built and measured.
+opclass for one strategy (`&&`, region-region `INTERSECTS`), now on its third
+design pass: past the initial spike (Quadratic split + a value-cached
+`consistent`), past a split-algorithm pass that plateaued (R*-tree-style
+split), to a multi-cap key redesign that closes the at-scale gap to pgSphere
+and beats it outright at smaller scale. Still not exercised under concurrent
+writes, and `<@`/`@>` aren't wired up. See "Round three" for the current
+design and numbers, and "Spike scope"/"Performance" for the full history.
 
 ## Why this, and why now
 
@@ -209,13 +211,94 @@ shape PostgreSQL's own `box` opclass uses), and it costs less to compute
 (O(n log n) vs O(n^2) per split, a real win for index *build* time even
 where it didn't move query time).
 
+## Round three: a multi-cap key, and it actually closes the gap
+
+Round two's diagnosis pointed at the key, not the split algorithm: a single
+bounding cap per region can't discriminate between enough same-scale,
+overlapping regions once a footprint table gets large, and no split
+algorithm can fix that after the fact. The fix tried here: give each region
+up to **four** bounding caps instead of one, reusing machinery the extension
+already had rather than inventing new geometry.
+
+**The key.** `GistMultiCap = { overall: GistCap; sub[4]: GistCap }`. A cone
+still gets exactly one sub-cap (itself, exact -- no approximation loss for
+the shape that was already exact). A polygon is decomposed via the
+extension's own MOC builder (`moc_for_region`, previously `static` in
+`skycell.c`, now exposed through `skycell_internal.h` for `gist_region.c` to
+call directly) into up to four HEALPix cells at order <= 20, each converted
+to a `(center, radius)` cap via the existing `sc_pix2vec`/`sc_pixrad`/
+`sc_nuniq_decode` functions. `overall` is a plain union of the sub-caps,
+computed and stored only as a cheap summary for `picksplit`'s axis-sort
+heuristic and as a fast reject in `consistent()` -- every real overlap test
+in `consistent()` walks the sub-cap lists (`multicap_overlaps`), never just
+`overall` alone, since collapsing back to one cap there would throw away
+exactly the precision this redesign is for.
+
+**Merging many regions' sub-caps down to four.** `union()` (merging a whole
+page's worth of entries into a parent key) and `penalty()` (merging two)
+both need to reduce an arbitrary flat list of caps to at most four. Used a
+greedy nearest-cluster-absorption pass (`merge_caps_greedy`): seed with the
+first four caps, then fold each remaining cap into whichever of the four
+running clusters it would waste the least area merging into. This is
+O(n * 4), not a globally-optimal clustering -- deliberately cheap, since
+both functions run on every index build/insert, not just at query time.
+
+**`picksplit`** keeps the R*-tree-style axis-sort/margin/overlap structure
+from round two, still driven by each entry's `.overall` cap for the split
+*decision* (sorting and margin-summing four sub-caps per entry, three times
+over, would multiply picksplit's own cost for no clear benefit -- the
+overall cap is a fine proxy for *where* to cut). But the two output keys
+(`spl_ldatum`/`spl_rdatum`) are built via `multicap_union_many` over the
+*full* multi-cap sets of the entries assigned to each side, not by unioning
+their overall caps -- so the sharper sub-cap structure actually propagates
+into internal nodes, not just leaves, which is precisely what round two's
+`EXPLAIN (ANALYZE, BUFFERS)` finding (excess internal-page traversal) called
+for.
+
+**Results, same two scales as round two, same query shape:**
+
+| approach | 200 x 5,000 | 500 x 50,000 (25x the pair-work) |
+|---|---|---|
+| pgSphere native `&&` | ~25-27 ms | ~89-93 ms |
+| MOC-ranges recipe (#6) | ~72-75 ms | ~252-284 ms |
+| this opclass, round two (single cap) | ~30-34 ms | ~466-477 ms |
+| **this opclass, round three (multi-cap)** | **~6.8-6.9 ms** | **~106-115 ms** |
+
+Both scopes agree exactly with brute force at both scales (203/203 matches
+at 5000 rows; 1282/1282 at 50,000 rows, 0 false positives/negatives).
+Correctness was also re-checked against a fresh 2923-row mixed circle/
+polygon self-join stress test (clusters near both poles and RA=0/360,
+sizes spanning ~2 orders of magnitude, same shape as the earlier one but
+regenerated): 104,215/104,215 matches, 0 false positives, 0 false
+negatives.
+
+This is the headline result of the whole investigation: the multi-cap key
+doesn't just close the at-scale gap round two found, it makes this opclass
+**faster than pgSphere's native operator** at the smaller scale (~3.7x) and
+**close to it** at the larger one (~1.2x slower, down from ~5.3x slower with
+the single-cap key), while beating the MOC-ranges recipe at both scales by
+a wide margin. The scaling ratio itself (6.8ms -> ~110ms is still a steeper
+25x-work-for-~16x-time curve than pgSphere's own ~3.5x) shows the multi-cap
+key hasn't changed the fundamental shape of the scaling curve -- it has
+just moved the whole curve down far enough that it no longer matters at
+either scale tested. Whether it still matters at 500,000+ rows is untested;
+the same MAX_SUBCAPS=4 cap could in principle need to grow for far larger
+or far more oddly-shaped polygon-heavy tables, but there is no evidence yet
+that it does.
+
 ## Spike scope
 
 Built and measured:
 
 - `compress`, `decompress`, `union`, `penalty`, `same`, `consistent` (`&&`
-  only), and `picksplit` (see below, and "Picksplit, round two" further down
-  for why it went through three versions).
+  only), and `picksplit` (see below, "Picksplit, round two", and "Round
+  three" further up for why the key and split went through three versions).
+- The key is now `GistMultiCap` (up to 4 sub-caps per region plus a summary
+  `overall` cap), not a single `GistCap` -- see "Round three" above for the
+  full design. Everything below this point describes pieces that predate
+  that redesign but are otherwise still accurate (the R*-tree split
+  structure, the value-based query cache, the `cap_union2` weak spot, etc.)
+  now operating on multi-cap keys instead of single caps.
 - `picksplit` is now an **R*-tree-style split** (Beckmann et al. 1990),
   adapted from axis-aligned boxes to spherical caps: try sorting the entries
   by their cap centre's x, y, and z coordinate in turn (three candidate
@@ -298,26 +381,27 @@ costlier Quadratic split.
 
 The core hypothesis -- `skyregion` can carry a real, standards-shaped GiST
 opclass, built almost entirely from pieces the extension already had
-(`sc_region_centroid`, the newly-exposed `region_farthest`, and
-`sc_region_overlaps`'s own overlap formula) -- still holds, and the
-correctness bar is solid: two real, well-understood bugs found and fixed
-along the way, both re-verified against a 2923-row/33,361-pair stress test
-each time. But the performance verdict has to lead with the larger-scale
-result, not the smaller one this investigation started with: **at 5000
-rows this opclass looks competitive with pgSphere; at 50,000 rows it is 5x
-slower, and even the manual MOC-ranges recipe beats it.** Two split
-algorithms (Quadratic, then R*-tree-style) gave one real win (2.5x, from
-Quadratic) and one null result (R*-tree-style, on top of Quadratic) --
-enough evidence that a *third* split algorithm is not the next thing worth
-trying. The bottleneck this points to is the bounding-cap key itself being
-too coarse once enough same-scale regions accumulate, which is a
-representation question, not a tree-balancing one -- closing it for real
-would mean a sharper per-region key (something closer to the MOC-ranges
-recipe's multiple cell ranges, or an entirely different embedding), which
-is a bigger redesign than this branch's remaining scope, not a tuning pass.
-Recommendation: this opclass is a solid answer to "can `&&` be indexed
-directly, with a correct, working implementation and two genuinely
-instructive bugs to show for it" and not yet a good answer to "should this
-replace the MOC-ranges recipe" -- that call should wait on whether closing
-the at-scale gap is worth a real key redesign, not on further picksplit
-tuning.
+(`sc_region_centroid`, the newly-exposed `region_farthest`, the existing MOC
+builder, and `sc_region_overlaps`'s own overlap formula) -- holds, and now
+the performance verdict is a genuinely good one, not a qualified one. Three
+rounds of tuning: Quadratic split (2.5x win), R*-tree-style split (null
+result on top of Quadratic, but confirmed the bottleneck was the key, not
+the split algorithm), and a multi-cap key redesign (the real win) -- took
+this opclass from "2-3x slower than pgSphere, competitive only at small
+scale" to **faster than pgSphere at 5000 rows and within ~1.2x of it at
+50,000**, while beating the MOC-ranges recipe -- the manual recipe this
+opclass was meant to replace -- at both scales by 2.5-10x. The correctness
+bar stayed solid throughout: two real, well-understood bugs found and fixed
+in earlier rounds (the `picksplit` offset-convention crash, the pointer-
+identity cache), a third design pass that introduced no new ones, and a
+fresh 2923-row/104,215-pair stress test plus both benchmark scales agreeing
+exactly with brute force after the multi-cap rewrite.
+
+Recommendation: this opclass is now a good answer to both of the questions
+this investigation opened with -- "can `&&` be indexed directly, correctly"
+and "should this replace the MOC-ranges recipe" -- yes to both, on the
+evidence gathered here. What's left before calling it non-experimental is
+scope, not performance: `<@`/`@>` strategies are unbuilt, concurrent-write
+behavior is untested, and the two scales measured (5000, 50,000 rows) don't
+prove the multi-cap key's advantage holds at 500,000+ rows or under a very
+different footprint-size distribution than the ones benchmarked here.

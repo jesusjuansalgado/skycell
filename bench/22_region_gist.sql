@@ -9,11 +9,13 @@
 -- Depends on `fpr` from 20_region_xmatch.sql (2500 circle + 2500 polygon
 -- footprints): run that script first.
 --
--- The comparison to pgSphere/the MOC-ranges recipe is scale-sensitive: this
--- opclass looks competitive at fpr's default 5000 rows but falls behind both
--- at 50,000 (`20_region_xmatch.sql -v nfp=50000`, this script with
--- `-v nprobe=500`) -- see GIST_REGION_DESIGN.md's "Picksplit, round two"
--- before trusting a single run of this script at the default size.
+-- As of the multi-cap key redesign (GIST_REGION_DESIGN.md's "Round three"),
+-- this opclass beats pgSphere's native && at fpr's default 5000 rows and
+-- stays within ~1.2x of it at 50,000 (`20_region_xmatch.sql -v nfp=50000`,
+-- this script with `-v nprobe=500`), and beats the MOC-ranges recipe at both
+-- scales. Earlier single-cap versions of this opclass were competitive only
+-- at the smaller scale -- see "Picksplit, round two" for that history if
+-- comparing against an older commit.
 \set ON_ERROR_STOP 1
 \if :{?nprobe}
 \else

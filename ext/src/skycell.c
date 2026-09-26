@@ -2058,7 +2058,7 @@ skycell_nuniq_hi(PG_FUNCTION_ARGS)
  * partial cell with the most outside area first (S2 RegionCoverer style).
  * Used to index stored regions (footprints) in a plain B-tree.
  */
-static ArrayType *
+ArrayType *
 moc_for_region(const sc_region *r, int max_cells, int max_order)
 {
 	typedef struct
