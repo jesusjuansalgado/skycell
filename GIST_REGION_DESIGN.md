@@ -1,9 +1,11 @@
 # A GiST opclass for skyregion: design notes
 
 Branch: `claude/zealous-cerf-mkda2j`. Status: a working, correctness-verified
-spike for one strategy (`&&`, region-region `INTERSECTS`), not a tuned or
-production-ready index. See "Spike scope" below for exactly what is and isn't
-built and measured.
+opclass for one strategy (`&&`, region-region `INTERSECTS`), tuned once past
+the initial spike (Quadratic split + a value-cached `consistent`) to close
+most of the gap to pgSphere's native opclass. Still not exercised under
+concurrent writes, and `<@`/`@>` aren't wired up. See "Spike scope" and
+"Performance" below for exactly what is and isn't built and measured.
 
 ## Why this, and why now
 
@@ -93,7 +95,7 @@ packing -- was ruled out first, by switching to `memcpy` and `VARDATA_ANY`;
 neither actually the cause, but both are still correct, defensive choices
 worth keeping regardless.)
 
-This is the single most important finding in this document, arguably more
+This is the single most important finding from the first pass, arguably more
 than the performance numbers below: **a subtly wrong GiST opclass doesn't
 fail loudly or return wrong rows -- it crashes the server**, and only past a
 row count large enough to force a page split, which a small smoke test
@@ -102,20 +104,67 @@ correctly; the bug only showed up at ~3000 rows). Any future work on this
 opclass, or any new one, needs a correctness test large enough to force
 multiple splits before it can be trusted at all.
 
+## A second bug, from the performance pass, and a sharper lesson
+
+Closing the performance gap to pgSphere (see "Performance" below) started
+with an obvious win: `consistent()` is called once per index entry visited
+during a scan, and for one probe row's scan that's easily dozens of calls,
+all with the *same* query region -- yet the first version re-parsed that
+region and recomputed its bounding cap from scratch on every single call.
+Cached it in `fn_extra`, keyed on the query `Datum`'s own pointer, the same
+shape `skycell.c`'s existing cone/poly/histogram caches already use.
+
+The correctness suite caught this immediately: the self-join test that had
+been 33,361/33,361 dropped to 3/64 matches on a smaller fixture used while
+iterating -- 61 real matches silently missing, zero spurious ones. The
+pointer-identity cache is unsound specifically *because* this opclass's main
+use case is a join: PostgreSQL gives each outer row's evaluation a fresh
+per-tuple memory context that gets reset and reused for the next row, so two
+genuinely *different* rows' region values can land at the exact same
+address. The cache took a matching pointer as "same value as last time, skip
+recomputing" and silently kept serving a stale cap from an unrelated earlier
+row. That is not a survivable kind of wrong: a false "no overlap" from
+`consistent()` prunes a subtree outright, with no recheck downstream to
+catch it -- unlike a false *positive*, which the real `intersects()` recheck
+still filters out correctly. Zero false positives, en masse false negatives,
+is exactly what a stale-cache-causing-false-pruning bug looks like, and nailed
+down the cause immediately once framed that way.
+
+Fixed by keying the cache on the query's actual *bytes* (a `memcmp` against a
+copy held in `fn_extra`) instead of the Datum's pointer -- still a real win
+within one scan (the same region's bytes genuinely repeat across all the
+calls consistent() makes while walking one probe row's tree), but immune to
+address reuse across different rows, since it compares content, not
+identity. Re-ran the full 2923-row/33,361-pair correctness check clean
+afterward. **The general lesson, sharper than "test at a scale that forces a
+split": for a GiST opclass whose whole point is serving joins, `fn_extra`
+caching keyed on Datum pointer identity is unsound by construction, not just
+occasionally unlucky** -- the fresh-per-tuple-context/address-reuse pattern
+this hits is exactly how PostgreSQL evaluates a join's inner index scan for
+every outer row, not an edge case.
+
 ## Spike scope
 
 Built and measured:
 
 - `compress`, `decompress`, `union`, `penalty`, `same`, `consistent` (`&&`
   only), and `picksplit` (see below).
-- `picksplit` is Guttman's original **linear split**: pick the two entries
-  whose caps are farthest apart as seeds, then greedily assign every other
-  entry to whichever seed's group needs the smaller penalty to absorb it,
-  with a simple guard against a fully lopsided split. This is *correct* for
-  any resulting grouping (union is always recomputed from whatever ends up on
-  each side), but it is not the R*-tree-style split PostgreSQL's own `box`
-  opclass uses, and tree quality -- so query performance -- has real,
-  unexplored headroom left on the table.
+- `picksplit` is Guttman's **Quadratic split**: seeds are the pair whose
+  combined cap wastes the most area if forced together (`area(union(i,j)) -
+  area(i) - area(j)`, not just the pair that's farthest apart -- a large but
+  mostly-overlapping pair wastes little and is a poor seed choice even if its
+  centres are far apart), and the remaining entries are assigned one at a
+  time, each round picking whichever unassigned entry has the *largest*
+  preference margin between the two groups (not positional/arbitrary order,
+  so the entries with a weak preference are placed last, once the groups'
+  shapes are already mostly settled). This replaced an initial, cheaper
+  Linear split (arbitrary-order seeds and assignment) once benchmarking
+  showed real headroom; see "Performance" for what it was worth. Still short
+  of the R*-tree margin/overlap search PostgreSQL's own `box` opclass uses --
+  a further, smaller lever if more is ever wanted.
+- `consistent()` caches the query region's bounding cap across repeated calls
+  within one scan (see the bug writeup above for why this has to be a
+  value-based cache, not a pointer-based one).
 - `cap_union2`'s general-position formula (place the merged cap's centre
   along the geodesic between the two input centres, radius =
   `(d + r1 + r2) / 2`) has a documented, un-exercised weak spot: near-
@@ -129,8 +178,8 @@ Not built: `<@`/`@>` strategies (point-in-region or full containment via the
 same opclass -- likely a small addition once `&&` is trusted, since the cap
 math is identical, only the strategy dispatch in `consistent` would grow),
 concurrent-insert/VACUUM stress testing (only single-threaded `CREATE INDEX`
-and read-only querying were exercised), and any tuning pass on `picksplit`
-or the `penalty` cap-area-proxy weighting.
+and read-only querying were exercised), and the R*-tree-style split
+mentioned above.
 
 ## Correctness
 
@@ -155,32 +204,38 @@ overlap.sql`'s MOC-ranges recipe and pgSphere's native `&&` already agree on.
 Same 200-probe x 5000-footprint join as `bench/21_region_overlap.sql`
 (`bench/22_region_gist.sql`, same probe construction, same seed):
 
-| approach | time | setup needed | matches |
-|---|---|---|---|
-| unindexed (`intersects()`) | ~1.4-1.8 s | none | 203 |
-| MOC-ranges recipe (PR #6) | ~74-75 ms | side table + hand-written join | 203 |
-| **this opclass** | **~80-83 ms** | `CREATE INDEX ... USING gist (region)` | 203 |
-| pgSphere native `&&` | ~27-42 ms | none (native types) | 203 |
+| approach | time (before tuning) | time (after: Quadratic split + cached consistent) | setup needed | matches |
+|---|---|---|---|---|
+| unindexed (`intersects()`) | ~1.4-1.8 s | -- (unchanged) | none | 203 |
+| MOC-ranges recipe (PR #6) | ~74-75 ms | -- (unchanged) | side table + hand-written join | 203 |
+| **this opclass** | ~80-83 ms | **~31-34 ms** | `CREATE INDEX ... USING gist (region)` | 203 |
+| pgSphere native `&&` | ~27-42 ms | ~25-27 ms (re-measured same run) | none (native types) | 203 |
 
-So: roughly on par with the MOC-ranges recipe's *speed*, for a materially
-better *interface* -- an ordinary index and an ordinary `&&`, no side table,
-no `LATERAL`, no manual recheck -- but still 2-3x behind pgSphere's own
-mature, tuned opclass. Confirmed via `EXPLAIN`: the join plans as
-`Nested Loop -> Index Scan using <idx> on fpr, Index Cond: (s_region &&
-p.s_region)`, i.e. a genuine per-row (non-constant) indexed nested loop, the
-same shape a GiST-backed join always takes -- no special-casing was needed
-for "the query side isn't a literal", which is precisely the point of
-building a real opclass instead of a recipe.
+The tuning pass -- Guttman's Quadratic split instead of Linear, plus caching
+`consistent()`'s query-cap computation across repeated calls in one scan --
+roughly **2.5x'd** this opclass's own speed and closed the gap to pgSphere
+from 2-3x down to about **1.2-1.4x**, on this benchmark. `EXPLAIN` confirms
+the join still plans as `Nested Loop -> Index Scan using <idx> on fpr,
+Index Cond: (s_region && p.s_region)`, a genuine per-row (non-constant)
+indexed nested loop -- no special-casing was needed for "the query side
+isn't a literal", which is precisely the point of building a real opclass
+instead of a recipe. Index build itself stayed cheap: ~205ms for 5000 rows
+with the more expensive Quadratic split, not a concern at this scale.
 
 ## Where this leaves the decision
 
-The core hypothesis holds: `skyregion` can carry a real, standards-shaped
-GiST opclass, built almost entirely from pieces the extension already had
-(`sc_region_centroid`, the newly-exposed `region_farthest`, and
-`sc_region_overlaps`'s own overlap formula), and it gets to roughly the same
-speed as the recipe this replaces while being much nicer to use. It is not
-yet faster than either the recipe or pgSphere, and the honest reason is
-`picksplit` quality, not the cap-key idea itself -- a linear split reliably
-builds a worse tree than a proper R*-tree-style split, and that gap is where
-pgSphere's decades of tuning actually live. Closing it further is a tuning
-project on top of a now-validated foundation, not a new design question.
+The core hypothesis holds, and better than the first pass suggested:
+`skyregion` can carry a real, standards-shaped GiST opclass, built almost
+entirely from pieces the extension already had (`sc_region_centroid`, the
+newly-exposed `region_farthest`, and `sc_region_overlaps`'s own overlap
+formula), and with one further, still-modest tuning pass (a standard
+textbook split algorithm, a correctly-scoped cache) it now lands within
+striking distance of pgSphere's own mature, tuned opclass rather than
+trailing it by 2-3x. The remaining gap's likely source is the same one
+named after the first pass -- Quadratic split still isn't the R*-tree
+margin/overlap search PostgreSQL's own `box` opclass uses -- but the
+returns from *this* round of tuning (2.5x from two contained, well-
+understood changes) suggest the remaining gap is worth closing only if the
+opclass is going somewhere real: `<@`/`@>` support, concurrent-write
+testing, and a decision on whether an experimental spike graduates to
+something this project ships.

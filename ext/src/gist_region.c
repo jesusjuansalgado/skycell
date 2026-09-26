@@ -37,17 +37,19 @@
  * project's own benchmarks), not on PostgreSQL's textbook point/box
  * example, since a unit-sphere cap has no direct textbook analogue.
  *
- * STATUS: a correctness-first spike, not yet a tuned index. picksplit uses
- * a simple max-distance-seed linear split (R-tree "linear split", not the
- * R*-tree-style split PostgreSQL's own box opclass uses) -- correct, but
- * likely to build a lower-quality tree than a production opclass would.
- * cap_union's near-antipodal case (centres almost pi radians apart) is
- * approximated rather than handled exactly; skyregion itself already
- * forbids a cone larger than a hemisphere and a polygon spanning one, so a
- * single region's own cap cannot be near-antipodal internally, but a union
- * of two widely-separated small regions' caps could approach it. Meant to
- * answer "is this approach even worth pursuing further", not to be merged
- * as-is.
+ * STATUS: a correctness-verified spike, not yet a fully tuned index.
+ * picksplit uses Guttman's Quadratic split (waste-based seed selection,
+ * most-decisive-entry-first assignment) -- a real step up from this file's
+ * first version (a cheaper Linear split), but still short of the R*-tree
+ * margin/overlap search PostgreSQL's own box opclass uses, which is the
+ * likely remaining source of any gap to a mature native opclass like
+ * pgSphere's. cap_union's near-antipodal case (centres almost pi radians
+ * apart) is approximated rather than handled exactly; skyregion itself
+ * already forbids a cone larger than a hemisphere and a polygon spanning
+ * one, so a single region's own cap cannot be near-antipodal internally,
+ * but a union of two widely-separated small regions' caps could approach
+ * it. Meant to answer "is this approach even worth pursuing further", not
+ * to be merged as-is.
  *
  * picksplit's loop bounds below are OffsetNumber/FirstOffsetNumber, not
  * plain 0-based indices, on purpose: an earlier version treated
@@ -296,14 +298,23 @@ skyregion_gist_penalty(PG_FUNCTION_ARGS)
 }
 
 /*
- * Linear split (Guttman's original, not the R*-tree quadratic/greedy split
- * PostgreSQL's own box opclass uses): pick the two entries whose caps are
- * farthest apart as seeds, then assign every other entry to whichever
- * seed's group needs the smaller penalty to absorb it, breaking ties by
- * putting entries in the smaller group so a split cannot degenerate into
- * "everything on one side". Correct for any assignment (union is computed
- * from whatever ends up in each side), just not necessarily a *good* split
- * -- see the file header.
+ * Guttman's Quadratic split (the middle of his three algorithms -- costlier
+ * than Linear, still short of the R*-tree margin/overlap search PostgreSQL's
+ * own box opclass uses, but a real step up from this file's original linear-
+ * split spike, and the change that closed most of the gap to pgSphere's
+ * native opclass -- see GIST_REGION_DESIGN.md):
+ *
+ *   PickSeeds: the pair whose combined cap wastes the most area if forced
+ *   together -- area(union(i,j)) - area(i) - area(j) -- not just the pair
+ *   that's farthest apart (a large-but-mostly-overlapping pair wastes little
+ *   and is a poor seed choice even if its centres are far apart).
+ *
+ *   PickNext (assignment order): at each step, among all unassigned entries,
+ *   pick the one with the *largest preference margin* between the two
+ *   groups (|penalty_left - penalty_right|) and assign it now, not in
+ *   arbitrary/positional order -- the entries with a weak preference are
+ *   left for last, when the groups' shapes are already mostly settled and
+ *   there is more information to place them well.
  */
 PG_FUNCTION_INFO_V1(skyregion_gist_picksplit);
 Datum
@@ -319,6 +330,7 @@ skyregion_gist_picksplit(PG_FUNCTION_ARGS)
 	OffsetNumber maxoff = (OffsetNumber) (entryvec->n - 1);
 	sc_vec3    *c = palloc(sizeof(sc_vec3) * (maxoff + 1));
 	double	   *r = palloc(sizeof(double) * (maxoff + 1));
+	bool	   *assigned = palloc0(sizeof(bool) * (maxoff + 1));
 	OffsetNumber seed1 = FirstOffsetNumber,
 				seed2 = FirstOffsetNumber + 1;
 	double		worst = -1;
@@ -326,18 +338,24 @@ skyregion_gist_picksplit(PG_FUNCTION_ARGS)
 				rc;
 	double		lr,
 				rr;
+	int			nunassigned;
 
 	for (OffsetNumber i = FirstOffsetNumber; i <= maxoff; i++)
 		bytea_to_cap(DatumGetByteaP(entryvec->vector[i].key), &c[i], &r[i]);
 
+	/* PickSeeds */
 	for (OffsetNumber i = FirstOffsetNumber; i <= maxoff; i++)
 		for (OffsetNumber j = i + 1; j <= maxoff; j++)
 		{
-			double		d = sc_angle(c[i], c[j]) + r[i] + r[j];
+			sc_vec3		uc;
+			double		ur;
+			double		waste;
 
-			if (d > worst)
+			cap_union2(c[i], r[i], c[j], r[j], &uc, &ur);
+			waste = cap_area_proxy(ur) - cap_area_proxy(r[i]) - cap_area_proxy(r[j]);
+			if (waste > worst)
 			{
-				worst = d;
+				worst = waste;
 				seed1 = i;
 				seed2 = j;
 			}
@@ -350,57 +368,91 @@ skyregion_gist_picksplit(PG_FUNCTION_ARGS)
 	lr = r[seed1];
 	rc = c[seed2];
 	rr = r[seed2];
+	assigned[seed1] = assigned[seed2] = true;
+	v->spl_left[v->spl_nleft++] = seed1;
+	v->spl_right[v->spl_nright++] = seed2;
+	nunassigned = (maxoff - FirstOffsetNumber + 1) - 2;
 
-	for (OffsetNumber i = FirstOffsetNumber; i <= maxoff; i++)
+	/* PickNext, one entry at a time */
+	while (nunassigned > 0)
 	{
-		sc_vec3		ulc,
-					urc;
-		double		ulr,
-					urr;
-		double		pl,
-					pr;
-		bool		goLeft;
+		OffsetNumber best = InvalidOffsetNumber;
+		double		bestMargin = -1;
+		bool		bestGoLeft = true;
+		sc_vec3		bestUlc,
+					bestUrc;
+		double		bestUlr,
+					bestUrr;
 
-		if (i == seed1)
-		{
-			v->spl_left[v->spl_nleft++] = i;
-			continue;
-		}
-		if (i == seed2)
-		{
-			v->spl_right[v->spl_nright++] = i;
-			continue;
-		}
-
-		cap_union2(lc, lr, c[i], r[i], &ulc, &ulr);
-		cap_union2(rc, rr, c[i], r[i], &urc, &urr);
-		pl = cap_area_proxy(ulr) - cap_area_proxy(lr);
-		pr = cap_area_proxy(urr) - cap_area_proxy(rr);
-
-		if (pl < pr)
-			goLeft = true;
-		else if (pr < pl)
-			goLeft = false;
-		else
-			goLeft = (v->spl_nleft <= v->spl_nright);
-
-		/* keep either side from absorbing everything */
+		/* keep either side from absorbing everything: force all remaining
+		 * entries to the other side once one side is one short of full */
 		if (v->spl_nleft >= maxoff - 1)
-			goLeft = false;
-		else if (v->spl_nright >= maxoff - 1)
-			goLeft = true;
-
-		if (goLeft)
 		{
-			v->spl_left[v->spl_nleft++] = i;
-			lc = ulc;
-			lr = ulr;
+			for (OffsetNumber i = FirstOffsetNumber; i <= maxoff; i++)
+				if (!assigned[i])
+				{
+					cap_union2(rc, rr, c[i], r[i], &rc, &rr);
+					v->spl_right[v->spl_nright++] = i;
+					assigned[i] = true;
+				}
+			break;
+		}
+		if (v->spl_nright >= maxoff - 1)
+		{
+			for (OffsetNumber i = FirstOffsetNumber; i <= maxoff; i++)
+				if (!assigned[i])
+				{
+					cap_union2(lc, lr, c[i], r[i], &lc, &lr);
+					v->spl_left[v->spl_nleft++] = i;
+					assigned[i] = true;
+				}
+			break;
+		}
+
+		for (OffsetNumber i = FirstOffsetNumber; i <= maxoff; i++)
+		{
+			sc_vec3		ulc,
+						urc;
+			double		ulr,
+						urr;
+			double		pl,
+						pr,
+						margin;
+
+			if (assigned[i])
+				continue;
+
+			cap_union2(lc, lr, c[i], r[i], &ulc, &ulr);
+			cap_union2(rc, rr, c[i], r[i], &urc, &urr);
+			pl = cap_area_proxy(ulr) - cap_area_proxy(lr);
+			pr = cap_area_proxy(urr) - cap_area_proxy(rr);
+			margin = fabs(pl - pr);
+
+			if (margin > bestMargin)
+			{
+				bestMargin = margin;
+				best = i;
+				bestGoLeft = (pl < pr) || (pl == pr && v->spl_nleft <= v->spl_nright);
+				bestUlc = ulc;
+				bestUlr = ulr;
+				bestUrc = urc;
+				bestUrr = urr;
+			}
+		}
+
+		assigned[best] = true;
+		nunassigned--;
+		if (bestGoLeft)
+		{
+			v->spl_left[v->spl_nleft++] = best;
+			lc = bestUlc;
+			lr = bestUlr;
 		}
 		else
 		{
-			v->spl_right[v->spl_nright++] = i;
-			rc = urc;
-			rr = urr;
+			v->spl_right[v->spl_nright++] = best;
+			rc = bestUrc;
+			rr = bestUrr;
 		}
 	}
 
@@ -408,6 +460,7 @@ skyregion_gist_picksplit(PG_FUNCTION_ARGS)
 	v->spl_rdatum = PointerGetDatum(cap_to_bytea(rc, rr));
 	pfree(c);
 	pfree(r);
+	pfree(assigned);
 	PG_RETURN_POINTER(v);
 }
 
@@ -429,6 +482,34 @@ skyregion_gist_same(PG_FUNCTION_ARGS)
 	PG_RETURN_POINTER(result);
 }
 
+/*
+ * consistent() is called once per index entry visited during a scan -- for
+ * one probe row's index scan that can easily be dozens of internal-page
+ * entries plus every matching leaf, all with the *same* query argument (the
+ * one outer row's region, unchanged for the scan's lifetime). Re-parsing
+ * that region and recomputing its bounding cap on every single call is
+ * wasted work worth caching in fn_extra, the same pattern skycell.c's
+ * cone/poly/hist caches already use elsewhere in this extension -- but
+ * keyed on the query Datum's own *bytes*, not its pointer: in a join (this
+ * opclass's main use case), each outer row gets a fresh per-tuple memory
+ * context that is reset and reused for the next row, so two genuinely
+ * different rows' region values can legitimately land at the same address.
+ * A pointer-identity cache took that as "same value, skip recomputing" and
+ * silently reused a stale, wrong cap -- consistent() returning a false
+ * "no overlap" from it prunes a subtree outright, with no recheck to catch
+ * it afterwards (unlike a false positive, which recheck still filters).
+ * Caught by the large self-join correctness test after this cache first
+ * went in: 61 of 64 true matches missing, 0 spurious ones -- exactly what a
+ * stale cache causing false pruning looks like, not a geometry bug.
+ */
+typedef struct
+{
+	bytea	   *last_query;		/* palloc'd copy in fn_mcxt, or NULL */
+	Size		last_query_size;
+	sc_vec3		qc;
+	double		qr;
+}			region_gist_query_cache;
+
 PG_FUNCTION_INFO_V1(skyregion_gist_consistent);
 Datum
 skyregion_gist_consistent(PG_FUNCTION_ARGS)
@@ -437,11 +518,11 @@ skyregion_gist_consistent(PG_FUNCTION_ARGS)
 	Datum		queryDatum = PG_GETARG_DATUM(1);
 	StrategyNumber strategy = (StrategyNumber) PG_GETARG_UINT16(2);
 	bool	   *recheck = (bool *) PG_GETARG_POINTER(4);
-	sc_vec3		ec,
-				qc;
-	double		er,
-				qr;
-	sc_region	qreg;
+	region_gist_query_cache *qcache = (region_gist_query_cache *) fcinfo->flinfo->fn_extra;
+	bytea	   *qb = DatumGetByteaP(queryDatum);
+	Size		qsz = VARSIZE(qb);
+	sc_vec3		ec;
+	double		er;
 	bool		result;
 
 	bytea_to_cap(DatumGetByteaP(entry->key), &ec, &er);
@@ -449,10 +530,30 @@ skyregion_gist_consistent(PG_FUNCTION_ARGS)
 	switch (strategy)
 	{
 		case GIST_REGION_STRATEGY_OVERLAP:
-			skycell_region_from_datum(queryDatum, &qreg);
-			sc_region_bounding_cap(&qreg, &qc, &qr);
-			sc_region_free(&qreg);
-			result = cap_overlaps(ec, er, qc, qr);
+			if (qcache == NULL)
+			{
+				qcache = MemoryContextAllocZero(fcinfo->flinfo->fn_mcxt, sizeof(region_gist_query_cache));
+				fcinfo->flinfo->fn_extra = qcache;
+			}
+			if (qcache->last_query == NULL || qcache->last_query_size != qsz ||
+				memcmp(qcache->last_query, qb, qsz) != 0)
+			{
+				sc_region	qreg;
+
+				skycell_region_from_datum(queryDatum, &qreg);
+				sc_region_bounding_cap(&qreg, &qcache->qc, &qcache->qr);
+				sc_region_free(&qreg);
+
+				if (qcache->last_query == NULL || qcache->last_query_size < qsz)
+				{
+					if (qcache->last_query != NULL)
+						pfree(qcache->last_query);
+					qcache->last_query = MemoryContextAlloc(fcinfo->flinfo->fn_mcxt, qsz);
+				}
+				memcpy(qcache->last_query, qb, qsz);
+				qcache->last_query_size = qsz;
+			}
+			result = cap_overlaps(ec, er, qcache->qc, qcache->qr);
 			*recheck = true;	/* the cap test is lossy either way */
 			break;
 		default:
