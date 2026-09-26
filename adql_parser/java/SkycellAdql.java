@@ -207,25 +207,8 @@ public final class SkycellAdql {
                 String inner = raw.get(0), outer = raw.get(1);
                 String[] cols = pointOfColumns(inner);
                 if (dialect == Dialect.SKYCELL) {
-                    // A cross-match: the position is a pair of plain columns, the region
-                    // is a circle, and the circle is not a literal constant -- its centre
-                    // comes from another table's row. `<@`'s rewrite
-                    // (skycell_region_support) gives up outright when the region isn't a
-                    // compile-time constant, so this would otherwise reach no index at
-                    // all. skycell_radial_query (Q3C's own argument order) reaches
-                    // simplify_cone's non-constant branch instead, which still covers
-                    // with an index, if capped to skycell.join_slots ranges. A literal
-                    // circle is left as `<@`, which already reaches the same, uncapped
-                    // covering for that case.
-                    Matcher cm = Pattern.compile("\\s*CIRCLE\\s*\\((.*)\\)\\s*",
-                            Pattern.CASE_INSENSITIVE | Pattern.DOTALL).matcher(outer);
-                    if (cols != null && cm.matches()) {
-                        List<String> a = stripFrame(splitArgs(cm.group(1)), "CIRCLE");
-                        if (a.size() == 3 && !isConstCircle(a)) {
-                            return "skycell_radial_query(" + cols[0] + ", " + cols[1] + ", "
-                                    + a.get(0) + ", " + a.get(1) + ", " + a.get(2) + ")";
-                        }
-                    }
+                    String xm = crossmatchRadial(cols, outer);
+                    if (xm != null) return xm;
                     return "(" + translateExpression(inner) + " <@ " + translateExpression(outer) + ")";
                 }
                 Matcher m = Pattern.compile("\\s*(CIRCLE|POLYGON)\\s*\\((.*)\\)\\s*",
@@ -244,9 +227,20 @@ public final class SkycellAdql {
             }
             case "INTERSECTS": {
                 need(raw, 2, "INTERSECTS takes two geometries");
-                String a = translateExpression(raw.get(0)), b = translateExpression(raw.get(1));
-                return dialect == Dialect.SKYCELL
-                        ? "intersects(" + a + ", " + b + ")" : "(" + a + " && " + b + ")";
+                if (dialect == Dialect.SKYCELL) {
+                    // A point has no area: intersecting a region is the same as being
+                    // contained in it (see skycell_intersects_pos's own comment). A
+                    // cross-match written as INTERSECTS(POINT, CIRCLE) either way round
+                    // hits the same unindexed-non-constant-region gap as CONTAINS; reuse
+                    // its detection so it gets the same skycell_radial_query redirect.
+                    String xm = crossmatchRadial(pointOfColumns(raw.get(0)), raw.get(1));
+                    if (xm == null) xm = crossmatchRadial(pointOfColumns(raw.get(1)), raw.get(0));
+                    if (xm != null) return xm;
+                    return "intersects(" + translateExpression(raw.get(0)) + ", "
+                            + translateExpression(raw.get(1)) + ")";
+                }
+                return "(" + translateExpression(raw.get(0)) + " && "
+                        + translateExpression(raw.get(1)) + ")";
             }
             case "DISTANCE": {
                 if (raw.size() == 4) {              // ADQL 2.1 scalar form
@@ -294,6 +288,31 @@ public final class SkycellAdql {
 
     private static void need(List<String> a, int n, String message) {
         if (a.size() != n) throw new TranslationException(message);
+    }
+
+    /**
+     * skycell_radial_query(...) for a cross-match shape: {@code cols} a point
+     * over a pair of plain columns and {@code region} a CIRCLE whose centre or
+     * radius is not a literal constant -- it comes from another table's row.
+     * {@code <@}'s rewrite (skycell_region_support) gives up outright when the
+     * region isn't a compile-time constant, so this would otherwise reach no
+     * index at all. skycell_radial_query (Q3C's own argument order) reaches
+     * simplify_cone's non-constant branch instead, which still covers with an
+     * index, if capped to skycell.join_slots ranges. Null if the shape doesn't
+     * match -- a literal circle is left alone, since {@code <@}/{@code
+     * intersects} already reach the same, uncapped covering for that case.
+     */
+    private String crossmatchRadial(String[] cols, String region) {
+        if (cols == null) return null;
+        Matcher cm = Pattern.compile("\\s*CIRCLE\\s*\\((.*)\\)\\s*",
+                Pattern.CASE_INSENSITIVE | Pattern.DOTALL).matcher(region);
+        if (!cm.matches()) return null;
+        List<String> a = stripFrame(splitArgs(cm.group(1)), "CIRCLE");
+        if (a.size() == 3 && !isConstCircle(a)) {
+            return "skycell_radial_query(" + cols[0] + ", " + cols[1] + ", "
+                    + a.get(0) + ", " + a.get(1) + ", " + a.get(2) + ")";
+        }
+        return null;
     }
 
     /** POINT('ICRS', ra, dec) over plain columns -&gt; {ra, dec}, else null. */

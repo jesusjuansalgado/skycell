@@ -214,26 +214,38 @@ def _split_args(s: str) -> list[str]:
     return out
 
 
+def _crossmatch_radial(cols: tuple[str, str] | None, region: str, version: str) -> str | None:
+    """skycell_radial_query(...) for a cross-match shape: `cols` a point over a
+    pair of plain columns and `region` a CIRCLE whose centre or radius is not a
+    literal constant -- it comes from another table's row. `<@`'s rewrite
+    (skycell_region_support) gives up outright when the region isn't a
+    compile-time constant, so this would otherwise reach no index at all.
+    skycell_radial_query (Q3C's own argument order) reaches simplify_cone's
+    non-constant branch instead, which still covers with an index, if capped
+    to skycell.join_slots ranges. None if the shape doesn't match -- a literal
+    circle is left alone, since `<@`/`intersects` already reach the same,
+    uncapped covering for that case.
+    """
+    if not cols:
+        return None
+    m = re.fullmatch(r"\s*CIRCLE\s*\((.*)\)\s*", region, re.I | re.S)
+    if not m:
+        return None
+    a = _frame([p.strip() for p in _split_args(m.group(1))], version, "CIRCLE")
+    if len(a) == 3 and not _is_const_circle(a):
+        return f"skycell_radial_query({cols[0]}, {cols[1]}, {a[0]}, {a[1]}, {a[2]})"
+    return None
+
+
 def _contains(args: list[str], d: Dialect, version: str) -> str:
     if len(args) != 2:
         raise TranslationError("CONTAINS takes two geometries")
     inner, outer = args
     cols = _is_point_of_columns(inner)
     if d is SKYCELL:
-        # A cross-match: the position is a pair of plain columns, the region is a
-        # circle, and the circle is not a literal constant -- its centre comes
-        # from another table's row. `<@`'s rewrite (skycell_region_support) gives
-        # up outright when the region isn't a compile-time constant, so this
-        # would otherwise reach no index at all. skycell_radial_query (Q3C's own
-        # argument order) reaches simplify_cone's non-constant branch instead,
-        # which still covers with an index, if capped to skycell.join_slots
-        # ranges. A literal circle is left as `<@`, which already reaches the
-        # same, uncapped covering for that case.
-        m = re.fullmatch(r"\s*CIRCLE\s*\((.*)\)\s*", outer, re.I | re.S)
-        if cols and m:
-            a = _frame([p.strip() for p in _split_args(m.group(1))], version, "CIRCLE")
-            if len(a) == 3 and not _is_const_circle(a):
-                return f"skycell_radial_query({cols[0]}, {cols[1]}, {a[0]}, {a[1]}, {a[2]})"
+        xm = _crossmatch_radial(cols, outer, version)
+        if xm is not None:
+            return xm
         return f"({translate_expr(inner, d, version)} <@ {translate_expr(outer, d, version)})"
     # pgSphere+Q3C: use Q3C when the position is a pair of columns and the region
     # is a circle or polygon, because that is the fast path; otherwise pgSphere.
@@ -253,9 +265,19 @@ def _contains(args: list[str], d: Dialect, version: str) -> str:
 def _intersects(args: list[str], d: Dialect, version: str) -> str:
     if len(args) != 2:
         raise TranslationError("INTERSECTS takes two geometries")
-    a, b = (translate_expr(x, d, version) for x in args)
     if d is SKYCELL:
+        # A point has no area: intersecting a region is the same as being
+        # contained in it (see skycell_intersects_pos's own comment). A
+        # cross-match written as INTERSECTS(POINT, CIRCLE) either way round
+        # hits the same unindexed-non-constant-region gap as CONTAINS; reuse
+        # its detection so it gets the same skycell_radial_query redirect.
+        for pos, region in (args, (args[1], args[0])):
+            xm = _crossmatch_radial(_is_point_of_columns(pos), region, version)
+            if xm is not None:
+                return xm
+        a, b = (translate_expr(x, d, version) for x in args)
         return f"intersects({a}, {b})"
+    a, b = (translate_expr(x, d, version) for x in args)
     return f"({a} && {b})"          # pgSphere only; Q3C has no region type
 
 

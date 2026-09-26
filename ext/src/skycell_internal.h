@@ -17,7 +17,7 @@ extern Const *int8_const(int64 v);
 extern Const *float8_const(double v);
 extern Expr *int8_cmp(int strategy, Node *left, Expr *right);
 extern Expr *range_arm(Node *cell, Expr *lo, Expr *hi);
-extern Node *ranges_and_exact(sc_cover *cov, Node *cell, Expr *exact);
+extern Node *ranges_and_exact(sc_cover *cov, Node *cell, Expr *exact, bool uses_cell_ops);
 extern Oid	lookup_sibling_func(Oid funcid, const char *name, int nargs, const Oid *argtypes);
 
 extern void cover_cached(const sc_region *reg, const sc_density *d,

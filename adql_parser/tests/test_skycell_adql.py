@@ -44,6 +44,24 @@ def test_crossmatch_uses_skycell_radial_query():
         "SELECT * FROM a, b WHERE q3c_radial_query(a.ra, a.dec, b.ra, b.dec, 0.0003)")
 
 
+def test_intersects_crossmatch_uses_skycell_radial_query():
+    # A point has no area, so INTERSECTS(POINT, CIRCLE) is CONTAINS in disguise;
+    # a cross-match written either argument order must get the same rewrite.
+    q = ("SELECT * FROM a, b WHERE "
+         "INTERSECTS(POINT('ICRS', a.ra, a.dec), CIRCLE('ICRS', b.ra, b.dec, 0.0003)) = 1")
+    assert translate(q) == (
+        "SELECT * FROM a, b WHERE skycell_radial_query(a.ra, a.dec, b.ra, b.dec, 0.0003)")
+    q2 = ("SELECT * FROM a, b WHERE "
+          "INTERSECTS(CIRCLE('ICRS', b.ra, b.dec, 0.0003), POINT('ICRS', a.ra, a.dec)) = 1")
+    assert translate(q2) == (
+        "SELECT * FROM a, b WHERE skycell_radial_query(a.ra, a.dec, b.ra, b.dec, 0.0003)")
+    # A literal circle, or two regions with no point at all, are untouched.
+    lit = "SELECT * FROM t WHERE INTERSECTS(POINT('ICRS', ra, dec), CIRCLE('ICRS', 10, 20, 0.5)) = 1"
+    assert "intersects(" in translate(lit)
+    rr = "SELECT * FROM t WHERE INTERSECTS(CIRCLE('ICRS', 1, 2, 3), CIRCLE('ICRS', 4, 5, 6)) = 1"
+    assert "intersects(" in translate(rr)
+
+
 def test_negation():
     q = "SELECT * FROM t WHERE CONTAINS(POINT('ICRS', ra, dec), CIRCLE('ICRS', 1, 2, 3)) = 0"
     assert translate(q).startswith("SELECT * FROM t WHERE NOT (")

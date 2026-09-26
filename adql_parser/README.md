@@ -104,7 +104,9 @@ literal numbers) and emits `skycell_radial_query(a.ra, a.dec, b.ra, b.dec, r)`
 instead: Q3C's own argument order, which reaches skycell's non-constant
 covering path and stays index-backed, capped to `skycell.join_slots` ranges
 per probe. A literal `CIRCLE` is untouched -- `<@` already covers that case
-without a cap.
+without a cap. `INTERSECTS(POINT, CIRCLE)` gets the same treatment, either
+argument order -- a point has no area, so intersecting a region is exactly
+containment (skycell's own `skycell_intersects_pos` says as much).
 
 ## Tests
 

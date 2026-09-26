@@ -919,17 +919,19 @@ all_const(List *args, int from, int to, bool *anynull)
 /* ------------------------------------------------------------------ */
 
 Node *
-ranges_and_exact(sc_cover *cov, Node *cell, Expr *exact)
+ranges_and_exact(sc_cover *cov, Node *cell, Expr *exact, bool uses_cell_ops)
 {
 	List	   *arms = NIL;
+	Oid			opfamily = uses_cell_ops ? cell_ops_opfamily() : INTEGER_BTREE_FAM_OID;
 
 	if (cov->n == 0)
 		return (Node *) makeBoolConst(false, false);
 
 	for (int i = 0; i < cov->n; i++)
-		arms = lappend(arms, range_arm(cell,
+		arms = lappend(arms, range_arm_family(cell,
 									   (Expr *) int8_const(cov->r[i].lo),
-									   (Expr *) int8_const(cov->r[i].hi)));
+									   (Expr *) int8_const(cov->r[i].hi),
+									   opfamily));
 	if (cov->n == 1)
 		return (Node *) makeBoolExpr(AND_EXPR,
 									 list_concat(((BoolExpr *) linitial(arms))->args,
@@ -984,7 +986,7 @@ simplify_cone(PlannerInfo *root, FuncExpr *fexpr)
 												 copyObject(list_nth(args, 5))),
 									  InvalidOid, InvalidOid, COERCE_EXPLICIT_CALL);
 		((FuncExpr *) exact)->args = lappend(((FuncExpr *) exact)->args, float8_const(sel));
-		return ranges_and_exact(&cov, cell, exact);
+		return ranges_and_exact(&cov, cell, exact, cell_uses_cell_ops);
 	}
 	else
 	{
@@ -1052,7 +1054,7 @@ simplify_poly(PlannerInfo *root, FuncExpr *fexpr)
 	double		sel;
 	Oid			exact_types[4] = {FLOAT8OID, FLOAT8OID, FLOAT8ARRAYOID, FLOAT8OID};
 	FuncExpr   *exact;
-	bool		unused_uses_cell_ops;
+	bool		uses_cell_ops;
 
 	if (!IsA(poly, Const))
 		return NULL;			/* not rewritten: exact test only */
@@ -1060,7 +1062,7 @@ simplify_poly(PlannerInfo *root, FuncExpr *fexpr)
 		return (Node *) makeBoolConst(false, true);
 
 	poly_from_array(DatumGetArrayTypeP(((Const *) poly)->constvalue), &reg);
-	density_for_var(root, cell, &dens, &dens_statrel, &unused_uses_cell_ops);
+	density_for_var(root, cell, &dens, &dens_statrel, &uses_cell_ops);
 	current_params(&p, skycell_max_ranges, &dens);
 	sc_cover_compute(&reg, &dens, &p, &cov);
 	sel = (cov.area > 0) ? fmin(1.0, reg.area / cov.area) : 0.0;
@@ -1070,7 +1072,7 @@ simplify_poly(PlannerInfo *root, FuncExpr *fexpr)
 						 list_make4(copyObject(lsecond(args)), copyObject(lthird(args)),
 									copyObject(poly), float8_const(sel)),
 						 InvalidOid, InvalidOid, COERCE_EXPLICIT_CALL);
-	return ranges_and_exact(&cov, cell, (Expr *) exact);
+	return ranges_and_exact(&cov, cell, (Expr *) exact, uses_cell_ops);
 }
 
 /*
