@@ -387,6 +387,39 @@ this benchmark's numbers above come from a database that ran a fresh
 no such step. Noted in `bench/23_region_contains.sql`'s own header for
 whoever hits this next.
 
+## Tried and rejected: MAX_SUBCAPS=8
+
+Round four's `@>` numbers showed the same "too many pages visited" signature
+as round two's original diagnosis (~65 buffers per probe at 50,000 rows,
+`Rows Removed by Index Recheck: 0`), which raised the obvious question:
+since more sub-caps per region is exactly the lever that fixed `&&`'s
+scaling in round three, would doubling it again (4 -> 8) help further,
+for both strategies at once since they share one index?
+
+Tested directly, both strategies, both scales, same session and script so
+the comparison is apples-to-apples:
+
+| MAX_SUBCAPS | index size (50k rows) | `&&` @ 5k/50k | `@>` @ 5k/50k | buffers/probe (`@>`, 50k) |
+|---|---|---|---|---|
+| 4 (current) | 16 MB | ~6.8-7.0 / ~83-91 ms | ~5.4-5.9 / ~94 ms | ~65.5 |
+| 8 | 28 MB | ~11.1-11.5 / ~147-151 ms | ~7.8 / ~130-134 ms | ~83.4 |
+
+**Worse, not better, on every measurement, at both scales, for both
+strategies** -- roughly 1.4-1.6x slower, with a ~1.75x bigger index and
+*more* buffer visits per probe, not fewer. Correctness stayed clean at
+MAX_SUBCAPS=8 (exact match against brute force at both scales), so this
+isn't a bug -- it's a real cost/benefit finding: doubling the sub-cap count
+roughly doubles the key's storage cost (fewer entries fit per index page,
+so fanout drops and the tree gets taller/wider), and the extra pruning
+precision doesn't pay that back at these scales -- if anything, the higher
+buffer count suggests the fanout loss dominates outright rather than being
+merely offset. Reverted; MAX_SUBCAPS stays 4. Left as a documented dead end
+rather than silently not-tried, the same way "round two: R*-tree split
+moved nothing" was recorded rather than omitted -- a negative result here
+is exactly why round three's redesign (a coarser change: restructuring
+*what* the key is, not just how many of the existing kind) was the right
+lever and turning the existing dial further was not.
+
 ## Spike scope
 
 Built and measured:
