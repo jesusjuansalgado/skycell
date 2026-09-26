@@ -24,3 +24,22 @@ CREATE FUNCTION skycell_poly_join(ra float8, "dec" float8, poly float8[]) RETURN
 AS 'MODULE_PATHNAME', 'skycell_in_poly'
 LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE
 SUPPORT skycell_support;
+
+-- ------------------------------------------------------------------
+-- Non-constant skyregion cross-matches: <@'s planner support
+-- (skycell_region_support) already handles a constant CIRCLE-or-POLYGON
+-- region generically; this adds the same non-constant fallback the CIRCLE
+-- and POLYGON cases above already have, so `point(...) <@ b.s_region` -- a
+-- cross-match against another table's per-row footprint column, of either
+-- kind -- reaches an index too, instead of falling back to a sequential
+-- scan the way any non-constant region did before.
+-- ------------------------------------------------------------------
+
+-- run-time range slot i (lo = even, hi = odd) for a non-constant skyregion
+-- column (joins): the generic-region analogue of skycell_cone_bound/
+-- skycell_poly_bound, for <@ against a per-row region of either kind (a
+-- cross-match whose CIRCLE-or-POLYGON comes from another table's row, e.g.
+-- an archive's per-row s_region footprint).
+CREATE FUNCTION skycell_region_bound(region skyregion, i int, nslots int, ntotal float8,
+                                     hist int8[]) RETURNS int8
+AS 'MODULE_PATHNAME' LANGUAGE C STABLE STRICT PARALLEL SAFE;

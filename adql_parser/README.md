@@ -121,9 +121,38 @@ predicates fall back to PostgreSQL's stock selectivity estimate even against a
 `skycell_cell_ops` index -- there is no equivalent scalar to recover a
 polygon's area from a non-constant, per-row shape. The result is still
 correct and index-backed either way; only the plan's row-count estimate is
-coarser than the circle case's. `BOX` and a stored `skyregion` column (an
-arbitrary per-row footprint, as opposed to a literal `POLYGON(...)` call) are
-not covered by this -- both remain open.
+coarser than the circle case's. `BOX` remains open.
+
+A cross-match against a stored **`skyregion` column** -- `CONTAINS(POINT('ICRS',
+a.ra, a.dec), b.s_region) = 1`, matching points against another table's
+per-row footprint of either kind, circle or polygon, mixed in the same column
+-- gets the same fix at the C extension level, and needs **no translator
+change at all**: a bare column reference doesn't match the `CIRCLE(...)`/
+`POLYGON(...)` literal-call shapes above, so it was already passed through as
+plain `<@`. What changed is `<@`'s own planner support
+(`skycell_region_support`), which now has a non-constant branch generalising
+`skycell_poly_bound` over either region kind (`skycell_region_bound`,
+dispatching on each row's own kind tag) -- the same gap, the same fix, one
+level down where it covers every ADQL spelling that reaches `<@` at once,
+translator included. The same selectivity caveat as `POLYGON` applies (no
+constant scalar to estimate from), and the same "literal region is untouched"
+rule applies too.
+
+**What none of this covers**, because it is a different problem entirely:
+searching a large table of stored footprints for the ones matching a *given*
+point or shape (rather than matching many points against them) needs an index
+*on* the region column itself, not a per-row covering -- there's no single
+outer row to compute one covering from. skycell already has the pieces for
+this (`skycell_region_moc`/`skycell_cone_moc`/`skycell_poly_moc`,
+`skycell_ancestors`), used as: decompose each stored region into an IVOA MOC,
+unnest it into a `(row_id, nuniq)` side table with a plain B-tree index on
+`nuniq`, then join a point's `skycell_ancestors(cell)` against it. This is
+tested (`ext/test/sql/skycell.sql`, "stored regions as MOCs in a B-tree:
+point-in-footprint") but is a genuine multi-table JOIN restructuring, not a
+function-call substitution -- something this translator, by design, cannot
+do (see "What it is, and is not" above): it never sees or introduces tables,
+so it cannot add the unnested side table a query would need. Building that
+side table, and writing the join, is up to the application for now.
 
 ## Tests
 

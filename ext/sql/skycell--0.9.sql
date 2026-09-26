@@ -87,6 +87,29 @@ AS 'MODULE_PATHNAME' LANGUAGE C STABLE CALLED ON NULL INPUT PARALLEL SAFE;
 -- regions as multi-order coverages (IVOA MOC NUNIQ), for indexing stored
 -- footprints in a B-tree: a point's candidate regions are those with a
 -- covering cell equal to one of the point's 30 ancestors.
+--
+-- This is a different problem from the cross-match join above: here it's the
+-- *stored regions* being searched (which footprint contains this point?),
+-- not a per-row region being matched against an indexed point column, so
+-- there's no single outer row to compute one covering from -- the region
+-- column itself needs the index.
+--
+--   CREATE TABLE fp_cells AS
+--     SELECT fid, unnest(skycell_region_moc(s_region, 12)) AS nuniq FROM footprints;
+--   CREATE INDEX ON fp_cells (nuniq);
+--
+--   SELECT DISTINCT f.* FROM points p
+--   JOIN LATERAL (SELECT DISTINCT fid FROM fp_cells
+--                 WHERE nuniq = ANY (skycell_ancestors(p.cell))) m ON true
+--   JOIN footprints f ON f.fid = m.fid
+--   WHERE skycell_pos_in_region(point(p.ra, p.dec), f.s_region);  -- refine: the MOC overshoots
+--
+-- Not something a query rewrite can do -- unlike every other recipe in this
+-- file, it needs a side table and a join the original query doesn't have, so
+-- it has no automatic form (planner support function or ADQL translator
+-- alike): build fp_cells once, keep it in sync with footprints, and write the
+-- join above by hand. See ext/test/sql/skycell.sql's "stored regions as MOCs
+-- in a B-tree" for a complete, tested example.
 -- ------------------------------------------------------------------
 
 CREATE FUNCTION skycell_ancestors(cell int8, min_order int DEFAULT 0, max_order int DEFAULT 29) RETURNS int8[]
@@ -228,6 +251,16 @@ SUPPORT skycell_region_sel_support;
 CREATE FUNCTION skycell_pos_in_region(p skypos, r skyregion) RETURNS bool
 AS 'MODULE_PATHNAME' LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE
 SUPPORT skycell_region_support;
+
+-- run-time range slot i (lo = even, hi = odd) for a non-constant skyregion
+-- column (joins): the generic-region analogue of skycell_cone_bound/
+-- skycell_poly_bound, for <@ against a per-row region of either kind (a
+-- cross-match whose CIRCLE-or-POLYGON comes from another table's row, e.g.
+-- an archive's per-row s_region footprint).
+CREATE FUNCTION skycell_region_bound(region skyregion, i int, nslots int, ntotal float8,
+                                     hist int8[]) RETURNS int8
+AS 'MODULE_PATHNAME' LANGUAGE C STABLE STRICT PARALLEL SAFE;
+
 CREATE FUNCTION skycell_region_has_pos(r skyregion, p skypos) RETURNS bool
 AS 'MODULE_PATHNAME' LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
 CREATE FUNCTION skycell_region_overlap(a skyregion, b skyregion) RETURNS bool

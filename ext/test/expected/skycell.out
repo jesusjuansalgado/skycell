@@ -129,6 +129,41 @@ SELECT (SELECT count(*) FROM tile t, cat c
 (1 row)
 
 DROP TABLE tile;
+-- skycell_region_bound / <@ against a non-constant skyregion column: the
+-- generic-region analogue of skycell_poly_join, dispatching on each row's own
+-- kind tag the same way skycell_region_from_datum already does for a
+-- constant region. Covers a cross-match against another table's per-row
+-- footprint column (e.g. an archive's s_region), whichever kind it holds.
+CREATE TABLE footprint AS
+  SELECT ra, least(greatest(dec, -85), 85) AS dec,
+         CASE WHEN row_number() OVER () % 2 = 0
+              THEN circle('ICRS', ra, least(greatest(dec, -85), 85), 0.05)
+              ELSE polygon('ICRS', ra-0.05, least(greatest(dec, -85), 85)-0.05,
+                                   ra+0.05, least(greatest(dec, -85), 85)-0.05,
+                                   ra+0.05, least(greatest(dec, -85), 85)+0.05,
+                                   ra-0.05, least(greatest(dec, -85), 85)+0.05)
+         END AS s_region
+  FROM probe;
+SELECT plan_uses_index(
+  $q$SELECT count(*) FROM footprint f, cat c
+     WHERE point('ICRS', c.ra, c.dec) <@ f.s_region$q$
+) AS region_join_indexed;
+ region_join_indexed 
+---------------------
+ t
+(1 row)
+
+SELECT (SELECT count(*) FROM footprint f, cat c
+          WHERE point('ICRS', c.ra, c.dec) <@ f.s_region)
+      = (SELECT count(*) FROM footprint f, cat c
+          WHERE skycell_in_region(point('ICRS', c.ra, c.dec), f.s_region))
+      AS region_join_matches_exact;
+ region_join_matches_exact 
+---------------------------
+ t
+(1 row)
+
+DROP TABLE footprint;
 DROP TABLE probe;
 DROP INDEX cat_a2c;
 -- The cell-range operator class: same answers as the stock operators, and the

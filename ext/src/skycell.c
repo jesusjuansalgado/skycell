@@ -82,7 +82,7 @@ static double skycell_split_cost = 1.0;
 static double skycell_max_area_ratio = 64.0;
 static int	skycell_max_ranges = 64;
 static int	skycell_max_steps = 4000;
-static int	skycell_join_slots = 4;
+int			skycell_join_slots = 4;	/* adql.c's non-constant skyregion branch shares this */
 static bool skycell_use_stats = true;
 static bool skycell_cache_coverings = true;
 static bool skycell_exact_cells = true;
@@ -668,7 +668,7 @@ load_density(Oid relid, AttrNumber attnum, sc_density *d)
  * stock int8 estimators.  InvalidOid before 0.7 or if the name was changed;
  * every caller treats that as "fall back to the stock operators".
  */
-static Oid
+Oid
 cell_ops_opfamily(void)
 {
 	List	   *name = list_make1(makeString("skycell_cell_ops"));
@@ -858,7 +858,7 @@ float8_const(double v)
 					 Float8GetDatum(v), false, true);
 }
 
-static Const *
+Const *
 int4_const(int32 v)
 {
 	return makeConst(INT4OID, -1, InvalidOid, sizeof(int32),
@@ -883,7 +883,7 @@ int8_cmp(int strategy, Node *left, Expr *right)
 }
 
 /* cell >= lo AND cell <= hi */
-static Expr *
+Expr *
 range_arm_family(Node *cell, Expr *lo, Expr *hi, Oid opfamily)
 {
 	return makeBoolExpr(AND_EXPR,
@@ -1661,6 +1661,102 @@ skycell_poly_bound(PG_FUNCTION_ARGS)
 		poly_slot_cache.valid = true;
 	}
 	PG_RETURN_INT64((i % 2 == 0) ? poly_slot_cache.lo[i / 2] : poly_slot_cache.hi[i / 2]);
+}
+
+/*
+ * The generic-region analogue of skycell_poly_bound(): a skyregion column can
+ * hold either kind (its own tag says which -- adql.c's skycell_region_from_
+ * datum() dispatches on it), so this covers a non-constant CIRCLE-or-POLYGON
+ * column with one function instead of needing a region_support equivalent
+ * for each kind. Same hash-of-bytes caching as skycell_poly_bound, for the
+ * same reason: a skyregion has no fixed-arity description either.
+ */
+static struct
+{
+	bool		valid;
+	uint32		reghash,
+				hhash;
+	double		ntotal,
+				range_cost,
+				split_cost,
+				area_ratio;
+	int			nslots;
+	int64		lo[MAX_SLOTS],
+				hi[MAX_SLOTS];
+}			region_slot_cache;
+
+PG_FUNCTION_INFO_V1(skycell_region_bound);
+Datum
+skycell_region_bound(PG_FUNCTION_ARGS)
+{
+	struct varlena *regarr = PG_DETOAST_DATUM(PG_GETARG_DATUM(0));
+	int32		i = PG_GETARG_INT32(1),
+				nslots = PG_GETARG_INT32(2);
+	double		ntotal = PG_GETARG_FLOAT8(3);
+	ArrayType  *harr = PG_GETARG_ARRAYTYPE_P(4);
+	hist_cache *hc = (hist_cache *) fcinfo->flinfo->fn_extra;
+	uint32		reghash;
+
+	if (nslots < 1 || nslots > MAX_SLOTS || i < 0 || i >= 2 * nslots)
+		elog(ERROR, "skycell: bad slot %d/%d", i, nslots);
+
+	if (hc == NULL)
+	{
+		MemoryContext old = MemoryContextSwitchTo(fcinfo->flinfo->fn_mcxt);
+		Datum	   *elems;
+		bool	   *nulls;
+
+		hc = palloc0(sizeof(hist_cache));
+		deconstruct_array(harr, INT8OID, sizeof(int64), true, TYPALIGN_DOUBLE, &elems, &nulls, &hc->n);
+		hc->b = palloc(sizeof(int64) * Max(hc->n, 1));
+		for (int j = 0; j < hc->n; j++)
+			hc->b[j] = DatumGetInt64(elems[j]);
+		hc->hash = hash_bytes((const unsigned char *) hc->b, sizeof(int64) * hc->n) ^ (uint32) hc->n;
+		fcinfo->flinfo->fn_extra = hc;
+		MemoryContextSwitchTo(old);
+	}
+
+	reghash = hash_bytes((const unsigned char *) regarr, VARSIZE(regarr));
+
+	if (!region_slot_cache.valid || region_slot_cache.reghash != reghash ||
+		region_slot_cache.ntotal != ntotal ||
+		region_slot_cache.hhash != hc->hash || region_slot_cache.nslots != nslots ||
+		region_slot_cache.range_cost != skycell_range_cost ||
+		region_slot_cache.split_cost != skycell_split_cost ||
+		region_slot_cache.area_ratio != skycell_max_area_ratio)
+	{
+		sc_region	reg;
+		sc_cover	cov;
+		sc_cover_params p;
+		sc_density	d = {ntotal, hc->n, hc->b};
+		int			s;
+
+		region_slot_cache.valid = false;
+		skycell_region_from_datum(PointerGetDatum(regarr), &reg);
+		current_params(&p, nslots, &d);
+		sc_cover_compute(&reg, &d, &p, &cov);
+		for (s = 0; s < cov.n && s < nslots; s++)
+		{
+			region_slot_cache.lo[s] = cov.r[s].lo;
+			region_slot_cache.hi[s] = cov.r[s].hi;
+		}
+		for (; s < nslots; s++)
+		{
+			region_slot_cache.lo[s] = 1;	/* empty range: never matches */
+			region_slot_cache.hi[s] = 0;
+		}
+		sc_cover_free(&cov);
+		sc_region_free(&reg);
+		region_slot_cache.reghash = reghash;
+		region_slot_cache.ntotal = ntotal;
+		region_slot_cache.hhash = hc->hash;
+		region_slot_cache.nslots = nslots;
+		region_slot_cache.range_cost = skycell_range_cost;
+		region_slot_cache.split_cost = skycell_split_cost;
+		region_slot_cache.area_ratio = skycell_max_area_ratio;
+		region_slot_cache.valid = true;
+	}
+	PG_RETURN_INT64((i % 2 == 0) ? region_slot_cache.lo[i / 2] : region_slot_cache.hi[i / 2]);
 }
 
 /* ------------------------------------------------------------------ */
