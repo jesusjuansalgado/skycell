@@ -143,6 +143,14 @@ double		sc_region_distance(const sc_region *r, sc_vec3 p);
 /* a representative interior point (ADQL CENTROID) */
 sc_vec3		sc_region_centroid(const sc_region *r);
 
+/*
+ * A cheap, valid (not necessarily minimal) enclosing spherical cap: exact for
+ * a cone (it already is one), centroid + farthest vertex for a polygon.  For
+ * a GiST index key, not the cost-based covering above -- a cap is a single
+ * fixed-size bound, cheap to union/compare, not a set of HEALPix ranges.
+ */
+void		sc_region_bounding_cap(const sc_region *r, sc_vec3 *center, double *radius);
+
 /* use exact cell corners for cones (1, default) or the bounding cap (0) */
 extern int	sc_exact_cells;
 extern int	sc_order_probe;

@@ -452,6 +452,13 @@ region_farthest(const sc_region *r, sc_vec3 p)
 	return d;
 }
 
+void
+sc_region_bounding_cap(const sc_region *r, sc_vec3 *center, double *radius)
+{
+	*center = sc_region_centroid(r);
+	*radius = (r->kind == SC_REGION_CONE) ? r->radius : region_farthest(r, *center);
+}
+
 /* do the minor arcs a1-a2 and b1-b2 cross? */
 static int
 arcs_cross(sc_vec3 a1, sc_vec3 a2, sc_vec3 na, sc_vec3 b1, sc_vec3 b2, sc_vec3 nb)
