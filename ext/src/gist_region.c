@@ -115,6 +115,21 @@
  * same scale, but pgSphere's native point-in-shape test is cheaper than its
  * native shape-shape overlap test, so pgSphere's <@ pulls further ahead of
  * its own && than this opclass's <@ does of its own &&.
+ *
+ * STATUS (round five): tried making picksplit's own cost functions sub-cap
+ * aware instead of overall-cap-only (see skyregion_gist_picksplit's own
+ * comment below for the design). A real, if modest, win: ~10-15% fewer
+ * index pages visited per probe at both benchmark scales, for both
+ * strategies (measured via EXPLAIN BUFFERS, not wall-clock time, which was
+ * too noisy on this machine to trust directly at these sub-100ms query
+ * times -- the buffer count is deterministic and moved the same direction
+ * every time it was measured, unlike a handful of individual timing runs).
+ * Kept over the overall-cap-only version: strictly better on the one metric
+ * that isolates the split algorithm's own effect, same O(n) per axis
+ * complexity, and it actually simplifies picksplit's own code (the final
+ * spl_ldatum/spl_rdatum fall out of the same sweep that chose the split
+ * point, instead of a separate multicap_union_many() pass over the result).
+ * See GIST_REGION_DESIGN.md's "Round five" for the full numbers.
  */
 #include "postgres.h"
 
@@ -405,6 +420,46 @@ multicap_union_many(const GistMultiCap **entries, int n, GistMultiCap *out)
 	merge_caps_greedy(flat, nflat, out->sub, &nout);
 }
 
+/* union of exactly two multi-cap keys -- a thin wrapper so picksplit's
+ * incremental sweep (below) can fold one more entry into a running multi-cap
+ * at a time, reusing multicap_union_many's own overall-cap and greedy
+ * sub-cap merge logic rather than duplicating it. */
+static void
+multicap_union2(const GistMultiCap *a, const GistMultiCap *b, GistMultiCap *out)
+{
+	const GistMultiCap *ptrs[2];
+
+	ptrs[0] = a;
+	ptrs[1] = b;
+	multicap_union_many(ptrs, 2, out);
+}
+
+/* how much two multi-caps overlap, not just whether: the sum of every
+ * pairwise sub-cap overlap amount (cap_overlap_amount(), the same angular
+ * proxy && and picksplit's single-cap version already use), zero when no
+ * sub-cap pair overlaps at all. A sum rather than a max: picksplit uses this
+ * only to *compare* candidate split points against each other, so what
+ * matters is a monotonic proxy for "how much total overlap this split
+ * leaves," not a physically exact overlap volume. */
+static double
+multicap_overlap_amount(const GistMultiCap *a, const GistMultiCap *b)
+{
+	double		total = 0;
+
+	for (int i = 0; i < MAX_SUBCAPS; i++)
+	{
+		if (a->sub[i].radius < 0)
+			continue;
+		for (int j = 0; j < MAX_SUBCAPS; j++)
+		{
+			if (b->sub[j].radius < 0)
+				continue;
+			total += cap_overlap_amount(a->sub[i], b->sub[j]);
+		}
+	}
+	return total;
+}
+
 static double
 multicap_penalty(const GistMultiCap *orig, const GistMultiCap *newc)
 {
@@ -592,21 +647,29 @@ axis_sort_cmp(const void *a, const void *b)
 }
 
 /*
- * R*-tree-style split (Beckmann et al. 1990), adapted to spherical caps, and
- * driven by each entry's *overall* cap only (see file header for why): try
- * sorting by the overall cap centre's x, y, and z coordinate in turn,
- * measure each axis's total margin (radius, as a size proxy) summed over
- * every valid split point, keep the axis with the smallest sum, then on
- * that axis pick the split point minimising overlap between the two
- * resulting overall caps (ties broken by combined area). O(n log n) per
- * axis (sort once, then a forward and backward cumulative-union sweep).
+ * R*-tree-style split (Beckmann et al. 1990), adapted to spherical caps.
+ * Entries are still *ordered* along a candidate axis by their overall cap
+ * centre's x/y/z coordinate (a cheap, single-number sort key -- sub-caps
+ * have no one natural per-axis coordinate the way a single cap's centre
+ * does), but the *cost* of a candidate split -- both the per-axis margin
+ * sum used to choose an axis, and the per-split-point overlap used to
+ * choose where to cut on it -- is now computed from the *full* multi-cap
+ * union of each side (multicap_union2(), multicap_overlap_amount()), not
+ * just the overall caps. This is round five's answer to a question the
+ * round three/four file header left open: since the tighter sub-cap
+ * representation already showed up as a genuine win when used for
+ * consistent()'s pruning, does using it for the split *decision* itself
+ * (not just the final left/right keys, which round three already built
+ * this way) help further? The running fwdMC[k]/bwdMC[k] arrays below fold
+ * one more entry's full multi-cap into the running union per step
+ * (O(MAX_SUBCAPS^2), a small constant), keeping the whole sweep O(n) per
+ * axis, same complexity class as the overall-cap-only version it replaces.
+ * See GIST_REGION_DESIGN.md's "Round five" for whether it actually helped.
  *
- * The actual spl_ldatum/spl_rdatum written out are the *full* multi-cap
- * union (multicap_union_many) of whichever entries the overall-cap-driven
- * split above assigned to each side, not just their overall caps -- this is
- * what lets the tighter sub-cap representation propagate into internal
- * nodes rather than collapsing back to one cap per node immediately above
- * the leaves.
+ * A useful side effect: since fwdMC[bestM-1]/bwdMC[bestM] are already the
+ * exact full multi-cap union of everything picksplit assigned to each side,
+ * they're used directly as spl_ldatum/spl_rdatum -- no separate final
+ * multicap_union_many() pass needed, unlike the overall-cap-only version.
  */
 PG_FUNCTION_INFO_V1(skyregion_gist_picksplit);
 Datum
@@ -624,10 +687,8 @@ skyregion_gist_picksplit(PG_FUNCTION_ARGS)
 	GistMultiCap *mc = palloc(sizeof(GistMultiCap) * (maxoff + 1));
 	int			minfill = Max(1, n * 3 / 10);
 	axis_sort_entry *sorted = palloc(sizeof(axis_sort_entry) * n);
-	sc_vec3    *fwdC = palloc(sizeof(sc_vec3) * n);	/* fwdC[k]/fwdR[k]: overall union of sorted[0..k] */
-	double	   *fwdR = palloc(sizeof(double) * n);
-	sc_vec3    *bwdC = palloc(sizeof(sc_vec3) * n);	/* bwdC[k]/bwdR[k]: overall union of sorted[k..n-1] */
-	double	   *bwdR = palloc(sizeof(double) * n);
+	GistMultiCap *fwdMC = palloc(sizeof(GistMultiCap) * n);	/* fwdMC[k]: full multi-cap union of sorted[0..k] */
+	GistMultiCap *bwdMC = palloc(sizeof(GistMultiCap) * n);	/* bwdMC[k]: full multi-cap union of sorted[k..n-1] */
 	int			bestAxis = 0;
 	double		bestAxisMargin = HUGE_VAL;
 
@@ -648,19 +709,21 @@ skyregion_gist_picksplit(PG_FUNCTION_ARGS)
 		}
 		qsort(sorted, n, sizeof(axis_sort_entry), axis_sort_cmp);
 
-		fwdC[0] = cap_center(mc[sorted[0].idx].overall);
-		fwdR[0] = mc[sorted[0].idx].overall.radius;
+		fwdMC[0] = mc[sorted[0].idx];
 		for (int k = 1; k < n; k++)
-			cap_union2(fwdC[k - 1], fwdR[k - 1], cap_center(mc[sorted[k].idx].overall),
-					   mc[sorted[k].idx].overall.radius, &fwdC[k], &fwdR[k]);
-		bwdC[n - 1] = cap_center(mc[sorted[n - 1].idx].overall);
-		bwdR[n - 1] = mc[sorted[n - 1].idx].overall.radius;
+			multicap_union2(&fwdMC[k - 1], &mc[sorted[k].idx], &fwdMC[k]);
+		bwdMC[n - 1] = mc[sorted[n - 1].idx];
 		for (int k = n - 2; k >= 0; k--)
-			cap_union2(bwdC[k + 1], bwdR[k + 1], cap_center(mc[sorted[k].idx].overall),
-					   mc[sorted[k].idx].overall.radius, &bwdC[k], &bwdR[k]);
+			multicap_union2(&bwdMC[k + 1], &mc[sorted[k].idx], &bwdMC[k]);
 
+		/* total sub-cap area, not a single cap's radius, as the "margin" a
+		 * multi-cap union has no single linear extent to measure the way one
+		 * cap's radius did in the overall-cap-only version this replaces --
+		 * area is the closest available proxy for "how big is this side",
+		 * used the same way here: to compare axes against each other, not as
+		 * an absolute quantity. */
 		for (int m = minfill; m <= n - minfill; m++)
-			marginSum += fwdR[m - 1] + bwdR[m];
+			marginSum += multicap_total_area(&fwdMC[m - 1]) + multicap_total_area(&bwdMC[m]);
 
 		if (marginSum < bestAxisMargin)
 		{
@@ -670,7 +733,7 @@ skyregion_gist_picksplit(PG_FUNCTION_ARGS)
 	}
 
 	/* redo the winning axis's sort + cumulative unions (cheap: one more
-	 * O(n log n) pass, and keeps the loop above simple) */
+	 * O(n) pass, and keeps the loop above simple) */
 	for (int k = 0; k < n; k++)
 	{
 		OffsetNumber idx = (OffsetNumber) (k + FirstOffsetNumber);
@@ -680,16 +743,12 @@ skyregion_gist_picksplit(PG_FUNCTION_ARGS)
 		sorted[k].key = (bestAxis == 0) ? c.x : (bestAxis == 1) ? c.y : c.z;
 	}
 	qsort(sorted, n, sizeof(axis_sort_entry), axis_sort_cmp);
-	fwdC[0] = cap_center(mc[sorted[0].idx].overall);
-	fwdR[0] = mc[sorted[0].idx].overall.radius;
+	fwdMC[0] = mc[sorted[0].idx];
 	for (int k = 1; k < n; k++)
-		cap_union2(fwdC[k - 1], fwdR[k - 1], cap_center(mc[sorted[k].idx].overall),
-				   mc[sorted[k].idx].overall.radius, &fwdC[k], &fwdR[k]);
-	bwdC[n - 1] = cap_center(mc[sorted[n - 1].idx].overall);
-	bwdR[n - 1] = mc[sorted[n - 1].idx].overall.radius;
+		multicap_union2(&fwdMC[k - 1], &mc[sorted[k].idx], &fwdMC[k]);
+	bwdMC[n - 1] = mc[sorted[n - 1].idx];
 	for (int k = n - 2; k >= 0; k--)
-		cap_union2(bwdC[k + 1], bwdR[k + 1], cap_center(mc[sorted[k].idx].overall),
-				   mc[sorted[k].idx].overall.radius, &bwdC[k], &bwdR[k]);
+		multicap_union2(&bwdMC[k + 1], &mc[sorted[k].idx], &bwdMC[k]);
 
 	{
 		int			bestM = minfill;
@@ -698,10 +757,8 @@ skyregion_gist_picksplit(PG_FUNCTION_ARGS)
 
 		for (int m = minfill; m <= n - minfill; m++)
 		{
-			GistCap		lc = cap_make(fwdC[m - 1], fwdR[m - 1]);
-			GistCap		rc = cap_make(bwdC[m], bwdR[m]);
-			double		overlap = cap_overlap_amount(lc, rc);
-			double		area = cap_area_proxy(fwdR[m - 1]) + cap_area_proxy(bwdR[m]);
+			double		overlap = multicap_overlap_amount(&fwdMC[m - 1], &bwdMC[m]);
+			double		area = multicap_total_area(&fwdMC[m - 1]) + multicap_total_area(&bwdMC[m]);
 
 			if (overlap < bestOverlap || (overlap == bestOverlap && area < bestArea))
 			{
@@ -719,31 +776,14 @@ skyregion_gist_picksplit(PG_FUNCTION_ARGS)
 		for (int k = bestM; k < n; k++)
 			v->spl_right[v->spl_nright++] = sorted[k].idx;
 
-		{
-			const GistMultiCap **lptrs = palloc(sizeof(GistMultiCap *) * bestM);
-			const GistMultiCap **rptrs = palloc(sizeof(GistMultiCap *) * (n - bestM));
-			GistMultiCap lout,
-						rout;
-
-			for (int k = 0; k < bestM; k++)
-				lptrs[k] = &mc[sorted[k].idx];
-			for (int k = bestM; k < n; k++)
-				rptrs[k - bestM] = &mc[sorted[k].idx];
-			multicap_union_many(lptrs, bestM, &lout);
-			multicap_union_many(rptrs, n - bestM, &rout);
-			v->spl_ldatum = PointerGetDatum(multicap_to_bytea(&lout));
-			v->spl_rdatum = PointerGetDatum(multicap_to_bytea(&rout));
-			pfree(lptrs);
-			pfree(rptrs);
-		}
+		v->spl_ldatum = PointerGetDatum(multicap_to_bytea(&fwdMC[bestM - 1]));
+		v->spl_rdatum = PointerGetDatum(multicap_to_bytea(&bwdMC[bestM]));
 	}
 
 	pfree(mc);
 	pfree(sorted);
-	pfree(fwdC);
-	pfree(fwdR);
-	pfree(bwdC);
-	pfree(bwdR);
+	pfree(fwdMC);
+	pfree(bwdMC);
 	PG_RETURN_POINTER(v);
 }
 

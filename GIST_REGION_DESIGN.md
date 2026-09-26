@@ -1,13 +1,20 @@
 # A GiST opclass for skyregion: design notes
 
 Branch: `claude/zealous-cerf-mkda2j`. Status: a working, correctness-verified
-opclass for one strategy (`&&`, region-region `INTERSECTS`), now on its third
-design pass: past the initial spike (Quadratic split + a value-cached
-`consistent`), past a split-algorithm pass that plateaued (R*-tree-style
-split), to a multi-cap key redesign that closes the at-scale gap to pgSphere
-and beats it outright at smaller scale. Still not exercised under concurrent
-writes, and `<@`/`@>` aren't wired up. See "Round three" for the current
-design and numbers, and "Spike scope"/"Performance" for the full history.
+opclass covering two strategies (`&&`, region-region `INTERSECTS`, and `@>`/
+`<@`, region-contains-point), five design passes in: past the initial spike
+(Quadratic split + a value-cached `consistent`), past a split-algorithm pass
+that plateaued (R*-tree-style split), through a multi-cap key redesign that
+closed `&&`'s at-scale gap to pgSphere and beat it outright at smaller
+scale (round three), a second strategy built on that same key with no new
+geometry needed (round four), a rejected tuning idea recorded rather than
+silently dropped (`MAX_SUBCAPS=8`, worse at every scale), and a sub-cap-aware
+picksplit that shaved a further ~10-15% off index pages visited per probe
+(round five). Region-region full containment (`skyregion @> skyregion`, as
+opposed to point containment) is still unbuilt, and it's still not exercised
+under concurrent writes. See "Round three" through "Round five" for the
+current design and numbers, and "Spike scope"/"Performance" for the full
+history.
 
 ## Why this, and why now
 
@@ -244,16 +251,22 @@ O(n * 4), not a globally-optimal clustering -- deliberately cheap, since
 both functions run on every index build/insert, not just at query time.
 
 **`picksplit`** keeps the R*-tree-style axis-sort/margin/overlap structure
-from round two, still driven by each entry's `.overall` cap for the split
-*decision* (sorting and margin-summing four sub-caps per entry, three times
-over, would multiply picksplit's own cost for no clear benefit -- the
-overall cap is a fine proxy for *where* to cut). But the two output keys
-(`spl_ldatum`/`spl_rdatum`) are built via `multicap_union_many` over the
-*full* multi-cap sets of the entries assigned to each side, not by unioning
-their overall caps -- so the sharper sub-cap structure actually propagates
-into internal nodes, not just leaves, which is precisely what round two's
-`EXPLAIN (ANALYZE, BUFFERS)` finding (excess internal-page traversal) called
-for.
+from round two. Entries are still *ordered* along a candidate axis by each
+entry's `.overall` cap centre coordinate (sub-caps have no single natural
+per-axis coordinate the way one cap's centre does, so this stays a cheap,
+single-number sort key). As of round five, though, the split *cost itself*
+-- both the per-axis margin sum used to choose an axis, and the per-point
+overlap used to choose where to cut on it -- is computed from the *full*
+multi-cap union of each side (`multicap_union2`, `multicap_overlap_amount`),
+not just the overall caps; round three/four's version used the overall cap
+for the cost too, reserving the full multi-cap union only for the two
+output keys (`spl_ldatum`/`spl_rdatum`). Either way, the sharper sub-cap
+structure propagates into internal nodes, not just leaves, which is
+precisely what round two's `EXPLAIN (ANALYZE, BUFFERS)` finding (excess
+internal-page traversal) called for -- round five's change is *how much*
+of the split process gets to see that structure, not whether it does at
+all. See "Round five" above for the measured effect (~10-15% fewer buffer
+visits) of extending it to the cost functions too.
 
 **Results, same two scales as round two, same query shape:**
 
@@ -419,6 +432,82 @@ moved nothing" was recorded rather than omitted -- a negative result here
 is exactly why round three's redesign (a coarser change: restructuring
 *what* the key is, not just how many of the existing kind) was the right
 lever and turning the existing dial further was not.
+
+## Round five: a sub-cap-aware picksplit -- a real, modest win
+
+MAX_SUBCAPS=8 was one answer to "picksplit's buffer trace still shows the
+same too-many-pages-visited pattern round two diagnosed -- what else is
+there to try": make the *existing* key sharper. The other answer, tried
+here: picksplit already has the sharper multi-cap data sitting right there
+in `mc[]` and only uses each entry's *overall* cap (a single summary cap) to
+decide the split itself -- the full sub-cap sets are used only afterward, to
+build the two output keys (`spl_ldatum`/`spl_rdatum`), a round-three design
+choice made explicitly to keep the split search cheap. Does using the full
+multi-cap data for the split *decision itself* -- both which axis to split
+on, and where to cut on it -- do better than the overall-cap proxy?
+
+**The change.** Two new helpers, both reusing existing machinery rather than
+inventing new geometry: `multicap_union2()` (a thin wrapper over
+`multicap_union_many()` for exactly two multi-caps, so the running
+sweep can fold one more entry in at a time) and `multicap_overlap_amount()`
+(the sum of `cap_overlap_amount()` over every pairwise sub-cap combination
+between two multi-caps -- zero when no sub-cap pair overlaps at all).
+`picksplit`'s forward/backward cumulative-union sweep, previously tracking a
+single running `(centre, radius)` cap per side, now tracks a running full
+`GistMultiCap` per side instead, folding in one more entry's *entire*
+sub-cap set per step. Each fold is `O(MAX_SUBCAPS^2)` (a small constant, 16
+comparisons at MAX_SUBCAPS=4), so the whole sweep stays `O(n)` per axis --
+same complexity class as the overall-cap-only version it replaces, not the
+`O(n^2)` the discarded Quadratic split needed. The per-axis margin sum (used
+to *choose* an axis) switched from summed cap radius to summed multi-cap
+area, since a multi-cap union has no single linear "extent" the way one
+cap's radius did; the per-split-point cost (used to *choose where* to cut)
+switched from single-cap overlap to `multicap_overlap_amount()`. A pleasant
+side effect: since the winning split's `fwdMC[bestM-1]`/`bwdMC[bestM]` are
+already the exact full multi-cap union of everything assigned to each side,
+they're used directly as the output keys -- no separate final
+`multicap_union_many()` pass needed, simplifying the code slightly on top of
+whatever performance changed.
+
+**Correctness**, same fresh stress test as every prior round: 104,215/104,215
+for `&&`, 55,929/55,929 for `<@` (a different point count than round four's
+59,342 -- a freshly regenerated probe set, not a regression), 0 false
+positives/negatives on both.
+
+**Performance.** Wall-clock timing at these query sizes (single-digit to
+low-triple-digit milliseconds) turned out too noisy on this machine to trust
+directly -- repeated runs of the *identical* query against the *identical,
+unchanged* index varied by 20-30ms in isolation, larger than the effect
+being measured. `EXPLAIN (ANALYZE, BUFFERS)`'s buffer count is not subject
+to that noise (it is deterministic for a given index and query), so it is
+the number trusted here; wall-clock medians over 6-8 repeated runs each are
+reported alongside it as corroborating, not as the primary evidence:
+
+| | buffers/probe, `&&` (50k) | buffers/probe, `<@` (50k) | buffers/probe, `&&` (5k) | buffers/probe, `<@` (5k) |
+|---|---|---|---|---|
+| overall-cap-only picksplit (round three/four) | 67.1 | 62.9 | 12.2 | 11.3 |
+| **sub-cap-aware picksplit (round five)** | **58.5** | **53.9** | **10.9** | **10.0** |
+
+**~11-15% fewer index pages visited per probe, at both scales, for both
+strategies** -- a real, structural improvement, not noise, since it shows up
+identically in a deterministic metric measured on unchanged data with only
+the split algorithm's own code swapped out (verified with a controlled
+A/B: same seed, same generated tables, only the installed `.so` differed
+between runs). Wall-clock medians over 6-8 runs each moved the same
+direction at a roughly similar magnitude (e.g. ~82ms -> ~76ms median for
+`&&` at 50k rows, ~97ms -> ~84ms median for `<@`), consistent with, though
+noisier than, the buffer-count finding.
+
+**Kept.** Same complexity class as what it replaces, no correctness
+regression, a genuine (if modest, ~10-15%, not the 2-3x round three's key
+redesign delivered) reduction in the exact metric round two's original
+diagnosis flagged as the bottleneck, and it happens to simplify picksplit's
+own code besides. This is the "yes, and by how much" answer to the question
+left open in round three/four's own file header about whether picksplit
+could be made sub-cap aware too -- worth doing, not a game-changer on its
+own, and not a substitute for whatever it would take to close the remaining
+gap to pgSphere at 50,000+ rows (still open, per round three's and round
+four's own honest scaling caveats).
 
 ## Spike scope
 
