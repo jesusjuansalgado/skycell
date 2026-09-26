@@ -8,6 +8,12 @@
 --
 -- Depends on `fpr` from 20_region_xmatch.sql (2500 circle + 2500 polygon
 -- footprints): run that script first.
+--
+-- The comparison to pgSphere/the MOC-ranges recipe is scale-sensitive: this
+-- opclass looks competitive at fpr's default 5000 rows but falls behind both
+-- at 50,000 (`20_region_xmatch.sql -v nfp=50000`, this script with
+-- `-v nprobe=500`) -- see GIST_REGION_DESIGN.md's "Picksplit, round two"
+-- before trusting a single run of this script at the default size.
 \set ON_ERROR_STOP 1
 \if :{?nprobe}
 \else

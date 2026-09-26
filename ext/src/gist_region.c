@@ -37,19 +37,21 @@
  * project's own benchmarks), not on PostgreSQL's textbook point/box
  * example, since a unit-sphere cap has no direct textbook analogue.
  *
- * STATUS: a correctness-verified spike, not yet a fully tuned index.
- * picksplit uses Guttman's Quadratic split (waste-based seed selection,
- * most-decisive-entry-first assignment) -- a real step up from this file's
- * first version (a cheaper Linear split), but still short of the R*-tree
- * margin/overlap search PostgreSQL's own box opclass uses, which is the
- * likely remaining source of any gap to a mature native opclass like
- * pgSphere's. cap_union's near-antipodal case (centres almost pi radians
- * apart) is approximated rather than handled exactly; skyregion itself
- * already forbids a cone larger than a hemisphere and a polygon spanning
- * one, so a single region's own cap cannot be near-antipodal internally,
- * but a union of two widely-separated small regions' caps could approach
- * it. Meant to answer "is this approach even worth pursuing further", not
- * to be merged as-is.
+ * STATUS: correctness-verified (see GIST_REGION_DESIGN.md for the full
+ * history: an initial Linear split, then Guttman's Quadratic split, then the
+ * current R*-tree-style margin/overlap split below), but the performance
+ * verdict is scale-dependent and not a clean win: competitive with pgSphere's
+ * native opclass at a 5000-row footprint table, ~5x slower at 50,000 rows,
+ * where even the MOC-ranges recipe this opclass was meant to replace pulls
+ * ahead of it. Two split algorithms (Quadratic, R*-tree-style) bracket the
+ * likely cause as the bounding-cap key itself being too coarse at scale, not
+ * the tree-balancing on top of it -- see GIST_REGION_DESIGN.md's "Picksplit,
+ * round two" before trying a third split algorithm. Not concurrent-write-
+ * tested. cap_union's near-antipodal case (centres almost pi radians apart)
+ * is approximated rather than handled exactly; skyregion itself already
+ * forbids a cone larger than a hemisphere and a polygon spanning one, so a
+ * single region's own cap cannot be near-antipodal internally, but a union
+ * of two widely-separated small regions' caps could approach it.
  *
  * picksplit's loop bounds below are OffsetNumber/FirstOffsetNumber, not
  * plain 0-based indices, on purpose: an earlier version treated
@@ -218,6 +220,18 @@ cap_overlaps(sc_vec3 c1, double r1, sc_vec3 c2, double r2)
 	return sc_angle(c1, c2) <= r1 + r2;
 }
 
+/* how much two caps overlap, not just whether they do: 0 when disjoint (or
+ * merely touching), growing with how far the sum of radii exceeds the
+ * centre distance -- a cheap angular proxy, not a real lens-shaped overlap
+ * area, in the same spirit as cap_area_proxy() above. */
+static double
+cap_overlap_amount(sc_vec3 c1, double r1, sc_vec3 c2, double r2)
+{
+	if (r1 < 0 || r2 < 0)
+		return 0.0;
+	return fmax(0.0, r1 + r2 - sc_angle(c1, c2));
+}
+
 PG_FUNCTION_INFO_V1(skyregion_gist_compress);
 Datum
 skyregion_gist_compress(PG_FUNCTION_ARGS)
@@ -297,24 +311,46 @@ skyregion_gist_penalty(PG_FUNCTION_ARGS)
 	PG_RETURN_POINTER(result);
 }
 
+typedef struct
+{
+	double		key;			/* cap centre's coordinate along the axis being tried */
+	OffsetNumber idx;
+}			axis_sort_entry;
+
+static int
+axis_sort_cmp(const void *a, const void *b)
+{
+	double		ka = ((const axis_sort_entry *) a)->key;
+	double		kb = ((const axis_sort_entry *) b)->key;
+
+	return (ka > kb) - (ka < kb);
+}
+
 /*
- * Guttman's Quadratic split (the middle of his three algorithms -- costlier
- * than Linear, still short of the R*-tree margin/overlap search PostgreSQL's
- * own box opclass uses, but a real step up from this file's original linear-
- * split spike, and the change that closed most of the gap to pgSphere's
- * native opclass -- see GIST_REGION_DESIGN.md):
+ * R*-tree-style split (Beckmann et al. 1990), adapted from axis-aligned
+ * boxes to spherical caps -- replaced Guttman's Quadratic split (see git
+ * history / GIST_REGION_DESIGN.md for that version and why it was tried
+ * first) once benchmarking showed room past it:
  *
- *   PickSeeds: the pair whose combined cap wastes the most area if forced
- *   together -- area(union(i,j)) - area(i) - area(j) -- not just the pair
- *   that's farthest apart (a large-but-mostly-overlapping pair wastes little
- *   and is a poor seed choice even if its centres are far apart).
+ *   ChooseSplitAxis: try sorting the entries by their cap centre's x, y, and
+ *   z coordinate in turn (three candidate axes -- a cap has no natural
+ *   per-axis bounding box the way a box does, so the centre's own
+ *   coordinate stands in for it); for each axis, sum the "margin" (here,
+ *   cap radius as a size proxy) of every valid left/right split along it;
+ *   the axis with the smallest total margin sum is the one along which the
+ *   entries are most naturally separable.
  *
- *   PickNext (assignment order): at each step, among all unassigned entries,
- *   pick the one with the *largest preference margin* between the two
- *   groups (|penalty_left - penalty_right|) and assign it now, not in
- *   arbitrary/positional order -- the entries with a weak preference are
- *   left for last, when the groups' shapes are already mostly settled and
- *   there is more information to place them well.
+ *   ChooseSplitIndex: along the chosen axis, pick the split point that
+ *   minimises the *overlap* between the resulting left and right caps
+ *   (cap_overlap_amount, not just whether they overlap), breaking ties by
+ *   minimising their combined area -- overlap is what actually costs a GiST
+ *   scan extra work later (a query cap intersecting both children's caps
+ *   has to descend into both), not raw size.
+ *
+ * O(n log n) per axis (sort once, then a single forward and backward
+ * cumulative-union sweep), so three axes is still O(n log n) overall --
+ * cheaper to compute than Quadratic split's O(n^2) seed search, as well as
+ * a better split by the numbers (see GIST_REGION_DESIGN.md).
  */
 PG_FUNCTION_INFO_V1(skyregion_gist_picksplit);
 Datum
@@ -328,139 +364,109 @@ skyregion_gist_picksplit(PG_FUNCTION_ARGS)
 	 * the loop indices below are used as OffsetNumbers directly, with no
 	 * +1/-1 conversion). */
 	OffsetNumber maxoff = (OffsetNumber) (entryvec->n - 1);
+	int			n = maxoff - FirstOffsetNumber + 1;
 	sc_vec3    *c = palloc(sizeof(sc_vec3) * (maxoff + 1));
 	double	   *r = palloc(sizeof(double) * (maxoff + 1));
-	bool	   *assigned = palloc0(sizeof(bool) * (maxoff + 1));
-	OffsetNumber seed1 = FirstOffsetNumber,
-				seed2 = FirstOffsetNumber + 1;
-	double		worst = -1;
-	sc_vec3		lc,
-				rc;
-	double		lr,
-				rr;
-	int			nunassigned;
+	int			minfill = Max(1, n * 3 / 10);
+	axis_sort_entry *sorted = palloc(sizeof(axis_sort_entry) * n);
+	sc_vec3    *fwdC = palloc(sizeof(sc_vec3) * n);	/* fwdC[k]/fwdR[k]: union of sorted[0..k] */
+	double	   *fwdR = palloc(sizeof(double) * n);
+	sc_vec3    *bwdC = palloc(sizeof(sc_vec3) * n);	/* bwdC[k]/bwdR[k]: union of sorted[k..n-1] */
+	double	   *bwdR = palloc(sizeof(double) * n);
+	int			bestAxis = 0;
+	double		bestAxisMargin = HUGE_VAL;
 
 	for (OffsetNumber i = FirstOffsetNumber; i <= maxoff; i++)
 		bytea_to_cap(DatumGetByteaP(entryvec->vector[i].key), &c[i], &r[i]);
 
-	/* PickSeeds */
-	for (OffsetNumber i = FirstOffsetNumber; i <= maxoff; i++)
-		for (OffsetNumber j = i + 1; j <= maxoff; j++)
-		{
-			sc_vec3		uc;
-			double		ur;
-			double		waste;
-
-			cap_union2(c[i], r[i], c[j], r[j], &uc, &ur);
-			waste = cap_area_proxy(ur) - cap_area_proxy(r[i]) - cap_area_proxy(r[j]);
-			if (waste > worst)
-			{
-				worst = waste;
-				seed1 = i;
-				seed2 = j;
-			}
-		}
-
-	v->spl_left = palloc(sizeof(OffsetNumber) * maxoff);
-	v->spl_right = palloc(sizeof(OffsetNumber) * maxoff);
-	v->spl_nleft = v->spl_nright = 0;
-	lc = c[seed1];
-	lr = r[seed1];
-	rc = c[seed2];
-	rr = r[seed2];
-	assigned[seed1] = assigned[seed2] = true;
-	v->spl_left[v->spl_nleft++] = seed1;
-	v->spl_right[v->spl_nright++] = seed2;
-	nunassigned = (maxoff - FirstOffsetNumber + 1) - 2;
-
-	/* PickNext, one entry at a time */
-	while (nunassigned > 0)
+	for (int axis = 0; axis < 3; axis++)
 	{
-		OffsetNumber best = InvalidOffsetNumber;
-		double		bestMargin = -1;
-		bool		bestGoLeft = true;
-		sc_vec3		bestUlc,
-					bestUrc;
-		double		bestUlr,
-					bestUrr;
+		double		marginSum = 0;
 
-		/* keep either side from absorbing everything: force all remaining
-		 * entries to the other side once one side is one short of full */
-		if (v->spl_nleft >= maxoff - 1)
+		for (int k = 0; k < n; k++)
 		{
-			for (OffsetNumber i = FirstOffsetNumber; i <= maxoff; i++)
-				if (!assigned[i])
-				{
-					cap_union2(rc, rr, c[i], r[i], &rc, &rr);
-					v->spl_right[v->spl_nright++] = i;
-					assigned[i] = true;
-				}
-			break;
+			OffsetNumber idx = (OffsetNumber) (k + FirstOffsetNumber);
+
+			sorted[k].idx = idx;
+			sorted[k].key = (axis == 0) ? c[idx].x : (axis == 1) ? c[idx].y : c[idx].z;
 		}
-		if (v->spl_nright >= maxoff - 1)
+		qsort(sorted, n, sizeof(axis_sort_entry), axis_sort_cmp);
+
+		fwdC[0] = c[sorted[0].idx];
+		fwdR[0] = r[sorted[0].idx];
+		for (int k = 1; k < n; k++)
+			cap_union2(fwdC[k - 1], fwdR[k - 1], c[sorted[k].idx], r[sorted[k].idx], &fwdC[k], &fwdR[k]);
+		bwdC[n - 1] = c[sorted[n - 1].idx];
+		bwdR[n - 1] = r[sorted[n - 1].idx];
+		for (int k = n - 2; k >= 0; k--)
+			cap_union2(bwdC[k + 1], bwdR[k + 1], c[sorted[k].idx], r[sorted[k].idx], &bwdC[k], &bwdR[k]);
+
+		for (int m = minfill; m <= n - minfill; m++)
+			marginSum += fwdR[m - 1] + bwdR[m];
+
+		if (marginSum < bestAxisMargin)
 		{
-			for (OffsetNumber i = FirstOffsetNumber; i <= maxoff; i++)
-				if (!assigned[i])
-				{
-					cap_union2(lc, lr, c[i], r[i], &lc, &lr);
-					v->spl_left[v->spl_nleft++] = i;
-					assigned[i] = true;
-				}
-			break;
-		}
-
-		for (OffsetNumber i = FirstOffsetNumber; i <= maxoff; i++)
-		{
-			sc_vec3		ulc,
-						urc;
-			double		ulr,
-						urr;
-			double		pl,
-						pr,
-						margin;
-
-			if (assigned[i])
-				continue;
-
-			cap_union2(lc, lr, c[i], r[i], &ulc, &ulr);
-			cap_union2(rc, rr, c[i], r[i], &urc, &urr);
-			pl = cap_area_proxy(ulr) - cap_area_proxy(lr);
-			pr = cap_area_proxy(urr) - cap_area_proxy(rr);
-			margin = fabs(pl - pr);
-
-			if (margin > bestMargin)
-			{
-				bestMargin = margin;
-				best = i;
-				bestGoLeft = (pl < pr) || (pl == pr && v->spl_nleft <= v->spl_nright);
-				bestUlc = ulc;
-				bestUlr = ulr;
-				bestUrc = urc;
-				bestUrr = urr;
-			}
-		}
-
-		assigned[best] = true;
-		nunassigned--;
-		if (bestGoLeft)
-		{
-			v->spl_left[v->spl_nleft++] = best;
-			lc = bestUlc;
-			lr = bestUlr;
-		}
-		else
-		{
-			v->spl_right[v->spl_nright++] = best;
-			rc = bestUrc;
-			rr = bestUrr;
+			bestAxisMargin = marginSum;
+			bestAxis = axis;
 		}
 	}
 
-	v->spl_ldatum = PointerGetDatum(cap_to_bytea(lc, lr));
-	v->spl_rdatum = PointerGetDatum(cap_to_bytea(rc, rr));
+	/* redo the winning axis's sort + cumulative unions (cheap: one more
+	 * O(n log n) pass, and keeps the loop above simple) */
+	for (int k = 0; k < n; k++)
+	{
+		OffsetNumber idx = (OffsetNumber) (k + FirstOffsetNumber);
+
+		sorted[k].idx = idx;
+		sorted[k].key = (bestAxis == 0) ? c[idx].x : (bestAxis == 1) ? c[idx].y : c[idx].z;
+	}
+	qsort(sorted, n, sizeof(axis_sort_entry), axis_sort_cmp);
+	fwdC[0] = c[sorted[0].idx];
+	fwdR[0] = r[sorted[0].idx];
+	for (int k = 1; k < n; k++)
+		cap_union2(fwdC[k - 1], fwdR[k - 1], c[sorted[k].idx], r[sorted[k].idx], &fwdC[k], &fwdR[k]);
+	bwdC[n - 1] = c[sorted[n - 1].idx];
+	bwdR[n - 1] = r[sorted[n - 1].idx];
+	for (int k = n - 2; k >= 0; k--)
+		cap_union2(bwdC[k + 1], bwdR[k + 1], c[sorted[k].idx], r[sorted[k].idx], &bwdC[k], &bwdR[k]);
+
+	{
+		int			bestM = minfill;
+		double		bestOverlap = HUGE_VAL;
+		double		bestArea = HUGE_VAL;
+
+		for (int m = minfill; m <= n - minfill; m++)
+		{
+			double		overlap = cap_overlap_amount(fwdC[m - 1], fwdR[m - 1], bwdC[m], bwdR[m]);
+			double		area = cap_area_proxy(fwdR[m - 1]) + cap_area_proxy(bwdR[m]);
+
+			if (overlap < bestOverlap || (overlap == bestOverlap && area < bestArea))
+			{
+				bestOverlap = overlap;
+				bestArea = area;
+				bestM = m;
+			}
+		}
+
+		v->spl_left = palloc(sizeof(OffsetNumber) * bestM);
+		v->spl_right = palloc(sizeof(OffsetNumber) * (n - bestM));
+		v->spl_nleft = v->spl_nright = 0;
+		for (int k = 0; k < bestM; k++)
+			v->spl_left[v->spl_nleft++] = sorted[k].idx;
+		for (int k = bestM; k < n; k++)
+			v->spl_right[v->spl_nright++] = sorted[k].idx;
+
+		v->spl_ldatum = PointerGetDatum(cap_to_bytea(fwdC[bestM - 1], fwdR[bestM - 1]));
+		v->spl_rdatum = PointerGetDatum(cap_to_bytea(bwdC[bestM], bwdR[bestM]));
+	}
+
 	pfree(c);
 	pfree(r);
-	pfree(assigned);
+	pfree(sorted);
+	pfree(fwdC);
+	pfree(fwdR);
+	pfree(bwdC);
+	pfree(bwdR);
 	PG_RETURN_POINTER(v);
 }
 

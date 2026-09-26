@@ -143,25 +143,92 @@ occasionally unlucky** -- the fresh-per-tuple-context/address-reuse pattern
 this hits is exactly how PostgreSQL evaluates a join's inner index scan for
 every outer row, not an edge case.
 
+## Picksplit, round two: R*-tree split, and what it actually bought
+
+The Quadratic split above closed most of the gap to pgSphere on a 200-probe
+x 5000-footprint benchmark (~1.2-1.4x, from 2-3x). The natural next question
+was whether PostgreSQL's own `box` opclass's actual split algorithm --
+R*-tree-style margin/overlap search, not Quadratic -- would close the rest
+of it. Implemented it (see "Spike scope" above for the algorithm), verified
+correctness clean at the same 2923-row/33,361-pair scale, and re-ran the
+200x5000 benchmark: **~30-32ms, statistically indistinguishable from
+Quadratic split's ~31-34ms.** On this benchmark, a materially more
+sophisticated, textbook-correct split algorithm bought nothing measurable
+over the simpler one it replaced -- a real, honest negative result, not a
+failed attempt to reproduce a known win.
+
+That raised the obvious next question: is 5000 rows too small to see a split
+algorithm's quality matter at all (a shallow tree has little for a good
+split to fix), and does the picture change at real scale? Rebuilt `fpr` at
+50,000 rows (10x) with 500 probes (2.5x) and re-measured all three
+approaches on the identical query shape:
+
+| approach | 200 x 5,000 | 500 x 50,000 (25x the pair-work) | scaling |
+|---|---|---|---|
+| pgSphere native `&&` | ~25-27 ms | ~88-89 ms | ~3.5x for 25x work |
+| MOC-ranges recipe (#6) | ~74-75 ms | ~270-288 ms | ~3.8x for 25x work |
+| **this opclass** | ~31-34 ms | **~466-477 ms** | **~14-15x for 25x work** |
+
+Both scopes agree exactly with brute force (1282/1282 matches at the larger
+scale, 0 false positives/negatives) -- this is a real performance finding,
+not a correctness regression hiding as one. But it is not a good one: **the
+gap to pgSphere widens sharply with table size, from ~1.3x at 5000 rows to
+~5.3x at 50,000**, and the MOC-ranges recipe -- the "worse" interface this
+opclass was meant to replace -- actually *scales better* than it does,
+ending up faster in absolute terms at 50,000 rows despite starting more than
+2x slower at 5000. `EXPLAIN (ANALYZE, BUFFERS)` on the 50,000-row case shows
+why it isn't a recheck problem: `Rows Removed by Index Recheck: 0` -- every
+candidate the index hands to the heap is a genuine match -- yet the scan
+still touches ~89 buffers per probe to find ~2.6 matches on average. The
+tree itself is being walked far more than it should be; a correctness-clean
+index can still be a slow one if too many internal and leaf pages have
+overlapping bounding caps for reasons no split algorithm fixes after the
+fact.
+
+**The likely real cause, and why another split algorithm won't fix it:**
+a single bounding cap per region is a coarser key than either pgSphere's
+native per-shape predicates or the MOC-ranges recipe's finer-grained cell
+decomposition (several `[lo,hi]` ranges per region, not one blob). Once
+enough regions of comparable, moderate size accumulate -- exactly what a
+5000-to-50,000-row footprint table does -- their caps start overlapping each
+other pervasively regardless of how cleverly they're grouped, because the
+*key itself*, not the tree built over it, can no longer discriminate between
+them. R*-tree split minimises overlap **given the caps as they are**; it has
+no lever over the caps being an inherently blunter representation than the
+alternatives at this scale. Closing this would need a sharper key (e.g. more
+than one cap per region, or a HEALPix-cell-based key resembling the MOC
+approach this opclass was meant to replace with something simpler) --
+a materially bigger change than a split-algorithm swap, and arguably
+undermines the "simpler than the recipe" case for building this opclass at
+all.
+
+`picksplit` was kept as the R*-tree-style version regardless of the flat
+result on the small benchmark: it is not worse than Quadratic split on any
+measurement here, it is a sounder, better-precedented algorithm (the same
+shape PostgreSQL's own `box` opclass uses), and it costs less to compute
+(O(n log n) vs O(n^2) per split, a real win for index *build* time even
+where it didn't move query time).
+
 ## Spike scope
 
 Built and measured:
 
 - `compress`, `decompress`, `union`, `penalty`, `same`, `consistent` (`&&`
-  only), and `picksplit` (see below).
-- `picksplit` is Guttman's **Quadratic split**: seeds are the pair whose
-  combined cap wastes the most area if forced together (`area(union(i,j)) -
-  area(i) - area(j)`, not just the pair that's farthest apart -- a large but
-  mostly-overlapping pair wastes little and is a poor seed choice even if its
-  centres are far apart), and the remaining entries are assigned one at a
-  time, each round picking whichever unassigned entry has the *largest*
-  preference margin between the two groups (not positional/arbitrary order,
-  so the entries with a weak preference are placed last, once the groups'
-  shapes are already mostly settled). This replaced an initial, cheaper
-  Linear split (arbitrary-order seeds and assignment) once benchmarking
-  showed real headroom; see "Performance" for what it was worth. Still short
-  of the R*-tree margin/overlap search PostgreSQL's own `box` opclass uses --
-  a further, smaller lever if more is ever wanted.
+  only), and `picksplit` (see below, and "Picksplit, round two" further down
+  for why it went through three versions).
+- `picksplit` is now an **R*-tree-style split** (Beckmann et al. 1990),
+  adapted from axis-aligned boxes to spherical caps: try sorting the entries
+  by their cap centre's x, y, and z coordinate in turn (three candidate
+  "axes" -- a cap has no natural per-axis bounding box the way a box does, so
+  the centre's coordinate stands in for one), pick whichever axis has the
+  smallest total margin (cap radius, as a size proxy) summed over every valid
+  split point along it, then along that axis pick the split point that
+  minimises *overlap* between the resulting two caps (not just their combined
+  size) -- the same two-phase ChooseSplitAxis/ChooseSplitIndex structure
+  PostgreSQL's own `box` opclass uses, with a cap-shaped overlap and margin
+  proxy standing in for a box's exact ones. O(n log n): sort once per axis,
+  then a single forward and backward cumulative-union sweep, versus the
+  O(n^2) seed search the Quadratic split it replaced needed.
 - `consistent()` caches the query region's bounding cap across repeated calls
   within one scan (see the bug writeup above for why this has to be a
   value-based cache, not a pointer-based one).
@@ -177,9 +244,8 @@ Built and measured:
 Not built: `<@`/`@>` strategies (point-in-region or full containment via the
 same opclass -- likely a small addition once `&&` is trusted, since the cap
 math is identical, only the strategy dispatch in `consistent` would grow),
-concurrent-insert/VACUUM stress testing (only single-threaded `CREATE INDEX`
-and read-only querying were exercised), and the R*-tree-style split
-mentioned above.
+and concurrent-insert/VACUUM stress testing (only single-threaded
+`CREATE INDEX` and read-only querying were exercised).
 
 ## Correctness
 
@@ -201,41 +267,57 @@ overlap.sql`'s MOC-ranges recipe and pgSphere's native `&&` already agree on.
 
 ## Performance
 
-Same 200-probe x 5000-footprint join as `bench/21_region_overlap.sql`
-(`bench/22_region_gist.sql`, same probe construction, same seed):
+200-probe x 5000-footprint join (`bench/22_region_gist.sql` vs
+`bench/21_region_overlap.sql`, same probe construction, same seed), across
+every version built in this investigation:
 
-| approach | time (before tuning) | time (after: Quadratic split + cached consistent) | setup needed | matches |
-|---|---|---|---|---|
-| unindexed (`intersects()`) | ~1.4-1.8 s | -- (unchanged) | none | 203 |
-| MOC-ranges recipe (PR #6) | ~74-75 ms | -- (unchanged) | side table + hand-written join | 203 |
-| **this opclass** | ~80-83 ms | **~31-34 ms** | `CREATE INDEX ... USING gist (region)` | 203 |
-| pgSphere native `&&` | ~27-42 ms | ~25-27 ms (re-measured same run) | none (native types) | 203 |
+| approach | first spike (Linear split) | + Quadratic split + cached consistent | + R*-tree-style split | setup needed | matches |
+|---|---|---|---|---|---|
+| unindexed (`intersects()`) | ~1.4-1.8 s | -- | -- | none | 203 |
+| MOC-ranges recipe (#6) | ~74-75 ms | -- | -- | side table + hand-written join | 203 |
+| **this opclass** | ~80-83 ms | ~31-34 ms | **~30-32 ms** | `CREATE INDEX ... USING gist (region)` | 203 |
+| pgSphere native `&&` | ~27-42 ms | ~25-27 ms | ~25-27 ms | none (native types) | 203 |
 
-The tuning pass -- Guttman's Quadratic split instead of Linear, plus caching
-`consistent()`'s query-cap computation across repeated calls in one scan --
-roughly **2.5x'd** this opclass's own speed and closed the gap to pgSphere
-from 2-3x down to about **1.2-1.4x**, on this benchmark. `EXPLAIN` confirms
-the join still plans as `Nested Loop -> Index Scan using <idx> on fpr,
-Index Cond: (s_region && p.s_region)`, a genuine per-row (non-constant)
+At this scale: the Quadratic-split-plus-caching pass roughly **2.5x'd**
+query speed and closed the gap to pgSphere from 2-3x down to ~1.2-1.4x; the
+further R*-tree-style split moved nothing measurable on top of that. See
+"Picksplit, round two" above for what happened when the same three
+approaches were re-measured at 10x the table size and 2.5x the probes: the
+gap to pgSphere *widens* to ~5.3x, and even the MOC-ranges recipe pulls
+ahead of this opclass in absolute terms -- the honest headline result of
+this investigation, not the flat 5000-row numbers above. `EXPLAIN` confirms
+the join plans as `Nested Loop -> Index Scan using <idx> on fpr, Index Cond:
+(s_region && p.s_region)` at both scales, a genuine per-row (non-constant)
 indexed nested loop -- no special-casing was needed for "the query side
 isn't a literal", which is precisely the point of building a real opclass
-instead of a recipe. Index build itself stayed cheap: ~205ms for 5000 rows
-with the more expensive Quadratic split, not a concern at this scale.
+instead of a recipe, even where its performance doesn't yet earn that out.
+Index build stayed cheap throughout: ~205ms for 5000 rows even with the
+costlier Quadratic split.
 
 ## Where this leaves the decision
 
-The core hypothesis holds, and better than the first pass suggested:
-`skyregion` can carry a real, standards-shaped GiST opclass, built almost
-entirely from pieces the extension already had (`sc_region_centroid`, the
-newly-exposed `region_farthest`, and `sc_region_overlaps`'s own overlap
-formula), and with one further, still-modest tuning pass (a standard
-textbook split algorithm, a correctly-scoped cache) it now lands within
-striking distance of pgSphere's own mature, tuned opclass rather than
-trailing it by 2-3x. The remaining gap's likely source is the same one
-named after the first pass -- Quadratic split still isn't the R*-tree
-margin/overlap search PostgreSQL's own `box` opclass uses -- but the
-returns from *this* round of tuning (2.5x from two contained, well-
-understood changes) suggest the remaining gap is worth closing only if the
-opclass is going somewhere real: `<@`/`@>` support, concurrent-write
-testing, and a decision on whether an experimental spike graduates to
-something this project ships.
+The core hypothesis -- `skyregion` can carry a real, standards-shaped GiST
+opclass, built almost entirely from pieces the extension already had
+(`sc_region_centroid`, the newly-exposed `region_farthest`, and
+`sc_region_overlaps`'s own overlap formula) -- still holds, and the
+correctness bar is solid: two real, well-understood bugs found and fixed
+along the way, both re-verified against a 2923-row/33,361-pair stress test
+each time. But the performance verdict has to lead with the larger-scale
+result, not the smaller one this investigation started with: **at 5000
+rows this opclass looks competitive with pgSphere; at 50,000 rows it is 5x
+slower, and even the manual MOC-ranges recipe beats it.** Two split
+algorithms (Quadratic, then R*-tree-style) gave one real win (2.5x, from
+Quadratic) and one null result (R*-tree-style, on top of Quadratic) --
+enough evidence that a *third* split algorithm is not the next thing worth
+trying. The bottleneck this points to is the bounding-cap key itself being
+too coarse once enough same-scale regions accumulate, which is a
+representation question, not a tree-balancing one -- closing it for real
+would mean a sharper per-region key (something closer to the MOC-ranges
+recipe's multiple cell ranges, or an entirely different embedding), which
+is a bigger redesign than this branch's remaining scope, not a tuning pass.
+Recommendation: this opclass is a solid answer to "can `&&` be indexed
+directly, with a correct, working implementation and two genuinely
+instructive bugs to show for it" and not yet a good answer to "should this
+replace the MOC-ranges recipe" -- that call should wait on whether closing
+the at-scale gap is worth a real key redesign, not on further picksplit
+tuning.
