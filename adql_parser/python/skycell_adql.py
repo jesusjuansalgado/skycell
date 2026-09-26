@@ -320,15 +320,18 @@ def _intersects(args: list[str], d: Dialect, version: str) -> str:
     if len(args) != 2:
         raise TranslationError("INTERSECTS takes two geometries")
     if d is SKYCELL:
-        # A point has no area: intersecting a region is the same as being
-        # contained in it (see skycell_intersects_pos's own comment). A
-        # cross-match written as INTERSECTS(POINT, CIRCLE-or-POLYGON) either
-        # way round hits the same unindexed-non-constant-region gap as
-        # CONTAINS; reuse its detection so it gets the same redirect.
+        # A point has no area: intersecting a region is exactly containment
+        # (see skycell_intersects_pos's own comment) -- for a literal region
+        # just as much as a per-row one. So this delegates entirely to
+        # _contains, not just its cross-match detection, whenever either
+        # argument is a point over plain columns: that picks up <@'s already
+        # -indexed constant-region path for free, alongside the cross-match
+        # redirect for a non-constant one. Only "two regions, no point at
+        # all" (or a point that isn't a plain-column POINT(...)) falls
+        # through to the genuinely unindexable generic intersects().
         for pos, region in (args, (args[1], args[0])):
-            xm = _crossmatch(_is_point_of_columns(pos), region, version)
-            if xm is not None:
-                return xm
+            if _is_point_of_columns(pos) is not None:
+                return _contains([pos, region], d, version)
         a, b = (translate_expr(x, d, version) for x in args)
         return f"intersects({a}, {b})"
     a, b = (translate_expr(x, d, version) for x in args)

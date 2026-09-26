@@ -205,12 +205,10 @@ public final class SkycellAdql {
             case "CONTAINS": {
                 need(raw, 2, "CONTAINS takes two geometries");
                 String inner = raw.get(0), outer = raw.get(1);
-                String[] cols = pointOfColumns(inner);
                 if (dialect == Dialect.SKYCELL) {
-                    String xm = crossmatch(cols, outer);
-                    if (xm != null) return xm;
-                    return "(" + translateExpression(inner) + " <@ " + translateExpression(outer) + ")";
+                    return containsSkycell(inner, outer);
                 }
+                String[] cols = pointOfColumns(inner);
                 Matcher m = Pattern.compile("\\s*(CIRCLE|POLYGON)\\s*\\((.*)\\)\\s*",
                         Pattern.CASE_INSENSITIVE | Pattern.DOTALL).matcher(outer);
                 if (cols != null && m.matches()) {
@@ -228,14 +226,19 @@ public final class SkycellAdql {
             case "INTERSECTS": {
                 need(raw, 2, "INTERSECTS takes two geometries");
                 if (dialect == Dialect.SKYCELL) {
-                    // A point has no area: intersecting a region is the same as being
-                    // contained in it (see skycell_intersects_pos's own comment). A
-                    // cross-match written as INTERSECTS(POINT, CIRCLE-or-POLYGON) either
-                    // way round hits the same unindexed-non-constant-region gap as
-                    // CONTAINS; reuse its detection so it gets the same redirect.
-                    String xm = crossmatch(pointOfColumns(raw.get(0)), raw.get(1));
-                    if (xm == null) xm = crossmatch(pointOfColumns(raw.get(1)), raw.get(0));
-                    if (xm != null) return xm;
+                    // A point has no area: intersecting a region is exactly containment
+                    // (see skycell_intersects_pos's own comment) -- for a literal region
+                    // just as much as a per-row one. So this delegates entirely to
+                    // containsSkycell, not just its cross-match detection, whenever
+                    // either argument is a point over plain columns: that picks up
+                    // <@'s already-indexed constant-region path for free, alongside the
+                    // cross-match redirect for a non-constant one. Only "two regions,
+                    // no point at all" falls through to the genuinely unindexable
+                    // generic intersects().
+                    for (int i = 0; i < 2; i++) {
+                        String pos = raw.get(i), region = raw.get(1 - i);
+                        if (pointOfColumns(pos) != null) return containsSkycell(pos, region);
+                    }
                     return "intersects(" + translateExpression(raw.get(0)) + ", "
                             + translateExpression(raw.get(1)) + ")";
                 }
@@ -373,6 +376,20 @@ public final class SkycellAdql {
         if (xm != null) return xm;
         xm = crossmatchPoly(cols, region);
         return xm != null ? xm : crossmatchBox(cols, region);
+    }
+
+    /**
+     * {@code inner <@ outer} for the skycell dialect, or the cross-match
+     * redirect if {@code inner} is a point over plain columns and
+     * {@code outer} is a non-constant CIRCLE/POLYGON/BOX. Shared between
+     * CONTAINS and INTERSECTS: a point has no area, so intersecting a
+     * region is exactly containment (see skycell_intersects_pos's own
+     * comment), whether the region is literal or per-row.
+     */
+    private String containsSkycell(String inner, String outer) {
+        String xm = crossmatch(pointOfColumns(inner), outer);
+        if (xm != null) return xm;
+        return "(" + translateExpression(inner) + " <@ " + translateExpression(outer) + ")";
     }
 
     /** POINT('ICRS', ra, dec) over plain columns -&gt; {ra, dec}, else null. */

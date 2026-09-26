@@ -87,10 +87,12 @@ def test_crossmatch_box_uses_plain_at_sign():
           "INTERSECTS(BOX('ICRS', b.ra, b.dec, b.w, b.h), POINT('ICRS', a.ra, a.dec)) = 1")
     assert translate(q3) == (
         "SELECT * FROM a, b WHERE (point('ICRS', a.ra, a.dec) <@ box('ICRS', b.ra, b.dec, b.w, b.h))")
-    # A literal box is untouched -- both CONTAINS and INTERSECTS already
-    # produce this for a literal region, and it isn't a cross-match anyway.
+    # A literal box: INTERSECTS(POINT, region) delegates fully to CONTAINS's
+    # own logic now, literal or not, so this also reaches <@ (already
+    # index-backed for a constant region) instead of the generic, genuinely
+    # unindexed intersects().
     lit = "SELECT * FROM t WHERE INTERSECTS(POINT('ICRS', ra, dec), BOX('ICRS', 10, 20, 1, 2)) = 1"
-    assert "intersects(" in translate(lit)
+    assert translate(lit) == "SELECT * FROM t WHERE (point('ICRS', ra, dec) <@ box('ICRS', 10, 20, 1, 2))"
 
 
 def test_intersects_crossmatch_uses_skycell_radial_query():
@@ -104,9 +106,12 @@ def test_intersects_crossmatch_uses_skycell_radial_query():
           "INTERSECTS(CIRCLE('ICRS', b.ra, b.dec, 0.0003), POINT('ICRS', a.ra, a.dec)) = 1")
     assert translate(q2) == (
         "SELECT * FROM a, b WHERE skycell_radial_query(a.ra, a.dec, b.ra, b.dec, 0.0003)")
-    # A literal circle, or two regions with no point at all, are untouched.
+    # A literal circle now reaches <@ too (INTERSECTS(POINT, region) delegates
+    # fully to CONTAINS's own logic, not just its cross-match detection) --
+    # only "two regions, no point at all" is genuinely unindexable and stays
+    # as the generic intersects().
     lit = "SELECT * FROM t WHERE INTERSECTS(POINT('ICRS', ra, dec), CIRCLE('ICRS', 10, 20, 0.5)) = 1"
-    assert "intersects(" in translate(lit)
+    assert translate(lit) == "SELECT * FROM t WHERE (point('ICRS', ra, dec) <@ circle('ICRS', 10, 20, 0.5))"
     rr = "SELECT * FROM t WHERE INTERSECTS(CIRCLE('ICRS', 1, 2, 3), CIRCLE('ICRS', 4, 5, 6)) = 1"
     assert "intersects(" in translate(rr)
 

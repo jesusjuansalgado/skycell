@@ -104,9 +104,22 @@ literal numbers) and emits `skycell_radial_query(a.ra, a.dec, b.ra, b.dec, r)`
 instead: Q3C's own argument order, which reaches skycell's non-constant
 covering path and stays index-backed, capped to `skycell.join_slots` ranges
 per probe. A literal `CIRCLE` is untouched -- `<@` already covers that case
-without a cap. `INTERSECTS(POINT, CIRCLE)` gets the same treatment, either
-argument order -- a point has no area, so intersecting a region is exactly
-containment (skycell's own `skycell_intersects_pos` says as much).
+without a cap.
+
+`INTERSECTS(POINT, CIRCLE)`, either argument order, is translated as if it
+had been written `CONTAINS` -- a point has no area, so intersecting a region
+is exactly containment (skycell's own `skycell_intersects_pos` says as much)
+-- for a literal circle just as much as a non-constant one. `intersects()`
+itself carries no planner support at all, constant argument or not, so
+without this a literal `INTERSECTS(POINT, CIRCLE('ICRS', 10, 20, 0.5))` would
+be just as unindexed as the cross-match case; redirecting it to the same
+`<@`/`skycell_radial_query` forms `CONTAINS` already produces reaches the
+index either way. Only `INTERSECTS` between two regions with no point at all
+-- `INTERSECTS(CIRCLE(...), CIRCLE(...))` and the like -- has no such
+rewrite and stays as the (unindexed) `intersects(...)` call: that's a
+genuinely different, harder problem (no `&&`/`skycell_region_overlap`
+planner support exists for it today), not something a point-vs-region
+redirect can help with.
 
 A non-constant `POLYGON` cross-match -- `CONTAINS(POINT('ICRS', a.ra, a.dec),
 POLYGON('ICRS', b.v1, b.v2, ...)) = 1`, matching points against a per-row
@@ -128,8 +141,9 @@ hood, built once at construction time -- so `<@`'s own non-constant branch
 already covers it, whatever kind of region it's built from. `CONTAINS(POINT,
 BOX(...))` already fell back to `<@` before any of this, so it needed no
 change; `INTERSECTS(POINT, BOX(...))`, either argument order, did, since its
-own function has no planner support at all -- the translator now redirects it
-to the same `<@` form CONTAINS already uses. A literal `BOX` is untouched.
+own function has no planner support at all, literal argument or not -- the
+translator now redirects it to the same `<@` form `CONTAINS` already uses,
+same as `CIRCLE` and `POLYGON` above.
 
 A cross-match against a stored **`skyregion` column** -- `CONTAINS(POINT('ICRS',
 a.ra, a.dec), b.s_region) = 1`, matching points against another table's
