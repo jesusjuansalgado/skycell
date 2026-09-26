@@ -823,7 +823,7 @@ protocol, so what is compared is the work each does. At 50 million rows this giv
 \texttt{q3c\_join} as the fastest established method by a factor 2.4 over pgSphere, and
 \texttt{skycell}'s \texttt{LATERAL} form level with it (0.78--0.92 of its time, not
 distinguishable) and 2.5--3.3 times faster than pgSphere; the fixed-slot join form is
-level with Q3C at 1\arcsec\ but 35\% slower at 10\arcsec, where a fixed slot count fits
+level with Q3C at 1\arcsec\ but 17\% slower at 10\arcsec, where a fixed slot count fits
 the covering less well.
 
 Why level rather than better traces to the covering itself: the sky it scans, as a
