@@ -576,7 +576,29 @@ PG_FUNCTION_INFO_V1(skycell_region_covers);
 Datum
 skycell_region_covers(PG_FUNCTION_ARGS)
 {
-	PG_RETURN_BOOL(region_region(fcinfo, true) != 0);
+	/* @>(a, b) must mean "a contains b" -- every point of b is in a --
+	 * the reverse of region_region(fcinfo, true)'s own ADQL CONTAINS(a, b)
+	 * convention ("every point of a is in b"), which skycell_contains_region
+	 * above correctly reuses unchanged. Swap the arguments going into
+	 * sc_region_contains_region instead of reusing region_region() as-is:
+	 * @>(a, b) was calling region_region(fcinfo, true), i.e.
+	 * sc_region_contains_region(a, b) = "a is inside b", backwards from
+	 * what @> and its own documentation have always said it computes.
+	 * Caught because it was never actually indexed until this file's own
+	 * new GiST strategy sent someone looking for the exact test it
+	 * reuses; the only regression test for this function,
+	 * skycell_region_covers(p, p), is symmetric and could never catch a
+	 * reversed argument order. */
+	sc_region	a,
+				b;
+	int			res;
+
+	skycell_region_from_datum(PG_GETARG_DATUM(0), &a);
+	skycell_region_from_datum(PG_GETARG_DATUM(1), &b);
+	res = sc_region_contains_region(&b, &a);
+	sc_region_free(&a);
+	sc_region_free(&b);
+	PG_RETURN_BOOL(res != 0);
 }
 
 PG_FUNCTION_INFO_V1(skycell_distance);
