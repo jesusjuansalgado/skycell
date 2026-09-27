@@ -373,7 +373,8 @@ omitted for space.
       \texttt{point(...) <@ circle(...)} \\[2pt]
     \texttt{INTERSECTS(r$_1$, r$_2$)} &
       \texttt{r$_1$ \&\& r$_2$} (pgSphere only; Q3C has no region type) &
-      \texttt{intersects(r$_1$, r$_2$)} \\[2pt]
+      \texttt{r$_1$ \&\& r$_2$} -- \texttt{intersects(...)} exists for ADQL compatibility
+      but is not indexed \\[2pt]
     \texttt{AREA}/\texttt{CENTROID(region)} &
       \texttt{area(spoly)} returns steradians (scaled by $(180/\pi)^2$); no direct
       \texttt{CENTROID} for a polygon; no Q3C equivalent for either &
