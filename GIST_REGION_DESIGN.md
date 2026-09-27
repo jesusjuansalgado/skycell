@@ -616,6 +616,87 @@ whole design is "reuse round three's test, pay whatever selectivity that
 costs", so inheriting round four's scaling shape rather than improving on
 it is exactly what should have been expected going in.
 
+## Round seven: a fourth strategy, region <@ region ("contained by"), and
+## the other direction round six's own comment flagged
+
+Round six's own "direction wrinkle" left something on the table:
+`@>(skyregion,skyregion)` had no `COMMUTATOR`, so only `indexed_col @>
+probe` -- "which of my candidates contain this one" -- could use the
+index. The mirror question, "which of my candidates are wholly contained
+*within* this one" (`indexed_col <@ probe`), is a different, real predicate
+(not just a different spelling of the same one), and round six explicitly
+deferred building it.
+
+**The design change needs no new geometry at all.** The necessary condition
+round six established -- "A contains B" (B nonempty) implies "A and B
+overlap", surviving the swap to sub-cap covers -- holds regardless of which
+side plays container and which plays contained, since "overlap" is
+symmetric. So `GIST_REGION_STRATEGY_CONTAINED_BY_REGION` shares
+`CONTAINS_REGION`'s entire `consistent()` case verbatim; the two differ only
+in strategy number, which only matters for GiST recheck to know which exact
+operator function to fall back to (`skycell_region_covers` vs the new
+`skycell_region_covered_by`) -- machinery GiST already owns, not something
+this file's code has to manage.
+
+**The exact test was almost free too.** `skycell_region_covered_by(a, b)` --
+"a is contained by b" -- is precisely `sc_region_contains_region(a, b)`'s own
+convention ("every point of a is also in b"), the same one ADQL
+`CONTAINS(a, b)` and `skycell_contains_region` already use correctly. Unlike
+`skycell_region_covers` (round six's `@>`, which needed its arguments
+swapped because `@>`'s convention is the opposite one), this new function
+just calls the existing `region_region(fcinfo, true)` helper unchanged.
+
+**Wiring in the commutator closes the loop properly**, not just for the new
+operator: `CREATE OPERATOR <@ (... COMMUTATOR = @> ...)` triggers
+PostgreSQL's documented forward-reference fixup and backfills the
+*pre-existing* `@>(skyregion,skyregion)` operator's own missing commutator
+link too (it has had none since skycell 0.1). Verified directly against
+`pg_operator`: both operators' `oprcom` now point at each other. The
+practical effect, mirroring how round four's point strategy already let
+both `f.region @> point(...)` and `point(...) <@ f.region` use the same
+index: `t.region <@ :probe` and the commutator spelling `:probe @>
+t.region` now both plan through `fpr_region_gist`, confirmed by `EXPLAIN`.
+
+**Correctness.** A self-join on the same nested/multi-scale fixture round
+six's own stress test used: 0 mismatches against `skycell_region_covered_by`
+directly, 1346/1346 genuine matches in one run (not a vacuous
+always-empty agreement). `ext/test/sql/skycell.sql` gained a matching
+`gist_region_covered_by_join_*` block, including a check that the
+commutator spelling (`b.region @> a.region`) returns exactly the same count
+as the direct one (`a.region <@ b.region`).
+
+**Performance** (`bench/24_region_contains_region.sql`, extended with a
+`covered_by` scope: probes are large regions nested around a sample of
+`fpr`'s own footprints -- the mirror of round six's tiny probes, since this
+direction wants candidates *smaller* than the query, not larger),
+`skycell_region_covered_by` as the honest sequential baseline, pgSphere's
+native `<@` as the mature-implementation comparison:
+
+| approach | 200 probes x 5,000 footprints | 500 probes x 50,000 footprints |
+|---|---|---|
+| brute force (`skycell_region_covered_by`) | ~1.17-1.22 s | ~29.4 s |
+| pgSphere native `<@` | ~12.4-12.9 ms | ~210-215 ms |
+| **this opclass, `<@` (region)** | **~7.6-8.3 ms** | **~134-139 ms** |
+
+Both scales agree exactly across all three methods (1250/1250/1250 at 5,000
+rows/200 probes; 26,768/26,768/26,768 at 50,000/500 -- a much higher match
+rate than `@>`'s scope, expected: the probes here are large enough to
+contain many small footprints each, not just the one they're centred on).
+Against sequential scan this is the same order of win as round six's:
+**~150-160x faster at 5,000 rows, ~215-220x at 50,000**. Against pgSphere,
+though, this strategy does something round six's `@>` scope never managed:
+**it wins outright, at both scales** -- about 1.6x faster at 5,000 rows and
+1.5x faster at 50,000, the gap *not* widening with scale the way `@>`'s
+did. The likely reason is the baseline, not this opclass: pgSphere's own
+`<@` for two extended shapes is exact shape-in-shape containment, not the
+cheap point-in-shape test round four's comparison benefited from, so it
+carries more of pgSphere's own overlap-test cost -- meanwhile this
+strategy's sub-cap test costs the same as `@>`'s did, and it's already
+competitive there. This is the first case in this file where the
+"reuse round three's test" strategy doesn't just win against sequential
+scan but against the native implementation too, without any tuning
+specific to this direction.
+
 ## Spike scope
 
 Built and measured:
