@@ -108,12 +108,15 @@ def test_intersects_crossmatch_uses_skycell_radial_query():
         "SELECT * FROM a, b WHERE skycell_radial_query(a.ra, a.dec, b.ra, b.dec, 0.0003)")
     # A literal circle now reaches <@ too (INTERSECTS(POINT, region) delegates
     # fully to CONTAINS's own logic, not just its cross-match detection) --
-    # only "two regions, no point at all" is genuinely unindexable and stays
-    # as the generic intersects().
+    # "two regions, no point at all" reaches && instead of the generic
+    # intersects() function, whose bare form used to leave a type error
+    # (int4 where WHERE needs boolean) once _fold_predicates dropped this
+    # case's own `= 1`, confirmed against a live database, not just asserted
+    # here as a string match.
     lit = "SELECT * FROM t WHERE INTERSECTS(POINT('ICRS', ra, dec), CIRCLE('ICRS', 10, 20, 0.5)) = 1"
     assert translate(lit) == "SELECT * FROM t WHERE (point('ICRS', ra, dec) <@ circle('ICRS', 10, 20, 0.5))"
     rr = "SELECT * FROM t WHERE INTERSECTS(CIRCLE('ICRS', 1, 2, 3), CIRCLE('ICRS', 4, 5, 6)) = 1"
-    assert "intersects(" in translate(rr)
+    assert translate(rr) == "SELECT * FROM t WHERE (circle('ICRS', 1, 2, 3) && circle('ICRS', 4, 5, 6))"
 
 
 def test_negation():
