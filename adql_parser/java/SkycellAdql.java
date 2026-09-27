@@ -232,14 +232,26 @@ public final class SkycellAdql {
                     // containsSkycell, not just its cross-match detection, whenever
                     // either argument is a point over plain columns: that picks up
                     // <@'s already-indexed constant-region path for free, alongside the
-                    // cross-match redirect for a non-constant one. Only "two regions,
-                    // no point at all" falls through to the genuinely unindexable
-                    // generic intersects().
+                    // cross-match redirect for a non-constant one. "Two regions, no
+                    // point at all" used to fall through to the generic intersects()
+                    // function -- unindexable at the time this branch was written, and
+                    // actually a latent bug besides: intersects() returns int (ADQL
+                    // compatibility), so the fold-predicates pass that strips this
+                    // case's own "= 1" wrapper left a bare int4-valued function call as
+                    // the whole WHERE condition, a type error PostgreSQL rejects
+                    // outright ("argument of WHERE must be type boolean, not type
+                    // integer"). skyregion's GiST opclass now gives && a real index
+                    // (CREATE INDEX ... USING gist (region)), the same operator
+                    // pgSphere already used below, so emit that directly instead: it is
+                    // boolean already, so the wrapper this translator strips is the
+                    // right one to strip, and no database-side rewrite could fix this
+                    // from inside intersects() itself -- its own support hook only
+                    // ever sees the int4-typed call, never the "= 1" around it.
                     for (int i = 0; i < 2; i++) {
                         String pos = raw.get(i), region = raw.get(1 - i);
                         if (pointOfColumns(pos) != null) return containsSkycell(pos, region);
                     }
-                    return "intersects(" + translateExpression(raw.get(0)) + ", "
+                    return "(" + translateExpression(raw.get(0)) + " && "
                             + translateExpression(raw.get(1)) + ")";
                 }
                 return "(" + translateExpression(raw.get(0)) + " && "

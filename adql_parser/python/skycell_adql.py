@@ -326,14 +326,27 @@ def _intersects(args: list[str], d: Dialect, version: str) -> str:
         # _contains, not just its cross-match detection, whenever either
         # argument is a point over plain columns: that picks up <@'s already
         # -indexed constant-region path for free, alongside the cross-match
-        # redirect for a non-constant one. Only "two regions, no point at
-        # all" (or a point that isn't a plain-column POINT(...)) falls
-        # through to the genuinely unindexable generic intersects().
+        # redirect for a non-constant one. "Two regions, no point at all" used
+        # to fall through to the generic intersects() function -- unindexable
+        # at the time this branch was written, and actually a latent bug
+        # besides: intersects() returns int (ADQL compatibility), so
+        # _fold_predicates stripping this case's own `= 1` wrapper left a bare
+        # int4-valued function call as the whole WHERE condition, a type error
+        # PostgreSQL rejects outright ("argument of WHERE must be type
+        # boolean, not type integer") -- confirmed against a live database,
+        # not just read off the regex. skyregion's GiST opclass now gives &&
+        # a real index (CREATE INDEX ... USING gist (region)), the same
+        # operator pgSphere already used below, so emit that directly
+        # instead: it is boolean already, so the wrapper this translator
+        # strips is the right one to strip, and no database-side rewrite
+        # could have fixed this from inside intersects() itself -- its own
+        # support hook only ever sees the int4-typed call, never the `= 1`
+        # around it.
         for pos, region in (args, (args[1], args[0])):
             if _is_point_of_columns(pos) is not None:
                 return _contains([pos, region], d, version)
         a, b = (translate_expr(x, d, version) for x in args)
-        return f"intersects({a}, {b})"
+        return f"({a} && {b})"
     a, b = (translate_expr(x, d, version) for x in args)
     return f"({a} && {b})"          # pgSphere only; Q3C has no region type
 
