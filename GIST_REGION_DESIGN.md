@@ -509,6 +509,113 @@ own, and not a substitute for whatever it would take to close the remaining
 gap to pgSphere at 50,000+ rows (still open, per round three's and round
 four's own honest scaling caveats).
 
+## Round six: a third strategy, region @> region ("wholly contains"), and a
+## real bug it found along the way
+
+README.md and the paper both described `skyregion @> skyregion` as "not yet
+indexed, evaluated by sequential scan". Round four indexed `region @> point`
+by reusing `&&`'s own sub-cap-overlap pruning test unchanged (a point is
+just a zero-radius region for that purpose); the same argument extends to
+`region @> region` in principle -- "A contains B" (B nonempty) implies "A
+and B overlap", and that implication survives replacing both sides with
+their (superset) sub-cap covers, so a provable non-overlap between A's cover
+and B's cover is still a sound proof that A does not contain B. **The
+design change is again small**: `GIST_REGION_STRATEGY_CONTAINS_REGION` is a
+second case label on the exact same `consistent()` branch `&&` already uses,
+computing the identical `multicap_overlaps()` test, differing only in
+strategy number and (implicitly) which exact operator recheck falls back
+to. No new geometry, no new sub-cap decomposition, no new query cache.
+
+This is a deliberate choice, not a placeholder for a tighter test written
+later. A tighter one is temptingly easy to imagine -- "every sub-cap of B
+sits inside some single sub-cap of A" -- but that is a *sufficient*
+condition for containment, not a *necessary* one, so it cannot be used to
+*prune*: a query region straddling two adjacent sub-caps of a row that
+genuinely contains it would be wrongly rejected by that test, a false
+negative with no recheck to catch it (unlike a spurious candidate, which
+recheck always filters). The overlap-reuse test has no such failure mode.
+What it costs is selectivity: `region @> region` prunes exactly as sharply
+as `&&` does and no sharper, so a row merely touching the query region
+reaches recheck alongside a row that actually contains it.
+
+**A direction wrinkle, found while designing the benchmark, not a bug in
+the opclass itself:** `@>(skyregion,skyregion)` has no registered
+`COMMUTATOR` (there is no `<@(skyregion,skyregion)` operator at all), so
+unlike round four's point strategy -- where PostgreSQL's own commutator
+resolution lets *either* spelling, `f.region @> point(...)` or `point(...)
+<@ f.region`, use the same index -- only the direction that puts the
+indexed table's region on `@>`'s left argument can use this index. `probe
+@> footprint` (indexed table on the right) plans as `Nested Loop -> Seq
+Scan` on both sides; `footprint @> probe` (indexed table on the left) plans
+as the intended `Nested Loop -> Index Scan using fpr_region_gist, Index
+Cond: (s_region @> p.s_region)`. Both are real predicates asking different
+questions ("which of my candidate containers contain this probe" vs "does
+this one region contain each of these candidates"), not two spellings of
+the same one, so this is not a bug to fix so much as a scope boundary to
+document: a `<@(skyregion,skyregion)` operator plus a fourth strategy would
+be needed to index the other direction, and nothing here builds one.
+
+**A real, previously-undiscovered bug, found verifying the exact test this
+strategy's recheck relies on:** `skycell_region_covers` (the function
+behind `@>`) had its argument order backwards since the extension's very
+first commit. It called the same primitive ADQL `CONTAINS(a, b)` correctly
+uses ("is every point of a also in b"), so `a @> b` computed "a is inside
+b" -- the reverse of what `@>` and its own documentation have always said.
+A big circle genuinely containing a small one, `skycell_region_covers(big,
+small)`, returned `false`; the reversed call returned `true`. The only
+prior regression test for this function, `skycell_region_covers(p, p)`,
+compares a region to itself, where argument order cannot matter -- exactly
+why this survived undetected across every prior round of this file. Fixed
+by swapping the arguments passed into `sc_region_contains_region` inside
+`skycell_region_covers` specifically; `skycell_contains_region` (ADQL's own
+`CONTAINS(a, b)`, which is supposed to use that "a inside b" convention) was
+untouched. This opclass's own correctness is unaffected either way -- GiST
+recheck always calls the real operator function, so indexed and sequential
+results agreed before and after the fix -- but every containment answer
+this database ever gave through `@>` before this fix was backwards for any
+non-symmetric pair.
+
+**Correctness.** A mixed circle/polygon table with deliberately nested
+regions (a small circle exactly inside a larger one, and rows spanning
+three orders of magnitude in size) against `skycell_region_covers` (post-
+fix) directly: 0 mismatches, with genuine positive matches (not merely
+agreement on an empty result -- `region_covers_bruteforce`'s own count was
+539/539 nonzero in one such run). `ext/test/sql/skycell.sql`'s regression
+suite gained both the asymmetric direction test and a self-join `@>`
+correctness check requiring `gist_region_covers_join_has_positives`, so a
+future change cannot silently regress back to a vacuous "always agrees on
+zero" test.
+
+**Performance** (`bench/24_region_contains_region.sql`; probes are tiny
+regions nested near a sample of `fpr`'s own footprints, in the one
+direction the index can serve -- see the direction wrinkle above),
+`skycell_region_covers` (post-fix) as the honest sequential baseline:
+
+| approach | 200 probes x 5,000 footprints | 500 probes x 50,000 footprints |
+|---|---|---|
+| brute force (`skycell_region_covers`) | ~1.14-1.16 s | ~28.4-28.9 s |
+| pgSphere native `~` | ~3.0-3.1 ms | ~14.7-14.8 ms |
+| **this opclass, `@>` (region)** | **~4.6 ms** | **~72.2-72.6 ms** |
+
+Both scales agree exactly with the brute-force baseline (206/206 at 5,000
+rows/200 probes; 888/888 at 50,000/500). Against the only baseline that
+existed for this direction, this is another unambiguous win: **~250x faster
+than sequential scan at 5,000 rows, ~390x at 50,000**. Against pgSphere the
+pattern from round four repeats, only more so: ~1.5x slower at 5,000 rows,
+widening to ~4.9x at 50,000 -- a *wider* gap than round four's point
+strategy saw at the same scale (~2x -> ~5.5x there, starting from a lower
+baseline), consistent with this strategy reusing `&&`'s own (less
+selective, for this predicate) pruning test rather than a dedicated one:
+more candidates reach recheck here than would for a tighter, purpose-built
+containment test, so there is more room for pgSphere's native, exact
+primitive to pull ahead as the table grows. The qualitative lesson from
+round four holds again -- an unambiguous win over the only prior
+alternative (sequential scan), a real but scale-dependent gap to a mature,
+native implementation -- without needing to re-derive it: this strategy's
+whole design is "reuse round three's test, pay whatever selectivity that
+costs", so inheriting round four's scaling shape rather than improving on
+it is exactly what should have been expected going in.
+
 ## Spike scope
 
 Built and measured:
@@ -624,7 +731,15 @@ Recommendation: this opclass is now a good answer to both of the questions
 this investigation opened with -- "can `&&` be indexed directly, correctly"
 and "should this replace the MOC-ranges recipe" -- yes to both, on the
 evidence gathered here. What's left before calling it non-experimental is
-scope, not performance: `<@`/`@>` strategies are unbuilt, concurrent-write
-behavior is untested, and the two scales measured (5000, 50,000 rows) don't
-prove the multi-cap key's advantage holds at 500,000+ rows or under a very
-different footprint-size distribution than the ones benchmarked here.
+scope, not performance: concurrent-write behavior is untested, and the two
+scales measured (5000, 50,000 rows) don't prove the multi-cap key's
+advantage holds at 500,000+ rows or under a very different footprint-size
+distribution than the ones benchmarked here.
+
+(Written as of round three, before `@>` existed in either direction; rounds
+four and six since added it for point and region respectively -- see those
+sections for what that did and didn't close. The one direction still
+genuinely unbuilt is `<@(skyregion,skyregion)`, i.e. indexing "which of my
+candidate footprints are contained *within* this region" rather than
+"contains it" -- round six's own "direction wrinkle" explains why that
+needs its own operator and strategy, not just a different query spelling.)

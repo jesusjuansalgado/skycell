@@ -303,7 +303,12 @@ one purpose-built for containment (see `ext/src/gist_region.c`'s "round six" for
 why a tighter test would risk silently dropping a true match): it prunes every
 row whose footprint doesn't even touch the query region, same as `&&`, and lets
 the exact test decide the rest, so it is sound but not as selective as `&&`
-itself is for its own predicate.
+itself is for its own predicate. It is also indexable in one direction only:
+`t.region @> :probe` (which of my stored regions contain this one) uses the
+index on `t`; `:probe @> t.region` (does this one region contain each of my
+stored regions) does not, because there is no `<@(skyregion,skyregion)`
+operator to let the planner flip it — write the query with the indexed column
+on the left of `@>`.
 
 ### The index key
 
