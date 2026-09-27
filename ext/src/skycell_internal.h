@@ -8,10 +8,12 @@
 
 #include "nodes/pathnodes.h"
 #include "nodes/primnodes.h"
+#include "utils/array.h"
 #include "cover.h"
 
 extern void check_err(const char *err);
 extern void current_params(sc_cover_params *p, int max_ranges, const sc_density *d);
+extern ArrayType *moc_for_region(const sc_region *r, int max_cells, int max_order);
 
 extern int	skycell_join_slots;
 
@@ -33,7 +35,8 @@ extern bool density_for_expr(PlannerInfo *root, Node *arg, sc_density *d, Oid *s
 extern void density_for_var(PlannerInfo *root, Node *arg, sc_density *d, Oid *statrel,
 							 bool *uses_cell_ops);
 
-/* adql.c: the region behind a skyregion datum, as cover.c understands it */
+/* adql.c: a skypos/skyregion datum, as cover.c understands it */
+extern sc_vec3 skycell_pos_from_datum(Datum d);
 extern void skycell_region_from_datum(Datum d, sc_region *r);
 
 #endif

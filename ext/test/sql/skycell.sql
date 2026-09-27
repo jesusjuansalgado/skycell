@@ -301,6 +301,52 @@ brute AS (SELECT count(*) AS n FROM rr_a a, rr_b b WHERE intersects(a.region, b.
 SELECT brute.n > 50 AS many, moc.n = brute.n AS region_overlap_matches_exact FROM moc, brute;
 DROP TABLE rr_a, rr_b, rr_b_moc;
 
+-- skyregion GiST opclass (EXPERIMENTAL, ext/src/gist_region.c): the same
+-- region-region INTERSECTS as above, but indexed directly (bounding-cap key)
+-- with a plain CREATE INDEX ... USING gist (region) and no side table at
+-- all. Both self-join (many-to-many) and literal-vs-column forms must plan
+-- through the index and agree with the unindexed exact predicate.
+CREATE TABLE rg_gist AS
+  SELECT fid, ra0, dec0, r,
+         CASE WHEN fid % 2 = 0 THEN circle('ICRS', ra0, dec0, r)
+              ELSE polygon('ICRS', ra0-r, dec0-r, ra0+r, dec0-r, ra0+r, dec0+r, ra0-r, dec0+r)
+         END AS region
+  FROM fp WHERE abs(dec0) < 85;
+CREATE INDEX ON rg_gist USING gist (region);
+ANALYZE rg_gist;
+SELECT plan_uses_index(
+  $q$SELECT a.fid FROM rg_gist a, rg_gist b WHERE a.region && b.region AND a.fid < b.fid$q$
+) AS gist_region_join_indexed;
+SELECT (SELECT count(*) FROM rg_gist a, rg_gist b WHERE a.region && b.region AND a.fid < b.fid)
+     = (SELECT count(*) FROM rg_gist a, rg_gist b WHERE intersects(a.region, b.region) = 1 AND a.fid < b.fid)
+     AS gist_region_join_matches_exact;
+-- (not asserting plan_uses_index for this single-table filter form: on a
+-- fixture this small, a plain Seq Scan legitimately costs less than the
+-- index regardless of operator, the same as any other tiny-table case in
+-- this file -- the self-join above, where an index pays off even at this
+-- size, is the one that must plan through it.)
+SELECT (SELECT count(*) FROM rg_gist WHERE region && circle('ICRS', 0, 0, 20))
+     = (SELECT count(*) FROM rg_gist WHERE intersects(region, circle('ICRS', 0, 0, 20)) = 1)
+     AS gist_region_literal_matches_exact;
+
+-- second strategy on the same opclass: @>(skyregion,skypos) / its commutator
+-- <@(skypos,skyregion) ("which regions contain this point") -- the direction
+-- the point-in-footprint recipe elsewhere in this file cannot serve at all
+-- (it needs the point side to be the large, cell-indexed table). Probe
+-- points are offset from each row's own centre, so most land inside their
+-- source region (and sometimes a neighbour's, from overlap) rather than
+-- every probe trivially matching only its own row.
+CREATE TABLE rg_gist_pts AS
+  SELECT fid AS pid, point('ICRS', ra0 + 0.3*r, dec0) AS pos FROM rg_gist;
+SELECT plan_uses_index(
+  $q$SELECT p.pid FROM rg_gist_pts p, rg_gist f WHERE p.pos <@ f.region$q$
+) AS gist_region_contains_indexed;
+SELECT (SELECT count(*) FROM rg_gist_pts p, rg_gist f WHERE p.pos <@ f.region)
+     = (SELECT count(*) FROM rg_gist_pts p, rg_gist f WHERE skycell_in_region(p.pos, f.region))
+     AS gist_region_contains_matches_exact;
+DROP TABLE rg_gist_pts;
+DROP TABLE rg_gist;
+
 -- expression index instead of a cell column (how egernia's ivoa.obscore is
 -- indexed): the rewrite must use it and read its statistics
 CREATE TABLE cat_expr AS SELECT id, ra, dec FROM cat;

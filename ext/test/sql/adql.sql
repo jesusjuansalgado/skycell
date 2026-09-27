@@ -57,6 +57,20 @@ SELECT adql_plan_uses_index('SELECT * FROM acat WHERE pos <@ circle(''ICRS'', 10
        -- a region that is not a constant cannot be rewritten, and must not be
        adql_plan_uses_index('SELECT * FROM acat a WHERE a.pos <@ (SELECT circle(''ICRS'', b.ra, b.dec, 0.5) FROM acat b WHERE b.id = a.id)') AS not_constant;
 
+-- @>'s commutator spelling (region @> pos) must be rewritten exactly like
+-- <@ (pos <@ region): skycell_region_has_pos, the function backing @>, used
+-- to carry no SUPPORT function of its own and silently fell back to a
+-- sequential scan even though it and skycell_pos_in_region (backing <@)
+-- compute the identical predicate with the arguments swapped.
+SELECT adql_plan_uses_index('SELECT * FROM acat WHERE circle(''ICRS'', 10, 20, 0.5) @> pos') AS reversed_stored_pos,
+       adql_plan_uses_index('SELECT * FROM acat WHERE circle(''ICRS'', 10, 20, 0.5) @> skycell_point(ra, dec)') AS reversed_from_columns,
+       adql_plan_uses_index('SELECT * FROM acat WHERE polygon(''ICRS'', 10,10, 12,10, 12,12, 10,12) @> pos') AS reversed_poly,
+       adql_plan_uses_index('SELECT * FROM acat WHERE box(''ICRS'', 10, 20, 2, 1) @> pos') AS reversed_bx;
+
+SELECT (SELECT count(*) FROM acat WHERE pos <@ circle('ICRS', 10, 20, 0.5))
+     = (SELECT count(*) FROM acat WHERE circle('ICRS', 10, 20, 0.5) @> pos)
+     AS reversed_matches_forward;
+
 -- indexed and sequential answers must be identical
 CREATE FUNCTION op_mismatches() RETURNS TABLE(n_queries int, n_rows bigint, mismatches int)
 LANGUAGE plpgsql AS $$

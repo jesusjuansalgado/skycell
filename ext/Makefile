@@ -1,5 +1,5 @@
 MODULE_big = skycell
-OBJS = src/skycell.o src/adql.o src/astro.o src/cover.o src/healpix.o
+OBJS = src/skycell.o src/adql.o src/astro.o src/cover.o src/healpix.o src/gist_region.o
 EXTENSION = skycell
 # Every version script and every upgrade script, so that adding a version means
 # adding a file and nothing else.
@@ -18,6 +18,7 @@ include $(PGXS)
 src/skycell.o src/adql.o src/astro.o: src/cover.h src/healpix.h src/sc_alloc.h src/skycell_internal.h
 src/cover.o: src/cover.h src/healpix.h src/sc_alloc.h
 src/healpix.o: src/healpix.h
+src/gist_region.o: src/cover.h src/healpix.h src/skycell_internal.h
 
 # standalone geometry tests (no PostgreSQL needed)
 selftest:
