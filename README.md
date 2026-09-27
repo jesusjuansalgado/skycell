@@ -287,19 +287,23 @@ all exist there), either install into a schema that precedes it in
 | `skypos <@ skyregion` | position inside region — **the one the planner rewrites into index ranges**, against a constant region and an indexed point catalogue |
 | `skyregion @> skypos` | the same, reversed — the same rewrite, or, when `skyregion` is itself a stored column with a GiST index on it, indexed that way instead (the region side need not be constant then) |
 | `skyregion && skyregion` | regions overlap — indexed by a plain `CREATE INDEX ON t USING gist (region)` on a `skyregion` column, no side table and no manual recipe needed (new; see the caveat below) |
-| `skyregion @> skyregion` | region wholly contains region — **not yet indexed**, evaluated by sequential scan |
+| `skyregion @> skyregion` | left region wholly contains right region — indexed the same way (new; see the caveat below) |
 
 `<@`/`@>` against a constant region and a plain `ra`/`dec` (or `skypos`) catalogue
 go through the B-tree cell rewrite described above. A `skyregion` column with its
-own GiST index additionally indexes `&&` and `@>` (point) directly against it,
-region side non-constant included — what a stored footprint column (an ObsCore
-`s_region`, say) should carry. For a per-row region cross-matched against a plain
-point catalogue with no `skyregion` column of its own, use `skycell_cone()` or
-`skycell_cone_ranges()` instead.
+own GiST index additionally indexes `&&`, `@>` (point), and `@>` (region) directly
+against it, region side non-constant included — what a stored footprint column
+(an ObsCore `s_region`, say) should carry. For a per-row region cross-matched
+against a plain point catalogue with no `skyregion` column of its own, use
+`skycell_cone()` or `skycell_cone_ranges()` instead.
 
 The `skyregion` GiST opclass is new and not yet stress-tested under concurrent
-writes; region-region full containment (`skyregion @> skyregion`, the last row
-above) isn't covered by it and has no indexed path yet.
+writes. Region-region `@>` reuses `&&`'s own pruning test rather than a tighter
+one purpose-built for containment (see `ext/src/gist_region.c`'s "round six" for
+why a tighter test would risk silently dropping a true match): it prunes every
+row whose footprint doesn't even touch the query region, same as `&&`, and lets
+the exact test decide the rest, so it is sound but not as selective as `&&`
+itself is for its own predicate.
 
 ### The index key
 
