@@ -375,6 +375,25 @@ SELECT (SELECT count(*) FROM rg_gist a, rg_gist b WHERE a.region @> b.region AND
      AS gist_region_covers_join_matches_exact;
 SELECT (SELECT count(*) FROM rg_gist a, rg_gist b WHERE a.region @> b.region AND a.fid <> b.fid) > 0
      AS gist_region_covers_join_has_positives;
+
+-- fourth strategy: <@(skyregion,skyregion), the third strategy's mirror --
+-- "which rows are wholly contained within that other region". Round six's
+-- @> had no COMMUTATOR, so only "indexed_col @> probe" could use the index;
+-- round seven adds <@ (and backfills @>'s COMMUTATOR), so "indexed_col <@
+-- probe" and the commutator spelling "probe @> indexed_col" both should.
+SELECT plan_uses_index(
+  $q$SELECT a.fid FROM rg_gist a, rg_gist b WHERE a.region <@ b.region AND a.fid <> b.fid$q$
+) AS gist_region_covered_by_join_indexed;
+SELECT (SELECT count(*) FROM rg_gist a, rg_gist b WHERE a.region <@ b.region AND a.fid <> b.fid)
+     = (SELECT count(*) FROM rg_gist a, rg_gist b WHERE skycell_region_covered_by(a.region, b.region) AND a.fid <> b.fid)
+     AS gist_region_covered_by_join_matches_exact;
+SELECT (SELECT count(*) FROM rg_gist a, rg_gist b WHERE a.region <@ b.region AND a.fid <> b.fid) > 0
+     AS gist_region_covered_by_join_has_positives;
+-- the commutator spelling of the same predicate must agree exactly (both
+-- plan through a's index, per the direction note above)
+SELECT (SELECT count(*) FROM rg_gist a, rg_gist b WHERE a.region <@ b.region AND a.fid <> b.fid)
+     = (SELECT count(*) FROM rg_gist a, rg_gist b WHERE b.region @> a.region AND a.fid <> b.fid)
+     AS gist_region_covered_by_commutator_agrees;
 DROP TABLE rg_gist;
 
 -- expression index instead of a cell column (how egernia's ivoa.obscore is

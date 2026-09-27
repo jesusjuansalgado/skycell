@@ -149,6 +149,20 @@
  * against a full sequential scan whenever most of a catalogue's footprints
  * don't touch the query region at all, which is the common case. See
  * bench/24_region_contains_region.sql for the measured numbers.
+ *
+ * A fourth strategy, <@(skyregion,skyregion) (round seven: "is this row's
+ * region wholly contained within that region", CONTAINS_REGION's mirror --
+ * "which of my candidate footprints fit inside this one" rather than "which
+ * of my candidates contain this one"), closes the direction gap round six's
+ * own comment flagged: @>(skyregion,skyregion) had no COMMUTATOR, so only
+ * `indexed_col @> probe` could use the index, never `probe @> indexed_col`.
+ * Needs no new pruning logic at all -- the same overlap-of-covers necessary
+ * condition CONTAINS_REGION already established holds regardless of which
+ * side is "the container" and which is "the contained", so this strategy
+ * shares CONTAINS_REGION's whole case body in consistent(), differing only
+ * in which exact function GiST's own recheck falls back to (determined by
+ * which operator the query actually used, not by anything this file does).
+ * See GIST_REGION_DESIGN.md's "Round seven" for the numbers.
  */
 #include "postgres.h"
 
@@ -169,6 +183,7 @@
 #define GIST_REGION_STRATEGY_OVERLAP 1	/* && (skyregion, skyregion) */
 #define GIST_REGION_STRATEGY_CONTAINS_POINT 2	/* @> (skyregion, skypos) */
 #define GIST_REGION_STRATEGY_CONTAINS_REGION 3	/* @> (skyregion, skyregion) */
+#define GIST_REGION_STRATEGY_CONTAINED_BY_REGION 4	/* <@ (skyregion, skyregion) */
 #define MAX_SUBCAPS 4
 
 typedef struct
@@ -873,15 +888,16 @@ skyregion_gist_consistent(PG_FUNCTION_ARGS)
 	{
 		case GIST_REGION_STRATEGY_OVERLAP:
 		case GIST_REGION_STRATEGY_CONTAINS_REGION:
+		case GIST_REGION_STRATEGY_CONTAINED_BY_REGION:
 			{
-				/* the query is a skyregion (bytea-backed) for both these
-				 * strategies -- STRATEGY_CONTAINS_POINT's query is a skypos
-				 * instead, a fixed-size by-reference struct with no varlena
-				 * header at all, so DatumGetByteaP/VARSIZE on it would
-				 * misread its raw bytes as a (possibly toasted) varlena,
-				 * corrupting whatever that garbage "pointer" happens to
-				 * land on. Computed here, not above the switch, so it only
-				 * ever runs for the strategies it's valid for.
+				/* the query is a skyregion (bytea-backed) for all three of
+				 * these strategies -- STRATEGY_CONTAINS_POINT's query is a
+				 * skypos instead, a fixed-size by-reference struct with no
+				 * varlena header at all, so DatumGetByteaP/VARSIZE on it
+				 * would misread its raw bytes as a (possibly toasted)
+				 * varlena, corrupting whatever that garbage "pointer"
+				 * happens to land on. Computed here, not above the switch,
+				 * so it only ever runs for the strategies it's valid for.
 				 *
 				 * CONTAINS_REGION (round six) reuses OVERLAP's own test
 				 * rather than a tighter one: "A covers B" (B nonempty)
@@ -904,7 +920,23 @@ skyregion_gist_consistent(PG_FUNCTION_ARGS)
 				 * doesn't even touch the query region, which is most rows
 				 * on a real catalogue. See bench/24_region_contains_region.sql
 				 * for the measured selectivity and speed this buys over
-				 * the sequential scan it replaces. */
+				 * the sequential scan it replaces.
+				 *
+				 * CONTAINED_BY_REGION (round seven) is CONTAINS_REGION's
+				 * mirror: "is the indexed row's region wholly contained
+				 * *within* this query region" (<@, not @>), the direction
+				 * round six's own opclass comment flagged as needing its
+				 * own operator and strategy rather than a different query
+				 * spelling. The necessary condition is exactly the same
+				 * overlap test, unchanged: "B contains A" implies "A and B
+				 * overlap" regardless of which of A/B is the indexed row and
+				 * which is the query, so this needs no new pruning logic at
+				 * all -- only a new strategy number for the planner to
+				 * dispatch a differently-named operator to, and a different
+				 * exact function (skycell_region_covered_by) for recheck to
+				 * fall back to, which GiST's own recheck machinery already
+				 * handles by calling whatever operator the query actually
+				 * used. */
 				bytea	   *qb = DatumGetByteaP(queryDatum);
 				Size		qsz = VARSIZE(qb);
 

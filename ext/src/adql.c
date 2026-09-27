@@ -601,6 +601,18 @@ skycell_region_covers(PG_FUNCTION_ARGS)
 	PG_RETURN_BOOL(res != 0);
 }
 
+PG_FUNCTION_INFO_V1(skycell_region_covered_by);
+Datum
+skycell_region_covered_by(PG_FUNCTION_ARGS)
+{
+	/* <@(a, b) must mean "a is contained by b" -- every point of a is in b
+	 * -- exactly region_region(fcinfo, true)'s own ADQL CONTAINS(a, b)
+	 * convention, the same one skycell_contains_region above already uses
+	 * correctly. Unlike skycell_region_covers (@>), this needs no argument
+	 * swap: it can reuse region_region() directly. */
+	PG_RETURN_BOOL(region_region(fcinfo, true) != 0);
+}
+
 PG_FUNCTION_INFO_V1(skycell_distance);
 Datum
 skycell_distance(PG_FUNCTION_ARGS)

@@ -307,6 +307,8 @@ CREATE FUNCTION skycell_region_overlap(a skyregion, b skyregion) RETURNS bool
 AS 'MODULE_PATHNAME' LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
 CREATE FUNCTION skycell_region_covers(a skyregion, b skyregion) RETURNS bool
 AS 'MODULE_PATHNAME' LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
+CREATE FUNCTION skycell_region_covered_by(a skyregion, b skyregion) RETURNS bool
+AS 'MODULE_PATHNAME' LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
 
 CREATE OPERATOR <@ (
     LEFTARG = skypos, RIGHTARG = skyregion,
@@ -325,7 +327,12 @@ CREATE OPERATOR && (
 );
 CREATE OPERATOR @> (
     LEFTARG = skyregion, RIGHTARG = skyregion,
-    FUNCTION = skycell_region_covers,
+    FUNCTION = skycell_region_covers, COMMUTATOR = <@,
+    RESTRICT = contsel, JOIN = contjoinsel
+);
+CREATE OPERATOR <@ (
+    LEFTARG = skyregion, RIGHTARG = skyregion,
+    FUNCTION = skycell_region_covered_by, COMMUTATOR = @>,
     RESTRICT = contsel, JOIN = contjoinsel
 );
 CREATE OPERATOR <-> (
@@ -625,6 +632,7 @@ CREATE OPERATOR CLASS skyregion_gist_ops
     OPERATOR 1 && (skyregion, skyregion),
     OPERATOR 2 @> (skyregion, skypos),
     OPERATOR 3 @> (skyregion, skyregion),
+    OPERATOR 4 <@ (skyregion, skyregion),
     FUNCTION 1 skyregion_gist_consistent(internal, internal, int4, oid, internal),
     FUNCTION 2 skyregion_gist_union(internal, internal),
     FUNCTION 3 skyregion_gist_compress(internal),
@@ -635,4 +643,4 @@ CREATE OPERATOR CLASS skyregion_gist_ops
     STORAGE bytea;
 
 COMMENT ON OPERATOR CLASS skyregion_gist_ops USING gist IS
-  'EXPERIMENTAL: indexes region-region && and @>, and region @> point, directly (multi-cap bounding key, R*-tree-style picksplit). Region-region @> reuses &&''s own pruning test (sound but not tight -- see ext/src/gist_region.c). See ext/src/gist_region.c, bench/22_region_gist.sql, bench/23_region_contains.sql, and bench/24_region_contains_region.sql before relying on this.';
+  'EXPERIMENTAL: indexes region-region && and both directions of full containment (@>, <@), and region @> point, directly (multi-cap bounding key, R*-tree-style picksplit). Region-region @>/<@ reuse &&''s own pruning test (sound but not tight -- see ext/src/gist_region.c). See ext/src/gist_region.c, bench/22_region_gist.sql, bench/23_region_contains.sql, and bench/24_region_contains_region.sql before relying on this.';
