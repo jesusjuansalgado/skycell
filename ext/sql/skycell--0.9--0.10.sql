@@ -50,3 +50,20 @@ CREATE OPERATOR CLASS skyregion_gist_ops
 
 COMMENT ON OPERATOR CLASS skyregion_gist_ops USING gist IS
   'EXPERIMENTAL: indexes region-region && and region @> point directly (multi-cap bounding key, R*-tree-style picksplit). See ext/src/gist_region.c, bench/22_region_gist.sql, and bench/23_region_contains.sql before relying on this.';
+
+-- ------------------------------------------------------------------
+-- @>(skyregion,skypos) -- <@'s commutator -- was never rewritten into
+-- index ranges: skycell_pos_in_region (backing <@) has always carried
+-- SUPPORT skycell_region_support, but skycell_region_has_pos (backing @>,
+-- args reversed) never carried a support function of its own, so
+-- `region @> point` silently fell back to a sequential scan while the
+-- otherwise-identical `point <@ region` was indexed. Same rewrite, region
+-- and point simply swapped before handing off to the shared
+-- implementation in adql.c (region_support_simplify).
+-- ------------------------------------------------------------------
+
+CREATE FUNCTION skycell_region_has_pos_support(internal) RETURNS internal
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
+
+ALTER FUNCTION skycell_region_has_pos(skyregion, skypos)
+  SUPPORT skycell_region_has_pos_support;

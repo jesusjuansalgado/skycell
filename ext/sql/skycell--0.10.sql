@@ -277,6 +277,8 @@ AS 'MODULE_PATHNAME' LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
 
 CREATE FUNCTION skycell_region_support(internal) RETURNS internal
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
+CREATE FUNCTION skycell_region_has_pos_support(internal) RETURNS internal
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
 CREATE FUNCTION skycell_region_sel_support(internal) RETURNS internal
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
 
@@ -299,7 +301,8 @@ CREATE FUNCTION skycell_region_bound(region skyregion, i int, nslots int, ntotal
 AS 'MODULE_PATHNAME' LANGUAGE C STABLE STRICT PARALLEL SAFE;
 
 CREATE FUNCTION skycell_region_has_pos(r skyregion, p skypos) RETURNS bool
-AS 'MODULE_PATHNAME' LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
+AS 'MODULE_PATHNAME' LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE
+SUPPORT skycell_region_has_pos_support;
 CREATE FUNCTION skycell_region_overlap(a skyregion, b skyregion) RETURNS bool
 AS 'MODULE_PATHNAME' LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
 CREATE FUNCTION skycell_region_covers(a skyregion, b skyregion) RETURNS bool
