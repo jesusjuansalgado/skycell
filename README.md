@@ -269,7 +269,7 @@ for ADQL compatibility and must be `'ICRS'`; convert other frames first with
 | `box(ra, dec, width, height)`<br>`box(coordsys, …)` | `skyregion` | centre and extent, as ADQL defines it. Errors if it reaches a pole — use a polygon there. ADQL `BOX` |
 | `polygon(ra1, dec1, ra2, dec2, …)`<br>`polygon(coordsys, …)` | `skyregion` | ≥ 3 vertices, **convex**, smaller than a hemisphere. ADQL `POLYGON` |
 | `contains(p skypos, r skyregion)`<br>`contains(a skyregion, b skyregion)` | `integer` (1/0) | ADQL `CONTAINS`. For an *indexable* test use the `<@` operator below |
-| `intersects(p skypos, r skyregion)`<br>`intersects(a skyregion, b skyregion)` | `integer` (1/0) | ADQL `INTERSECTS` |
+| `intersects(p skypos, r skyregion)`<br>`intersects(a skyregion, b skyregion)` | `integer` (1/0) | ADQL `INTERSECTS`. For an *indexable* test use `<@` (point-region) or `&&` (region-region) below |
 | `distance(a skypos, b skypos)`<br>`distance(ra1, dec1, ra2, dec2)` | `float8` | degrees. ADQL `DISTANCE`, both forms |
 | `area(r skyregion)` | `float8` | square degrees. ADQL `AREA` |
 | `coord1(p)` / `coord2(p)` | `float8` | right ascension / declination, degrees |
@@ -284,14 +284,22 @@ all exist there), either install into a schema that precedes it in
 
 | Operator | Meaning |
 |---|---|
-| `skypos <@ skyregion` | position inside region — **this is the one the planner rewrites into index ranges** |
-| `skyregion @> skypos` | the same, reversed |
-| `skyregion @> skyregion` | region wholly contains region |
-| `skyregion && skyregion` | regions overlap |
+| `skypos <@ skyregion` | position inside region — **the one the planner rewrites into index ranges**, against a constant region and an indexed point catalogue |
+| `skyregion @> skypos` | the same, reversed — the same rewrite, or, when `skyregion` is itself a stored column with a GiST index on it, indexed that way instead (the region side need not be constant then) |
+| `skyregion && skyregion` | regions overlap — indexed by a plain `CREATE INDEX ON t USING gist (region)` on a `skyregion` column, no side table and no manual recipe needed (new; see the caveat below) |
+| `skyregion @> skyregion` | region wholly contains region — **not yet indexed**, evaluated by sequential scan |
 
-Only `<@` / `@>` against a **constant** region are rewritten. For a region that
-varies per row (a cross-match), use `skycell_cone()` or
-`skycell_cone_ranges()`.
+`<@`/`@>` against a constant region and a plain `ra`/`dec` (or `skypos`) catalogue
+go through the B-tree cell rewrite described above. A `skyregion` column with its
+own GiST index additionally indexes `&&` and `@>` (point) directly against it,
+region side non-constant included — what a stored footprint column (an ObsCore
+`s_region`, say) should carry. For a per-row region cross-matched against a plain
+point catalogue with no `skyregion` column of its own, use `skycell_cone()` or
+`skycell_cone_ranges()` instead.
+
+The `skyregion` GiST opclass is new and not yet stress-tested under concurrent
+writes; region-region full containment (`skyregion @> skyregion`, the last row
+above) isn't covered by it and has no indexed path yet.
 
 ### The index key
 
