@@ -227,6 +227,19 @@ FROM (SELECT polygon('ICRS', 229.54244884307008-0.05, -48.37916509457751-0.05,
 SELECT skycell_region_overlap(polygon('ICRS', 0,0, 1,0, 1,1, 0,1),
                                polygon('ICRS', 1,0, 2,0, 2,1, 1,1)) AS shared_edge_ok;
 
+-- skycell_region_covers(a, b), backing @>, had its argument order backwards
+-- since the extension's first commit: it called the same underlying
+-- primitive CONTAINS(a, b) uses ("is every point of a also in b"), so
+-- `a @> b` computed "a is inside b" instead of "a contains b". Undetected
+-- because the only prior test here, self_covers above, compares a region
+-- to itself, where direction cannot matter. These use a genuinely
+-- asymmetric pair, so a reversed argument order fails them.
+SELECT skycell_region_covers(circle('ICRS', 10, 20, 5.0), circle('ICRS', 10, 20, 1.0)) AS big_contains_small,
+       skycell_region_covers(circle('ICRS', 10, 20, 1.0), circle('ICRS', 10, 20, 5.0)) AS small_does_not_contain_big,
+       (circle('ICRS', 10, 20, 5.0) @> circle('ICRS', 10, 20, 1.0)) AS op_form_agrees,
+       contains(circle('ICRS', 10, 20, 1.0), circle('ICRS', 10, 20, 5.0)) = 1 AS
+         adql_contains_still_right_way_round;
+
 -- joins: run-time slots and LATERAL vs brute force -------------------------
 CREATE TABLE probe AS
 SELECT id, ra + 0.0003 * (random() - 0.5) AS ra, greatest(-90, least(90, dec + 0.0003 * (random() - 0.5))) AS dec
@@ -345,6 +358,42 @@ SELECT (SELECT count(*) FROM rg_gist_pts p, rg_gist f WHERE p.pos <@ f.region)
      = (SELECT count(*) FROM rg_gist_pts p, rg_gist f WHERE skycell_in_region(p.pos, f.region))
      AS gist_region_contains_matches_exact;
 DROP TABLE rg_gist_pts;
+
+-- third strategy: @>(skyregion,skyregion) ("which rows wholly contain that
+-- other region") -- reuses OVERLAP's own pruning test rather than a tighter
+-- one (see ext/src/gist_region.c's "round six" for why a tighter test would
+-- risk a false negative), so recheck (skycell_region_covers) does the real
+-- work; this checks the index-accelerated answer still matches it exactly.
+-- rg_gist's own row sizes span three orders of magnitude (fid <= 2 down to
+-- sub-arcsecond, Table cones), so the self-join finds genuine containment,
+-- not just the trivial a=b case skycell_region_covers(p, p) above covers.
+SELECT plan_uses_index(
+  $q$SELECT a.fid FROM rg_gist a, rg_gist b WHERE a.region @> b.region AND a.fid <> b.fid$q$
+) AS gist_region_covers_join_indexed;
+SELECT (SELECT count(*) FROM rg_gist a, rg_gist b WHERE a.region @> b.region AND a.fid <> b.fid)
+     = (SELECT count(*) FROM rg_gist a, rg_gist b WHERE skycell_region_covers(a.region, b.region) AND a.fid <> b.fid)
+     AS gist_region_covers_join_matches_exact;
+SELECT (SELECT count(*) FROM rg_gist a, rg_gist b WHERE a.region @> b.region AND a.fid <> b.fid) > 0
+     AS gist_region_covers_join_has_positives;
+
+-- fourth strategy: <@(skyregion,skyregion), the third strategy's mirror --
+-- "which rows are wholly contained within that other region". Round six's
+-- @> had no COMMUTATOR, so only "indexed_col @> probe" could use the index;
+-- round seven adds <@ (and backfills @>'s COMMUTATOR), so "indexed_col <@
+-- probe" and the commutator spelling "probe @> indexed_col" both should.
+SELECT plan_uses_index(
+  $q$SELECT a.fid FROM rg_gist a, rg_gist b WHERE a.region <@ b.region AND a.fid <> b.fid$q$
+) AS gist_region_covered_by_join_indexed;
+SELECT (SELECT count(*) FROM rg_gist a, rg_gist b WHERE a.region <@ b.region AND a.fid <> b.fid)
+     = (SELECT count(*) FROM rg_gist a, rg_gist b WHERE skycell_region_covered_by(a.region, b.region) AND a.fid <> b.fid)
+     AS gist_region_covered_by_join_matches_exact;
+SELECT (SELECT count(*) FROM rg_gist a, rg_gist b WHERE a.region <@ b.region AND a.fid <> b.fid) > 0
+     AS gist_region_covered_by_join_has_positives;
+-- the commutator spelling of the same predicate must agree exactly (both
+-- plan through a's index, per the direction note above)
+SELECT (SELECT count(*) FROM rg_gist a, rg_gist b WHERE a.region <@ b.region AND a.fid <> b.fid)
+     = (SELECT count(*) FROM rg_gist a, rg_gist b WHERE b.region @> a.region AND a.fid <> b.fid)
+     AS gist_region_covered_by_commutator_agrees;
 DROP TABLE rg_gist;
 
 -- expression index instead of a cell column (how egernia's ivoa.obscore is
