@@ -400,6 +400,25 @@ this benchmark's numbers above come from a database that ran a fresh
 no such step. Noted in `bench/23_region_contains.sql`'s own header for
 whoever hits this next.
 
+**A faster alternative exists for this exact query, and is deliberately not
+recommended.** The MOC-in-a-B-tree recipe already documented in
+`skycell--0.11.sql` (`skycell_region_moc` + `skycell_ancestors`, a manually
+built and maintained side table of MOC cells per stored region) answers
+"which regions contain this point" too. Run head-to-head against this
+opclass on the identical `fpr` fixture and probe points: ~2.5-4.8ms against
+this opclass's ~4.9-5.3ms at 5,000 rows/200 probes, and ~20-30ms against
+~86-89ms at 50,000/500 -- roughly 2x faster at the smaller scale and 3-4x
+at the larger one, closing most of the gap to pgSphere's native `<@`
+(~2.5-2.6ms and ~12-14ms respectively) that this opclass does not.
+Correctness matches exactly at both scales. Not written up as a benchmark
+script or mentioned in README.md: it needs a hand-maintained side table and
+a hand-written join, exactly what the `skyregion` GiST opclass exists to
+make unnecessary, so recommending it here for one specific query shape
+would undercut the thing this whole file is trying to build. Recorded
+because it is true and someone chasing this opclass's remaining gap to
+pgSphere should know a faster path already exists, priced at the
+side-table cost skycell's single-index design is meant to avoid.
+
 ## Tried and rejected: MAX_SUBCAPS=8
 
 Round four's `@>` numbers showed the same "too many pages visited" signature
