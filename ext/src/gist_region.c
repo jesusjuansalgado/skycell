@@ -130,6 +130,25 @@
  * spl_ldatum/spl_rdatum fall out of the same sweep that chose the split
  * point, instead of a separate multicap_union_many() pass over the result).
  * See GIST_REGION_DESIGN.md's "Round five" for the full numbers.
+ *
+ * A third strategy, @>(skyregion,skyregion) (round six: "does this region
+ * wholly contain that region", the full-containment test README.md and the
+ * paper both used to describe as "not yet indexed, evaluated by sequential
+ * scan"), was added the cheap way: it reuses OVERLAP's own consistent()
+ * test rather than a new one. That is a deliberate, sound choice, not a
+ * placeholder -- see the comment at the top of skyregion_gist_consistent's
+ * OVERLAP/CONTAINS_REGION case for why a tighter per-sub-cap test would
+ * risk a false negative (pruning a true match) where this one cannot: "A
+ * contains B" implies "A and B overlap" whenever B is nonempty, and that
+ * implication survives replacing both sides with their (superset) cap
+ * covers, so non-overlapping covers are still a sound proof of
+ * non-containment. What this buys is exactly OVERLAP's own selectivity,
+ * not tighter -- a row can pass this strategy's index test by merely
+ * touching the query region, with recheck (skycell_region_covers) doing
+ * the actual containment decision -- but that is still a real filter
+ * against a full sequential scan whenever most of a catalogue's footprints
+ * don't touch the query region at all, which is the common case. See
+ * bench/24_region_contains_region.sql for the measured numbers.
  */
 #include "postgres.h"
 
@@ -149,6 +168,7 @@
 
 #define GIST_REGION_STRATEGY_OVERLAP 1	/* && (skyregion, skyregion) */
 #define GIST_REGION_STRATEGY_CONTAINS_POINT 2	/* @> (skyregion, skypos) */
+#define GIST_REGION_STRATEGY_CONTAINS_REGION 3	/* @> (skyregion, skyregion) */
 #define MAX_SUBCAPS 4
 
 typedef struct
@@ -852,15 +872,39 @@ skyregion_gist_consistent(PG_FUNCTION_ARGS)
 	switch (strategy)
 	{
 		case GIST_REGION_STRATEGY_OVERLAP:
+		case GIST_REGION_STRATEGY_CONTAINS_REGION:
 			{
-				/* the query is a skyregion (bytea-backed) only for this
-				 * strategy -- STRATEGY_CONTAINS_POINT's query is a skypos
+				/* the query is a skyregion (bytea-backed) for both these
+				 * strategies -- STRATEGY_CONTAINS_POINT's query is a skypos
 				 * instead, a fixed-size by-reference struct with no varlena
 				 * header at all, so DatumGetByteaP/VARSIZE on it would
 				 * misread its raw bytes as a (possibly toasted) varlena,
 				 * corrupting whatever that garbage "pointer" happens to
 				 * land on. Computed here, not above the switch, so it only
-				 * ever runs for the strategy it's valid for. */
+				 * ever runs for the strategies it's valid for.
+				 *
+				 * CONTAINS_REGION (round six) reuses OVERLAP's own test
+				 * rather than a tighter one: "A covers B" (B nonempty)
+				 * implies "A and B overlap", so CoverA and CoverB (each a
+				 * superset of its region, by the same covering guarantee
+				 * OVERLAP and CONTAINS_POINT already rely on) must overlap
+				 * too whenever A actually covers B -- a valid necessary
+				 * condition, sound to prune on. A tighter test -- e.g.
+				 * requiring every sub-cap of B to sit inside a single
+				 * sub-cap of A -- would be a SUFFICIENT condition for
+				 * containment, not a necessary one, so it cannot be used to
+				 * prune (a query region straddling two adjacent sub-caps of
+				 * a genuinely containing A would be wrongly rejected: a
+				 * false negative, unlike a spurious candidate that recheck
+				 * still catches). This costs pruning precision -- rows that
+				 * merely overlap the query region pass through to recheck
+				 * alongside rows that truly contain it -- but is the same
+				 * bbox-then-recheck shape PostGIS's own GiST opclass uses
+				 * for ST_Contains, and still prunes every row whose cover
+				 * doesn't even touch the query region, which is most rows
+				 * on a real catalogue. See bench/24_region_contains_region.sql
+				 * for the measured selectivity and speed this buys over
+				 * the sequential scan it replaces. */
 				bytea	   *qb = DatumGetByteaP(queryDatum);
 				Size		qsz = VARSIZE(qb);
 
