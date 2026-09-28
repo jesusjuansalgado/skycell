@@ -2826,3 +2826,81 @@ individually significant. But that's operator guidance for a GUC that
 ships off, not a case for changing the default: round thirty's
 conclusion holds at the cheapest depth too. `skycell.probe_orders` stays
 at `0`, `skycell.split_cost` stays at `1.0`.
+
+## Round thirty-two: could BRIN replace the B-tree for cone search?
+## No -- lossy block-level summaries can't match row-exact ranges
+
+Went looking directly in pgSphere's source (`gist.c`, `gist_support.c`,
+`gq_cache.c`, `key.c`, `brin.c`) for whatever else might explain its
+performance, beyond the Box3D/R-tree architecture already characterised.
+Two things confirmed dead ends immediately: pgSphere's `gq_cache.c`
+caches the query's derived box key across a whole index scan to avoid
+re-running `gen_key()`'s trig on every node -- `gist_region.c`'s own
+`region_gist_query_cache` (in `fn_extra`, keyed on the query's *bytes*,
+not pointer identity -- more robust than pgSphere's own version) already
+does exactly this, since round one. And pgSphere's per-node pruning test
+being a plain axis-aligned-box overlap (`spherekey_inter_two()`, six
+comparisons, no trig at all) rather than a cap comparison is precisely
+what round twenty-four's `GistBox3D` field tried adding to the region
+GiST key, and reverted for the same key-bloat/fanout cost every
+size-growing attempt in this file has hit.
+
+The one genuinely new thing pgSphere's source surfaced: it also ships a
+BRIN opclass (`brin.c`), built on the same box/union primitives but
+summarizing per *block range* rather than per row. This is architecturally
+unrelated to anything compared in this whole investigation (GiST, GIN,
+SP-GiST, B-tree) and specifically suited to naturally spatially-clustered
+tables -- worth checking directly against skycell's own B-tree covering
+path (`cover.c`), which has no BRIN counterpart at all.
+
+**Tested under BRIN's own best case, not a strawman.** A BRIN index only
+has a chance when the table's physical row order correlates with the
+indexed column, so the 10M-row corpus was explicitly `CLUSTER`ed on
+`cell` first (`CLUSTER cat_cell USING cat_cell_idx`) before building
+`brin(cell)` -- the synthetic catalogue's natural load order (population
+group, then insertion order within each) has no such correlation
+otherwise. Compared the existing B-tree against BRIN on that *same*
+physically-clustered table (the B-tree dropped and rebuilt around the
+BRIN test so only one index services the query at a time), across the
+same 130-center, 6'-120' corpus rounds thirty/thirty-one used.
+
+**BRIN loses decisively, at every radius, even here:**
+
+| radius | btree avg buffers | brin avg buffers (ppr=32) | brin avg ms | btree avg ms |
+|---|---|---|---|---|
+| 6' | 31.87 | 185.83 | 1.30 | 0.22 |
+| 15' | 44.33 | 225.40 | 1.61 | 0.24 |
+| 30' | 114.33 | 443.60 | 3.51 | 0.54 |
+| 60' | 323.00 | 1036.60 | 7.36 | 2.28 |
+| 120' | 433.25 | 1143.45 | 7.81 | 3.22 |
+
+~3.3x more buffers and ~3.5x slower overall (130 centers), consistently
+across radii -- not close at any scale tested. A finer `pages_per_range`
+(4 instead of the default-ish 32) made it markedly *worse* (2561 avg
+buffers, ~8x worse than the B-tree), not better: more, smaller ranges
+means more separate BRIN entries to visit for the same physical span,
+without shrinking the per-range false-positive rate enough to pay for it.
+
+**Mechanism, seen directly in `EXPLAIN (ANALYZE, BUFFERS)`:** `Heap
+Blocks: lossy=128` and `Rows Removed by Index Recheck: 15308` for a
+single 15' query. BRIN's bitmap is *lossy* -- it can only say "this whole
+page might contain a match," not name the matching rows the way a
+B-tree's exact TID bitmap does, so every flagged page's rows all get
+pulled and rechecked against the *range* condition itself (before the
+geometric filter even runs). skycell's own covering computation already
+produces tight, near-minimal cell ranges (the whole point of
+`cover.c`'s cost model); collapsing that per-row precision down to
+whatever a 32-or-4-page block happens to contain throws away exactly the
+precision the covering algorithm worked to produce, and a real match
+region essentially never aligns with block-range boundaries, so some
+fraction of every flagged block is always pure waste. No page-range size
+fixes this -- it's structural, not a tuning problem.
+
+**No code change; nothing to ship.** `cat_cell_idx` (B-tree) remains the
+only index skycell needs for the cone-search path. BRIN isn't a
+dead-simple free alternative for this workload even under its own best
+conditions (deliberately clustered data) -- it would only be worth a
+second look for a use case BRIN is actually built for (a table too large
+for a B-tree to be worth maintaining at all, trading row-level precision
+for near-zero index size/maintenance cost), which isn't what any of this
+investigation's benchmarks are testing for.

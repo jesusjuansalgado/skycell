@@ -553,6 +553,18 @@ not in priority order — pick what matches the actual goal:
   like a real, statistically significant 18% effect until checked against
   `skycell_cover_info()`'s actual covering decisions. Only a per-(rep,
   center) randomized visit order, cross-checked against buffer counts
-  (immune to timing noise entirely), gave a trustworthy answer.
+  (immune to timing noise entirely), gave a trustworthy answer. Round
+  thirty-one confirmed the same conclusion holds even at the cheapest
+  possible probe depth (buffer counts byte-identical between
+  `probe_orders=1` and `=3` at every radius, proving the deeper probe is
+  pure waste — but still not enough to beat leaving it off). Round
+  thirty-two asked whether pgSphere's BRIN opclass points at a cheaper
+  index for this same path and found no: BRIN loses to the B-tree by
+  ~3.3x buffers / ~3.5x wall-clock at every radius even on a table
+  deliberately `CLUSTER`ed on `cell` for BRIN's own best case — its
+  lossy, block-granular bitmap (`Heap Blocks: lossy=...`, thousands of
+  rows pulled per query just for the range recheck) can't match the
+  B-tree's row-exact result, and a finer `pages_per_range` made it worse,
+  not better. `cat_cell_idx` (B-tree) remains the only index this path needs.
 - `GIST_REGION_DESIGN.md` is the source of truth for exact numbers, code
   reasoning, and anything this summary compressed or left out.
