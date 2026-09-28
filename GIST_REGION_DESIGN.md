@@ -1662,3 +1662,54 @@ round two's own text already flagged as "a materially bigger change than a
 split-algorithm swap, and arguably undermines the 'simpler than the recipe'
 case for building this opclass at all." Left as an open question, not
 attempted here.
+
+## Round fifteen: MAX_SUBCAPS=8, tried and reverted -- a real tradeoff, not
+## a free lunch
+
+Round three's 1->4 jump was framed as "does this pay for itself" and
+answered yes, unambiguously, on both buffer count and wall-clock at once.
+The natural next question: does continuing in the same direction (more
+sub-caps) keep paying? Bumped `MAX_SUBCAPS` from 4 to 8 -- a one-line
+change, since every array/loop in the file is already sized off the macro,
+not hardcoded -- and re-ran round two/three's own `&&` benchmark and round
+six/seven's `@>`/`<@` benchmark, same corpus, same probes, same 50,000-row/
+500-probe scale, A/B'd directly against the committed MAX_SUBCAPS=4 code.
+
+**Correctness held**: exact match counts against the known-correct values
+for all three predicates (1282, 788, 22349).
+
+**The two usual metrics disagreed, which is itself the finding.** Buffer
+counts (deterministic) went down at 8 caps across all three: && 35,238 ->
+28,988 (18% fewer), @> 31,819 -> 27,390 (14% fewer), <@ 65,998 -> 64,202
+(3% fewer). But repeated wall-clock runs (4 passes each, to separate signal
+from this machine's noise) went the other way, consistently: && ~121ms ->
+~153ms, @> ~78ms -> ~89ms, both *worse* at 8 caps, every time measured. <@
+was roughly flat.
+
+**Why they disagree**: this whole corpus is cache-resident (every buffer
+in `EXPLAIN (ANALYZE, BUFFERS)` is a `shared hit`, never a read), so "fewer
+buffers" here means "fewer index tuples visited," not "less I/O" -- and
+`multicap_overlaps()`/`multicap_overlap_amount()` are O(MAX_SUBCAPS^2) per
+comparison. Doubling MAX_SUBCAPS quadruples that (16 -> 64 cap-pairs
+checked per key comparison), and that CPU cost grows faster than the
+tuple-visit count shrinks. Round three's own 1->4 jump was a rare case
+where a sharper key both prunes more *and* costs little extra per check
+(1 cap vs up to 4, not yet quadratic in a way that mattered at that
+scale); by 8, the quadratic term has caught up and started costing more
+than it saves. The index also grew 69% on disk (16MB -> 27MB) for this
+negative result.
+
+**Reverted**, same standard as rounds nine, twelve, and fourteen. Not
+tried: MAX_SUBCAPS=16 -- with the loss already consistent and growing at
+8, and the O(k^2) comparison cost about to quadruple again, there was no
+reason to expect a reversal. The real implication is narrower than "more
+sub-caps don't help": it's that round three's win was not simply "more
+caps is better, indefinitely" -- the sweet spot is wherever the marginal
+pruning gain crosses the marginal O(k^2) comparison cost, and for this
+corpus and MAX_SUBCAPS's current linear-scan overlap test, that crossing
+point is at or before 4. A sharper key that doesn't pay the full O(k^2)
+cost of comparing every sub-cap against every other sub-cap (e.g. spatially
+sorting/indexing each key's own sub-caps so overlap search is sub-quadratic,
+or a fundamentally different key shape) is the more promising version of
+"sharper key" left untried -- see the handoff summary at the top of this
+file (SPATIAL_INDEXING_HANDOFF.md) for the full open-questions list.
