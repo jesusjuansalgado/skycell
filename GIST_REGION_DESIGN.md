@@ -2588,3 +2588,76 @@ twenty-seven) is more likely to be structural -- something about
 pgSphere's own index descent shape for point-in-shape queries -- than a
 further-untapped fix inside this file's own code, though that's an
 inference from elimination, not independently verified.
+
+## Round twenty-nine: caching cos(radius) for cap_overlaps()/cap_area_
+## proxy() -- exact, correct, and still a net loss, via key bloat
+
+Round twenty-seven's trig-free point test doesn't apply to genuine
+cap-vs-cap comparisons (`cap_overlaps()`, used by `&&`, `@>`(region,
+region), `<@`(region,region) via `multicap_overlaps()`), since those
+compare against a *sum* of two radii, not one. But the angle-sum identity
+`cos(ra+rb) = cos(ra)cos(rb) - sin(ra)sin(rb)` gives the same kind of
+shortcut IF `cos(radius)` is available cheaply for each cap -- so added
+`cos_radius` as a new field on `GistCap`, computed once in `cap_make()`
+(the same clamped `cos(min(radius, pi))` value `cap_area_proxy()` used to
+recompute fresh every call, so that function got the same optimization
+for free). `cap_overlaps()` rewritten to use `dot(a,b) >= cos(ra+rb)`
+via the identity, with `sin` derived from the cached `cos` via
+`sqrt(1-cos^2)` rather than a second trig call.
+
+**A real correctness subtlety caught before shipping, not after**: the
+angle-sum identity only stays valid while `ra+rb` remains in cos's
+monotonic range `[0, pi]` -- past `pi`, `cos(ra+rb)` starts increasing
+again, which would silently produce false negatives for near-antipodal
+caps. This isn't a theoretical edge case here: `cover.c` clamps a single
+CONE region's own radius up to `M_PI` (not `M_PI/2` -- only *polygons*
+are restricted to smaller-than-a-hemisphere), so two large circular
+regions alone, no unioning required, can have `ra+rb` exceed `pi`.
+Guarded explicitly (`if (a.radius + b.radius >= M_PI) return true;` --
+correct, since every angle is trivially `<= pi <= ra+rb` once that
+holds) rather than trusted to the formula.
+
+**Correctness verified two ways**: the standard 50,000-row suite (all
+four strategies, brute-force counts matching GiST and pgSphere exactly),
+and a dedicated stress test built specifically to exercise the guard --
+400 circular regions with radii 30-179 degrees (well past the `pi/2`
+range where the old and new formulas start being able to diverge if the
+guard were wrong), full self-join for `&&`/`@>`(region,region) and a
+2,000-point cross-check for `@>`(region,point): brute force matched GiST
+exactly in every case (76,169 `&&` pairs, 18,728 `@>` pairs, 487,742
+point-containment pairs).
+
+**But the key grew** -- one more `double` per cap, 5 caps per
+`GistMultiCap` (`overall` + `sub[4]`), 40 bytes more per stored key,
+confirmed directly: index size 17MB -> 21MB, ~24% bigger, matching the
+~24% key-size growth almost exactly. Same-database, index rebuilt under
+each binary:
+
+| strategy | buffers before | buffers after | change |
+|---|---|---|---|
+| `&&` | 29,353 | 33,432 | +13.9% worse |
+| `@>`(region,region) | 25,937 | 29,286 | +12.9% worse |
+| `<@`(region,region) | 68,355 | 73,685 | +7.8% worse |
+
+Wall-clock was mixed, not a clean win either way (`&&` worse, `@>`/`<@`
+each modestly better) -- consistent with a real per-comparison speedup
+being mostly offset, and for `&&` outweighed, by visiting more pages.
+**Reverted** (stashed; working tree and installed extension back to
+round twenty-eight's shipped state).
+
+**Exactly the risk flagged before implementing, now confirmed a fourth
+time**: rounds two, fifteen, and twenty-four all found that growing the
+stored key costs real fanout, and this round's own regression is the
+same mechanism precisely (not a bad proxy this time -- the computed
+*values* are provably identical to the original, byte-for-byte-equivalent
+math, confirmed by every correctness check -- just a bigger key). Round
+twenty-seven's point-test win avoided this entirely by deriving
+everything from the *already-stored* radius with zero new storage; this
+round's version needed to cache a value to get the same class of
+speedup, and that caching is what cost it. Left as an open question, not
+attempted: whether a NON-cached version (recomputing `cos`/`sin` fresh
+per comparison, no format change at all) could still win on pure
+instruction count against `sc_angle()`'s cross-product/sqrt/atan2 chain
+-- unlikely on a rough operation-count basis (four trig calls instead of
+one atan2 plus one sqrt), and not measured here since the whole point of
+caching was to avoid paying for `cos`/`sin` more than once per cap.

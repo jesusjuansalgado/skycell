@@ -162,6 +162,8 @@ about pgSphere's own point-in-shape descent) than a further fix sitting
 in this file's code — an inference from elimination, not independently
 confirmed.
 
+| 29 | Extended round twenty-seven's trig-avoidance idea to genuine cap-vs-cap tests: `cap_overlaps()` (backing `&&`/`@>`/`<@`(region,region) via `multicap_overlaps()`) compares against a radius *sum*, not one radius, but the angle-sum identity `cos(ra+rb)=cos(ra)cos(rb)-sin(ra)sin(rb)` gives the same shortcut if `cos(radius)` is cached per cap. Added `cos_radius` to `GistCap` (computed once in `cap_make()`), rewrote `cap_overlaps()` to use it (with an explicit `ra+rb >= pi` guard — the identity's monotonic range, and a real case here since `cover.c` allows a single cone's own radius up to `pi`, not just `pi/2`), and got `cap_area_proxy()`'s existing `1-cos(radius)` sped up for free from the same cache. | **Exact and correct — verified two ways, including a dedicated 400-region, 30-179°-radius stress test built specifically to exercise the `pi` guard, brute force matching GiST exactly throughout — but a net loss anyway.** The cache costs 40 bytes/key (5 caps × 8 bytes); confirmed directly via index size, 17MB→21MB (~24% bigger, matching the key growth almost exactly). Same-database buffers: `&&` +13.9%, `@>`(region,region) +12.9%, `<@`(region,region) +7.8%, all worse; wall-clock mixed, not a clean win. **Reverted.** The same fanout-cost mechanism rounds two, fifteen, and twenty-four all hit — not a bad proxy this time (the computed values are provably identical to the original), just a bigger key; round twenty-seven's win avoided this entirely by needing zero new storage. |
+
 A methodological note from round twenty-one, carried forward and validated
 twice since: round twenty-one's same-database baseline (rerun immediately
 after its "after" pass) measured meaningfully different absolute numbers
@@ -474,9 +476,17 @@ not in priority order — pick what matches the actual goal:
   twenty-one regressed `@>` and `<@`; twenty-three measured a real but
   too-small-to-justify buffer improvement; twenty-four and twenty-six both
   measured clear buffer regressions, the latter from an unintended coupling
-  with round twenty-two's order-sensitive seeding — see §3); rounds
-  twenty-two and twenty-seven are the two changes from this whole
-  investigation actually shipped. `@>`(region,region)'s gap to pgSphere is
+  with round twenty-two's order-sensitive seeding — see §3). No
+  `cos_radius` field on `GistCap` — round twenty-nine's cap-vs-cap
+  trig-caching extension of round twenty-seven's idea was exact and
+  correct (verified against a dedicated large-radius stress test) but
+  reverted: caching costs 40 bytes/key, confirmed as ~24% more index size,
+  and buffers got consistently worse (+7.8% to +13.9%) despite the
+  per-comparison math being provably identical — the same key-bloat/
+  fanout mechanism rounds two, fifteen, and twenty-four hit, this time
+  from pure size growth rather than a bad proxy. Rounds twenty-two and
+  twenty-seven remain the only two changes from this whole investigation
+  actually shipped. `@>`(region,region)'s gap to pgSphere is
   narrowed (~5x → ~2.3-2.9x at 50,000 rows) but not closed; every
   tree/key-quality direction from this file's original open-questions list
   for it has now been tried and found wanting — round twenty-six's own
