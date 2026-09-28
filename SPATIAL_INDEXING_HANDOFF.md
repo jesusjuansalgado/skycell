@@ -100,41 +100,38 @@ PostGIS's own bounding-key idea, not invented from scratch.
 | 20 | Farthest-point seeding for `merge_caps_greedy` (the greedy cluster-merge behind `union()`/`penalty()`), motivated by reading pgSphere's actual GiST source: its key is a plain 3D axis-aligned box, unioned by exact per-axis min/max — lossless at every tree level, unlike skycell's own capped-cluster merge, which its own header comment already calls "not a globally optimal clustering." Replacing its arbitrary first-k seeding with farthest-point (greedy k-center) selection looked like a small, safe tightening. | **Regression, not a win, on both strategies**: true A/B on identical 50,000-row corpus/probes, index rebuilt fresh under each binary — `@>` went 80-83ms → 225-273ms (2.9x worse), `<@` went from *beating* pgSphere 1.4x (160-174ms vs 232-252ms) to *losing* to it 1.2x (281-286ms). **Reverted.** Hypothesized cause: `merge_caps_greedy` backs `penalty()`, called on every incremental insert to choose subtree placement, not just to polish an already-decided split — farthest-point seeding is a better one-shot clustering but is also more outlier-sensitive, hypothesized to make the waste estimate a noisier placement signal across thousands of incremental calls than the first-k seeding it replaced. |
 | 21 | Test that round-twenty hypothesis directly: stop `penalty()` calling `merge_caps_greedy` at all, score placement by `overall`-cap area growth instead (a plain two-cap union, exact, O(1), already computed, already used by picksplit's axis-sort) — no seeding, no clustering, fully deterministic. | **Worse than round twenty, not better — falsifies round twenty's own hypothesis.** Same true-A/B discipline, same-session back-to-back this time (see note below): `@>` 87-88ms → 243-256ms (2.9x worse); `<@` 172-197ms (beats pgSphere 1.3-1.5x) → 435-446ms (now *loses* 1.08-1.11x). **Reverted.** It wasn't the seeding's noise specifically — a simpler, deterministic, non-clustering metric hurt *more*. Real explanation: `overall` is a single bounding cap, exactly round one's original too-coarse key design; using it for placement throws away the sub-cap shape information round three's redesign exists to capture, and `consistent()`'s pruning at a badly-placed leaf can't undo a bad placement decision made further up the tree. Placement quality apparently needs the same rich information pruning does — simplifying it, or reseeding it, both hurt so far. |
 
-**Where this leaves the region GiST opclass**: `&&` and `<@` are solid wins
-(the latter outright beats pgSphere at scale); `@>`(region,region) has a
-persistent, unclosed, *widening* gap to pgSphere that four different
-targeted fixes (round fourteen's area check, round fifteen's sharper key,
-round twenty's seeding change, round twenty-one's simplified penalty
-signal) have now failed to close — rounds twenty and twenty-one both made
-`@>` and `<@` *worse*, not neutral. Round two's original diagnosis — "too
-many internal/leaf pages have overlapping bounding caps" — is still the
-standing, unaddressed explanation. Rounds twenty/twenty-one add a real
-mechanism for *why* it's resisted four different fixes: skycell's cluster
-union is inherently lossy no matter how it's seeded (pgSphere's own box
-union is exact at every level, which no reseeding or simplifying of a
-capped cluster merge can replicate), the specific function performing
-that merge (`merge_caps_greedy`) is on the hot path for incremental tree
-placement via `penalty()`, not just final-key polish — and placement
-quality turns out to need the same rich sub-cap information pruning does,
-which is why *both* reseeding it and simplifying it away made things
-worse rather than neutral. Untried: leaving `penalty()` completely alone
-(proven, by omission across both rounds, not to be the problem in
-isolation) and scoping any future seeding/clustering improvement to only
-the key actually written to disk at split time (`multicap_union_many()`),
-via a separate function that never touches `penalty()`'s signal. Neither
-round twenty (which changed the shared function, hitting both call sites)
-nor round twenty-one (which changed only `penalty()`) tested that. See §6
-for how this and the pgSphere-style exact-box idea are now positioned.
+| 22 | The untried direction rounds twenty/twenty-one both pointed at: farthest-point seeding for the sub-cap merge, but scoped to *only* `multicap_union_many()` (the path building the key `consistent()` actually reads) via a new `merge_caps_greedy_fp()`, while `multicap_penalty()` keeps calling the original, untouched `merge_caps_greedy()`. | **A real win — kept, not reverted, the first one in this thread.** Same-database/same-session A/B throughout (learned directly from round twenty-one's own methodological note). At 50,000 rows/500 probes: `@>` 116-117ms → **51-52ms (2.2-2.3x faster)**; `<@` 163-172ms (beat pgSphere 1.4-1.5x) → **134-136ms (beats pgSphere 1.76-1.91x)**. At 5,000 rows/200 probes: flat to modestly better, no regression (`&&` 7.25-7.30ms→6.56-6.74ms; `@>`/`<@` within noise). Correctness verified at both scales, all four strategies (brute-force count matches GiST and pgSphere exactly everywhere). The scale-dependence (win at 50k, neutral at 5k) makes sense: fewer rows means a shallower tree with fewer internal-node unions for a tighter merge to compound across — the mirror image of round two's single-cap gap "widening with scale." `@>`'s gap to pgSphere narrows from ~5x to ~2.3-2.9x — not closed, but the first real progress on it since round two. |
 
-A methodological note from round twenty-one, worth carrying forward: its
-same-database baseline (rerun immediately after its "after" pass, same
-session) measured meaningfully different absolute numbers from round
-twenty's own baseline on a separately-built database with identical seeds
-and row counts — directionally consistent (both confirm `<@` beats
-pgSphere), not bit-for-bit reproducible. Every A/B in this file that
-matters is a same-database, same-session, back-to-back comparison for
-exactly this reason; round twenty-one is a concrete instance of why, not
-just a restated principle.
+**Where this leaves the region GiST opclass**: `&&` and `<@` are solid wins
+(the latter's win over pgSphere widened further this round); `@>`(region,
+region) still has a gap to pgSphere, but round twenty-two narrowed it
+substantially (~5x → ~2.3-2.9x at 50,000 rows) after three prior targeted
+fixes (round fourteen's area check, round fifteen's sharper key, round
+twenty's unscoped seeding change) failed to close it and two of them
+(twenty, twenty-one) actively made it worse. The mechanism rounds twenty
+and twenty-one diagnosed held up: `merge_caps_greedy` backs both
+`union()`'s key-building and `penalty()`'s incremental placement, and
+placement quality needs the same rich sub-cap information pruning does —
+so the fix that finally worked was scoping the improvement to the
+key-building path alone and leaving placement's signal exactly as shipped.
+`merge_caps_greedy()` (first-k seeding) remains unchanged, used only by
+`multicap_penalty()`; the new `merge_caps_greedy_fp()` (farthest-point
+seeding) is used only by `multicap_union_many()`. Round two's original
+diagnosis — overlapping bounding caps at internal/leaf pages — still
+applies to whatever the tighter merge doesn't catch; §6's remaining ideas
+(a sub-quadratic overlap test, the pgSphere-style exact-box summary) are
+still open for narrowing the gap further.
+
+A methodological note from round twenty-one, carried forward and validated
+by round twenty-two: round twenty-one's same-database baseline (rerun
+immediately after its "after" pass) measured meaningfully different
+absolute numbers from round twenty's own baseline on a separately-built
+database with identical seeds and row counts — directionally consistent,
+not bit-for-bit reproducible. Round twenty-two followed the same-database/
+same-session discipline throughout from the start, and it's what made its
+result trustworthy enough to keep rather than just measure. Every A/B in
+this file that matters is a same-database, same-session, back-to-back
+comparison for exactly this reason.
 
 ## 4. Point SP-GiST opclass (`spgist_region.c`): round-by-round
 
@@ -347,22 +344,26 @@ not in priority order — pick what matches the actual goal:
    sorting by one coordinate and using it to skip non-overlapping pairs)
    could let MAX_SUBCAPS grow without paying the full quadratic cost —
    untried.
-4. **Scope any future `merge_caps_greedy` improvement to `union()` alone,
-   never `penalty()`** (§3, rounds twenty/twenty-one). Both tried fixes so
-   far changed what `penalty()` sees — round twenty by reseeding the shared
-   function (hitting both call sites at once), round twenty-one by
-   replacing `penalty()`'s signal outright — and both regressed. Neither
-   isolated the one thing still untested: leave `multicap_penalty()` calling
-   the original, unmodified `merge_caps_greedy` exactly as shipped (proven,
-   by omission across two rounds, not to be the problem on its own), and
-   put any seeding/clustering improvement into a *separate* function used
-   only by `multicap_union_many()` — the path that actually builds the key
-   written to disk and later read by `consistent()`. If placement quality
-   really does need the rich, if arbitrary, first-k-seeded signal (rounds
-   twenty/twenty-one's shared implication), touching only the key-building
-   path might tighten pruning without perturbing tree shape at all. Smaller
-   than item 5, more targeted than either of the two tried fixes — untried.
-5. **A pgSphere-style exact composable summary for internal nodes only**
+4. ~~Scope any future `merge_caps_greedy` improvement to `union()` alone,
+   never `penalty()`~~ — **done, shipped, round twenty-two.** A new
+   `merge_caps_greedy_fp()` (farthest-point seeding) is used only by
+   `multicap_union_many()`; `multicap_penalty()` still calls the original,
+   unmodified `merge_caps_greedy()`. Measured a real win: `@>` 2.2-2.3x
+   faster, `<@`'s existing win over pgSphere widened, both at 50,000 rows,
+   no regression at 5,000. `@>`'s gap to pgSphere narrowed (~5x → ~2.3-2.9x)
+   but not closed — see §3 for the numbers, and the two items below for
+   what's left.
+5. **Push the now-decoupled `union()`-only merge further** (§3, natural
+   follow-up to round twenty-two, untried). With `penalty()` fully insulated
+   from the key-building path, there's no longer any reason to keep
+   `merge_caps_greedy_fp()`'s assignment pass a single greedy sweep — a
+   bounded local-improvement pass (one or two Lloyd's-style reassignment
+   sweeps after the initial farthest-point-seeded partition, re-checking
+   whether each already-placed cap would now fit a *different* cluster
+   better) could tighten the stored key further, at some bounded extra cost
+   that -- unlike round twenty's mistake -- can't touch placement quality at
+   all, since `penalty()` never sees it.
+6. **A pgSphere-style exact composable summary for internal nodes only**
    (§3, prompted by reading pgSphere's actual `gist.c`: its `spherekey` is
    a plain 3D axis-aligned box, unioned by exact per-axis min/max, losslessly
    at every tree level — the likely real reason its internal nodes stay
@@ -382,12 +383,12 @@ not in priority order — pick what matches the actual goal:
    union logic, key format grows again), not a tuning pass — untried,
    unproven, the only idea left in this thread that changes the mechanism
    (exact vs. approximate composition) rather than its parameters.
-6. **A `min_area` field for `CONTAINED_BY_REGION` (`<@`)**, the mirror of
+7. **A `min_area` field for `CONTAINED_BY_REGION` (`<@`)**, the mirror of
    round fourteen's reverted `max_area` idea — except `<@` already wins
    against pgSphere at both scales tested (round seven), so this is lower
    priority; worth checking only if a future benchmark finds `<@` losing
    somewhere round seven didn't test.
-7. **A bulk-loaded, statically-packed structure for the point predicate**,
+8. **A bulk-loaded, statically-packed structure for the point predicate**,
    instead of the point SP-GiST's incremental `choose`/`picksplit`
    construction (flagged, not attempted, when round twelve/thirteen closed
    out — see the "so, the conclusion is that SP-GiST is a dead end?"
@@ -396,7 +397,7 @@ not in priority order — pick what matches the actual goal:
    risks converging on "just reimplement the B-tree as an index AM" —
    flagged as the one idea with a real mechanism behind it that hasn't
    been measured, not as something expected to obviously win.
-8. **Real survey-footprint sparsity** for the point SP-GiST's covering-walk
+9. **Real survey-footprint sparsity** for the point SP-GiST's covering-walk
    idea (round thirteen's own caveat): the corpus used throughout this
    whole investigation is synthetic with a substantial uniform-sky
    component, so it has no true coverage gaps. A real archive's actual
@@ -404,7 +405,7 @@ not in priority order — pick what matches the actual goal:
    low-density sky) might make round thirteen's "0% empty cells" result
    corpus-specific rather than general — untested, no corpus available in
    this repo to test it with.
-9. **`skycell.probe_orders`** (`cover.c`): an existing, off-by-default GUC
+10. **`skycell.probe_orders`** (`cover.c`): an existing, off-by-default GUC
    for scoring several candidate covering orders instead of trusting the
    closed-form choice — its own code comment says forcing a finer order
    directly measures a real 30-48% win at 6'-30' that the *scored* probe
@@ -415,17 +416,18 @@ not in priority order — pick what matches the actual goal:
 
 ## 7. Where things stand right now (as of this document)
 
-- Region GiST opclass: shipped as-is (`MAX_SUBCAPS=4`, shared overlap test
-  for all containment strategies, original first-k-seeded
-  `merge_caps_greedy`, original `overall`-cap-free `multicap_penalty()`).
-  Working tree matches this exactly — rounds fourteen, fifteen, twenty, and
-  twenty-one's experimental changes were all reverted after measurement
-  (rounds twenty and twenty-one both regressed `@>` and `<@`, worse than
-  doing nothing). `@>`(region,region)'s gap to pgSphere remains open; §6
-  items 4-5 are the two untried directions closest to the actual mechanism
-  (exact vs. approximate bounding-volume composition, and scoping any fix
-  away from `penalty()`'s now-twice-proven sensitivity) rather than another
-  tuning pass on the current lossy merge.
+- Region GiST opclass: `MAX_SUBCAPS=4`, shared overlap test for all
+  containment strategies, original first-k-seeded `merge_caps_greedy` (used
+  only by `multicap_penalty()`) plus a new farthest-point-seeded
+  `merge_caps_greedy_fp()` (used only by `multicap_union_many()`, round
+  twenty-two, kept — a real, measured win, not experimental). Rounds
+  fourteen, fifteen, twenty, and twenty-one's changes were all reverted
+  after measurement (twenty and twenty-one both regressed `@>` and `<@`);
+  round twenty-two is the one change from this whole seeding/merge
+  investigation actually shipped. `@>`(region,region)'s gap to pgSphere is
+  narrowed (~5x → ~2.3-2.9x at 50,000 rows) but not closed; §6 items 5-6
+  are the closest untried directions to closing it further (extending the
+  now-decoupled union-only merge, and the pgSphere-style exact-box idea).
 - Point SP-GiST opclass: shipped as a correctness-verified, documented
   negative result (`SPLIT_WIDTH=1`, effectively single-order splits; the
   bytea-prefix/explicit-width fix from round twelve is real and kept even

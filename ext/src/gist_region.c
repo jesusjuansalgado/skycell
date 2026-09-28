@@ -346,6 +346,14 @@ cap_overlap_amount(GistCap a, GistCap b)
  * seed selection in the single-cap round one). O(n * MAX_SUBCAPS), not a
  * globally optimal clustering, but cheap enough to run on every union()/
  * penalty() call.
+ *
+ * Used by multicap_penalty() ONLY (see merge_caps_greedy_fp() below for why
+ * multicap_union_many() uses a different seeding) -- rounds twenty and
+ * twenty-one (GIST_REGION_DESIGN.md) both found that changing what feeds
+ * penalty()'s placement decisions regresses tree quality, whether by
+ * reseeding this function (round twenty) or by replacing its signal
+ * outright (round twenty-one). Left exactly as shipped for that reason:
+ * proven, by omission across both rounds, not to be the problem on its own.
  */
 static void
 merge_caps_greedy(const GistCap *caps, int n, GistCap *out, int *nout)
@@ -359,6 +367,93 @@ merge_caps_greedy(const GistCap *caps, int n, GistCap *out, int *nout)
 		int			best = 0;
 		double		bestWaste = HUGE_VAL;
 
+		for (int j = 0; j < k; j++)
+		{
+			GistCap		u = cap_union_caps(out[j], caps[i]);
+			double		waste = cap_area_proxy(u.radius) - cap_area_proxy(out[j].radius) - cap_area_proxy(caps[i].radius);
+
+			if (waste < bestWaste)
+			{
+				bestWaste = waste;
+				best = j;
+			}
+		}
+		out[best] = cap_union_caps(out[best], caps[i]);
+	}
+	*nout = k;
+	for (int i = k; i < MAX_SUBCAPS; i++)
+		out[i].radius = -1;
+}
+
+/*
+ * Round twenty-two: same farthest-point-seeded merge round twenty tried and
+ * reverted, but scoped to ONLY the key-building path (multicap_union_many(),
+ * called from union() and picksplit's incremental sweep) -- never
+ * multicap_penalty(), which keeps calling the plain merge_caps_greedy()
+ * above unchanged. Round twenty's regression hit both call sites at once,
+ * so it couldn't tell whether the seeding change itself was the problem, or
+ * only its effect on penalty()'s placement signal; rounds twenty and
+ * twenty-one together now make the latter the leading explanation.  This
+ * isolates the untested case: does a tighter *stored* key -- the one
+ * consistent() actually prunes against -- help once penalty()'s incremental
+ * placement is left with the same signal it always had.
+ */
+static void
+merge_caps_greedy_fp(const GistCap *caps, int n, GistCap *out, int *nout)
+{
+	int			k = Min(n, MAX_SUBCAPS);
+	bool		chosen[MAX_SUBCAPS * 64];
+
+	Assert(n > 0);
+	Assert(n <= (int) lengthof(chosen));
+	memset(chosen, 0, n * sizeof(bool));
+
+	if (k == 0)
+	{
+		*nout = 0;
+		for (int i = 0; i < MAX_SUBCAPS; i++)
+			out[i].radius = -1;
+		return;
+	}
+
+	out[0] = caps[0];
+	chosen[0] = true;
+	for (int s = 1; s < k; s++)
+	{
+		int			bestCap = -1;
+		double		bestMinWaste = -1;
+
+		for (int i = 0; i < n; i++)
+		{
+			double		minWaste = HUGE_VAL;
+
+			if (chosen[i])
+				continue;
+			for (int j = 0; j < s; j++)
+			{
+				GistCap		u = cap_union_caps(out[j], caps[i]);
+				double		waste = cap_area_proxy(u.radius) - cap_area_proxy(out[j].radius) - cap_area_proxy(caps[i].radius);
+
+				if (waste < minWaste)
+					minWaste = waste;
+			}
+			if (minWaste > bestMinWaste)
+			{
+				bestMinWaste = minWaste;
+				bestCap = i;
+			}
+		}
+		out[s] = caps[bestCap];
+		chosen[bestCap] = true;
+	}
+
+	for (int i = 0; i < n; i++)
+	{
+		int			best = 0;
+		double		bestWaste = HUGE_VAL;
+
+		if (chosen[i])
+			continue;
 		for (int j = 0; j < k; j++)
 		{
 			GistCap		u = cap_union_caps(out[j], caps[i]);
@@ -477,7 +572,10 @@ multicap_contains_point(const GistMultiCap *m, sc_vec3 p)
 }
 
 /* union of N multi-cap keys: overall caps reduce pairwise as before; sub-caps
- * flatten into one list and merge_caps_greedy back down to MAX_SUBCAPS. */
+ * flatten into one list and merge_caps_greedy_fp back down to MAX_SUBCAPS --
+ * the farthest-point-seeded variant, used here (the actual stored-key path)
+ * and deliberately NOT in multicap_penalty() (see merge_caps_greedy_fp()'s
+ * own comment for why). */
 static void
 multicap_union_many(const GistMultiCap **entries, int n, GistMultiCap *out)
 {
@@ -495,7 +593,7 @@ multicap_union_many(const GistMultiCap **entries, int n, GistMultiCap *out)
 			if (entries[i]->sub[j].radius >= 0 && nflat < (int) lengthof(flat))
 				flat[nflat++] = entries[i]->sub[j];
 	}
-	merge_caps_greedy(flat, nflat, out->sub, &nout);
+	merge_caps_greedy_fp(flat, nflat, out->sub, &nout);
 }
 
 /* union of exactly two multi-cap keys -- a thin wrapper so picksplit's

@@ -2153,3 +2153,69 @@ experiments tested that -- round twenty's reseeding change hit both call
 sites at once (so its regression can't be blamed on the union-time path
 in isolation), and this round's change touched only `penalty()`. See §6
 for how this is written up as an open direction.
+
+## Round twenty-two: scoping the seeding fix to union() alone -- a real win,
+## kept
+
+The untried direction rounds twenty and twenty-one both pointed at:
+farthest-point seeding for the greedy sub-cap merge, but applied *only* to
+`multicap_union_many()` (the path that builds the key actually stored on
+disk and read by `consistent()`), never to `multicap_penalty()` (the
+placement signal both prior rounds found sensitive to any change). Added a
+second function, `merge_caps_greedy_fp()` -- the same farthest-point
+seeding logic round twenty tried -- called only from
+`multicap_union_many()`; `multicap_penalty()` keeps calling the original,
+untouched `merge_caps_greedy()`.
+
+**Measured with the same true-A/B discipline, same-session/same-database
+throughout this time** (learning directly from round twenty-one's own
+methodological note):
+
+50,000 rows / 500 probes:
+
+| direction | before (original) | after (union()-only farthest-point) | pgSphere |
+|---|---|---|---|
+| `@>`(region,region) | 116-117ms | **51-52ms (2.2-2.3x faster)** | 19-24ms |
+| `<@`(region,region) | 163-172ms (beats pgSphere 1.4-1.5x) | **134-136ms (beats pgSphere 1.76-1.91x)** | 236-257ms |
+
+5,000 rows / 200 probes (`&&` included):
+
+| strategy | before | after |
+|---|---|---|
+| `&&` | 7.25-7.30ms | 6.56-6.74ms (modestly faster, ~7-8%) |
+| `@>`(region,region) | 5.83-6.32ms | 5.98-6.99ms (flat, within noise) |
+| `<@`(region,region) | 10.29-10.88ms | 9.74-10.67ms (flat, within noise) |
+
+**A genuine win at the scale that matters, no regression at the smaller
+one.** `@>`'s persistent, widening gap to pgSphere -- unclosed since round
+two, untouched by three prior targeted fixes (rounds fourteen, fifteen,
+twenty) and actively worsened by two of them (twenty, twenty-one) --
+narrows from ~4.9-5.2x to ~2.3-2.9x at 50,000 rows. `<@`'s existing win
+over pgSphere widens too. The neutral (not negative) result at 5,000 rows
+makes directional sense: fewer rows means a shallower tree and fewer
+internal-node union operations for a tighter merge to compound across,
+the same scale-dependence this file has seen before (round two's single-
+cap gap itself "widened with scale" in the other direction).
+
+**Correctness verified at both scales, all four strategies** (`&&`,
+`@>`(region,point), `@>`(region,region), `<@`(region,region)): brute-force
+count matches both the GiST-indexed and pgSphere-native count exactly in
+every comparison run. `@>`(region,point) (round four's strategy, sharing
+the same union path but not independently A/B'd this round) measured
+67.72-69.94ms at 50,000 rows under the fix -- correctness-clean, no
+"before" comparison taken since this round didn't target that strategy
+specifically.
+
+**Kept, not reverted** -- the first proven win in this specific
+investigative thread (rounds fourteen, fifteen, twenty, twenty-one were
+all reverted; this one measures as a clear net improvement with no
+observed downside). `merge_caps_greedy()` (first-k seeding) remains
+exactly as shipped, used only by `multicap_penalty()`; `merge_caps_greedy_
+fp()` (farthest-point seeding) is new, used only by
+`multicap_union_many()`. The `@>`(region,region) gap to pgSphere is
+narrowed, not closed -- round two's original diagnosis (internal/leaf
+pages still have overlapping bounding caps, just less so now) still
+applies to whatever the farthest-point-seeded merge doesn't catch;
+§6's remaining ideas (a sub-quadratic overlap test, the pgSphere-style
+exact-box summary) are still open for whoever wants to keep closing it
+further.
