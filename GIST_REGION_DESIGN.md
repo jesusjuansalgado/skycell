@@ -1940,3 +1940,69 @@ cost for them to address. Not attempted here: either fix. Also untested:
 whether a real (non-synthetic, non-uniform-sky) catalog would push this
 1% figure higher, since dense real surveys plausibly have more large-
 radius/high-density queries than this benchmark's mixed distribution.
+
+## Round nineteen: disabling JIT for this query shape -- a cheap win, but
+## not one skycell can apply automatically
+
+Round eighteen's own closing question, option (b): is disabling JIT (or
+raising its threshold) for skycell's wide-OR cone query shape a cheap win
+with no covering-algorithm change needed? Tested directly, on a fresh
+10M-row corpus and a new 300-query benchmark (same shape as round
+eighteen's: 60 queries each at 1″/1′/30′/1°/3°, mixed real-data/uniform
+centers, resampled so the "data" centers are drawn IID via `ORDER BY
+random()` over the full row population, not block-sampled -- block
+sampling on a HEALPix-clustered table undersamples the rare extreme-
+density hits that matter here).
+
+Three configurations run head-to-head for every query, same connection,
+same corpus: (a) default GUCs (`jit_above_cost=100000`), (b) `SET jit =
+off`, (c) `SET jit_above_cost = 400000` (raised comfortably above every
+cost this benchmark produced, `jit` itself left on). This run reproduced
+2 of 300 queries (0.67%, both 3° / real-data-cluster centers) crossing
+the default threshold:
+
+| qid | ranges | cost | (a) default | (b) jit off | (c) threshold=400k |
+|---|---|---|---|---|---|
+| 266 | 25 | 386,662 | 44.3ms | 25.2ms | **22.2ms** |
+| 248 | 21 | 376,970 | 68.1ms | 30.7ms | **29.5ms** |
+
+Raising the threshold performs *at least as well as* turning JIT off
+entirely -- unsurprising, since it produces the identical plan-time
+decision (`jit_present_highthresh = false` for both, confirmed from the
+JSON) while leaving JIT available for anything actually costing more than
+400,000 elsewhere in the same database. Across the full 300-query set,
+zero regressions: every query flagged by a >10% slowdown check under (b)
+or (c) had `jit_present_default = false` already -- i.e. it was already
+below the default 100,000 threshold, so neither change could have altered
+its plan; the flagged deltas are pure sub-millisecond measurement noise on
+trivial queries, not real regressions.
+
+**So yes, it is a cheap win -- confirmed, not just plausible.** But it is
+an *operational* win, not a code change skycell itself can make. The
+mechanism why: PostgreSQL's own docs are explicit that the JIT decision is
+made once, at the end of planning, by comparing the finished plan's total
+cost against `jit_above_cost`/`jit_inline_above_cost` -- before execution
+starts, and therefore before any skycell C function (`skycell_cone`,
+`sc_cover_compute`, the GiST/SP-GiST support functions) ever runs. Those
+functions execute during the scan, strictly after the JIT go/no-go
+decision is already baked into the `PlannedStmt`. Nothing skycell's
+extension code does at execution time -- and nothing exposed through its
+existing GUCs (`skycell.range_cost`, `skycell.max_ranges`, etc.) -- can
+reach back and change a decision already made. The only hook that
+*could* intervene at the right time is a `planner_hook` wrapping
+`standard_planner()`, inspecting the finished plan for skycell's own
+operators and clearing `jitFlags` selectively; skycell has no
+`planner_hook` today, and implementing one is a materially bigger,
+different kind of change than anything else in this file (a plan-tree
+walk plus a new extension-wide hook, not a `cover.c`/`gist_region.c`
+tweak) -- not attempted, and arguably out of proportion to a 0.67%-of-
+queries problem unless real-catalog density (§round eighteen's other open
+question) turns out to make it much more common.
+
+**Practical recommendation, actionable today with zero code changes**:
+applications running skycell cone/region queries at large radii (≳3° on
+catalogs with dense clusters) should raise
+`jit_above_cost` (tested clean at 400,000; needs recalibrating per corpus,
+not a universal constant) or set `jit = off` for the session/connection
+pool handling that workload -- confirmed strictly non-regressive and as
+good as or better than a blanket JIT disable, on every query tested.

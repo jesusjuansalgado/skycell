@@ -241,6 +241,35 @@ uninvestigated cost on the already-shipped path, for realistic large-
 radius/high-density queries. Neither of round seventeen's two candidate
 fixes has been attempted yet.
 
+**Round nineteen tried the cheaper of those two fixes directly: disabling
+or raising the threshold on JIT for this query shape.** A fresh 10M-row
+corpus and a resampled 300-query benchmark (IID `ORDER BY random()`
+sampling this time, not block sampling, which had undersampled the rare
+extreme-density hits) reproduced 2/300 queries (0.67%) crossing
+`jit_above_cost`. Ran three configurations head-to-head on the same
+connection: default GUCs, `SET jit = off`, and `SET jit_above_cost =
+400000` (JIT left on, threshold raised past every cost this benchmark
+produced). Result: **raising the threshold matched or beat a full JIT
+disable** (22.2ms/29.5ms vs. 25.2ms/30.7ms vs. 44.3ms/68.1ms baseline,
+for the 2 triggering queries) — expected, since it produces the identical
+plan-time no-JIT decision while leaving JIT available for anything that
+actually costs more than 400,000 elsewhere in the database. Zero
+regressions across the other 298 queries. **But this is confirmed to be
+an operational fix, not one skycell's own code can apply**: PostgreSQL's
+JIT go/no-go decision is made once, at the end of planning, strictly
+before any skycell C function ever executes — nothing skycell does at
+scan time (nor any of its existing GUCs) can reach back and change a
+decision already baked into the `PlannedStmt`. The only mechanism that
+*could* intervene at the right point is a `planner_hook` wrapping
+`standard_planner()` to selectively clear `jitFlags` for plans built from
+skycell's own operators — not implemented, and a materially bigger kind
+of change (a new extension-wide hook, not a `cover.c` tweak) than
+anything else in this investigation. Actionable today with zero code
+changes: document that applications running skycell cone/region queries
+at large radii on dense catalogs should raise `jit_above_cost` (or
+disable JIT) for that session/connection pool — confirmed non-regressive
+and at least as good as a blanket disable.
+
 ## 6. Open questions and concrete untried directions
 
 In rough order of how well-scoped/promising they seem from this history,
@@ -259,15 +288,21 @@ not in priority order — pick what matches the actual goal:
    from B-tree descent cost) has no term for this at all. `p->max_ranges=64`
    itself is not the binding constraint (max seen in round eighteen's
    benchmark: 26 ranges) — the JIT threshold is crossed well before the
-   range-count ceiling is. Two concrete, untried options: (a) add a
-   range-count-and-expected-parallel-worker-count term to the cost model so
-   the covering computation itself prices in execution-side JIT cost, not
-   just descent cost; (b) check whether raising
-   `jit_above_cost`/`jit_inline_above_cost` for skycell's own wide-OR query
-   shape, or disabling JIT for it specifically, is a cheap win with no
-   covering-algorithm change needed at all. This is now the best-evidenced
-   item on this list — the cost is measured and live, only the fix is
-   untried.
+   range-count ceiling is. **Round nineteen closed one of the two candidate
+   fixes**: raising `jit_above_cost`/disabling JIT for the session running
+   skycell's wide-OR queries is a confirmed, non-regressive, zero-code-
+   change win (matches or beats a blanket disable) — but it is an
+   *operational* fix (a GUC set by the application/connection pool), not
+   something skycell's own code can apply per-query, because PostgreSQL's
+   JIT decision is finalized at the end of planning, strictly before any
+   skycell C function executes; only a `planner_hook` (not implemented,
+   a materially bigger change than anything else in this file) could make
+   it automatic. The other option is still untried and is now the more
+   interesting remaining one: add a range-count-and-expected-parallel-
+   worker-count term to `cover.c`'s own cost model, so the covering
+   computation itself prices in execution-side JIT cost rather than just
+   descent cost — the only path to a fix skycell can ship without asking
+   every deployment to tune a PostgreSQL GUC by hand.
 2. **Recalibrate `SC_COVER_MAX_DRY_STREAK`** (round sixteen's reverted fix,
    `cover.c`) against a broad query set, not one failing query -- the
    underlying bug (density alone justifying unbounded speculative
@@ -330,6 +365,11 @@ not in priority order — pick what matches the actual goal:
   cost on this exact shipped path: ~1% of realistic large-radius/high-
   density queries already cross PostgreSQL's `jit_above_cost` on range
   count alone (nowhere near `p->max_ranges=64`) and pay a 3-6x parallel-
-  JIT tax as a result — measured, not yet fixed.
+  JIT tax as a result. Round nineteen confirmed the cheap fix (raise
+  `jit_above_cost`/disable JIT for the session) works cleanly with zero
+  regressions, but it's a GUC applications must set themselves — skycell's
+  own code has no hook into a decision PostgreSQL finalizes before any
+  skycell function runs. Still unshipped: either that documented
+  operational guidance, or a JIT-aware term in `cover.c`'s own cost model.
 - `GIST_REGION_DESIGN.md` is the source of truth for exact numbers, code
   reasoning, and anything this summary compressed or left out.
