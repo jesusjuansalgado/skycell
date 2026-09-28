@@ -2006,3 +2006,72 @@ catalogs with dense clusters) should raise
 not a universal constant) or set `jit = off` for the session/connection
 pool handling that workload -- confirmed strictly non-regressive and as
 good as or better than a blanket JIT disable, on every query tested.
+
+## Round twenty: farthest-point seeding for merge_caps_greedy -- tried,
+## measured, a clear regression, reverted
+
+Prompted by reading pgSphere's actual GiST source (`gist.c` from the
+upstream `pgsphere/pgsphere` repo, not previously looked at directly in
+this investigation): its bounding key isn't a cap at all -- it's a plain
+3D axis-aligned box in Cartesian space (`Box3D { Point3D low, high; }`,
+6 `int32` coordinates, 24 bytes, matching the installed extension's own
+`spherekey` type's `internallength = 24`), unioned by exact per-axis
+`min`/`max`. That union is lossless at every tree level. skycell's own
+`merge_caps_greedy` -- the function `multicap_union_many()` and
+`multicap_penalty()` both call to fold a node's children's sub-caps back
+down to `MAX_SUBCAPS` -- is not: its own header comment already says so
+("Not a globally optimal clustering"), and it seeds its k clusters by
+just taking the first `MAX_SUBCAPS` input caps in whatever order the
+caller's flattened list happens to be in -- an order that comes from tree
+traversal, not spatial layout. That looked like a plausible, cheap,
+narrowly-scoped fix: replace that arbitrary seeding with farthest-point
+selection (each new seed is the unchosen cap whose *minimum* waste to
+every already-chosen seed is largest -- the standard greedy k-center
+heuristic), without touching the key format, `consistent()`, or anything
+else -- exactly the kind of small, reversible experiment this file's own
+discipline calls for before a bigger redesign.
+
+**Measured with a true A/B**: same 50,000-row mixed circle/polygon
+footprint corpus, same 500-probe sets, same seeds, index dropped and
+rebuilt from scratch under each binary so the comparison isn't
+contaminated by an index already shaped by the other code.
+
+| direction | before (first-k seeding) | after (farthest-point seeding) | pgSphere |
+|---|---|---|---|
+| `@>`(region,region) | 80-83ms | **225-273ms (2.9x worse)** | ~20ms |
+| `<@`(region,region) | 160-174ms (beats pgSphere 1.4x) | **281-286ms (now loses to pgSphere 1.2x)** | 232-252ms |
+
+Not a wash, not noise (both passes in each configuration agree tightly) --
+a clear regression on *both* strategies, and it erased round seven's own
+headline result (`<@` beating pgSphere outright at this scale).
+**Reverted** (`git stash`, working tree and installed extension both back
+to the original `merge_caps_greedy`).
+
+**Why, best explanation available, not independently confirmed**:
+`merge_caps_greedy` isn't only invoked to polish an already-decided split's
+final keys -- `multicap_penalty()` calls it on every candidate subtree for
+every single row GiST inserts, to decide *where the row goes*. Farthest-
+point/greedy-k-center seeding is a better one-shot clustering for a fixed
+input set, but it's also the textbook-known-sensitive-to-outliers member
+of the clustering-heuristic family: whichever cap happens to be most
+extreme relative to whatever's currently in `out[]` dominates each seed
+choice. Across thousands of incremental `penalty()` calls, each comparing
+a different candidate subtree's current children, that sensitivity likely
+makes the *waste* estimate less consistent from one call to the next than
+the plain first-k seeding it replaced -- locally tighter for one fixed
+merge, but a noisier placement signal repeated over the whole incremental
+build, which is a property first-k seeding's very naivety doesn't have
+(same deterministic order every time, at least self-consistent even if
+arbitrary). Not verified further (would need direct tree-shape/buffer
+inspection, not just wall-clock, to confirm this specific mechanism rather
+than just the outcome) -- but the outcome itself is unambiguous enough
+that this specific fix is closed, not just paused.
+
+**What this doesn't close**: the box-vs-cap union insight that motivated
+it is still real and still unexplained away -- an *exact* union composes
+losslessly at every tree level; a *capped* cluster union, however seeded,
+structurally cannot (there is some input for which any seeding strategy
+loses information MAX_SUBCAPS+1 items in). Round twenty only tested one
+narrow fix (reseed the same lossy algorithm) and found it backfires
+specifically because of penalty()'s incremental-build role -- it says
+nothing about whether a *different* kind of fix (below) would do better.
