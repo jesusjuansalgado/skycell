@@ -108,6 +108,8 @@ PostGIS's own bounding-key idea, not invented from scratch.
 
 | 25 | Round twenty-two measured `@>`/`<@`(region,region) directly (what rounds twenty/twenty-one's regressions were about) but never re-checked `&&` or `@>`(region,point) against pgSphere under the shipped fix — even though both share the same `multicap_union_many()` path that changed. Filled the gap: fresh corpus, both scales, current shipped code. | **A genuinely new finding, not something round twenty-two claimed.** `&&` at 50,000 rows was skycell's one lingering loss to pgSphere since round three (~1.2x slower, untouched by rounds four through twenty-one) — round twenty-two's fix flipped it too: 63.70-65.07ms vs pgSphere's 83.23-98.76ms, **~1.28-1.55x faster**, an apparent side effect of tightening the same shared key-building path every strategy's `consistent()` prunes against. At 5,000 rows `&&` is unchanged (~3.9-4.1x faster, matches round three). `@>`(region,point) shows no comparable improvement — 73.64-75.38ms vs pgSphere's 16.30-18.24ms at 50,000 rows, **~4.0-4.6x slower**, consistent with round four's own diagnosis being a different mechanism (pgSphere's native point-in-shape test is inherently cheaper than a sub-cap loop) that round twenty-two's key-tightness fix doesn't reach. Correctness verified at both scales, both strategies. |
 
+| 26 | Round fifteen's own conclusion, the last untried item: an O(MAX_SUBCAPS²) all-pairs overlap test is what capped the profitable sub-cap count at 4. Sorted each key's valid sub-cap prefix by centre x at build time (`sort_subcaps_by_cx()`), then rewrote `multicap_overlaps()`/`multicap_overlap_amount()` to skip pairs a real geometric bound proves can't overlap (a coordinate difference exceeding the chord of the radius sum) instead of checking all pairs. | **Correctness held at both scales, all four strategies — but buffers got consistently worse, not better**: `&&` +4.5%, `@>`(point) +4.6%, `@>`(region,region) +3.0%, `<@`(region,region) +2.0%, all measured same-database. **Reverted.** Not a flaw in the pruning bound itself (proven exact, not approximate — a skipped pair genuinely never contributes) but an unintended coupling with round twenty-two's `merge_caps_greedy_fp()`: its farthest-point seeding is deliberately order-sensitive (`caps[0]` becomes the first seed), and `multicap_union_many()` flattens `entries[i]->sub[j]` in entry order to build the next level's input — so sorting a stored key's `sub[]` for query-time benefit silently reseeds every future clustering decision that reads it back, producing a different (not wrong, just worse) tree shape. |
+
 **Where this leaves the region GiST opclass**: `&&` and `<@` are now solid
 wins at both scales (round twenty-five found `&&`'s one lingering loss at
 50,000 rows flipped by round twenty-two's fix, previously unverified);
@@ -117,21 +119,32 @@ targeted fixes (round fourteen's area check, round fifteen's sharper key,
 round twenty's unscoped seeding change) failed to close it and two of
 them (twenty, twenty-one) actively made it worse; `@>`(region,point) has
 a wide, structurally explained, untouched gap (round four) that no round
-since has addressed. Rounds twenty-three and twenty-four both tried to
-push `@>`(region,region) further — tightening `merge_caps_greedy_fp()`
-itself (small, real, not worth its cost) and adding an exact box summary
-for picksplit's cost metric (a clear regression, not just a wash) — and
-both were reverted. The mechanism rounds twenty/twenty-one diagnosed held
-up across all four of the last rounds: `merge_caps_greedy` (unchanged,
-first-k seeding) backs `penalty()`'s incremental placement exclusively;
-the new `merge_caps_greedy_fp()` (farthest-point seeding, single greedy
-sweep, no refinement pass) backs `multicap_union_many()`'s key-building
-exclusively; `picksplit`'s cost metric is back to `multicap_total_area()`,
-unchanged from round twenty-two. Round two's original diagnosis —
-overlapping bounding caps at internal/leaf pages — still applies to
-whatever the tighter merge doesn't catch; the sub-quadratic overlap test
-(§6) is now the one remaining untried direction from this file's own list
-that hasn't been tried and found wanting.
+since has addressed. Rounds twenty-three, twenty-four, and twenty-six all
+tried to push `@>`(region,region) (and, for twenty-six, all four
+strategies) further and were all reverted — tightening
+`merge_caps_greedy_fp()` itself (small, real, not worth its cost), adding
+an exact box summary for picksplit's cost metric (a clear regression),
+and a sub-quadratic overlap test (mathematically sound, regressed anyway
+via an unintended coupling with round twenty-two's seeding). The
+mechanism rounds twenty/twenty-one diagnosed held up across all five of
+the last rounds: `merge_caps_greedy` (unchanged, first-k seeding) backs
+`penalty()`'s incremental placement exclusively; the new
+`merge_caps_greedy_fp()` (farthest-point seeding, single greedy sweep, no
+refinement pass, output order untouched by round twenty-six's revert)
+backs `multicap_union_many()`'s key-building exclusively;
+`multicap_overlaps()`/`multicap_overlap_amount()` are back to the plain
+O(MAX_SUBCAPS²) all-pairs check, unchanged from round twenty-two. Round
+two's original diagnosis — overlapping bounding caps at internal/leaf
+pages — still applies to
+whatever the tighter merge doesn't catch. Every direction on this file's
+own original open-questions list for this gap (a sub-quadratic overlap
+test, the pgSphere-style exact box) has now been tried and found wanting;
+the two live directions going forward are both bigger/riskier than
+anything tried so far: decoupling `sub[]`'s stored order from
+`merge_caps_greedy_fp()`'s clustering input (round twenty-six's own
+closing note — a second, unsorted copy, or an order-independent seeding
+scheme), or accepting the current gap as this opclass's likely floor and
+moving effort elsewhere.
 
 A methodological note from round twenty-one, carried forward and validated
 twice since: round twenty-one's same-database baseline (rerun immediately
@@ -350,13 +363,17 @@ not in priority order — pick what matches the actual goal:
    diagnosed; the specific cap chosen (2) demonstrably regressed a nearby
    case. Also untested against the adaptive path's actual existing callers
    (polygon coverings) at all.
-3. **A sub-quadratic overlap test for the region GiST multi-cap key**
-   (§3, round fifteen's own conclusion). The O(MAX_SUBCAPS²) all-pairs
-   check is what capped the profitable cap count at ~4. A key whose own
-   sub-caps are spatially sorted/indexed (even something as simple as
-   sorting by one coordinate and using it to skip non-overlapping pairs)
-   could let MAX_SUBCAPS grow without paying the full quadratic cost —
-   untried.
+3. ~~A sub-quadratic overlap test for the region GiST multi-cap key~~ —
+   **tried, round twenty-six, reverted.** Sorted sub-caps by centre x,
+   skipped pairs a real (not approximate) geometric bound proves can't
+   overlap. Correctness held; buffers got consistently *worse* (+2.0% to
+   +4.6%) across all four strategies — not from the pruning bound (exact)
+   but from an unintended coupling with round twenty-two's order-sensitive
+   farthest-point seeding, which silently reseeds differently once a
+   stored key's `sub[]` is reordered. Untried follow-up if revisited:
+   decouple by keeping a second, unsorted copy for clustering input, or
+   make the seeding itself order-independent — both bigger than this
+   round's fix, not attempted.
 4. ~~Scope any future `merge_caps_greedy` improvement to `union()` alone,
    never `penalty()`~~ — **done, shipped, round twenty-two.** A new
    `merge_caps_greedy_fp()` (farthest-point seeding) is used only by
@@ -430,16 +447,22 @@ not in priority order — pick what matches the actual goal:
   only by `multicap_union_many()`, round twenty-two, kept — a real,
   measured win, not experimental). `picksplit`'s cost metric is
   `multicap_total_area()` (sub-cap-area sum), unchanged from round
-  twenty-two — no `GistBox3D` field, round twenty-four's exact-box summary
-  was reverted. Rounds fourteen, fifteen, twenty, twenty-one, twenty-three,
-  and twenty-four's changes were all reverted after measurement (twenty and
-  twenty-one regressed `@>` and `<@`; twenty-three measured a real but
-  too-small-to-justify buffer improvement; twenty-four measured a clear
-  buffer regression); round twenty-two is the one change from this whole
-  investigation actually shipped. `@>`(region,region)'s gap to pgSphere is
-  narrowed (~5x → ~2.3-2.9x at 50,000 rows) but not closed; the
-  sub-quadratic overlap test (§6) is the one remaining direction on this
-  list not yet tried and found wanting. Round twenty-five confirmed round
+  twenty-two — no `GistBox3D` field (round twenty-four reverted), `sub[]`
+  unsorted and `multicap_overlaps()`/`multicap_overlap_amount()` plain
+  O(MAX_SUBCAPS²) all-pairs (round twenty-six reverted). Rounds fourteen,
+  fifteen, twenty, twenty-one, twenty-three, twenty-four, and twenty-six's
+  changes were all reverted after measurement (twenty and twenty-one
+  regressed `@>` and `<@`; twenty-three measured a real but
+  too-small-to-justify buffer improvement; twenty-four and twenty-six both
+  measured clear buffer regressions, the latter from an unintended coupling
+  with round twenty-two's order-sensitive seeding — see §3); round
+  twenty-two is the one change from this whole investigation actually
+  shipped. `@>`(region,region)'s gap to pgSphere is narrowed
+  (~5x → ~2.3-2.9x at 50,000 rows) but not closed; every direction from
+  this file's original open-questions list for it has now been tried and
+  found wanting — round twenty-six's own closing note (decoupling `sub[]`'s
+  stored order from clustering input) is the least-tried remaining idea,
+  bigger than anything attempted so far. Round twenty-five confirmed round
   twenty-two's fix also flipped `&&` at 50,000 rows from a ~1.2x loss
   (unclosed since round three) to a ~1.28-1.55x win, a side effect never
   directly measured until now; `@>`(region,point) remains a wide,

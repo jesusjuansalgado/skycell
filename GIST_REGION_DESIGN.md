@@ -2401,3 +2401,83 @@ solid wins at both scales; `@>`(region,region) has a narrowed but real
 gap (round twenty-two); `@>`(region,point) has a wide, structurally
 explained, untouched gap (round four) that no round since has addressed
 and that round twenty-two's fix does not reach.
+
+## Round twenty-six: a sub-quadratic overlap test -- mathematically sound,
+## measured worse on all four strategies, and why
+
+The remaining untried item from round fifteen's own conclusion: the
+O(MAX_SUBCAPS^2) all-pairs check in `multicap_overlaps()`/`multicap_
+overlap_amount()` is what capped the profitable sub-cap count at 4 --
+doubling it to 8 (round fifteen) quadrupled comparison cost and lost on
+wall-clock despite better buffers. The proposed fix: sort each key's
+valid sub-cap prefix by centre x coordinate at build time, then skip
+pairs that provably cannot overlap at query time, using a real
+(not approximate) geometric bound: for unit-vector centres, one
+coordinate's difference is always <= the true chord (3D Euclidean)
+distance between centres, and chord distance is monotonic in angular
+distance -- so if `|a.sub[i].cx - b.sub[j].cx|` exceeds the chord of
+`(a.sub[i].radius + max radius among b's sub-caps)`, that pair cannot
+overlap, full stop, and (with `b` sorted ascending by `cx`) every `j`
+past that point can't either.
+
+Implemented: `cap_radius_chord()` (the chord identity), `sort_subcaps_
+by_cx()` (insertion sort on the valid prefix, called from `region_to_
+multicap()`'s polygon branch and `merge_caps_greedy_fp()`'s output --
+the two places that finalize a *stored* `sub[]`), and rewrote both
+overlap functions to walk the sorted lists with a skip-low/break-high
+window instead of the naive double loop.
+
+**Correctness held at 50,000 rows, all four strategies** (brute-force
+count matches GiST and pgSphere exactly: `&&` 1349, `@>`(point) 765,
+`@>`(region,region) 882, `<@`(region,region) 28186) -- the pruning bound
+itself is exact, not approximate, so this isn't surprising.
+
+**But buffer counts got consistently worse, not better, across all four**
+(same-database comparison, index rebuilt under each binary):
+
+| strategy | buffers before | buffers after | change |
+|---|---|---|---|
+| `&&` | 29,905 | 31,244 | +4.5% worse |
+| `@>`(region,point) | 25,449 | 26,625 | +4.6% worse |
+| `@>`(region,region) | 26,594 | 27,399 | +3.0% worse |
+| `<@`(region,region) | 69,090 | 70,461 | +2.0% worse |
+
+**Reverted** (stashed; working tree and installed extension back to
+round twenty-five's shipped code).
+
+**Why, and it's not the overlap test itself**: the pruning bound is
+mathematically airtight (proven above, not just measured), so a skipped
+pair genuinely never contributes to the boolean answer or the sum --
+`multicap_overlaps()`/`multicap_overlap_amount()` return *exactly* the
+same values sorted or not. The regression comes from an unintended
+coupling with round twenty-two's `merge_caps_greedy_fp()`: its farthest-
+point seeding is deliberately order-sensitive (`out[0] = caps[0]` --
+the *first* input cap becomes the first seed, by design, and every
+subsequent seed choice builds on that). `multicap_union_many()` builds
+`merge_caps_greedy_fp()`'s input by flattening `entries[i]->sub[j]` in
+entry order, so `flat[0]` is `entries[0]->sub[0]` -- and sorting
+`entries[0]`'s own `sub[]` by `cx` (this round's whole change) changes
+*which cap that is*, compared to round twenty-two's original order
+(whatever the earlier seeding/assignment pass happened to produce).
+Since a stored key's `sub[]` becomes some *future* call's flattened
+input the next time it's read back during an insert or split, sorting
+for query-time benefit silently reseeds every downstream clustering
+decision -- not incorrectly (the resulting multi-cap is still a valid
+summary either way), just *differently*, and this round's specific
+different tree shape happened to be worse on all four metrics tested.
+
+**What this rules out, and what it doesn't**: this isn't evidence the
+sub-quadratic *technique* is unsound -- it's evidence that ordering
+changes to `sub[]` are not "free" the way they'd naively look, given
+round twenty-two's order-sensitive seeding is now load-bearing shipped
+behavior. A version that kept clustering's input order untouched (e.g.
+sorting only a serialization-time copy that never feeds back into a
+future `merge_caps_greedy_fp()` call, or making the seeding itself
+order-independent) could still work -- neither was attempted here, and
+the first would need a second, unsorted copy of `sub[]` carried
+alongside the sorted one (doubling that part of the key, undermining
+the cheapness that made this idea attractive), while the second means
+touching round twenty-two's proven seeding logic again, which this
+file's own track record (four reverted attempts, rounds twenty through
+twenty-four, all centered on this exact function family) suggests
+doing carefully, not as a quick follow-up.
