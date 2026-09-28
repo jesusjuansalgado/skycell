@@ -2661,3 +2661,119 @@ instruction count against `sc_angle()`'s cross-product/sqrt/atan2 chain
 -- unlikely on a rough operation-count basis (four trig calls instead of
 one atan2 plus one sqrt), and not measured here since the whole point of
 caching was to avoid paying for `cos`/`sin` more than once per cap.
+
+## Round thirty: trying to calibrate `cover.c`'s `split_cost` -- no net
+## win found, and two measurement confounds caught along the way
+
+This round is about `cover.c`, not `gist_region.c` -- `skycell.probe_orders`
+(default 0, off) is a mechanism that, when enabled, probes 1-N covering
+orders finer than the closed-form starting order and scores each via
+`rlist_score()`: `l->n * range_cost + rows + steps * split_cost`.
+`split_cost` defaults to `1.0`, and the code's own comment says this is
+wrong -- it treats "examining one cell while building the covering" as
+costing the same as "fetching one false-positive row", and prescribes
+calibrating it against measurement the way `range_cost` already is
+(`auto_range_cost()`, derived from PostgreSQL's own planner constants).
+Unlike `range_cost`, there's no PostgreSQL-native cost to borrow from for
+`split_cost` -- covering computation is a pure skycell-internal,
+in-memory, planning-time operation -- so this had to be measured directly.
+
+Both `skycell.split_cost` and `skycell.probe_orders` are live GUCs
+(settable via `SET`, no rebuild needed), which made this look like a
+cheap experiment: build a query-center corpus at the docstring's own
+cited "6'-30'" radii on a 10M-row corpus, sweep `split_cost` with
+`probe_orders=3`, and see which value wins on wall-clock.
+
+**First attempt -- sequential blocks, invalidated by a ~40% time drift.**
+Running each `split_cost` value as a full block of 90 queries, one block
+after another, repeating the whole grid twice as a sanity check: the
+*second* pass of every identical configuration came in ~40% faster than
+the first, with no relationship to the actual `split_cost` value --
+purely a function of position in the run. At sub-millisecond
+per-query times, some combination of cache warming and system-level
+drift dominates any real signal in a sequential A/B block design.
+
+**Second attempt -- interleaved by center, invalidated by a
+within-cycle position bias.** Redesigned to cycle through all 6 variants
+for each query center before moving to the next center (so no single
+config is systematically "later" in the overall run). This looked like
+it worked -- and produced an eye-catching result: `probe_orders=3` at
+the *shipped* `split_cost=1.0` beat `default` (`probe_orders=0`) by 18%
+at 6' radius, with the win shrinking to ~6% at 15'/30' and lower
+`split_cost` values trailing off worse than `default`. Paired by query
+center (t ~ 5.3), this looked like a real, significant effect -- until
+checked against `skycell_cover_info()`: for the 6' sample, the chosen
+order changed in only 3 of 30 queries, with `nranges` essentially
+unchanged (2.07 -> 2.07 average). An 18% wall-clock difference with a
+90%-of-the-time-identical covering decision isn't plausible as a real
+effect of the GUC. The actual cause: `default` was *always first* in
+each 6-variant cycle for a given center, so it alone paid the cold-buffer
+cost of that center's first touch in the cycle, while the other five
+variants inherited warm buffers from `default`'s own touch moments
+earlier -- a pure position artifact, not a `split_cost` effect.
+
+**Third attempt -- order shuffled independently per (repetition, query
+center), the fix that held up.** With the 6-variant visit order
+re-randomized on every cycle so no variant is systematically
+first-in-cycle, the effect mostly vanished: `default` vs `probe_orders=3`
+at `split_cost=1.0` or `0.3` came back statistically indistinguishable
+(paired difference 0.0028ms and -0.0017ms respectively, both well under
+one standard error over 90 paired centers x 8 repetitions). Lower
+`split_cost` values (0.1, 0.05, 0.0) came back measurably *worse* than
+`default` (paired difference -0.0095 to -0.0173ms, `default` vs `0.0`
+significant at t ~ -6.4).
+
+**Buffer counts -- immune to timing noise, and telling a real,
+consistent story that wall-clock doesn't fully reflect.** Independent of
+all three wall-clock attempts, `EXPLAIN (ANALYZE, BUFFERS)` (second run
+per query, so buffers reflect warm state for every variant equally) shows
+a genuine, monotonic, noise-free reduction as `split_cost` drops from
+`1.0` to `0.0`, holding at every radius from 6' to 30':
+
+| radius | default | sc=1.0 | sc=0.3 | sc=0.1 | sc=0.05 | sc=0.0 |
+|---|---|---|---|---|---|---|
+| 6' | 29.80 | 29.60 | 27.93 | 27.73 | 27.73 | 27.60 |
+| 15' | 42.80 | 42.47 | 41.47 | 40.53 | 39.80 | 39.73 |
+| 30' | 109.07 | 106.47 | 104.40 | 103.20 | 103.13 | 103.13 |
+| 60' | 262.10 | 260.60 | 260.20 | 260.20 | 260.20 | 260.20 |
+| 120' | 355.30 | 355.30 | 355.30 | 355.30 | 355.30 | 355.30 |
+
+(90 centers at 6'/15'/30', 20 at 60'/120', avg buffers/query.) So the
+docstring's underlying premise is correct as far as it goes: `split_cost`
+lower than `1.0` really does make the mechanism pick finer, tighter
+coverings more often, and that really does touch fewer buffers -- a
+genuine 6-8% reduction at 6'-30' radii, saturating to nothing by 60' and
+vanishing entirely by 120' (matching the docstring's own cited "6'-30'"
+window almost exactly -- past that, the closed-form order is apparently
+already about as good as probing can find).
+
+**But the buffer win doesn't show up as a wall-clock win, because
+`probe_orders` itself has a fixed planning-time cost that a `split_cost`
+tweak alone can't pay for.** `skycell_cover_info()`'s `steps` field
+(the covering algorithm's own step counter) jumped from 18 to 79 for one
+sample query when `probe_orders` went from 0 to 3 -- with the *chosen
+order unchanged* -- confirming that probing 3 extra candidate orders
+costs real, fixed C-level work independent of whether it changes the
+final decision or of what `split_cost` is set to (`probe_orders=3` was
+held constant across the whole buffer sweep above; only `split_cost`
+varied, and the buffer curve moved smoothly while this fixed cost did
+not). At this corpus/query scale -- sub-millisecond queries touching
+tens to low hundreds of buffers -- that fixed planning tax outweighs the
+handful of buffers saved by a better covering choice. A real net win
+would need either a cheaper probing loop (fewer or smarter candidate
+orders, not a fixed 3) or a context where the row-fetch savings are
+large enough to dominate the fixed probing cost (a much larger `radius`
+x `rows-per-cell` product than this corpus's 6'-30' sweet spot has, and
+by 60'/120' the buffer savings themselves have already vanished, so
+there's no wider-radius escape hatch either).
+
+**No code change made.** `skycell.split_cost` stays at its shipped
+default (`1.0`), `skycell.probe_orders` stays off (`0`) -- calibrating
+`split_cost` doesn't unlock the win the docstring anticipates, because
+the mechanism's own fixed overhead, not the cost-model imbalance, is
+what's actually blocking it. This is a negative result, but a real one:
+worth recording so a future attempt doesn't re-derive the same dead end,
+and doesn't repeat either of the two measurement confounds this round
+had to find and rule out first (sequential-block time drift, and
+within-cycle first-position cache bias) before trusting any A/B number
+at this query scale.

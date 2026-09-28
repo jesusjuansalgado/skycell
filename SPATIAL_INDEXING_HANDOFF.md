@@ -447,14 +447,18 @@ not in priority order — pick what matches the actual goal:
    low-density sky) might make round thirteen's "0% empty cells" result
    corpus-specific rather than general — untested, no corpus available in
    this repo to test it with.
-10. **`skycell.probe_orders`** (`cover.c`): an existing, off-by-default GUC
-   for scoring several candidate covering orders instead of trusting the
-   closed-form choice — its own code comment says forcing a finer order
-   directly measures a real 30-48% win at 6'-30' that the *scored* probe
-   version doesn't yet capture, because `split_cost`'s calibration
-   (1 row/cell examined) isn't measured the way `range_cost` now is. A
-   real, already-diagnosed, already-partially-measured gain sitting
-   uncollected — closing it is calibration work, not new design.
+10. ~~`skycell.probe_orders` (`cover.c`): calibrate `split_cost`~~ — tried
+   (round thirty), no net win. Buffer counts *do* improve monotonically as
+   `split_cost` drops from `1.0` toward `0.0` (6-8% fewer buffers at
+   6'-30', matching the docstring's own cited range, vanishing by 60'-
+   120'), confirming the cost-model imbalance the docstring describes is
+   real. But `probe_orders=3`'s own fixed planning-time cost (confirmed via
+   `skycell_cover_info()`'s `steps` counter jumping 18→79 with the chosen
+   order unchanged) outweighs that buffer saving at this corpus/query
+   scale in wall-clock terms, regardless of `split_cost`'s value — so no
+   calibrated value of `split_cost` alone unlocks the win. Left as shipped
+   (`split_cost=1.0`, `probe_orders=0`). Getting a real win here would mean
+   cutting the probing loop's own fixed overhead, not retuning its score.
 
 ## 7. Where things stand right now (as of this document)
 
@@ -526,5 +530,21 @@ not in priority order — pick what matches the actual goal:
   own code has no hook into a decision PostgreSQL finalizes before any
   skycell function runs. Still unshipped: either that documented
   operational guidance, or a JIT-aware term in `cover.c`'s own cost model.
+  Round thirty attempted the other open `cover.c` item — calibrating
+  `split_cost` so `skycell.probe_orders`'s scored mechanism picks the
+  already-proven-better finer covering order automatically — and found no
+  net win: real buffer savings from lower `split_cost` are real but small
+  (6-8% at 6'-30', the docstring's own cited window) and are outweighed by
+  `probe_orders`' own fixed per-query planning overhead at this corpus
+  scale, so `split_cost=1.0`/`probe_orders=0` ship unchanged. The attempt
+  also surfaced two measurement-methodology traps worth remembering for
+  any future micro-benchmark at this query scale (sub-millisecond,
+  tens-to-hundreds of buffers): a sequential-block A/B design picked up a
+  ~40% pure time-drift artifact, and even an interleaved-by-center design
+  picked up a within-cycle first-position cache bias large enough to look
+  like a real, statistically significant 18% effect until checked against
+  `skycell_cover_info()`'s actual covering decisions. Only a per-(rep,
+  center) randomized visit order, cross-checked against buffer counts
+  (immune to timing noise entirely), gave a trustworthy answer.
 - `GIST_REGION_DESIGN.md` is the source of truth for exact numbers, code
   reasoning, and anything this summary compressed or left out.
