@@ -3105,3 +3105,66 @@ diminishing returns; the remaining unexamined pgSphere source
 the sparse MOC storage) is either unrelated to spatial-indexing
 performance or already covered in substance by what `skyregion`'s own
 multi-cap representation does.
+
+## Round thirty-six: `min_area` for `<@` -- round fourteen's mirror,
+## and the same outcome
+
+This file's own open-questions list carried a `min_area` field for
+`CONTAINED_BY_REGION` (`<@`) as the mirror of round fourteen's reverted
+`max_area` idea for `CONTAINS_REGION` (`@>`), flagged explicitly as low
+priority -- `<@` already wins against pgSphere at both scales tested
+(round seven), so there was never a known gap for this to close, only a
+"worth checking if a future benchmark finds `<@` losing somewhere round
+seven didn't test," which none has. Implemented and measured anyway.
+
+**The idea, precisely mirrored**: containment gives a sound area bound
+in the other direction too -- if `A <@ Q` (A nonempty) then `area(A) <=
+area(Q)`, the same ordinary measure monotonicity round fourteen used,
+min()-reduced through `union()` instead of max()-reduced. Added one field
+to `GistMultiCap` (`min_area`, set to `r->area` at leaf construction in
+`region_to_multicap()`, min-reduced in the one place `union()` and
+`picksplit()` both already route through, `multicap_union_many()`), and
+one check in `consistent()`, `CONTAINED_BY_REGION` only: reject outright,
+no recheck needed, whenever even the *smallest* region reachable under a
+key already exceeds the query's own area -- checked before the existing
+`O(MAX_SUBCAPS^2)` overlap test, cheaper besides.
+
+**Correctness held**: `<@` match counts identical to the unmodified
+code at both 5,000 rows (471) and 50,000 rows (4,900), matching round
+seven/twenty-five's own established reference counts exactly.
+
+**Performance didn't move, and needed care to see that clearly.** First
+buffer-count pass looked promising -- 50,000 rows via `REINDEX` on an
+already-built corpus showed 16179 -> 16130 (0.3% fewer) -- but a
+*second*, independently fresh build (`DROP`/recreate `fpr`, not just
+`REINDEX`) of the exact same corpus and query came back 16183, and
+reverting the code and rebuilding again came back 16186 -- all three
+numbers within a handful of buffers of each other, no reproducible
+direction. The first "improvement" was `REINDEX`-order page-layout
+noise, not a real effect, caught by rebuilding from scratch rather than
+trusting a single before/after pair (the same discipline this file has
+needed repeatedly at small scales -- rounds thirty/thirty-one's
+sequential-block and cache-position confounds are the same lesson
+again, this time from index build order rather than query timing). At
+5,000 rows the direction was at least consistent, but the wrong way:
+2099 -> 2197 buffers, a real 4.7% *regression*.
+
+**Why, matching round fourteen's own diagnosis exactly**: on realistic
+data, being too large to be contained by a query region and having a
+cap that doesn't overlap the query's cap are correlated failure modes,
+not independent ones -- the existing overlap test already rejects
+almost everything the area test would additionally catch. Round
+fourteen found this for `@>` ("too small... usually also positioned
+such that its cap doesn't overlap"); this round finds the exact mirror
+holds for `<@` too. The two tests are mostly redundant in practice for
+either direction.
+
+**Reverted**, same standard as rounds nine, twelve, fourteen, and
+twenty-nine: correct, sound code that costs 8 bytes/key (one `double` on
+`GistMultiCap`, a real if small ~5% key-size increase, well short of
+round twenty-nine's 24% but the same mechanism) for a measured effect
+that is either negative or indistinguishable from rebuild noise is not
+worth carrying. The open-questions list's own instinct -- that this
+mirror wasn't expected to close a gap that doesn't exist -- held up
+under actual measurement, not just prediction; worth having tried
+rather than left as a guess, but nothing to ship.

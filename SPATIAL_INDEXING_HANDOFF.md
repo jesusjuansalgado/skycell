@@ -425,11 +425,15 @@ not in priority order — pick what matches the actual goal:
    mattered more, and the cheap one tried here was the wrong one. A real
    spherical-area proxy for the box (not volume) is the natural next
    attempt for anyone who wants to pick this back up — not tried.
-7. **A `min_area` field for `CONTAINED_BY_REGION` (`<@`)**, the mirror of
-   round fourteen's reverted `max_area` idea — except `<@` already wins
-   against pgSphere at both scales tested (round seven), so this is lower
-   priority; worth checking only if a future benchmark finds `<@` losing
-   somewhere round seven didn't test.
+7. ~~A `min_area` field for `CONTAINED_BY_REGION` (`<@`)~~ — tried (round
+   thirty-six), reverted: same outcome as round fourteen's `max_area`
+   mirror. Correct, and a real (if small, ~5%) key-size cost, for a
+   measured effect that was a regression at 5,000 rows (2099→2197
+   buffers) and noise-level at 50,000 (three independent rebuilds landed
+   within a handful of buffers of each other in no consistent direction)
+   — the overlap test already rejects almost everything the area test
+   would additionally catch, the same redundancy round fourteen found in
+   the other direction.
 8. **A bulk-loaded, statically-packed structure for the point predicate**,
    instead of the point SP-GiST's incremental `choose`/`picksplit`
    construction (flagged, not attempted, when round twelve/thirteen closed
@@ -496,9 +500,12 @@ not in priority order — pick what matches the actual goal:
   and buffers got consistently worse (+7.8% to +13.9%) despite the
   per-comparison math being provably identical — the same key-bloat/
   fanout mechanism rounds two, fifteen, and twenty-four hit, this time
-  from pure size growth rather than a bad proxy. Rounds twenty-two and
-  twenty-seven remain the only two changes from this whole investigation
-  actually shipped. `@>`(region,region)'s gap to pgSphere is
+  from pure size growth rather than a bad proxy. Round thirty-six's
+  `min_area` field for `<@` (the mirror of round fourteen's `max_area`)
+  hit the exact same redundancy round fourteen already found in the
+  other direction — reverted, no `min_area` field either. Rounds
+  twenty-two and twenty-seven remain the only two changes from this
+  whole investigation actually shipped. `@>`(region,region)'s gap to pgSphere is
   narrowed (~5x → ~2.3-2.9x at 50,000 rows) but not closed; every
   tree/key-quality direction from this file's original open-questions list
   for it has now been tried and found wanting — round twenty-six's own
