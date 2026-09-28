@@ -388,11 +388,50 @@ multicap_total_area(const GistMultiCap *m)
 	return a;
 }
 
+/*
+ * Round nine (reverted) tried to shrink the *stored* key for a plain
+ * circle to match pgSphere's own scircle size and measured backwards even
+ * under a genuinely cold cache: the CPU cost of reconstructing a decoded
+ * key from a variable-length encoding outweighed the I/O saved by the
+ * smaller pages, in every regime tested. This is the narrower version of
+ * that same idea, scoped to avoid that failure mode entirely: no format
+ * change, no decode-time branching, nothing touching union()/penalty()/
+ * picksplit() or a single byte of what gets written to disk -- only a
+ * fast path inside these two comparison functions, for the case where a
+ * key (leaf or internal) has collapsed to a single cap. That happens for
+ * every leaf that is a plain circle (region_to_multicap sets sub[0] equal
+ * to overall for a cone -- "already exact, a second cap would add
+ * nothing", this file's own header) and for any internal node whose
+ * merge_caps_greedy union happened to collapse multiple children into
+ * one cluster. In that case the overall-cap check just above -- which
+ * both functions already had to pay for as their first line -- *is* the
+ * exact sub-cap test, since sub[0] and overall are the same cap; the
+ * O(MAX_SUBCAPS^2) (or O(MAX_SUBCAPS)) loop below it is redundant work
+ * re-deriving an answer already known. This is the same per-comparison
+ * cost pgSphere's own scircle_ops pays for a circle and nothing else;
+ * skycell now pays that same cost for the same case, instead of the flat
+ * sub-cap-loop cost round four's own design notes named as the reason
+ * pgSphere's cheap native point-in-shape test pulls further ahead of
+ * skycell's than pgSphere's own && does of its own.
+ *
+ * Sound because sub[] is always packed contiguously from index 0 in this
+ * file (region_to_multicap, merge_caps_greedy) -- sub[1] unused implies
+ * sub[2]/sub[3] are too, so checking just sub[1] is enough to know there
+ * is at most one real sub-cap, without an explicit stored count.
+ */
+static inline bool
+multicap_is_single_cap(const GistMultiCap *m)
+{
+	return m->sub[1].radius < 0;
+}
+
 static bool
 multicap_overlaps(const GistMultiCap *a, const GistMultiCap *b)
 {
 	if (!cap_overlaps(a->overall, b->overall))
 		return false;			/* every sub-cap lies within its own overall cap */
+	if (multicap_is_single_cap(a) && multicap_is_single_cap(b))
+		return true;			/* overall caps overlap, and each *is* its one sub-cap */
 	for (int i = 0; i < MAX_SUBCAPS; i++)
 	{
 		if (a->sub[i].radius < 0)
@@ -414,7 +453,9 @@ multicap_overlaps(const GistMultiCap *a, const GistMultiCap *b)
  * (moc_for_region()'s decomposition is always a covering, never an
  * approximation that leaves gaps, since it exists elsewhere to bound a
  * region for indexing, not to draw it), so "in no sub-cap" is a sound
- * rejection. Same overall-cap short-circuit as multicap_overlaps().
+ * rejection. Same overall-cap short-circuit as multicap_overlaps(), and
+ * the same single-cap fast path (see multicap_is_single_cap()'s comment
+ * above multicap_overlaps()).
  */
 static bool
 multicap_contains_point(const GistMultiCap *m, sc_vec3 p)
@@ -423,6 +464,8 @@ multicap_contains_point(const GistMultiCap *m, sc_vec3 p)
 
 	if (!cap_overlaps(m->overall, pc))
 		return false;
+	if (multicap_is_single_cap(m))
+		return true;
 	for (int i = 0; i < MAX_SUBCAPS; i++)
 	{
 		if (m->sub[i].radius < 0)

@@ -34,6 +34,9 @@ extern bool density_for_expr(PlannerInfo *root, Node *arg, sc_density *d, Oid *s
 							  bool *uses_cell_ops);
 extern void density_for_var(PlannerInfo *root, Node *arg, sc_density *d, Oid *statrel,
 							 bool *uses_cell_ops);
+extern bool gin_moc_index_for_region(PlannerInfo *root, Node *rg, Node **moc_expr,
+									  int *max_order);
+extern Expr *array_overlap_expr(Node *left, Expr *right);
 
 /* adql.c: a skypos/skyregion datum, as cover.c understands it */
 extern sc_vec3 skycell_pos_from_datum(Datum d);

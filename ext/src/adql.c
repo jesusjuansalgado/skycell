@@ -771,6 +771,46 @@ cell_expr_for_point(Oid selfid, Node *pt)
  * function names into the caller's own namespace (lookup_sibling_func), so
  * it does not need to be the same function whose args pt/rg came from.
  */
+/*
+ * "Which of my regions contain this point" (rg not constant, no index on
+ * the point side for the classic rewrite below to use): the GIN-indexed
+ * alternative to the region GiST opclass's own @>(region,point) strategy,
+ * built from a plain `CREATE INDEX ... USING gin (skycell_region_moc(rg))`
+ * -- see gin_moc_index_for_region()'s own comment in skycell.c for why
+ * max_order comes from the index's own definition rather than a guess, and
+ * GIST_REGION_DESIGN.md's "Round eight" for the numbers this rewrite is
+ * for. Returns NULL (not an error) if no such index exists or the array
+ * overlap operator can't be resolved, so the caller falls back exactly as
+ * it always has.
+ */
+static Node *
+gin_region_rewrite(Oid funcid, Node *pt, Node *rg, Node *cell,
+					Node *moc_expr, int max_order)
+{
+	Oid			ancestors_types[3] = {INT8OID, INT4OID, INT4OID};
+	Oid			exact_types[3];
+	FuncExpr   *ancestors;
+	Expr	   *overlap;
+	FuncExpr   *exact;
+
+	ancestors = makeFuncExpr(lookup_sibling_func(funcid, "skycell_ancestors", 3, ancestors_types),
+							 INT8ARRAYOID,
+							 list_make3(copyObject(cell), int4_const(0), int4_const(max_order)),
+							 InvalidOid, InvalidOid, COERCE_EXPLICIT_CALL);
+	overlap = array_overlap_expr(moc_expr, (Expr *) ancestors);
+	if (overlap == NULL)
+		return NULL;
+
+	exact_types[0] = exprType(pt);
+	exact_types[1] = exprType(rg);
+	exact_types[2] = FLOAT8OID;
+	exact = makeFuncExpr(lookup_sibling_func(funcid, "skycell_in_region", 3, exact_types),
+						 BOOLOID,
+						 list_make3(copyObject(pt), copyObject(rg), float8_const(-1.0)),
+						 InvalidOid, InvalidOid, COERCE_EXPLICIT_CALL);
+	return (Node *) makeBoolExpr(AND_EXPR, list_make2(overlap, (Expr *) exact), -1);
+}
+
 static Node *
 region_support_simplify(SupportRequestSimplify *req, Oid funcid, Node *pt, Node *rg)
 {
@@ -789,7 +829,20 @@ region_support_simplify(SupportRequestSimplify *req, Oid funcid, Node *pt, Node 
 
 	/* only worth rewriting if an index answers that expression */
 	if (!density_for_expr(req->root, cell, &dens, &statrel, &uses_cell_ops))
+	{
+		Node	   *moc_expr;
+		int			max_order;
+
+		/* the classic rewrite below needs a point-side index either way;
+		 * absent one, "many regions" (rg not constant) has its own
+		 * possible index instead -- see gin_region_rewrite() above. A
+		 * constant rg has no column to carry such an index, so this is
+		 * skipped rather than attempted and failing every time. */
+		if (!IsA(rg, Const) &&
+			gin_moc_index_for_region(req->root, rg, &moc_expr, &max_order))
+			return gin_region_rewrite(funcid, pt, rg, cell, moc_expr, max_order);
 		return NULL;
+	}
 
 	exact_types[0] = exprType(pt);
 	exact_types[1] = exprType(rg);

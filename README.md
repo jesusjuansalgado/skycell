@@ -285,7 +285,7 @@ all exist there), either install into a schema that precedes it in
 | Operator | Meaning |
 |---|---|
 | `skypos <@ skyregion` | position inside region — **the one the planner rewrites into index ranges**, against a constant region and an indexed point catalogue |
-| `skyregion @> skypos` | the same, reversed — the same rewrite, or, when `skyregion` is itself a stored column with a GiST index on it, indexed that way instead (the region side need not be constant then) |
+| `skyregion @> skypos` | the same, reversed — the same rewrite, or, when `skyregion` is itself a stored column with a GiST index on it, indexed that way instead (the region side need not be constant then); with a GIN index on `skycell_region_moc(region)` instead (or as well), rewritten into that array-overlap test automatically — see below |
 | `skyregion && skyregion` | regions overlap — indexed by a plain `CREATE INDEX ON t USING gist (region)` on a `skyregion` column, no side table and no manual recipe needed (new; see the caveat below) |
 | `skyregion @> skyregion` | region wholly contains region — indexed the same way, either spelling (new; see the caveat below) |
 | `skyregion <@ skyregion` | the same, reversed — the same index, either spelling (new; see the caveat below) |
@@ -310,6 +310,22 @@ selective as `&&` itself is for its own predicate. In exchange, unlike `@>`
 region-region `@>` predates `<@` by several versions and had no commutator of
 its own until `<@` was added — both directions are indexed now, and either
 spelling reaches the index regardless of which one you write.
+
+For "which of my regions contain this point" specifically, a plain
+`CREATE INDEX ON t USING gin (skycell_region_moc(region))` — an ordinary
+PostgreSQL GIN index over the array `skycell_region_moc()` already returns, no
+custom opclass — is usually the better choice over the GiST opclass above: the
+planner rewrites `region @> pos`/`pos <@ region` into that index's own
+array-overlap test automatically whenever the GIN index exists (`ext/src/adql.c`,
+`region_support_simplify`), and it measures faster than the GiST strategy at
+both benchmarked scales, matching or slightly beating pgSphere's own native
+`<@` (see `GIST_REGION_DESIGN.md`'s "Round eight"). By default it caps the
+lookup at whatever `max_order` the index itself was built with (safe: no
+row's covering can use a finer cell than that); passing a smaller `max_order`
+to `skycell_region_moc()` at index-creation time, if you know your own
+corpus doesn't need the full range, narrows it further and gets closer
+still. When both a GiST and this GIN index exist on the same column, the
+GIN rewrite always takes over — deliberately, not a bug to report.
 
 ### The index key
 
