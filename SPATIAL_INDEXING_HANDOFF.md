@@ -102,36 +102,41 @@ PostGIS's own bounding-key idea, not invented from scratch.
 
 | 22 | The untried direction rounds twenty/twenty-one both pointed at: farthest-point seeding for the sub-cap merge, but scoped to *only* `multicap_union_many()` (the path building the key `consistent()` actually reads) via a new `merge_caps_greedy_fp()`, while `multicap_penalty()` keeps calling the original, untouched `merge_caps_greedy()`. | **A real win — kept, not reverted, the first one in this thread.** Same-database/same-session A/B throughout (learned directly from round twenty-one's own methodological note). At 50,000 rows/500 probes: `@>` 116-117ms → **51-52ms (2.2-2.3x faster)**; `<@` 163-172ms (beat pgSphere 1.4-1.5x) → **134-136ms (beats pgSphere 1.76-1.91x)**. At 5,000 rows/200 probes: flat to modestly better, no regression (`&&` 7.25-7.30ms→6.56-6.74ms; `@>`/`<@` within noise). Correctness verified at both scales, all four strategies (brute-force count matches GiST and pgSphere exactly everywhere). The scale-dependence (win at 50k, neutral at 5k) makes sense: fewer rows means a shallower tree with fewer internal-node unions for a tighter merge to compound across — the mirror image of round two's single-cap gap "widening with scale." `@>`'s gap to pgSphere narrows from ~5x to ~2.3-2.9x — not closed, but the first real progress on it since round two. |
 
+| 23 | Round twenty-two's own flagged follow-up: `merge_caps_greedy_fp()`'s single greedy sweep is order-sensitive by construction, so add a "second-look" refinement pass afterward — safe (unlike anything touching `penalty()`) since this only feeds the stored key. Approximates true Lloyd's/k-means reassignment (which would need a cluster's union with a cap *removed*, expensive since caps don't subtract) by comparing each cap's recorded join-time cost against the cost of joining a different, now-fully-formed cluster, all decided against one frozen snapshot and applied in one batch. | **Correctness held, but not a clear enough win to keep.** Wall-clock was contradictory — `@>` looked ~1.8x faster, `<@` looked ~1.6x *slower* — while pgSphere's own unmodified numbers shifted by a similar magnitude between the two passes, pointing at ambient noise (a second concrete instance of round twenty-one's own caution) rather than a real effect. Switched to `EXPLAIN (ANALYZE, BUFFERS)`: a real but modest tightening, `@>` 26,202→24,870 buffers (-5.1%), `<@` 68,976→67,954 buffers (-1.5%) — unlike round fifteen's `MAX_SUBCAPS` increase (which paid its extra cost per *query*), this round's extra cost (a second O(n·MAX_SUBCAPS) pass plus an O(n) rebuild) lands per index-build `union()` call, in principle a cheaper place to spend cycles — but a 1-5% buffer reduction with no confident wall-clock signal isn't this file's bar. **Reverted**, working tree and installed extension back to round twenty-two's shipped code. |
+
 **Where this leaves the region GiST opclass**: `&&` and `<@` are solid wins
-(the latter's win over pgSphere widened further this round); `@>`(region,
-region) still has a gap to pgSphere, but round twenty-two narrowed it
-substantially (~5x → ~2.3-2.9x at 50,000 rows) after three prior targeted
+(the latter's win over pgSphere widened in round twenty-two); `@>`(region,
+region) still has a gap to pgSphere, narrowed substantially by round
+twenty-two (~5x → ~2.3-2.9x at 50,000 rows) after three prior targeted
 fixes (round fourteen's area check, round fifteen's sharper key, round
 twenty's unscoped seeding change) failed to close it and two of them
-(twenty, twenty-one) actively made it worse. The mechanism rounds twenty
-and twenty-one diagnosed held up: `merge_caps_greedy` backs both
-`union()`'s key-building and `penalty()`'s incremental placement, and
-placement quality needs the same rich sub-cap information pruning does —
-so the fix that finally worked was scoping the improvement to the
-key-building path alone and leaving placement's signal exactly as shipped.
-`merge_caps_greedy()` (first-k seeding) remains unchanged, used only by
-`multicap_penalty()`; the new `merge_caps_greedy_fp()` (farthest-point
-seeding) is used only by `multicap_union_many()`. Round two's original
-diagnosis — overlapping bounding caps at internal/leaf pages — still
-applies to whatever the tighter merge doesn't catch; §6's remaining ideas
-(a sub-quadratic overlap test, the pgSphere-style exact-box summary) are
-still open for narrowing the gap further.
+(twenty, twenty-one) actively made it worse. Round twenty-three tried to
+push further in the same direction (tighten `merge_caps_greedy_fp()`
+itself) and found the returns there are already small — real (1-5% fewer
+buffers) but not worth their build-time cost, so it was reverted rather
+than kept on a technicality. The mechanism rounds twenty/twenty-one
+diagnosed held up across all three of the last rounds: `merge_caps_greedy`
+(unchanged, first-k seeding) backs `penalty()`'s incremental placement
+exclusively; the new `merge_caps_greedy_fp()` (farthest-point seeding,
+single greedy sweep, no refinement pass) backs `multicap_union_many()`'s
+key-building exclusively. Round two's original diagnosis — overlapping
+bounding caps at internal/leaf pages — still applies to whatever the
+tighter merge doesn't catch; §6's remaining ideas (a sub-quadratic overlap
+test, the pgSphere-style exact-box summary) look more likely to move the
+gap further than more tuning inside the same greedy-merge family.
 
 A methodological note from round twenty-one, carried forward and validated
-by round twenty-two: round twenty-one's same-database baseline (rerun
-immediately after its "after" pass) measured meaningfully different
-absolute numbers from round twenty's own baseline on a separately-built
-database with identical seeds and row counts — directionally consistent,
-not bit-for-bit reproducible. Round twenty-two followed the same-database/
-same-session discipline throughout from the start, and it's what made its
-result trustworthy enough to keep rather than just measure. Every A/B in
-this file that matters is a same-database, same-session, back-to-back
-comparison for exactly this reason.
+twice since: round twenty-one's same-database baseline (rerun immediately
+after its "after" pass) measured meaningfully different absolute numbers
+from round twenty's own baseline on a separately-built database with
+identical seeds and row counts — directionally consistent, not
+bit-for-bit reproducible. Round twenty-two followed the same-database/
+same-session discipline throughout and it's what made its result
+trustworthy enough to keep. Round twenty-three hit the *same* noise even
+within one same-database session (pgSphere's own unmodified numbers moved
+between its two passes) and caught it by falling back to buffer counts —
+a second reminder that wall-clock alone, even same-session, isn't always
+enough; buffer counts are this file's tie-breaker when it isn't.
 
 ## 4. Point SP-GiST opclass (`spgist_region.c`): round-by-round
 
@@ -353,16 +358,15 @@ not in priority order — pick what matches the actual goal:
    no regression at 5,000. `@>`'s gap to pgSphere narrowed (~5x → ~2.3-2.9x)
    but not closed — see §3 for the numbers, and the two items below for
    what's left.
-5. **Push the now-decoupled `union()`-only merge further** (§3, natural
-   follow-up to round twenty-two, untried). With `penalty()` fully insulated
-   from the key-building path, there's no longer any reason to keep
-   `merge_caps_greedy_fp()`'s assignment pass a single greedy sweep — a
-   bounded local-improvement pass (one or two Lloyd's-style reassignment
-   sweeps after the initial farthest-point-seeded partition, re-checking
-   whether each already-placed cap would now fit a *different* cluster
-   better) could tighten the stored key further, at some bounded extra cost
-   that -- unlike round twenty's mistake -- can't touch placement quality at
-   all, since `penalty()` never sees it.
+5. ~~Push the now-decoupled `union()`-only merge further with a Lloyd's-style
+   refinement pass~~ — **tried, round twenty-three, reverted.** A real but
+   small buffer-count tightening (`@>` -5.1%, `<@` -1.5%), no confident
+   wall-clock signal (contaminated by ambient noise even same-session, a
+   second instance of round twenty-one's own caution), not worth the extra
+   per-`union()`-call cost. `merge_caps_greedy_fp()` stays a single greedy
+   sweep. Further tuning inside this same greedy-merge family looks like
+   diminishing returns now — item 6 and the sub-quadratic overlap test
+   above look more promising for narrowing `@>`'s remaining gap.
 6. **A pgSphere-style exact composable summary for internal nodes only**
    (§3, prompted by reading pgSphere's actual `gist.c`: its `spherekey` is
    a plain 3D axis-aligned box, unioned by exact per-axis min/max, losslessly
@@ -419,15 +423,18 @@ not in priority order — pick what matches the actual goal:
 - Region GiST opclass: `MAX_SUBCAPS=4`, shared overlap test for all
   containment strategies, original first-k-seeded `merge_caps_greedy` (used
   only by `multicap_penalty()`) plus a new farthest-point-seeded
-  `merge_caps_greedy_fp()` (used only by `multicap_union_many()`, round
-  twenty-two, kept — a real, measured win, not experimental). Rounds
-  fourteen, fifteen, twenty, and twenty-one's changes were all reverted
-  after measurement (twenty and twenty-one both regressed `@>` and `<@`);
-  round twenty-two is the one change from this whole seeding/merge
-  investigation actually shipped. `@>`(region,region)'s gap to pgSphere is
-  narrowed (~5x → ~2.3-2.9x at 50,000 rows) but not closed; §6 items 5-6
-  are the closest untried directions to closing it further (extending the
-  now-decoupled union-only merge, and the pgSphere-style exact-box idea).
+  `merge_caps_greedy_fp()`, single greedy sweep, no refinement pass (used
+  only by `multicap_union_many()`, round twenty-two, kept — a real,
+  measured win, not experimental). Rounds fourteen, fifteen, twenty,
+  twenty-one, and twenty-three's changes were all reverted after
+  measurement (twenty and twenty-one regressed `@>` and `<@`; twenty-three
+  measured a real but too-small-to-justify buffer improvement); round
+  twenty-two is the one change from this whole seeding/merge investigation
+  actually shipped. `@>`(region,region)'s gap to pgSphere is narrowed
+  (~5x → ~2.3-2.9x at 50,000 rows) but not closed; further tuning inside
+  the greedy-merge family looks like diminishing returns (round
+  twenty-three) — §6 item 6 (the pgSphere-style exact-box idea) and the
+  sub-quadratic overlap test are the more promising remaining directions.
 - Point SP-GiST opclass: shipped as a correctness-verified, documented
   negative result (`SPLIT_WIDTH=1`, effectively single-order splits; the
   bytea-prefix/explicit-width fix from round twelve is real and kept even

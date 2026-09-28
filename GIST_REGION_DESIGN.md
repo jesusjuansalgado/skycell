@@ -2219,3 +2219,71 @@ applies to whatever the farthest-point-seeded merge doesn't catch;
 §6's remaining ideas (a sub-quadratic overlap test, the pgSphere-style
 exact-box summary) are still open for whoever wants to keep closing it
 further.
+
+## Round twenty-three: a Lloyd's-style refinement pass on top of round
+## twenty-two -- small real gain, not worth its cost, reverted
+
+Round twenty-two's own flagged follow-up: `merge_caps_greedy_fp()`'s
+assignment is a single greedy sweep, order-sensitive by construction (a
+cap's cluster is locked in the moment it's absorbed, however the caps
+later assigned would have changed the picture). Added a second,
+"second-look" pass, safe here specifically because this function only
+feeds `multicap_union_many()`'s stored key, never `multicap_penalty()`'s
+placement decision (rounds twenty/twenty-one's whole reason for caution
+doesn't apply to a change scoped this way). A true Lloyd's/k-means
+reassignment step needs each cluster's union with a candidate cap
+*removed*, which a cap union can't do cheaply (unlike a centroid, nothing
+subtracts back out) -- approximated instead by comparing each cap's
+*recorded* marginal cost at the moment it first joined against the
+marginal cost of joining a different, now-fully-formed cluster, using the
+`out[]` snapshot frozen at the end of the first pass; all reassignments
+decided against that frozen snapshot and applied in one batch, then every
+cluster rebuilt from its final membership. Same O(n * MAX_SUBCAPS) order
+as the pass it follows.
+
+**Correctness held** (brute-force count matches GiST and pgSphere exactly,
+both strategies, 50,000 rows). **Wall-clock was contradictory enough to
+distrust on its own**: the "before"/"after" same-session pass showed `@>`
+apparently ~1.8x faster but `<@` apparently ~1.6x *slower* -- yet pgSphere's
+own unmodified numbers moved by a similar magnitude between the two passes
+(225-228ms -> 277-313ms for the same unchanged code), pointing at ambient
+system noise contaminating the comparison rather than a real effect either
+way (echoing, and now a second concrete instance of, round twenty-one's
+same methodological caution).
+
+**Switched to `EXPLAIN (ANALYZE, BUFFERS)` on the combined queries**, this
+file's usual fallback when wall-clock is too noisy to trust (index
+freshly rebuilt under each binary, same database, same corpus):
+
+| strategy | buffers before | buffers after | change |
+|---|---|---|---|
+| `@>`(region,region) | 26,202 | 24,870 | -5.1% |
+| `<@`(region,region) | 68,976 | 67,954 | -1.5% |
+
+**A real, if modest, tightening -- but not obviously worth what it costs.**
+Unlike round fifteen's `MAX_SUBCAPS` increase (which *also* improved
+buffers 14-18% while regressing wall-clock 20-25%, purely from added
+O(MAX_SUBCAPS²) `consistent()` cost paid on every query), this round's
+extra cost lands somewhere different: a whole second O(n * MAX_SUBCAPS)
+evaluation pass plus an O(n) rebuild, paid once per `union()`/split call
+during index *build*, not per query. That should in principle be a much
+cheaper place to spend extra cycles than round fifteen's per-query
+tax -- but a 1.5-5% buffer reduction is also a much smaller win than round
+fifteen's 14-18%, and the noisy wall-clock numbers gave no confident signal
+that the tighter tree actually pays for the extra build-time work. Round
+twenty-two's own gain (a real 2x+) came from fixing an actual bug in the
+signal (`penalty()` contaminating the key-building path); round
+twenty-three's gain is a genuine but marginal refinement of an
+already-reasonable greedy heuristic, and marginal wins built on noisy
+measurement aren't this file's bar. **Reverted** (stashed, working tree
+and installed extension back to round twenty-two's shipped code).
+
+**Where this leaves it**: `merge_caps_greedy_fp()` stays a single greedy
+sweep, as round twenty-two shipped it. If someone wants to revisit
+refinement passes specifically, the buffer-count numbers above are real
+and worth taking as a starting point -- but this round's own reading is
+that the returns from tuning `merge_caps_greedy_fp()`'s clustering quality
+further are getting small, and §6's other two directions (a sub-quadratic
+`consistent()` test, the pgSphere-style exact-box summary) look more
+likely to move the `@>` gap further than another pass over the same
+greedy-merge family.
