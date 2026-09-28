@@ -559,12 +559,44 @@ not in priority order — pick what matches the actual goal:
   `probe_orders=1` and `=3` at every radius, proving the deeper probe is
   pure waste — but still not enough to beat leaving it off). Round
   thirty-two asked whether pgSphere's BRIN opclass points at a cheaper
-  index for this same path and found no: BRIN loses to the B-tree by
-  ~3.3x buffers / ~3.5x wall-clock at every radius even on a table
+  index for this same path and found no at the radii tested (6'-120',
+  all under 0.03% of the sky): BRIN loses to the B-tree by ~3.3x buffers
+  / ~3.5x wall-clock at every one of those radii even on a table
   deliberately `CLUSTER`ed on `cell` for BRIN's own best case — its
   lossy, block-granular bitmap (`Heap Blocks: lossy=...`, thousands of
   rows pulled per query just for the range recheck) can't match the
   B-tree's row-exact result, and a finer `pages_per_range` made it worse,
-  not better. `cat_cell_idx` (B-tree) remains the only index this path needs.
+  not better. Round thirty-three swept radius up into BRIN's actual
+  proposition (1-90 degrees, ~0.008%-50% of the sky) and found buffers do
+  cross over cleanly around 15-20 degrees (~2-3% of the sky), growing to
+  29% fewer buffers at 90 degrees — the textbook BRIN-vs-B-tree condition
+  (bitmap-build cost scaling with result size for a B-tree, near-fixed
+  for BRIN's tiny index) once `skycell.max_ranges` caps range *count* and
+  each range's own result size keeps growing with radius. But wall-clock
+  doesn't track that cleanly and can reverse (BRIN's lossy bitmap forces
+  real CPU-bound recheck work a B-tree's exact bitmap never pays), so the
+  net win depends on whether the workload is I/O- or CPU-bound. Round
+  thirty-four then checked pgSphere's own BRIN test suite directly rather
+  than assuming its C source generalizes to every shape, and found
+  pgSphere's BRIN opclass isn't built for cone search at all — it's
+  registered only for `spoint`/`sbox`, tested only against a rectangular
+  RA/Dec box query (`sbox <@ sbox`), never a circle. Tested the actual
+  analogous case — composite B-tree(ra,dec) vs multi-column BRIN(ra,dec)
+  for a plain box range query — and BRIN wins decisively and *cleanly* on
+  both buffers and wall-clock from ~3 degrees on (9.4x fewer buffers,
+  2.5x faster at 30 degrees half-width), with no cone case's CPU-bound
+  reversal, because a box query's own recheck condition costs nothing
+  extra beyond the predicate itself (no separate trig-based geometric
+  filter riding on top the way `skycell_in_cone()` has). A bonus finding
+  along the way: skycell's existing `cell`-based physical clustering
+  (already the natural choice for cone search) serves a BRIN(ra,dec) box
+  index better than re-clustering by the composite `(ra,dec)` B-tree
+  itself would — a composite-index `CLUSTER` effectively sorts by its
+  first column only, leaving the second dimension's BRIN summary close
+  to useless. `cat_cell_idx` (B-tree) remains the only index skycell's
+  own cone-search path needs; BRIN is a real option for skycell users who
+  need wide, low-selectivity cone queries or plain rectangular RA/Dec
+  range queries, neither of which skycell's own operators currently
+  provide dedicated support for (no `sbox`-equivalent region type).
 - `GIST_REGION_DESIGN.md` is the source of truth for exact numbers, code
   reasoning, and anything this summary compressed or left out.
