@@ -522,135 +522,28 @@ multicap_penalty(const GistMultiCap *orig, const GistMultiCap *newc)
 }
 
 /*
- * On-disk encoding, round nine: a 1-byte sub-cap count followed by the
- * overall cap and only the *used* sub-caps -- not the fixed-size
- * GistMultiCap struct verbatim (round three through eight's own format).
- * The in-memory struct still always holds MAX_SUBCAPS slots with a
- * negative radius marking an unused one, unchanged everywhere else in this
- * file (union, penalty, picksplit, consistent, same all operate on the
- * decoded struct, not on these bytes) -- this function pair is the only
- * place that knows the packed layout.
- *
- * The saving is real because most rows don't use all MAX_SUBCAPS slots: a
- * cone stores exactly one sub-cap (itself -- "already exact, a second cap
- * would add nothing", this file's own file-header comment), so its packed
- * key is 1 + 2*sizeof(GistCap) bytes (overall, plus that one identical-
- * looking-but-separately-stored sub-cap) instead of 1 + 5*sizeof(GistCap)
- * -- on a mixed circle/polygon corpus, roughly a third smaller on average,
- * measured directly rather than assumed (see GIST_REGION_DESIGN.md's
- * "Round nine"). A polygon using every slot barely shrinks, but one that
- * doesn't (a simple shape moc_for_region covers in fewer than MAX_SUBCAPS
- * cells) shrinks too, for the same reason.
- *
- * The overall cap is stored in full even when there is exactly one
- * sub-cap, rather than assumed equal to it and reconstructed on read: they
- * are identical for a fresh leaf key (region_to_multicap sets them so
- * directly for a cone), but not guaranteed to stay identical after a
- * union() at an internal node -- overall accumulates via cap_union_caps
- * across children's overall caps, sub[] via merge_caps_greedy across
- * children's sub-caps, two different (both valid, not necessarily
- * identical) pairwise-union accumulations. Assuming they always match to
- * save 32 more bytes would be an unverified shortcut in exactly the kind
- * of code this file's own history (two real bugs, both from performance-
- * motivated shortcuts through picksplit/union) says not to take without
- * proof.
- *
- * VARDATA_ANY, not VARDATA, on read: an index tuple GiST hands back here
- * may have been repacked with a 1-byte varlena header (both sizes here
- * easily fit under the short-header limit), and VARDATA alone assumes the
- * 4-byte form we ourselves palloc'd it with -- reading through the wrong
- * offset there is exactly the kind of thing that segfaults deep in a page
- * split. Plain byte-at-a-time memcpy throughout, not struct assignment,
- * since the packed layout has no alignment padding to rely on.
+ * VARDATA_ANY, not VARDATA: an index tuple GiST hands back here may have
+ * been repacked with a 1-byte varlena header (it easily fits under the
+ * short-header limit), and VARDATA alone assumes the 4-byte form we
+ * ourselves palloc'd it with -- reading through the wrong offset there is
+ * exactly the kind of thing that segfaults deep in a page split. memcpy
+ * sidesteps any alignment assumption on top of that.
  */
 static bytea *
 multicap_to_bytea(const GistMultiCap *m)
 {
-	uint8		nsub = 0;
-	Size		sz;
-	bytea	   *out;
-	char	   *p;
+	Size		sz = VARHDRSZ + sizeof(GistMultiCap);
+	bytea	   *out = (bytea *) palloc(sz);
 
-	for (int i = 0; i < MAX_SUBCAPS; i++)
-		if (m->sub[i].radius >= 0)
-			nsub++;
-
-	sz = VARHDRSZ + 1 + (Size) (1 + nsub) * sizeof(GistCap);
-	out = (bytea *) palloc(sz);
 	SET_VARSIZE(out, sz);
-
-	p = VARDATA(out);
-	*p = (char) nsub;
-	p += 1;
-	memcpy(p, &m->overall, sizeof(GistCap));
-	p += sizeof(GistCap);
-	for (int i = 0; i < MAX_SUBCAPS; i++)
-	{
-		if (m->sub[i].radius >= 0)
-		{
-			memcpy(p, &m->sub[i], sizeof(GistCap));
-			p += sizeof(GistCap);
-		}
-	}
+	memcpy(VARDATA(out), m, sizeof(GistMultiCap));
 	return out;
 }
 
-/*
- * consistent() calls this once per index entry examined -- easily the
- * hottest function in this file at query time, far hotter than
- * multicap_to_bytea's own encode side (compress()/union() only, once per
- * insert or page split). Two earlier versions of this decode both measured
- * as a net *regression* end to end despite the smaller on-disk key: first
- * a plain per-sub-cap loop (~1.5-2x slower search at 50,000 rows), then a
- * single memcpy sized by the runtime value nsub*sizeof(GistCap) (still
- * ~2x slower at 5,000 rows) -- a memcpy whose length isn't known until
- * runtime cannot be inlined into the handful of load/store instructions
- * the compiler turns a fixed-size struct copy into, so it falls back to
- * a real call into libc's general-purpose memcpy, paid on every entry
- * this function is called for. nsub only ever takes 5 values
- * (0..MAX_SUBCAPS), so the switch below gives the compiler a
- * compile-time-constant length at each call site instead, letting it
- * inline/vectorise each case the same way it already does the fixed-size
- * copy below for the overall cap. Every writer of sub[] in this file
- * (region_to_multicap, merge_caps_greedy) packs used sub-caps
- * contiguously from index 0 with the unused tail always the one left
- * marked -- never a gap in the middle -- which is what makes copying them
- * as one block, of whichever constant length, correct at all.
- */
 static void
 bytea_to_multicap(bytea *b, GistMultiCap *m)
 {
-	const char *p = VARDATA_ANY(b);
-	uint8		nsub = (uint8) *p;
-
-	StaticAssertDecl(MAX_SUBCAPS == 4, "the switch below has one case per value of MAX_SUBCAPS -- update it if that changes");
-	if (nsub > MAX_SUBCAPS)
-		nsub = MAX_SUBCAPS;		/* defensive only: never written this way */
-	p += 1;
-	memcpy(&m->overall, p, sizeof(GistCap));
-	p += sizeof(GistCap);
-	switch (nsub)
-	{
-		case 4:
-			memcpy(&m->sub[0], p, 4 * sizeof(GistCap));
-			break;
-		case 3:
-			memcpy(&m->sub[0], p, 3 * sizeof(GistCap));
-			break;
-		case 2:
-			memcpy(&m->sub[0], p, 2 * sizeof(GistCap));
-			break;
-		case 1:
-			memcpy(&m->sub[0], p, 1 * sizeof(GistCap));
-			break;
-		default:
-			break;
-	}
-	for (int i = nsub; i < MAX_SUBCAPS; i++)
-	{
-		m->sub[i].cx = m->sub[i].cy = m->sub[i].cz = 0.0;
-		m->sub[i].radius = -1.0;
-	}
+	memcpy(m, VARDATA_ANY(b), sizeof(GistMultiCap));
 }
 
 /*
