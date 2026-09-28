@@ -110,7 +110,8 @@ PostGIS's own bounding-key idea, not invented from scratch.
 
 | 26 | Round fifteen's own conclusion, the last untried item: an O(MAX_SUBCAPS²) all-pairs overlap test is what capped the profitable sub-cap count at 4. Sorted each key's valid sub-cap prefix by centre x at build time (`sort_subcaps_by_cx()`), then rewrote `multicap_overlaps()`/`multicap_overlap_amount()` to skip pairs a real geometric bound proves can't overlap (a coordinate difference exceeding the chord of the radius sum) instead of checking all pairs. | **Correctness held at both scales, all four strategies — but buffers got consistently worse, not better**: `&&` +4.5%, `@>`(point) +4.6%, `@>`(region,region) +3.0%, `<@`(region,region) +2.0%, all measured same-database. **Reverted.** Not a flaw in the pruning bound itself (proven exact, not approximate — a skipped pair genuinely never contributes) but an unintended coupling with round twenty-two's `merge_caps_greedy_fp()`: its farthest-point seeding is deliberately order-sensitive (`caps[0]` becomes the first seed), and `multicap_union_many()` flattens `entries[i]->sub[j]` in entry order to build the next level's input — so sorting a stored key's `sub[]` for query-time benefit silently reseeds every future clustering decision that reads it back, producing a different (not wrong, just worse) tree shape. |
 
-| 27 | `@>`(region,point) sat untouched since round four's own diagnosis (a wide, scale-independent gap: "pgSphere's cheap native point-in-shape test pulls further ahead... than pgSphere's own `&&` does of its own"), confirmed unmoved by round twenty-two's key-tightening fix (round twenty-five) — a different lever entirely: per-comparison *cost*, not tree shape. `multicap_contains_point()` tested each sub-cap via `cap_overlaps(cap, cap_make(p,0.0))`, calling `sc_angle()` (cross product + `sqrt` + `atan2`) to get a true angle for comparison against a radius *sum* — but a point is a zero-radius cap, so that sum is just the cap's own radius, and `angle <= radius` reduces exactly to `dot(centre,point) >= cos(radius)` — one dot product, one cosine, no cross product/`sqrt`/`atan2`. Added `cap_contains_point()` implementing that, used only inside `multicap_contains_point()` — `cap_overlaps()` itself and every seeding/union/penalty function untouched. | **A real, consistent, kept win — the largest single-round improvement to this strategy since round four.** Correctness held at both scales; buffers near-identical (+2.0% at 50,000 rows, expected GiST build noise since no `consistent()` boolean answer can change). Wall-clock, same-database same-session: 5,000 rows 5.10-6.21ms→3.06-3.27ms (~1.6-1.9x faster, gap to pgSphere ~1.7-2.1x→~1.1-1.2x, nearly closed); 50,000 rows 83-85ms→47-50ms (~1.7-1.8x faster, gap ~4.0-4.6x→~3.4-3.9x). Not fully closed — likely a comparison-*count* (tree-tightness) remainder now, the same family as `@>`(region,region)'s gap, untested for this strategy specifically. |
+| 27 | `@>`(region,point) sat untouched since round four's own diagnosis (a wide, scale-independent gap: "pgSphere's cheap native point-in-shape test pulls further ahead... than pgSphere's own `&&` does of its own"), confirmed unmoved by round twenty-two's key-tightening fix (round twenty-five) — a different lever entirely: per-comparison *cost*, not tree shape. `multicap_contains_point()` tested each sub-cap via `cap_overlaps(cap, cap_make(p,0.0))`, calling `sc_angle()` (cross product + `sqrt` + `atan2`) to get a true angle for comparison against a radius *sum* — but a point is a zero-radius cap, so that sum is just the cap's own radius, and `angle <= radius` reduces exactly to `dot(centre,point) >= cos(radius)` — one dot product, one cosine, no cross product/`sqrt`/`atan2`. Added `cap_contains_point()` implementing that, used only inside `multicap_contains_point()` — `cap_overlaps()` itself and every seeding/union/penalty function untouched. | **A real, consistent, kept win — the largest single-round improvement to this strategy since round four.** Correctness held at both scales; buffers near-identical (+2.0% at 50,000 rows, expected GiST build noise since no `consistent()` boolean answer can change). Wall-clock, same-database same-session: 5,000 rows 5.10-6.21ms→3.06-3.27ms (~1.6-1.9x faster, gap to pgSphere ~1.7-2.1x→~1.1-1.2x, nearly closed); 50,000 rows 83-85ms→47-50ms (~1.7-1.8x faster, gap ~4.0-4.6x→~3.4-3.9x). Not fully closed — round twenty-eight (below) confirms the tree-tightness side is already accounted for, so the remainder is more likely structural. |
+| 28 | Round twenty-seven's own closing question: does round twenty-two's key-tightening fix, measured only for `@>`/`<@`(region,region) and `&&`, also meaningfully tighten `@>`(region,point)'s tree, separately from round twenty-seven's own per-comparison speedup? Pure measurement, no code change: temporarily reverted `multicap_union_many()`'s call back to the original `merge_caps_greedy()` (isolating round twenty-two's change alone), rebuilt the index under each binary, same database. | **Confirmed yes — a real, previously-unmeasured effect, but purely explanatory, not a new lever.** Buffers: 5,000 rows 2,619→1,946 (**-25.7%**), 50,000 rows 34,117→26,036 (**-23.7%**). Round twenty-two was never scoped to the region-region strategies specifically. That this barely showed up in round twenty-five's wall-clock numbers makes sense in hindsight: round twenty-seven's per-comparison cost (`sc_angle()`'s cross product/`sqrt`/`atan2`, paid once per sub-cap at *every* visited page) was the dominant term, so a ~24-26% reduction in pages visited was a smaller lever than removing the per-comparison cost itself. Both rounds twenty-two and twenty-seven were already shipped before this measurement — it adds no new speedup on top of what's already measured, it just closes the question of whether a second, separate tree-tightness fix was still available for this strategy (no — both known levers are now pulled). |
 
 **Where this leaves the region GiST opclass**: `&&`, `<@`, and now
 `@>`(region,point) are meaningfully improved or solid wins (round
@@ -149,10 +150,17 @@ live directions going forward there are both bigger/riskier than anything
 tried so far: decoupling `sub[]`'s stored order from `merge_caps_greedy_
 fp()`'s clustering input (round twenty-six's own closing note), or
 accepting the current gap as this opclass's likely floor. For
-`@>`(region,point), round twenty-seven's own closing note — checking
-whether round twenty-two's key-tightening also meaningfully helped this
-strategy's comparison *count*, not just per-comparison cost — is the
-natural next step, untried.
+`@>`(region,point), round twenty-eight settled round twenty-seven's own
+closing question directly: round twenty-two's key-tightening fix *did*
+also meaningfully tighten this strategy's tree (buffers -23.7% to -25.7%
+across both scales, isolated by temporarily reverting just that one
+change) — it just barely showed up in round twenty-five's wall-clock
+numbers because round twenty-seven's per-comparison cost was the
+dominant term at the time. Both known levers for this strategy have now
+been pulled; whatever gap remains is more likely structural (something
+about pgSphere's own point-in-shape descent) than a further fix sitting
+in this file's code — an inference from elimination, not independently
+confirmed.
 
 A methodological note from round twenty-one, carried forward and validated
 twice since: round twenty-one's same-database baseline (rerun immediately
@@ -482,10 +490,15 @@ not in priority order — pick what matches the actual goal:
   ~1.7-2.1x → ~1.1-1.2x slower, nearly closed; 50,000 rows: ~4.0-4.6x →
   ~3.4-3.9x slower) via a completely different lever (per-comparison cost,
   not tree quality) than anything tried on the region-region strategies.
+  Round twenty-eight then confirmed (pure measurement, no code change)
+  that round twenty-two's tree-tightening fix *also* helped this strategy
+  all along (buffers -23.7% to -25.7%, both scales) — both known levers
+  for `@>`(region,point) are now pulled, so its remaining gap is more
+  likely structural than a further fix waiting in this file's code.
   **Current scorecard vs. pgSphere, both scales**: `&&` and `<@` win
   outright; `@>`(region,region) loses but the gap narrowed substantially;
-  `@>`(region,point) loses by a margin cut sharply by round twenty-seven,
-  nearly closed at the smaller scale.
+  `@>`(region,point) loses by a margin cut sharply by rounds twenty-seven
+  and twenty-eight together, nearly closed at the smaller scale.
 - Point SP-GiST opclass: shipped as a correctness-verified, documented
   negative result (`SPLIT_WIDTH=1`, effectively single-order splits; the
   bytea-prefix/explicit-width fix from round twelve is real and kept even

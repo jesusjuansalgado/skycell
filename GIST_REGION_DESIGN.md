@@ -2545,3 +2545,46 @@ comparison-count side is already about as good as it gets, the
 remaining multiplier is likely structural (pgSphere's index descent
 shape vs. skycell's), which would make this gap's floor close to
 already reached.
+
+## Round twenty-eight: round twenty-two also tightened @>(region,point)'s
+## tree -- confirmed, but purely explanatory, not a new lever
+
+Round twenty-seven's own closing question: does round twenty-two's
+`merge_caps_greedy_fp()` fix -- measured only for `@>`/`<@`(region,region)
+and (round twenty-five) `&&` -- also meaningfully tighten `@>`(region,
+point)'s tree, separately from round twenty-seven's own per-comparison
+speedup? Pure measurement, no code change: temporarily reverted
+`multicap_union_many()`'s call from `merge_caps_greedy_fp()` back to the
+original `merge_caps_greedy()` (round twenty-two's own change, in
+isolation), rebuilt the index under each binary, same database.
+
+| scale | buffers before round 22 | buffers after round 22 | change |
+|---|---|---|---|
+| 5,000 rows | 2,619 | 1,946 | **-25.7%** |
+| 50,000 rows | 34,117 | 26,036 | **-23.7%** |
+
+Correctness held at both scales throughout (already established;
+re-confirmed here). **Yes, confirmed -- round twenty-two's fix was never
+scoped to the region-region strategies specifically; it tightened
+`@>`(region,point)'s tree by roughly a quarter at both scales, a real
+effect never separately measured until now.** That this barely showed up
+in round twenty-five's wall-clock comparison to pgSphere makes sense in
+hindsight: round twenty-seven's per-comparison cost (`sc_angle()`'s cross
+product/`sqrt`/`atan2`, paid once per sub-cap at *every* visited page) was
+the dominant term, so a ~24-26% reduction in *how many* pages get visited
+was a much smaller lever on total wall-clock than removing the
+per-comparison cost itself turned out to be.
+
+**Not a new performance change -- purely explanatory.** Both rounds
+twenty-two and twenty-seven were already shipped before this measurement;
+this doesn't alter any code or add any new speedup on top of what's
+already measured. Its value is in closing round twenty-seven's own open
+question cleanly: `@>`(region,point)'s remaining gap to pgSphere is not
+"one lever pulled, one still sitting on the table" -- both the tree-
+tightness lever (round twenty-two, confirmed here) and the per-comparison-
+cost lever (round twenty-seven) have already been pulled for this
+strategy. Whatever gap remains (~3.4-3.9x at 50,000 rows, round
+twenty-seven) is more likely to be structural -- something about
+pgSphere's own index descent shape for point-in-shape queries -- than a
+further-untapped fix inside this file's own code, though that's an
+inference from elimination, not independently verified.
