@@ -2777,3 +2777,52 @@ and doesn't repeat either of the two measurement confounds this round
 had to find and rule out first (sequential-block time drift, and
 within-cycle first-position cache bias) before trusting any A/B number
 at this query scale.
+
+## Round thirty-one: does a shallower probe fix it? No -- but it does
+## prove the deeper probe is pure waste
+
+Round thirty found `probe_orders`'s own fixed planning cost, not
+`split_cost`'s value, is what blocks a net win. The natural follow-up:
+`probe_orders=3` lets `sc_cover_compute()` try up to three orders finer
+than the closed-form starting point (`k0..k0+3`), each a full independent
+re-enumeration (`cover_cone_direct()` called fresh per candidate, "about
+four times the cells of the one just done" per the code's own comment).
+The loop already breaks the moment a candidate stops improving
+(`rlist_score()` not beating the running best), so in practice most
+queries never reach `k0+2` or `k0+3` -- but every query that tries even
+one losing candidate before breaking pays for a full wasted enumeration.
+Does capping the probe at depth 1 (`k0..k0+1`, at most one extra
+enumeration ever) recover any of that waste as a net win?
+
+**Buffers: `probe_orders=1` and `probe_orders=3` are byte-identical at
+every radius tested**, 6' through 120', at both `split_cost=1.0` and
+`0.3` (five radii, both split_cost values, same 130-center corpus as
+round thirty). Not "close" -- exactly equal, to the buffer. This proves
+directly, not just by code inspection, that for every query in this
+corpus the loop never successfully improves twice in a row: either
+`k0+1` doesn't beat `k0` (breaks immediately, `probe_orders=3` couldn't
+have gone further anyway), or `k0+1` beats `k0` but `k0+2` doesn't beat
+`k0+1` (so `probe_orders=3` tries one more full enumeration than
+`probe_orders=1` and gets nothing for it). Either way, depth beyond 1 is
+pure planning-time waste here, with zero quality difference.
+
+**Wall-clock (same randomized-per-repetition methodology round thirty
+had to adopt to trust the result): the direction matches but the margin
+doesn't clear noise, and the core conclusion is unchanged.**
+`probe_orders=3` came in slower than `probe_orders=1` at the same
+`split_cost` (paired diff 0.0087ms at `split_cost=1.0`, `t ~ 0.9` over
+130 paired centers x 10 repetitions) -- consistent with the wasted
+enumeration, but not significant at this scale. More importantly,
+neither `probe_orders=1` nor `probe_orders=3` beat plain `default`
+(probing off entirely) by a margin distinguishable from noise (`t ~ 0.5`
+for `default` vs `probe_orders=1` at `split_cost=1.0`). Cutting the probe
+to its cheapest possible depth removes the *proven* waste but still
+doesn't clear the bar against not probing at all.
+
+**No code change.** If `skycell.probe_orders` is ever turned on, there's
+no reason to set it above `1` -- proven zero quality cost either way,
+some planning time back, directionally consistent even where not
+individually significant. But that's operator guidance for a GUC that
+ships off, not a case for changing the default: round thirty's
+conclusion holds at the cheapest depth too. `skycell.probe_orders` stays
+at `0`, `skycell.split_cost` stays at `1.0`.

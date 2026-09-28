@@ -459,6 +459,14 @@ not in priority order — pick what matches the actual goal:
    calibrated value of `split_cost` alone unlocks the win. Left as shipped
    (`split_cost=1.0`, `probe_orders=0`). Getting a real win here would mean
    cutting the probing loop's own fixed overhead, not retuning its score.
+   Round thirty-one tried exactly that — capping the probe at depth 1
+   instead of 3 — and found it proves the deeper probe is pure waste
+   (buffer counts byte-identical between depth 1 and depth 3 at every
+   radius, 6'-120', both split_cost values tested) but still doesn't clear
+   the bar against leaving `probe_orders` off entirely (wall-clock
+   direction consistent with less waste, not statistically significant at
+   this scale). Conclusion holds at the cheapest possible probe depth too;
+   still no code change, still shipped as `split_cost=1.0`/`probe_orders=0`.
 
 ## 7. Where things stand right now (as of this document)
 
