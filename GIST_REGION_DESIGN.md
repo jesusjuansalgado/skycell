@@ -2356,3 +2356,48 @@ down. A real spherical-area proxy for the box (something like the box's
 own solid angle, more expensive to compute exactly, or a cheaper
 monotonic approximation of it) is the natural next thing to try if this
 idea is revisited -- not attempted here.
+
+## Round twenty-five: closing out the pgSphere comparison for `&&` and
+## `@>`(region,point) under round twenty-two's shipped code
+
+Round twenty-two measured `@>`/`<@`(region,region) directly, since those
+were what rounds twenty/twenty-one's regressions were about, but never
+re-measured `&&` or `@>`(region,point) against pgSphere -- even though
+both strategies share the exact same `multicap_union_many()` path that
+changed. Filled that gap directly: fresh corpus, both scales, current
+shipped code (round twenty-two's `merge_caps_greedy_fp()`, no later
+round's reverted changes).
+
+`&&` needs pgSphere's own number pulled from `21_region_overlap.sql`
+(the MOC-ranges-recipe-vs-pgSphere script; its `pgsphere` row is
+apples-to-apples with `22_region_gist.sql`'s `gist` row since both use
+the same seed/probe construction -- same match count, `226`/`1349` at
+5,000/50,000 rows respectively, confirming the two are comparable):
+
+| strategy | 5,000 rows | 50,000 rows |
+|---|---|---|
+| `&&` | 6.54-6.89ms vs pgSphere 26.81-26.82ms (**~3.9-4.1x faster**, matches round three) | 63.70-65.07ms vs pgSphere 83.23-98.76ms (**~1.28-1.55x faster**) |
+| `@>`(region,point) | 5.39-7.14ms vs pgSphere 2.95-3.06ms (~1.8-2.3x slower, matches round four) | 73.64-75.38ms vs pgSphere 16.30-18.24ms (~4.0-4.6x slower) |
+
+Correctness verified at both scales for both strategies (brute-force
+count matches GiST and pgSphere exactly: `226`/`1349` for `&&`,
+`209`/`765` for `@>`(region,point)).
+
+**A genuinely new finding, not something round twenty-two claimed**:
+`&&` at 50,000 rows was skycell's one lingering loss to pgSphere since
+round three (~1.2x slower, never closed by any of rounds four through
+twenty-one). Round twenty-two's `merge_caps_greedy_fp()` fix -- measured
+and justified purely by its effect on `@>`/`<@`(region,region) -- flipped
+this too, apparently as a side effect of tightening the same shared
+key-building path every strategy's `consistent()` prunes against.
+`@>`(region,point) shows no comparable improvement, consistent with round
+four's own diagnosis being a different mechanism entirely (pgSphere's
+native point-in-shape test is inherently cheaper than a sub-cap loop,
+not a key-tightness problem round twenty-two's fix could touch).
+
+**Where this leaves the region GiST opclass vs. pgSphere, complete
+picture as of round twenty-two's shipped code**: `&&` and `<@` are now
+solid wins at both scales; `@>`(region,region) has a narrowed but real
+gap (round twenty-two); `@>`(region,point) has a wide, structurally
+explained, untouched gap (round four) that no round since has addressed
+and that round twenty-two's fix does not reach.

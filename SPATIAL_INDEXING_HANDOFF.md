@@ -106,28 +106,32 @@ PostGIS's own bounding-key idea, not invented from scratch.
 
 | 24 | The remaining untried idea from reading pgSphere's `gist.c`: its box union is exact/lossless at every tree level, unlike skycell's capped sub-cap merge. Added a `GistBox3D` field to `GistMultiCap`, populated via a closed-form exact spherical-cap bounding box, unioned by plain min/max (always exact, no clustering). Scoped narrowly per rounds twenty/twenty-one's evidence: feeds only `skyregion_gist_picksplit()`'s cost metric (Euclidean box volume, replacing the sub-cap-area-sum `multicap_total_area()` for axis and split-point choice) — never `penalty()`, never `consistent()`. | **Correctness held; a clear regression on buffers, not a win.** Same-database comparison: `@>` 25,874→29,725 buffers (**+14.9% worse**), `<@` 68,365→74,304 buffers (**+8.7% worse**). **Reverted.** The theoretical premise (exact composition beats approximate) didn't survive contact with the actual proxy used: Euclidean box volume `(hi.x-lo.x)(hi.y-lo.y)(hi.z-lo.z)` isn't a good stand-in for true spherical coverage the way `cap_area_proxy()`'s `1-cos(radius)` is — a box near a pole and one of similar true angular coverage near the equator can have very different volumes purely from where their coordinates sit in `[-1,1]`, and a thin band-shaped region's box can be near-zero along one axis while covering real angular extent in the others. pgSphere's own box union being exact isn't by itself what makes it work — pgSphere's simpler, more compact native shapes are a corpus where Euclidean volume happens to track true coverage reasonably well; skycell's polygon-decomposed, scattered sub-caps are not. A genuine spherical-area proxy for the box (not Euclidean volume) is the natural next attempt, not tried here. |
 
-**Where this leaves the region GiST opclass**: `&&` and `<@` are solid wins
-(the latter's win over pgSphere widened in round twenty-two); `@>`(region,
-region) still has a gap to pgSphere, narrowed substantially by round
-twenty-two (~5x → ~2.3-2.9x at 50,000 rows) after three prior targeted
-fixes (round fourteen's area check, round fifteen's sharper key, round
-twenty's unscoped seeding change) failed to close it and two of them
-(twenty, twenty-one) actively made it worse. Rounds twenty-three and
-twenty-four both tried to push further — tightening
-`merge_caps_greedy_fp()` itself (small, real, not worth its cost) and
-adding an exact box summary for picksplit's cost metric (a clear
-regression, not just a wash) — and both were reverted. The mechanism
-rounds twenty/twenty-one diagnosed held up across all four of the last
-rounds: `merge_caps_greedy` (unchanged, first-k seeding) backs
-`penalty()`'s incremental placement exclusively; the new
-`merge_caps_greedy_fp()` (farthest-point seeding, single greedy sweep, no
-refinement pass) backs `multicap_union_many()`'s key-building exclusively;
-`picksplit`'s cost metric is back to `multicap_total_area()`, unchanged
-from round twenty-two. Round two's original diagnosis — overlapping
-bounding caps at internal/leaf pages — still applies to whatever the
-tighter merge doesn't catch; the sub-quadratic overlap test (§6) is now
-the one remaining untried direction from this file's own list that hasn't
-been tried and found wanting.
+| 25 | Round twenty-two measured `@>`/`<@`(region,region) directly (what rounds twenty/twenty-one's regressions were about) but never re-checked `&&` or `@>`(region,point) against pgSphere under the shipped fix — even though both share the same `multicap_union_many()` path that changed. Filled the gap: fresh corpus, both scales, current shipped code. | **A genuinely new finding, not something round twenty-two claimed.** `&&` at 50,000 rows was skycell's one lingering loss to pgSphere since round three (~1.2x slower, untouched by rounds four through twenty-one) — round twenty-two's fix flipped it too: 63.70-65.07ms vs pgSphere's 83.23-98.76ms, **~1.28-1.55x faster**, an apparent side effect of tightening the same shared key-building path every strategy's `consistent()` prunes against. At 5,000 rows `&&` is unchanged (~3.9-4.1x faster, matches round three). `@>`(region,point) shows no comparable improvement — 73.64-75.38ms vs pgSphere's 16.30-18.24ms at 50,000 rows, **~4.0-4.6x slower**, consistent with round four's own diagnosis being a different mechanism (pgSphere's native point-in-shape test is inherently cheaper than a sub-cap loop) that round twenty-two's key-tightness fix doesn't reach. Correctness verified at both scales, both strategies. |
+
+**Where this leaves the region GiST opclass**: `&&` and `<@` are now solid
+wins at both scales (round twenty-five found `&&`'s one lingering loss at
+50,000 rows flipped by round twenty-two's fix, previously unverified);
+`@>`(region,region) still has a gap to pgSphere, narrowed substantially
+by round twenty-two (~5x → ~2.3-2.9x at 50,000 rows) after three prior
+targeted fixes (round fourteen's area check, round fifteen's sharper key,
+round twenty's unscoped seeding change) failed to close it and two of
+them (twenty, twenty-one) actively made it worse; `@>`(region,point) has
+a wide, structurally explained, untouched gap (round four) that no round
+since has addressed. Rounds twenty-three and twenty-four both tried to
+push `@>`(region,region) further — tightening `merge_caps_greedy_fp()`
+itself (small, real, not worth its cost) and adding an exact box summary
+for picksplit's cost metric (a clear regression, not just a wash) — and
+both were reverted. The mechanism rounds twenty/twenty-one diagnosed held
+up across all four of the last rounds: `merge_caps_greedy` (unchanged,
+first-k seeding) backs `penalty()`'s incremental placement exclusively;
+the new `merge_caps_greedy_fp()` (farthest-point seeding, single greedy
+sweep, no refinement pass) backs `multicap_union_many()`'s key-building
+exclusively; `picksplit`'s cost metric is back to `multicap_total_area()`,
+unchanged from round twenty-two. Round two's original diagnosis —
+overlapping bounding caps at internal/leaf pages — still applies to
+whatever the tighter merge doesn't catch; the sub-quadratic overlap test
+(§6) is now the one remaining untried direction from this file's own list
+that hasn't been tried and found wanting.
 
 A methodological note from round twenty-one, carried forward and validated
 twice since: round twenty-one's same-database baseline (rerun immediately
@@ -435,7 +439,15 @@ not in priority order — pick what matches the actual goal:
   investigation actually shipped. `@>`(region,region)'s gap to pgSphere is
   narrowed (~5x → ~2.3-2.9x at 50,000 rows) but not closed; the
   sub-quadratic overlap test (§6) is the one remaining direction on this
-  list not yet tried and found wanting.
+  list not yet tried and found wanting. Round twenty-five confirmed round
+  twenty-two's fix also flipped `&&` at 50,000 rows from a ~1.2x loss
+  (unclosed since round three) to a ~1.28-1.55x win, a side effect never
+  directly measured until now; `@>`(region,point) remains a wide,
+  untouched gap (~4.0-4.6x slower at 50,000 rows, round four's own
+  diagnosis, a different mechanism round twenty-two's fix doesn't reach).
+  **Current scorecard vs. pgSphere, both scales**: `&&` and `<@` win
+  outright; `@>`(region,region) loses but the gap narrowed; `@>`(region,
+  point) loses by a wide, unaddressed margin.
 - Point SP-GiST opclass: shipped as a correctness-verified, documented
   negative result (`SPLIT_WIDTH=1`, effectively single-order splits; the
   bytea-prefix/explicit-width fix from round twelve is real and kept even
