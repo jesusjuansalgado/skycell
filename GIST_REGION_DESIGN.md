@@ -1600,3 +1600,65 @@ coverage gaps (unobserved sky, not just low density), which a real survey
 footprint might have and which this measurement cannot speak to -- but
 absent a concrete reason to expect that, this line of attack on the
 opclass's execution cost is closed.
+
+## Round fourteen: a dedicated CONTAINS_REGION pruning test, tried and
+## reverted
+
+Round six's own header already named the gap: `@>(skyregion,skyregion)`
+reuses OVERLAP's sub-cap-overlap test rather than a dedicated one, and
+explicitly ruled out the obvious tightening (requiring every sub-cap of the
+query to sit inside a single sub-cap of the candidate) as unsound -- a
+SUFFICIENT condition for containment, not a NECESSARY one, so using it to
+prune risks a false negative with no recheck to catch it. This round looked
+for a *sound* tightening instead, on top of the existing test rather than
+replacing it.
+
+**The idea**: containment has a real, provable property the cap-overlap test
+doesn't use at all -- if `A @> B` (B nonempty) then `area(A) >= area(B)`,
+ordinary measure monotonicity. Unlike a tighter *shape* test, this needs no
+approximation: `sc_region` already carries an exact `area` field for both
+cones and polygons, and a subtree's largest reachable region's area is
+exactly the max of its children's own, all the way down to true per-leaf
+areas -- nothing lossy to propagate, unlike the cap geometry. Implemented as
+one new field on `GistMultiCap` (`max_area`, max()-reduced through
+`union()`/`picksplit()`, no changes needed to either's existing cap logic)
+and one new check in `consistent()`, CONTAINS_REGION only: reject outright,
+no recheck needed, whenever even the largest region reachable under a key is
+smaller than the query region.
+
+**Correctness held throughout**: full regression suite; round six/seven's
+own fixtures agreed exactly with brute force at both 5,000 rows (206/206,
+1250/1250) and 50,000 rows (788/788, 22,349/22,349); a third fixture built
+specifically to give the new check something to reject (probe radii
+0.08-0.13, overlapping the footprint corpus's own 0.02-0.32 range, unlike
+round six's fixture where every probe is smaller than every footprint by
+construction) also came back exact.
+
+**Performance did not move.** Same corpus, same probes, A/B'd directly
+against the pre-change code at 50,000 rows: 79.98/63.15ms before,
+76.73/70.53ms after -- noise-level identical, nowhere near closing the
+~4.9x gap to pgSphere round six measured. `EXPLAIN (ANALYZE, BUFFERS)` on
+the size-mixed fixture (built to actually exercise the new check) showed
+why: of ~2,135 buffer touches, the new check eliminated exactly *one* false
+candidate that would otherwise have reached recheck. The overlap test was
+already rejecting almost everything the area test could additionally
+catch, because on realistic data the two failure modes are correlated, not
+independent: a footprint too small to contain the query is usually also
+positioned such that its cap doesn't overlap the query's cap in the first
+place. The two tests are mostly redundant in practice, not complementary.
+
+**Reverted rather than kept**, matching this file's own standard for a
+verified-negative change (rounds nine and twelve did the same): sound,
+correctness-clean code that adds 8 bytes/key and a comparison per
+consistent() call for a measured performance effect indistinguishable from
+noise is not worth carrying. Round two's own diagnosis of `@>`'s real
+bottleneck stands unaddressed by this attempt: `EXPLAIN (ANALYZE, BUFFERS)`
+already showed "too many internal and leaf pages have overlapping bounding
+caps," an internal-node fan-out problem this round's leaf-level candidate
+filter never touched. Closing `@>`'s gap for real would need to attack that
+-- a sharper key (more than MAX_SUBCAPS=4 caps, or a HEALPix-cell-based key
+closer to the MOC-ranges recipe this opclass exists to replace) -- which
+round two's own text already flagged as "a materially bigger change than a
+split-algorithm swap, and arguably undermines the 'simpler than the recipe'
+case for building this opclass at all." Left as an open question, not
+attempted here.
