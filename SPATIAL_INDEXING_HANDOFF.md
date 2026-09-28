@@ -104,26 +104,30 @@ PostGIS's own bounding-key idea, not invented from scratch.
 
 | 23 | Round twenty-two's own flagged follow-up: `merge_caps_greedy_fp()`'s single greedy sweep is order-sensitive by construction, so add a "second-look" refinement pass afterward — safe (unlike anything touching `penalty()`) since this only feeds the stored key. Approximates true Lloyd's/k-means reassignment (which would need a cluster's union with a cap *removed*, expensive since caps don't subtract) by comparing each cap's recorded join-time cost against the cost of joining a different, now-fully-formed cluster, all decided against one frozen snapshot and applied in one batch. | **Correctness held, but not a clear enough win to keep.** Wall-clock was contradictory — `@>` looked ~1.8x faster, `<@` looked ~1.6x *slower* — while pgSphere's own unmodified numbers shifted by a similar magnitude between the two passes, pointing at ambient noise (a second concrete instance of round twenty-one's own caution) rather than a real effect. Switched to `EXPLAIN (ANALYZE, BUFFERS)`: a real but modest tightening, `@>` 26,202→24,870 buffers (-5.1%), `<@` 68,976→67,954 buffers (-1.5%) — unlike round fifteen's `MAX_SUBCAPS` increase (which paid its extra cost per *query*), this round's extra cost (a second O(n·MAX_SUBCAPS) pass plus an O(n) rebuild) lands per index-build `union()` call, in principle a cheaper place to spend cycles — but a 1-5% buffer reduction with no confident wall-clock signal isn't this file's bar. **Reverted**, working tree and installed extension back to round twenty-two's shipped code. |
 
+| 24 | The remaining untried idea from reading pgSphere's `gist.c`: its box union is exact/lossless at every tree level, unlike skycell's capped sub-cap merge. Added a `GistBox3D` field to `GistMultiCap`, populated via a closed-form exact spherical-cap bounding box, unioned by plain min/max (always exact, no clustering). Scoped narrowly per rounds twenty/twenty-one's evidence: feeds only `skyregion_gist_picksplit()`'s cost metric (Euclidean box volume, replacing the sub-cap-area-sum `multicap_total_area()` for axis and split-point choice) — never `penalty()`, never `consistent()`. | **Correctness held; a clear regression on buffers, not a win.** Same-database comparison: `@>` 25,874→29,725 buffers (**+14.9% worse**), `<@` 68,365→74,304 buffers (**+8.7% worse**). **Reverted.** The theoretical premise (exact composition beats approximate) didn't survive contact with the actual proxy used: Euclidean box volume `(hi.x-lo.x)(hi.y-lo.y)(hi.z-lo.z)` isn't a good stand-in for true spherical coverage the way `cap_area_proxy()`'s `1-cos(radius)` is — a box near a pole and one of similar true angular coverage near the equator can have very different volumes purely from where their coordinates sit in `[-1,1]`, and a thin band-shaped region's box can be near-zero along one axis while covering real angular extent in the others. pgSphere's own box union being exact isn't by itself what makes it work — pgSphere's simpler, more compact native shapes are a corpus where Euclidean volume happens to track true coverage reasonably well; skycell's polygon-decomposed, scattered sub-caps are not. A genuine spherical-area proxy for the box (not Euclidean volume) is the natural next attempt, not tried here. |
+
 **Where this leaves the region GiST opclass**: `&&` and `<@` are solid wins
 (the latter's win over pgSphere widened in round twenty-two); `@>`(region,
 region) still has a gap to pgSphere, narrowed substantially by round
 twenty-two (~5x → ~2.3-2.9x at 50,000 rows) after three prior targeted
 fixes (round fourteen's area check, round fifteen's sharper key, round
 twenty's unscoped seeding change) failed to close it and two of them
-(twenty, twenty-one) actively made it worse. Round twenty-three tried to
-push further in the same direction (tighten `merge_caps_greedy_fp()`
-itself) and found the returns there are already small — real (1-5% fewer
-buffers) but not worth their build-time cost, so it was reverted rather
-than kept on a technicality. The mechanism rounds twenty/twenty-one
-diagnosed held up across all three of the last rounds: `merge_caps_greedy`
-(unchanged, first-k seeding) backs `penalty()`'s incremental placement
-exclusively; the new `merge_caps_greedy_fp()` (farthest-point seeding,
-single greedy sweep, no refinement pass) backs `multicap_union_many()`'s
-key-building exclusively. Round two's original diagnosis — overlapping
+(twenty, twenty-one) actively made it worse. Rounds twenty-three and
+twenty-four both tried to push further — tightening
+`merge_caps_greedy_fp()` itself (small, real, not worth its cost) and
+adding an exact box summary for picksplit's cost metric (a clear
+regression, not just a wash) — and both were reverted. The mechanism
+rounds twenty/twenty-one diagnosed held up across all four of the last
+rounds: `merge_caps_greedy` (unchanged, first-k seeding) backs
+`penalty()`'s incremental placement exclusively; the new
+`merge_caps_greedy_fp()` (farthest-point seeding, single greedy sweep, no
+refinement pass) backs `multicap_union_many()`'s key-building exclusively;
+`picksplit`'s cost metric is back to `multicap_total_area()`, unchanged
+from round twenty-two. Round two's original diagnosis — overlapping
 bounding caps at internal/leaf pages — still applies to whatever the
-tighter merge doesn't catch; §6's remaining ideas (a sub-quadratic overlap
-test, the pgSphere-style exact-box summary) look more likely to move the
-gap further than more tuning inside the same greedy-merge family.
+tighter merge doesn't catch; the sub-quadratic overlap test (§6) is now
+the one remaining untried direction from this file's own list that hasn't
+been tried and found wanting.
 
 A methodological note from round twenty-one, carried forward and validated
 twice since: round twenty-one's same-database baseline (rerun immediately
@@ -367,26 +371,21 @@ not in priority order — pick what matches the actual goal:
    sweep. Further tuning inside this same greedy-merge family looks like
    diminishing returns now — item 6 and the sub-quadratic overlap test
    above look more promising for narrowing `@>`'s remaining gap.
-6. **A pgSphere-style exact composable summary for internal nodes only**
-   (§3, prompted by reading pgSphere's actual `gist.c`: its `spherekey` is
-   a plain 3D axis-aligned box, unioned by exact per-axis min/max, losslessly
-   at every tree level — the likely real reason its internal nodes stay
-   tighter than skycell's own, independent of caps-vs-boxes as shapes).
-   Add an exactly-composable bounding volume (a 3D AABB, mirroring pgSphere
-   directly, or some other shape with a lossless union) to `GistMultiCap`
-   purely as a picksplit/penalty-time summary, while `consistent()` keeps
-   pruning on the sub-cap list exactly as now — so round three's proven
-   leaf-level precision win is kept, and only the internal-node tightness
-   problem round two originally diagnosed gets a structurally different
-   fix. **Caution added by round twenty-one**: it showed a single-shape
-   summary used for `penalty()` can actively hurt, not just fail to help —
-   a box is a tighter, more informative single shape than a bare cap (it
-   captures anisotropy a cap can't), so this isn't necessarily the same
-   failure mode, but it's now a real risk to test for specifically, not
-   just a design-purity question. A real design change (new field, new
-   union logic, key format grows again), not a tuning pass — untried,
-   unproven, the only idea left in this thread that changes the mechanism
-   (exact vs. approximate composition) rather than its parameters.
+6. ~~A pgSphere-style exact composable summary for internal nodes only~~ —
+   **tried, round twenty-four, reverted.** Added `GistBox3D` (exact,
+   closed-form spherical-cap bounding box, unioned by plain min/max) as
+   `GistMultiCap`'s new field, scoped only to `picksplit`'s cost metric
+   (never `penalty()`, matching round twenty-one's caution; never
+   `consistent()`). Measured a clear regression on both strategies (`@>`
+   +14.9% buffers, `<@` +8.7% buffers), not a wash. The likely reason:
+   Euclidean box volume, the cheap proxy used, isn't a good stand-in for
+   true spherical coverage — pgSphere's own simpler native shapes are a
+   corpus where that correlation happens to hold; skycell's polygon-
+   decomposed, scattered sub-caps are not. Exact composition turned out not
+   to be the missing ingredient by itself; the *proxy* built on top of it
+   mattered more, and the cheap one tried here was the wrong one. A real
+   spherical-area proxy for the box (not volume) is the natural next
+   attempt for anyone who wants to pick this back up — not tried.
 7. **A `min_area` field for `CONTAINED_BY_REGION` (`<@`)**, the mirror of
    round fourteen's reverted `max_area` idea — except `<@` already wins
    against pgSphere at both scales tested (round seven), so this is lower
@@ -425,16 +424,18 @@ not in priority order — pick what matches the actual goal:
   only by `multicap_penalty()`) plus a new farthest-point-seeded
   `merge_caps_greedy_fp()`, single greedy sweep, no refinement pass (used
   only by `multicap_union_many()`, round twenty-two, kept — a real,
-  measured win, not experimental). Rounds fourteen, fifteen, twenty,
-  twenty-one, and twenty-three's changes were all reverted after
-  measurement (twenty and twenty-one regressed `@>` and `<@`; twenty-three
-  measured a real but too-small-to-justify buffer improvement); round
-  twenty-two is the one change from this whole seeding/merge investigation
-  actually shipped. `@>`(region,region)'s gap to pgSphere is narrowed
-  (~5x → ~2.3-2.9x at 50,000 rows) but not closed; further tuning inside
-  the greedy-merge family looks like diminishing returns (round
-  twenty-three) — §6 item 6 (the pgSphere-style exact-box idea) and the
-  sub-quadratic overlap test are the more promising remaining directions.
+  measured win, not experimental). `picksplit`'s cost metric is
+  `multicap_total_area()` (sub-cap-area sum), unchanged from round
+  twenty-two — no `GistBox3D` field, round twenty-four's exact-box summary
+  was reverted. Rounds fourteen, fifteen, twenty, twenty-one, twenty-three,
+  and twenty-four's changes were all reverted after measurement (twenty and
+  twenty-one regressed `@>` and `<@`; twenty-three measured a real but
+  too-small-to-justify buffer improvement; twenty-four measured a clear
+  buffer regression); round twenty-two is the one change from this whole
+  investigation actually shipped. `@>`(region,region)'s gap to pgSphere is
+  narrowed (~5x → ~2.3-2.9x at 50,000 rows) but not closed; the
+  sub-quadratic overlap test (§6) is the one remaining direction on this
+  list not yet tried and found wanting.
 - Point SP-GiST opclass: shipped as a correctness-verified, documented
   negative result (`SPLIT_WIDTH=1`, effectively single-order splits; the
   bytea-prefix/explicit-width fix from round twelve is real and kept even

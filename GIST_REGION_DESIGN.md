@@ -2287,3 +2287,72 @@ further are getting small, and §6's other two directions (a sub-quadratic
 `consistent()` test, the pgSphere-style exact-box summary) look more
 likely to move the `@>` gap further than another pass over the same
 greedy-merge family.
+
+## Round twenty-four: the pgSphere-style exact box -- theoretically sound,
+## measured worse, reverted
+
+The remaining untried idea from reading pgSphere's own `gist.c` (§ round
+twenty-two/twenty-three): pgSphere's `spherekey` is a plain 3D
+axis-aligned box, unioned by exact per-axis min/max -- lossless at every
+tree level, unlike skycell's own capped sub-cap merge, bounded to
+`MAX_SUBCAPS` entries and forced to approximate once more accumulate.
+Added a `GistBox3D` (`lo[3]`, `hi[3]`) field to `GistMultiCap`, populated
+via a closed-form exact bounding box of a spherical cap (not an
+approximation -- for a cap at angular distance `theta` from an axis's
+pole with radius `r`, the extreme coordinate on that axis is the pole's
+own coordinate if the cap contains it outright, else `cos(theta -+ r)`,
+a standard spherical-cap identity), unioned exactly (plain min/max,
+`box_union_inplace()`) in `multicap_union_many()` alongside the existing
+sub-cap merge.
+
+**Scoped narrowly, informed directly by rounds twenty/twenty-one's
+accumulated evidence**: the box feeds only `skyregion_gist_picksplit()`'s
+cost metric (`box_area_proxy()`, Euclidean volume, replacing
+`multicap_total_area()`'s sub-cap-area sum for both axis selection and
+split-point choice) -- never `multicap_penalty()` (round twenty-one
+showed a single-shape summary can actively hurt placement specifically)
+and never `consistent()` (pruning stays on the sub-cap list exactly as
+shipped). The idea: `multicap_total_area()` reflects `merge_caps_greedy_
+fp()`'s own approximation, which can distort the very cost estimate
+picksplit uses to choose a *good* split; an exact, never-approximated
+volume should be a more reliable signal, mirroring how pgSphere's own
+penalty function is described (in its `gist.c`) as scoring by box volume
+growth.
+
+**Correctness held.** But `EXPLAIN (ANALYZE, BUFFERS)` on the same
+same-database, index-rebuilt-under-each-binary comparison this file has
+used since round twenty-one's lesson about noisy wall-clock:
+
+| strategy | buffers before (sub-cap area) | buffers after (box volume) | change |
+|---|---|---|---|
+| `@>`(region,region) | 25,874 | 29,725 | **+14.9% worse** |
+| `<@`(region,region) | 68,365 | 74,304 | **+8.7% worse** |
+
+**A clear regression on both strategies, not a wash and not noise --
+reverted** (stashed; working tree and installed extension back to round
+twenty-three's shipped state, which is round twenty-two's code). The
+theoretical premise (exact composition beats approximate composition)
+didn't translate into a better *picksplit cost function* in practice, and
+the likely reason is the proxy itself: `box_area_proxy()`'s Euclidean
+volume `(hi.x-lo.x)(hi.y-lo.y)(hi.z-lo.z)` is not a good stand-in for
+"how much of the sphere this region actually covers" the way
+`cap_area_proxy()`'s `1-cos(radius)` is a true monotonic spherical-area
+proxy -- a box near a pole and a box of similar true angular coverage
+near the equator can have very different Euclidean volumes purely from
+where their coordinates sit in `[-1,1]`, and a thin band-shaped region's
+box can have near-zero volume along one axis while covering a large
+angular extent in the other two. `multicap_total_area()`, despite
+reflecting an approximated sub-cap merge, is at least measuring something
+proportional to real spherical area throughout; `box_area_proxy()` is
+exact about the wrong quantity. **This isolates the actual gap, useful
+for anyone revisiting this idea**: pgSphere's box union being exact isn't
+by itself what makes it work for pgSphere -- pgSphere's own types
+(`spoint`, `scircle`, `spoly`) are relatively compact/simple shapes where
+Euclidean box volume tracks true coverage reasonably well across its
+whole corpus; skycell's regions (in particular polygons decomposed into
+several HEALPix-cell sub-caps scattered across a boundary) are a
+different, more scattered shape family where that correlation breaks
+down. A real spherical-area proxy for the box (something like the box's
+own solid angle, more expensive to compute exactly, or a cheaper
+monotonic approximation of it) is the natural next thing to try if this
+idea is revisited -- not attempted here.
