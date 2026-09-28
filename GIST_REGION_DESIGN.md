@@ -966,3 +966,267 @@ genuinely unbuilt is `<@(skyregion,skyregion)`, i.e. indexing "which of my
 candidate footprints are contained *within* this region" rather than
 "contains it" -- round six's own "direction wrinkle" explains why that
 needs its own operator and strategy, not just a different query spelling.)
+
+## Round nine: a variable-length key for the region GiST opclass -- reverted
+
+*(Documented here for the record; this round predates the SP-GiST work
+below and was carried out and reverted in the same session, without ever
+landing on `main`.)*
+
+Prompted by the observation that pgSphere's own per-type GiST keys
+(`scircle`/`spoly`, ~32-40 bytes) are far smaller than this opclass's fixed
+~164-byte `GistMultiCap`, tried a variable-length key: a `bytea` encoding
+only as many sub-caps as a region actually has (a cone: 1; a polygon: up to
+`MAX_SUBCAPS`), tagged with a small header so `multicap_to_bytea`/
+`bytea_to_multicap` could round-trip it. Measured index size dropped
+~35-47% at both 5,000 and 50,000 rows, and cold-cache `EXPLAIN (ANALYZE,
+BUFFERS)` confirmed ~35% fewer buffer reads per probe (1674-1691 vs
+2604-2612 at 50,000 rows) -- the fanout win was real.
+
+Query time got *worse* anyway, at every scale and cache state tried
+(warm: ~1.5-2x slower at 5,000 rows, ~1.5-2.2x at 50,000; cold, at the
+user's explicit request to re-check before deciding: still 35-45% slower
+despite the real drop in disk reads). The decode cost of a variable-length
+record on every `consistent()` call outweighed the fanout it bought --
+tree descent was never the dominant cost this key redesign assumed it was;
+per-candidate CPU was. Reverted (`git revert d0789b5`, commit `9f02a61`)
+rather than kept as a documented-but-off option, since a reverted commit's
+diff is already the full record of what was tried.
+
+A narrower, lower-risk slice of the same idea -- a fast path in
+`multicap_overlaps()`/`multicap_contains_point()` recognising when a key has
+collapsed to exactly one sub-cap (always true for a leaf circle) and
+skipping the O(MAX_SUBCAPS^2) loop in that case -- was tried right after
+(commit `7e0c6a2`) as a safe, format-unchanged alternative. Correct (full
+regression suite plus a 3,000-row/~4.5M-pair stress test), but measured as
+statistically indistinguishable from baseline at both scales: the fast path
+only fires for candidates that already pass the cheap overall-cap check,
+and internal nodes (built by `merge_caps_greedy` across many children)
+essentially never collapse to a single cap, so the optimisation rarely
+fires where the time is actually spent. Kept (it can never make anything
+slower), but closed out as a dead end: three independent attempts in this
+area now (round two's original picksplit tuning, this variable-length key,
+and this fast path) point at the same wall -- the multi-cap GiST's gap to
+pgSphere is a structural tree-depth/fanout limit, not a per-comparison-cost
+one, and not one `consistent()`-level tuning can close further.
+
+## Round ten: a different index scheme entirely -- SP-GiST over the HEALPix
+## hierarchy, indexing the *point* side
+
+Round nine's dead end reframed the question: instead of tuning
+`skyregion`'s own GiST key further, is there a *different* index structure
+that fits this data better than an R-tree-shaped GiST at all? Two candidate
+directions, both explored:
+
+### PostGIS: reused, not reinvented -- and not a win
+
+The obvious "why build this at all" question first: PostGIS ships its own
+SP-GiST opclasses (`spgist_geography_ops_nd` for `geography`, plus 2D/3D
+variants for `geometry`), an octree-style partition over 3D Cartesian
+coordinates, not HEALPix -- a real, mature, independent implementation, not
+a strawman. Installed (`postgresql-16-postgis-3`) and benchmarked directly
+against the same corpus this file's other rounds use:
+
+**Cone search** (`bench/03_cone.sql`'s harness, an added `postgis` arm using
+`ST_DWithin(pos, center, r, use_spheroid=false)`, radii 1" to 3deg, 50,000-row
+catalogue):
+
+| method | avg query time | vs pgSphere | index size (50,000 rows) |
+|---|---|---|---|
+| pgSphere (native GiST) | ~0.04-0.08 ms | 1x | 3.1 MB |
+| skycell (B-tree + planner rewrite) | ~0.05-0.14 ms | ~1.2-1.8x | 1.1 MB |
+| PostGIS geography (GiST) | ~1.2-1.4 ms | ~20-30x | 3.7 MB |
+| Q3C | ~2.8-3.5 ms | ~50-70x | 1.1 MB |
+
+PostGIS beats Q3C here but loses badly to both pgSphere and skycell, and its
+index is the largest of the four. For the region-contains-point workload
+(many footprints, mixed circle/polygon, probed by a point) the picture is
+more nuanced and workload-sensitive in an instructive way:
+
+- `ST_DWithin` cannot use an index at all when the distance argument is a
+  per-row column rather than a query-side constant (PostGIS's planner
+  support function needs a fixed radius to precompute an expanded bounding
+  box) -- exactly this project's own "many circles, one probe point, each
+  circle its own radius" shape. Naively indexed, PostGIS's circle side falls
+  back to a full sequential scan; the fix is to bake each circle's radius
+  into an actual buffered polygon at build time (`ST_Buffer`), which does
+  get indexed, at the cost of ~6.35s of one-time buffering for 5,000 rows and
+  losing exactness (a finite-segment polygon approximates a true circle).
+- With that fix, PostGIS's **GiST** on the buffered polygons (~17-24ms at
+  5,000 footprints x 500 probes) is close to this project's own region GiST
+  opclass (~14-15ms) -- genuinely competitive.
+- PostGIS's **SP-GiST**, on the *same* buffered-polygon data, was
+  consistently and substantially *slower* than its own GiST (~400-435ms vs
+  ~17-24ms) -- a real, measured result, not a configuration mistake (same
+  operator, same data, index type as the only variable): SP-GiST's
+  octree partition does not cope as well with large, overlapping features
+  as GiST's R-tree does, at least for this workload.
+
+Conclusion reused directly into the design decision below: PostGIS's own
+SP-GiST is not, on this evidence, a shortcut to beating pgSphere or Q3C --
+worth knowing before spending effort on it, and worth recording so the next
+person doesn't have to re-derive it. But it does confirm SP-GiST *can* be
+competitive for spatial data given the right partition scheme; the question
+became whether a HEALPix-native one (rather than PostGIS's generic
+Cartesian octree) would do better for this specific, HEALPix-shaped problem.
+
+### A HEALPix-native SP-GiST opclass for skypos
+
+`paper/response-to-referee-2.md` and `bench/tap-ab/RESULTS.md` already
+named "an SP-GiST opclass over the HEALPix cell hierarchy" as future work,
+aimed at a specific, different bottleneck: the planner-visible cost of
+covering computation and OR-ed B-tree ranges, 3% of query time at 10M rows
+and 13% at 50M, one of the only costs in the whole design that *grows*
+with catalogue size. This round builds a first version of exactly that,
+aimed at both that bottleneck and this file's own repeated finding that
+region-shape GiST is structurally capped against pgSphere.
+
+**What it indexes, and how that differs from every other strategy in this
+file.** Every strategy above indexes the *region* column (`skyregion_gist_
+ops`, `skycell_region_moc`'s GIN alternative): many candidate regions, one
+or few probe points. This is the mirror image: it indexes the *point*
+column (`skypos`), for "one query region (or many, from a join), many
+candidate points" -- cone search and cross-match against a large point
+catalogue, skycell's actual headline workload, currently answered entirely
+by the B-tree-rewrite planner machinery rather than a real index descent.
+New file: `ext/src/spgist_region.c`; new opclass `skypos_spgist_ops`,
+`DEFAULT FOR TYPE skypos USING spgist`, strategy 1 = the existing
+`<@(skypos,skyregion)` operator (unchanged; already had a planner-rewrite
+support function -- this opclass is a second, competing physical access
+path the planner now also gets to cost against the rewrite).
+
+**Tree shape.** A PATRICIA trie over HEALPix NESTED pixel ids: each inner
+tuple carries an explicit `(order, pix)` prefix ("every leaf under here is
+inside this HEALPix cell"), and its nodes decide the *next* order's digit --
+up to 12 at the very first branch (order 0 has exactly 12 base pixels), up
+to 4 below that (2 bits per order). `choose()`/`picksplit()` need only the
+indexed point's own coordinates to compute a digit at any given order
+(`sc_vec2pix()`, already in `healpix.h`); `inner_consistent()` reuses
+`sc_region_classify()` unchanged -- the exact same function `cover.c`'s
+cost-based covering and the region GiST opclass already use -- to prune a
+child whose pixel provably doesn't meet the query region; `leaf_consistent()`
+reuses `sc_region_contains()`, the same exact test `skycell_pos_in_region()`
+uses, so this opclass is exact (`recheck` always false), unlike the region
+opclass's intentionally-lossy multi-cap key.
+
+**A real, non-obvious bug, found empirically before it was reasoned out.**
+The first working version used one order per tree level with no prefix
+compression at all (deliberately, to avoid `spgSplitTuple`). It passed a
+6-million-pair correctness stress test (50,000 points, 120 mixed regions) --
+and then missed 2 of 3 true matches on a single cone query, but *only* when
+the indexed table was physically sorted by HEALPix cell before the index
+was built; an unsorted build of the identical rows answered the same query
+correctly. Root cause, found by bisecting the reproduction down to a
+minimal case and instrumenting `choose()`/`picksplit()` directly: SP-GiST's
+own core marks a freshly created inner tuple "all-the-same" whenever
+`picksplit` reports only one node, and once marked, refuses `spgAddNode`
+against it (a hard error) -- `choose()` is instead expected to dump
+anything arriving there into that one node regardless of its real value, on
+the documented assumption that "the eventual PickSplit call will re-sort
+things out". That assumption only holds if "one node" truly means
+"provably indistinguishable forever". A fixed one-order-per-level split
+cannot promise that: a small overflow batch at some deep order is often
+locally homogeneous by chance (especially under sorted insertion, where
+long runs share a prefix) rather than because every point that could ever
+land there shares that digit. A later point with a genuinely different
+digit then has no legal route, is forced into the wrong subtree anyway, and
+`inner_consistent`'s `classify()` calls downstream run against the WRONG
+assumed pixel -- correctly, by its own lights, pruning a leaf that the
+point's real position would not have been pruned from. An intermediate fix
+(always declare the full 12-or-4-wide label set so `nNodes` is never 1)
+turned out not to work either: SP-GiST's storage compacts an inner tuple
+down to whichever labels actually got a leaf, regardless of how many were
+declared, so the same trap re-opened one level deeper in testing.
+
+The real fix is the standard PATRICIA-trie discipline the built-in
+`inet_ops` spgist opclass already uses for address bits: `picksplit`
+searches forward, order by order, for the batch's actual first point of
+disagreement (a longest-common-prefix search, however many orders that
+takes), so "one node" is only ever reported when a batch is truly identical
+all the way to the deepest resolvable order (a genuine duplicate/near-
+duplicate cluster -- the correct, intended use of "all-the-same").
+`choose()` correspondingly reads a tuple's own `(order, pix)` prefix
+directly (packed into one `int8`, not derived from the SP-GiST core's own
+hop counter, which stops meaning "current order" once prefixes span more
+than one order at a time) and, on a later point whose true ancestor
+diverges from that prefix before reaching its decision order, issues
+`spgSplitTuple` to insert a new, shorter-prefixed tuple at the true point of
+divergence -- the case a no-compression design gets to skip entirely, and
+the part that turned out not to be optional.
+
+**Correctness, after the fix.** The regression suite (`skycell`, `adql`)
+passes unchanged. A dedicated stress test rebuilt the catalogue physically
+sorted by HEALPix cell -- the exact condition that exposed the bug -- and
+joined 50,000 points against 160 mixed circle/polygon regions (deliberately
+including near-pole clusters and RA=0/360 wraparound, sizes spanning three
+orders of magnitude) against the same table's own unindexed
+`skycell_pos_in_region`: 5,789 matches, 0 false positives, 0 false
+negatives, in both directions. The original failing query (a 30-arcmin cone
+that had returned 1 or 2 of 3 true matches at various points during
+debugging) now returns exactly 3, matching brute force and every other
+method.
+
+**Performance** (`bench/03_cone.sql`'s own harness and radii, 50,000-row
+catalogue, extended with a `skycell_spg` arm querying a `skypos`-indexed
+table via plain `<@`):
+
+| method | avg query time (1" to 3deg) | vs pgSphere |
+|---|---|---|
+| pgSphere (native GiST) | ~0.035-0.069 ms | 1x |
+| skycell (B-tree + planner rewrite) | ~0.045-0.135 ms | ~1.3-2x |
+| **this opclass (SP-GiST)** | **~0.14-0.27 ms** | **~3.5-4x** |
+| Q3C | ~2.8-3.5 ms | ~50-80x |
+
+Every radius bucket's row counts agreed exactly across all four methods.
+So: this is not (yet) a win over pgSphere or over skycell's own existing
+B-tree-rewrite path for the plain cone-search case at this scale -- but it
+soundly beats Q3C (~15-20x), does so via a genuine single-index-qual descent
+rather than a planner-time covering computation, and its index is
+competitive to build: 0.088s/2.3MB for the SP-GiST structure alone at
+50,000 rows (vs pgSphere's 0.2s/3.1MB GiST and skycell's 0.05s/1.1MB
+B-tree) -- cheaper and smaller than pgSphere's own index, if not yet faster
+to query. Where this direction was actually aimed -- removing the
+planning-time covering cost that grows with catalogue density and size, the
+paper's own flagged bottleneck at 10-50M rows -- has not yet been measured
+at that scale; the numbers above are all at 50,000 rows, the scale where
+that specific cost is smallest.
+
+**Cross-match** (`bench/20_region_xmatch.sql`'s own fixture: 5,000 mixed
+circle/polygon footprints x 50,000-row catalogue, `point <@ region`):
+
+| method | query time | plan |
+|---|---|---|
+| pgSphere (native GiST, per-type circle/poly union) | ~267-292 ms | `Nested Loop -> Index Scan` per type |
+| skycell, GIN-rewrite (round eight) | ~894-979 ms | `Nested Loop -> Bitmap Heap Scan on fpr` (GIN on `skycell_region_moc`) |
+| **this opclass, GIN dropped (forces the native SP-GiST plan)** | **~793-863 ms** | `Nested Loop -> Index Scan using cat_spg_idx` |
+
+A genuine, unplanned finding here: with *both* a GIN index on the footprint
+side and this opclass's SP-GiST on the point side present, the planner
+never even considers the SP-GiST plan -- `region_support_simplify`'s
+existing rewrite (round eight) unconditionally rewrites `point <@ region`
+into the GIN-array form the moment a matching GIN index exists, before
+physical index selection ever gets a chance to cost the alternatives
+against each other (documented, deliberate behaviour from round eight, not
+new; this is simply the first time two competing physical answers to the
+same predicate have coexisted on the same table). The two paths land within
+~10% of each other in practice (793-863ms native SP-GiST vs 894-979ms via
+the GIN rewrite), so it isn't costing much today, but it means this new
+opclass cannot currently be *chosen* by the query optimizer's own cost
+model on a table that also has the GIN index -- only on one that doesn't.
+Both trail pgSphere's native per-type GiST by ~3x at this scale.
+
+**Status: experimental, functionally complete for the point-in-region
+predicate, not yet a performance win over any incumbent path.** Beats Q3C
+soundly on cone search (~15-20x) and is a real, working, exact index
+descent where none existed before, but has not (yet) closed the gap to
+pgSphere on either cone search (~3.5-4x behind) or cross-match (~3x behind),
+and currently loses the planner's attention entirely on a table that also
+carries round eight's GIN index. Not yet measured: catalogue sizes at or
+near the 10-50M rows where the B-tree-rewrite's planning cost is largest
+relative to execution time (the regime this opclass should have its best
+chance of winning, per the paper's own diagnosis, since it pays no
+per-query covering-computation cost at all); and concurrent-write
+behaviour, `spgSplitTuple` in particular, which no other opclass in this
+file exercises. Prefix compression is real and load-bearing for correctness
+here, not merely an efficiency add-on the way it would be for a plain radix
+tree -- see `ext/src/spgist_region.c`'s file header for the full account.
