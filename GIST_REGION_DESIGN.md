@@ -1395,3 +1395,118 @@ trie over a skewed density field is the limit, as this file's rounds two,
 five, nine and ten found for the GiST opclass's own fanout, is untested)
 rather than the planning side, which is now a solved problem for this
 predicate.
+
+## Round twelve: wide-radix splitting, tried and measured -- reverted
+
+Round eleven ended by locating the SP-GiST opclass's remaining problem
+precisely: not planning (solved), but execution -- tree descent costs more
+buffer touches (14-99 at 10M rows) than the B-tree covering it was meant to
+replace (4-68 at the same radii). Its closing paragraph named a shallower
+tree, via real prefix compression, as the obvious next thing to try.
+
+**The idea**: `spg_healpix_choose`/`picksplit` decided one HEALPix order (a
+2-bit, up to 4-way digit) per tree level. Combining `SPLIT_WIDTH`
+consecutive orders into one combined digit -- up to 4^SPLIT_WIDTH-way
+branching per inner tuple -- divides tree depth, and so descent buffer
+touches, by roughly SPLIT_WIDTH, at the cost of more candidate children per
+`inner_consistent()` call. That trade looked safe because rejecting the
+extra candidates is pure in-memory trigonometry (`sc_region_classify()`),
+not I/O, unlike round nine's variable-length GiST key where the added
+per-page cost was itself on the critical path.
+
+**A fourth correctness bug, found before any performance measurement was
+trustworthy**: the first implementation derived a tuple's decision width
+from its stored `order` alone (`split_width(order)`, -1 -> 1, else
+`SPLIT_WIDTH`), on the claim that this was deterministic and needed no new
+per-tuple storage. It wasn't deterministic. `choose()`'s `spgSplitTuple`
+branch caps the new upper tuple's width by the *old* tuple's own
+established order (`Min(common_order + width, order)` -- the old content's
+digits beyond its own order live in its nodes, not in this prefix, so the
+upper tuple genuinely cannot decide anything deeper), and nothing let a
+later `choose()`/`inner_consistent()` call tell a capped tuple apart from a
+normal one using `order` alone. A sorted-insertion stress test at 50,000
+rows caught it directly: 2,869 false negatives, traced (the same
+`elog`-tracing/point-filtering method rounds ten and eleven used) to a
+point routed through an `order=1` tuple at insert time becoming unreachable
+at search time, because `inner_consistent` recomputed that tuple's span as
+the full `SPLIT_WIDTH` instead of the narrower width it was actually built
+with.
+
+**A second, latent bug found while designing the fix**: the existing
+`(order, pix)` prefix packed into one `int8`, with `pix` capped at 58 bits.
+A HEALPix NESTED id carries a face value (0-11) in bits *above* its
+`2*order` interleaved position bits, so a full id at order 28-29 needs up
+to 2*29+4 = 62 bits -- 4 more than the field had. This was never triggered
+by any reproduction used before now (all stayed too shallow, order
+0-15ish), but was always live: a large enough, dense enough cluster would
+have silently truncated real pixel ids.
+
+**The fix**: stop trying to fit `(order, width, pix)` into one `int8`'s
+bits at all. The prefix is now a small `bytea` (`SpgPrefixData`: two
+`int32`s and an `int64`, no packing), so `pix` stays the plain, full
+`sc_vec2pix()` value with no ceiling, and `width` is stored explicitly and
+read back verbatim by every later call -- never re-derived from `order`.
+`spgSplitTuple`'s capped case now just stores whatever width the cap
+actually produced; everything else (`choose()`'s normal-match branch,
+`inner_consistent()`) trusts the stored value and needs no further
+clamping. Re-verified after the fix: full regression suite, the specific
+previously-failing case (id=7272 against a region whose true match wide-
+radix had missed) now correct, the full 50,000-row x 160-region stress
+test (9.28M pairs, 0 mismatches both directions), and a fresh 10M-row x
+80-region correctness run identical in shape to round eleven's (2,496 true
+matches, 0 false positives, 0 false negatives).
+
+**The performance result, once correctness was no longer in question**:
+negative. Measured with the same `EXPLAIN (ANALYZE, BUFFERS)` cone-search
+harness round eleven used, at 10M rows, `SPLIT_WIDTH=3` (64-way) against
+`SPLIT_WIDTH=1` (the pre-experiment, single-order behaviour, rebuilt with
+the same bytea-prefix code to isolate the storage-format change from the
+wide-radix change itself):
+
+| radius | SPLIT_WIDTH=1 buffers | SPLIT_WIDTH=3 buffers | ratio |
+|---|---|---|---|
+| 1" | 14.5 | 15.6 | 1.08x |
+| 1' | 14.7 | 15.9 | 1.08x |
+| 30' | 47.1 | 99.5 | 2.11x |
+| 1deg | 98.8 | 278.1 | 2.82x |
+| 3deg | 472.3 | 1625.5 | 3.44x |
+
+`SPLIT_WIDTH=1`'s numbers reproduce round eleven's int8-prefix baseline
+almost exactly (14.3/14.7/46.7/98.7 there vs 14.5/14.7/47.1/98.8 here),
+confirming the regression is wide-radix's own effect, not the switch to a
+bigger prefix type. Execution time tracks the same pattern (e.g. 3.53ms vs
+0.99ms at 1deg, 14.6ms vs 7.4ms at 3deg), and the regression *grows* with
+query area rather than shrinking.
+
+**Why, in hindsight**: a PATRICIA trie's branching already tracks exactly
+where the data disagrees, at whatever order that happens to be -- that is
+the entire point of the from-scratch longest-common-prefix search rounds
+ten and eleven established. Forcing every decision to span `SPLIT_WIDTH`
+orders regardless inflates picksplit's node count (and so the index's
+total node/page count) past what the data's actual branch points need.
+That extra breadth is cheap for a query that lands cleanly inside one
+child, but a real cone or polygon query typically straddles a boundary at
+several levels, and at each one it must now classify and potentially
+descend into a wider set of siblings than a narrow split would have
+offered at that same point -- and a larger query region crosses more such
+boundaries, which is exactly the growing-with-radius shape measured above.
+
+**Where this leaves the opclass**: `SPLIT_WIDTH` is left at 1 in
+`ext/src/spgist_region.c` -- wide-radix splitting is implemented, correct,
+and measured worse, not removed outright, because the fix underneath it
+(explicit per-tuple width storage) is worth keeping independent of whether
+wide splitting itself pays off: it is what makes revisiting the idea safe
+to attempt again (e.g. a width chosen per-tuple from local density, rather
+than one constant for the whole tree) without re-deriving the same
+capped-width bug. Round eleven's own closing line ("real prefix compression
+already helps") was written before this measurement and is superseded by
+it: prefix compression, at least in this wide-radix form, does not help --
+it was the single biggest lever this file could identify for the descent
+cost, and it made descent cost worse. The opclass's standing verdict is
+otherwise unchanged from round eleven: planning cost is solved
+architecturally, execution cost is not, and after two attempts at the
+tree's shape (variable-length GiST keys in round nine, wide-radix SP-GiST
+here) that both made things worse, the more likely explanation is that a
+PATRICIA trie over this kind of skewed density field is close to its
+achievable shape already, the same conclusion this file's rounds two, five,
+nine and ten reached for the GiST opclass's own fanout.

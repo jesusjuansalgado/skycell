@@ -137,36 +137,147 @@
 #include "skycell_internal.h"
 
 /*
- * A prefix packs (order, pix) into one int8: order in the high bits (0..30,
- * where 30 is the "exhausted, genuinely all-the-same" sentinel one past
- * SC_MAX_ORDER), pix (up to 58 bits, order-29 pixel ids need 2*29=58) in the
- * low bits. order=-1 ("no ancestor established yet", the very first tuple)
- * is stored as 0 with pix ignored -- order is offset by +1 throughout so
- * the packed value is never negative.
+ * A prefix is (order, width, pix): "every leaf under this tuple is known to
+ * lie in HEALPix pixel `pix` at `order`" (order -1, pix irrelevant, for the
+ * very first tuple ever created; order TERMINAL_ORDER, one past
+ * SC_MAX_ORDER, for a genuinely exhausted all-the-same tuple), and this
+ * tuple's own nodes decide the next `width` orders as one combined digit
+ * (see WIDE-RADIX SPLITTING below). `pix` is the plain, full HEALPix NESTED
+ * pixel id sc_vec2pix() itself returns -- face included -- so classify()
+ * can use it directly with no reconstruction.
+ *
+ * This needs more than one int8's worth of bits: a NESTED id can carry a
+ * face value up to 11 in bits above its 2*order interleaved position bits,
+ * so a full id at order 29 needs up to 2*29+4 = 62 bits on its own, before
+ * `order` and `width` even get a look-in -- no single int8 field holds
+ * (order, width, pix) together for every order this opclass reaches. A
+ * previous version of this file packed (order, pix) into one int8 with
+ * pix capped at 58 bits; that silently truncated real pixel ids at
+ * order >= 28, a latent bug never triggered because no reproduction used
+ * before it was replaced ever built a tree that deep. Rather than continue
+ * squeezing bits, the prefix is a small bytea holding the three fields
+ * verbatim (SpgPrefixData below) -- a few bytes bigger per inner tuple, but
+ * with no ceiling to silently blow through.
  */
-#define PIX_BITS 58
-#define PACK_PREFIX(order, pix) \
-	((((int64) ((order) + 1)) << PIX_BITS) | ((pix) & ((INT64CONST(1) << PIX_BITS) - 1)))
-#define UNPACK_ORDER(p)	 (((int32) (((uint64) (p)) >> PIX_BITS)) - 1)
-#define UNPACK_PIX(p)	 ((int64) (p) & ((INT64CONST(1) << PIX_BITS) - 1))
+typedef struct SpgPrefixData
+{
+	int32		order;
+	int32		width;
+	int64		pix;
+} SpgPrefixData;
+
 #define TERMINAL_ORDER	 (SC_MAX_ORDER + 1)
 
-static inline int16
-healpix_digit(int order, sc_vec3 v)
+static inline Datum
+pack_prefix(int32 order, int32 width, int64 pix)
 {
-	int64		pix = sc_vec2pix(order, v);
+	bytea	   *b = (bytea *) palloc(VARHDRSZ + sizeof(SpgPrefixData));
+	SpgPrefixData pd;
 
-	return (order == 0) ? (int16) pix : (int16) (pix & 3);
+	pd.order = order;
+	pd.width = width;
+	pd.pix = pix;
+	SET_VARSIZE(b, VARHDRSZ + sizeof(SpgPrefixData));
+	memcpy(VARDATA(b), &pd, sizeof(SpgPrefixData));
+	return PointerGetDatum(b);
 }
 
-/* the digit at at_order implied by full_pix, a pixel value captured at the
- * (deeper-or-equal) stored_order */
-static inline int16
-pix_digit_at(int64 full_pix, int stored_order, int at_order)
+static inline void
+unpack_prefix(Datum d, int32 *order, int32 *width, int64 *pix)
 {
-	int64		shifted = full_pix >> (2 * (stored_order - at_order));
+	bytea	   *b = DatumGetByteaPP(d);
+	SpgPrefixData pd;
 
-	return (at_order == 0) ? (int16) shifted : (int16) (shifted & 3);
+	/* memcpy rather than casting VARDATA_ANY: nothing guarantees the int64
+	 * inside lands 8-byte aligned in memory. */
+	memcpy(&pd, VARDATA_ANY(b), sizeof(SpgPrefixData));
+	*order = pd.order;
+	*width = pd.width;
+	*pix = pd.pix;
+}
+
+/*
+ * WIDE-RADIX SPLITTING (tried, measured, not kept -- SPLIT_WIDTH is 1
+ * below): a node's decision does not have to be one HEALPix order (a 2-bit,
+ * up-to-4-way digit) at a time. Combining several consecutive orders into
+ * one combined digit (up to 4^width-way) makes each inner tuple decide that
+ * many orders at once, which does shrink tree depth by roughly `width`, on
+ * the theory that fewer, wider levels means fewer page reads per descent --
+ * classify() rejecting the extra candidates is pure in-memory trigonometry,
+ * no I/O, unlike round nine's variable-length GiST key where the added cost
+ * was itself on the critical path.
+ *
+ * Measured at 10M rows with SPLIT_WIDTH=3 against the same cone-search
+ * harness round eleven used (EXPLAIN (ANALYZE, BUFFERS)), buffer touches
+ * came out *higher* than SPLIT_WIDTH=1, and increasingly so as the query
+ * area grew: 15.6 vs 14.5 at 1", 15.9 vs 14.7 at 1', 99.5 vs 47.1 at 30'
+ * (2.1x), 278.1 vs 98.8 at 1deg (2.8x), 1625.5 vs 472.3 at 3deg (3.4x) --
+ * confirmed to be wide-radix's own effect, not the switch to a bytea prefix
+ * (rebuilding the SAME bytea-prefix code with SPLIT_WIDTH=1 reproduced
+ * round eleven's int8-prefix buffer counts almost exactly). The likely
+ * cause: a PATRICIA trie's own branching already tracks exactly where the
+ * data disagrees, at whatever order that happens to be; forcing every
+ * decision to cover `width` orders regardless inflates picksplit's node
+ * count (and thus the index's node/page count) past what the data actually
+ * needs, and that extra breadth costs more, for boundary-crossing range
+ * queries, than the shallower depth saves -- growing with query area
+ * because a bigger query crosses more of that inflated boundary. Left at
+ * SPLIT_WIDTH=1 (effectively single-order splits, the pre-experiment
+ * behaviour) rather than removing the mechanism entirely, since the
+ * explicit-width-storage fix below (SpgPrefixData.width) is worth keeping
+ * regardless of SPLIT_WIDTH -- it's what makes wide splitting *safe* to
+ * revisit, should a smarter version (e.g. width chosen per-tuple from
+ * local density rather than one constant) turn out to pay off later.
+ *
+ * split_width() below is only ever used to pick the *requested* width for a
+ * genuinely new, uncapped decision (picksplit's own new tuple). It is NOT a
+ * substitute for storing the width actually used: spgSplitTuple's upper
+ * tuple can be forced narrower than this by the old tuple's own established
+ * order (see choose() below), and once a tuple exists, whatever width it
+ * was actually built with is written into its prefix (SpgPrefixData.width
+ * above) and read back from there by every later choose()/inner_consistent()
+ * call on it -- never re-derived from `order` alone. An earlier version of
+ * this file tried exactly that re-derivation ("choose() has nowhere else to
+ * learn it, only the tuple's own base order, so split_width() is the single
+ * deterministic source of truth") and it was wrong: a capped split silently
+ * produces a tuple whose real width doesn't match what split_width(order)
+ * would predict, so reads using that prediction compute the wrong digit
+ * span and miss real matches. Caught at 50,000 rows via a sorted-insertion
+ * stress test (2869 false negatives) before this file ever claimed the
+ * technique worked.
+ */
+#define SPLIT_WIDTH 1
+#define MAX_NODES 64			/* max(12, 4^SPLIT_WIDTH); bump with SPLIT_WIDTH */
+
+static inline int
+split_width(int32 base_order)
+{
+	return (base_order < 0) ? 1 : SPLIT_WIDTH;
+}
+
+/* the combined digit spanning orders [from_order, to_order], computed fresh
+ * from a point's real coordinates */
+static inline int32
+wide_digit(int from_order, int to_order, sc_vec3 v)
+{
+	int64		pix = sc_vec2pix(to_order, v);
+
+	if (from_order == 0)
+		return (int32) pix;	/* order 0's full value already includes the
+								 * face, nothing to mask off */
+	return (int32) (pix & ((INT64CONST(1) << (2 * (to_order - from_order + 1))) - 1));
+}
+
+/* the same combined digit, extracted from a pix value already known at
+ * stored_order (>= to_order) rather than recomputed from a point */
+static inline int32
+wide_digit_from_pix(int64 full_pix, int stored_order, int from_order, int to_order)
+{
+	int64		shifted = full_pix >> (2 * (stored_order - to_order));
+
+	if (from_order == 0)
+		return (int32) shifted;
+	return (int32) (shifted & ((INT64CONST(1) << (2 * (to_order - from_order + 1))) - 1));
 }
 
 PG_FUNCTION_INFO_V1(spg_healpix_config);
@@ -176,7 +287,7 @@ spg_healpix_config(PG_FUNCTION_ARGS)
 	spgConfigIn *cfgin = (spgConfigIn *) PG_GETARG_POINTER(0);
 	spgConfigOut *cfg = (spgConfigOut *) PG_GETARG_POINTER(1);
 
-	cfg->prefixType = INT8OID;
+	cfg->prefixType = BYTEAOID;
 	cfg->labelType = INT2OID;
 	cfg->leafType = cfgin->attType;
 	cfg->canReturnData = false;
@@ -192,6 +303,7 @@ spg_healpix_choose(PG_FUNCTION_ARGS)
 	spgChooseOut *out = (spgChooseOut *) PG_GETARG_POINTER(1);
 	sc_vec3		v;
 	int32		order;
+	int32		width;
 	int64		pix;
 	int16		label;
 
@@ -223,8 +335,7 @@ spg_healpix_choose(PG_FUNCTION_ARGS)
 	}
 
 	Assert(in->hasPrefix);
-	order = UNPACK_ORDER(in->prefixDatum);
-	pix = UNPACK_PIX(in->prefixDatum);
+	unpack_prefix(in->prefixDatum, &order, &width, &pix);
 	v = skycell_pos_from_datum(in->datum);
 
 	/* this tuple's own prefix order must be < SC_MAX_ORDER (see picksplit's
@@ -241,6 +352,8 @@ spg_healpix_choose(PG_FUNCTION_ARGS)
 		 */
 		int32		common_order;
 		int64		common_pix = 0;
+		int32		upper_width;
+		int32		upper_to_order;
 		int16		old_label;
 		int16		new_label;
 
@@ -268,27 +381,52 @@ spg_healpix_choose(PG_FUNCTION_ARGS)
 		 * caught at 10M rows, where dense clusters make this path common
 		 * enough to hit (a smaller/sparser test can pass for a long time
 		 * without ever exercising a real split at all).
+		 *
+		 * Its requested width follows the same rule every other freshly
+		 * created tuple uses (split_width(common_order)), but gets capped by
+		 * `order`: the old content's digits beyond its own established order
+		 * live in ITS nodes, not in this prefix, so this tuple cannot decide
+		 * anything deeper than `order` either. Whatever width actually
+		 * results from that cap is what gets stored -- never re-derived
+		 * later from `common_order` alone (see the wide-radix comment above
+		 * split_width()).
 		 */
-		old_label = pix_digit_at(pix, order, common_order + 1);
-		new_label = healpix_digit(common_order + 1, v);
+		upper_width = Min(split_width(common_order), order - common_order);
+		upper_to_order = common_order + upper_width;
+		old_label = (int16) wide_digit_from_pix(pix, order, common_order + 1, upper_to_order);
+		new_label = (int16) wide_digit(common_order + 1, upper_to_order, v);
 		Assert(new_label != old_label);
 
 		out->resultType = spgSplitTuple;
 		out->result.splitTuple.prefixHasPrefix = true;
 		out->result.splitTuple.prefixPrefixDatum =
-			Int64GetDatum(PACK_PREFIX(common_order, common_pix));
+			pack_prefix(common_order, upper_width, common_pix);
 		out->result.splitTuple.prefixNNodes = 2;
 		out->result.splitTuple.prefixNodeLabels = (Datum *) palloc(sizeof(Datum) * 2);
 		out->result.splitTuple.prefixNodeLabels[0] = Int16GetDatum(old_label);
 		out->result.splitTuple.prefixNodeLabels[1] = Int16GetDatum(new_label);
 		out->result.splitTuple.childNodeN = 0;
 		out->result.splitTuple.postfixHasPrefix = true;
-		out->result.splitTuple.postfixPrefixDatum =
-			Int64GetDatum(PACK_PREFIX(order, pix));
+		/* the old tuple's content, position, and width are all unchanged --
+		 * only its place in the tree gains a new parent -- so reuse its
+		 * prefix datum verbatim rather than repacking it. */
+		out->result.splitTuple.postfixPrefixDatum = in->prefixDatum;
 		PG_RETURN_VOID();
 	}
 
-	label = healpix_digit(order + 1, v);
+	{
+		/*
+		 * `width` here is this tuple's OWN stored width, read at function
+		 * entry -- not split_width(order). It was fixed when this tuple was
+		 * created (by picksplit or by the spgSplitTuple branch above, in
+		 * either this call or an earlier one) and already reflects any
+		 * capping, so order+width is guaranteed <= SC_MAX_ORDER with no
+		 * further clamping needed here.
+		 */
+		int32		to_order = order + width;
+
+		label = (int16) wide_digit(order + 1, to_order, v);
+	}
 
 	for (int i = 0; i < in->nNodes; i++)
 	{
@@ -355,14 +493,14 @@ spg_healpix_picksplit(PG_FUNCTION_ARGS)
 	{
 		sc_vec3		v0 = skycell_pos_from_datum(in->datums[0]);
 
-		first_label = healpix_digit(candidate_order, v0);
+		first_label = (int16) wide_digit(candidate_order, candidate_order, v0);
 		labels[0] = first_label;
 		diverged = false;
 		for (int i = 1; i < in->nTuples; i++)
 		{
 			sc_vec3		v = skycell_pos_from_datum(in->datums[i]);
 
-			labels[i] = healpix_digit(candidate_order, v);
+			labels[i] = (int16) wide_digit(candidate_order, candidate_order, v);
 			if (labels[i] != first_label)
 				diverged = true;
 		}
@@ -379,7 +517,7 @@ spg_healpix_picksplit(PG_FUNCTION_ARGS)
 	{
 		/* every point agrees all the way to SC_MAX_ORDER: real duplicates */
 		out->hasPrefix = true;
-		out->prefixDatum = Int64GetDatum(PACK_PREFIX(TERMINAL_ORDER, 0));
+		out->prefixDatum = pack_prefix(TERMINAL_ORDER, 0, 0);
 		out->nNodes = 1;
 		out->nodeLabels = (Datum *) palloc(sizeof(Datum));
 		out->nodeLabels[0] = Int16GetDatum(0);
@@ -390,13 +528,31 @@ spg_healpix_picksplit(PG_FUNCTION_ARGS)
 
 	{
 		sc_vec3		v0 = skycell_pos_from_datum(in->datums[0]);
-		int64		ancestor_pix = (candidate_order > 0)
-			? sc_vec2pix(candidate_order - 1, v0) : 0;
-		int16		distinct[12];
+		int32		base_order = candidate_order - 1;
+		int64		ancestor_pix = (base_order >= 0)
+			? sc_vec2pix(base_order, v0) : 0;
+		int32		nominal_width = split_width(base_order);
+		int32		to_order = Min(candidate_order + nominal_width - 1, SC_MAX_ORDER);
+		int32		actual_width = to_order - base_order;
+		int16		distinct[MAX_NODES];
 		int			ndistinct = 0;
 
+		/*
+		 * labels[] currently holds the single-order digit at candidate_order
+		 * (just enough to find where the batch disagrees, above); the
+		 * actual node labels combine every order from there out to
+		 * to_order (see the wide-radix comment above choose()), so
+		 * recompute them now that the span is known.
+		 */
+		for (int i = 0; i < in->nTuples; i++)
+		{
+			sc_vec3		v = skycell_pos_from_datum(in->datums[i]);
+
+			labels[i] = (int16) wide_digit(candidate_order, to_order, v);
+		}
+
 		out->hasPrefix = true;
-		out->prefixDatum = Int64GetDatum(PACK_PREFIX(candidate_order - 1, ancestor_pix));
+		out->prefixDatum = pack_prefix(base_order, actual_width, ancestor_pix);
 
 		out->mapTuplesToNodes = (int *) palloc(sizeof(int) * in->nTuples);
 		for (int i = 0; i < in->nTuples; i++)
@@ -413,6 +569,7 @@ spg_healpix_picksplit(PG_FUNCTION_ARGS)
 			}
 			if (nodeidx < 0)
 			{
+				Assert(ndistinct < MAX_NODES);
 				nodeidx = ndistinct;
 				distinct[ndistinct++] = labels[i];
 			}
@@ -436,6 +593,7 @@ spg_healpix_inner_consistent(PG_FUNCTION_ARGS)
 	spgInnerConsistentIn *in = (spgInnerConsistentIn *) PG_GETARG_POINTER(0);
 	spgInnerConsistentOut *out = (spgInnerConsistentOut *) PG_GETARG_POINTER(1);
 	int32		order;
+	int32		width;
 	int64		pix;
 	bool		terminal;
 	sc_region	reg;
@@ -450,8 +608,7 @@ spg_healpix_inner_consistent(PG_FUNCTION_ARGS)
 	 * node, unconditionally, with no classify()-based pruning.
 	 */
 	Assert(in->hasPrefix);
-	order = UNPACK_ORDER(in->prefixDatum);
-	pix = UNPACK_PIX(in->prefixDatum);
+	unpack_prefix(in->prefixDatum, &order, &width, &pix);
 	terminal = in->allTheSame || (order >= TERMINAL_ORDER);
 
 	if (!terminal && in->nkeys > 0)
@@ -463,23 +620,36 @@ spg_healpix_inner_consistent(PG_FUNCTION_ARGS)
 	keep = (int *) palloc(sizeof(int) * in->nNodes);
 
 	{
-		int64	   *child_pixes = (int64 *) palloc(sizeof(int64) * in->nNodes);
+		/*
+		 * to_order/shift are only meaningful -- and order is only a real
+		 * order, not the TERMINAL_ORDER sentinel or an untrustworthy
+		 * allTheSame value -- when !terminal; computing them unconditionally
+		 * for a terminal tuple (order could be 30, past SC_MAX_ORDER) would
+		 * make to_order < order and shift negative, undefined behaviour in
+		 * C. Every node is kept unconditionally when terminal regardless
+		 * (see above), so child_pix is simply not needed in that case.
+		 *
+		 * `width` is this tuple's own stored width (read above), already
+		 * reflecting whatever cap applied when it was created -- not
+		 * split_width(order) -- so to_order needs no further clamping
+		 * either (see the wide-radix comment above choose()).
+		 */
+		int32		to_order = terminal ? 0 : order + width;
+		int32		shift = terminal ? 0 : 2 * (to_order - order);
 
 		for (int i = 0; i < in->nNodes; i++)
 		{
-			int64		child_pix = (order < 0)
-				? DatumGetInt16(in->nodeLabels[i])
-				: (pix << 2) | DatumGetInt16(in->nodeLabels[i]);
-
 			if (!terminal && have_reg)
 			{
+				int64		child_pix = (order < 0)
+					? DatumGetInt16(in->nodeLabels[i])
+					: (pix << shift) | DatumGetInt16(in->nodeLabels[i]);
 				double		fo;
-				sc_class	cls = sc_region_classify(&reg, order + 1, child_pix, &fo);
+				sc_class	cls = sc_region_classify(&reg, to_order, child_pix, &fo);
 
 				if (cls == SC_OUT)
 					continue;
 			}
-			child_pixes[nkeep] = child_pix;
 			keep[nkeep++] = i;
 		}
 
@@ -494,8 +664,6 @@ spg_healpix_inner_consistent(PG_FUNCTION_ARGS)
 			out->levelAdds[j] = 1;
 			out->traversalValues[j] = NULL;
 		}
-
-		pfree(child_pixes);
 	}
 
 	if (have_reg)
