@@ -1713,3 +1713,103 @@ sorting/indexing each key's own sub-caps so overlap search is sub-quadratic,
 or a fundamentally different key shape) is the more promising version of
 "sharper key" left untried -- see the handoff summary at the top of this
 file (SPATIAL_INDEXING_HANDOFF.md) for the full open-questions list.
+
+## Round sixteen: the density-adaptive covering path, dug into and parked --
+## a real bug found and fixed, but not a validated win, and a bigger
+## question opened along the way
+
+Prompted by an external proposal to build an "adaptive, density-aware
+hierarchical HEALPix covering" for `cover.c`'s cone-search path. Before
+writing anything new, checked whether the mechanism being proposed already
+existed: it does. `sc_cover_compute()` has always had two paths --
+`cover_cone_direct()`, the default for every cone (`p->direct=1`, covers
+every radius tested anywhere in this file, including 3deg), which picks one
+global target order and uniformly subdivides to it; and a heap-based
+`refine:` loop (the fallback for polygons, or when `cover_cone_direct`
+bails), which already does real per-cell adaptive KEEP-vs-SPLIT decisions
+using the density map. The proposal's own Phase 1 ("expose reusable
+`cover_cost`/`cover_split_cost` helpers") would have duplicated ~150 lines
+that already exist. This alone was worth surfacing before any code got
+written.
+
+**Phase 0: does the existing adaptive path already fix the 3deg gap round
+eleven found?** 10M rows, 40 real 3deg cone queries, `cover_cone_direct`
+(shipped) vs. the `refine` loop (forced on via `p->direct=0`), `EXPLAIN
+(ANALYZE, BUFFERS)`. On 39 of 40 queries: a wash (7.08ms vs 7.24ms
+execution, refine's buffers slightly better) plus a real, consistent
+planning-time tax for refine (~1.28ms vs ~0.45ms). **One query -- a 3deg
+cone landing on an exceptional density overlap, 137,535 true matches --
+was 5-7x worse under refine** (62-71ms -> 393-436ms), tracing back to 50
+generated ranges against direct's 21 for a similar total candidate volume.
+
+**Root cause, found by enabling `cover.c`'s own pre-existing `SC_COVER_TRACE`
+facility** (unused elsewhere in this codebase until now) directly against
+the failing query: of 362 split decisions, 85 (23%) had `removed == 0`
+(nothing excluded, zero benefit) and were accepted purely through the
+`delta <= 0 && P.pot > p->range_cost` fallback ("no extra ranges now, worth
+looking deeper"). All 85 had no `SC_OUT` child at all -- `potential()`
+scores a cell by expected row count alone, with no signal for whether
+genuine boundary uncertainty remains, so deep inside a dense cluster's
+interior (where density, and so `pot`, stays high at every order) the
+fallback keeps recommending "worth looking deeper" for many consecutive
+levels even once there is provably no false-positive area left nearby to
+exclude -- cascading 5+ extra levels deep, purely fragmenting the covering
+for no selectivity gain.
+
+**The fix**: a bounded "dry streak" on each heap candidate -- at most
+`SC_COVER_MAX_DRY_STREAK` (2) consecutive ancestor levels with
+`removed == 0` before the density-only fallback stops firing and the cell
+is just kept as one range instead. Not a removal of the fallback (a genuine
+boundary can be a level or two away without any individual step yet
+excluding area, so some speculative depth is worth keeping) -- a cap on how
+far pure density alone is allowed to justify continued speculation.
+Implemented, correctness-verified (full regression suite; the standalone
+`cover_selftest` harness, 0 false negatives across ~900,000 polygon-sample
+points and 30,000x200 cone samples; the exact failing query re-checked
+against brute truth). Mechanism-level verification confirmed the diagnosis
+exactly: zero-gain splits for the failing query dropped from 85 to 43
+(49% fewer), ranges from 50 to 37 (26% fewer).
+
+**But the net result did not validate as a win, and testing beyond the one
+query that started this found something more consequential.** Two nearby
+query centers (qids 64 and 74, all three sitting within a few degrees of
+each other -- one exceptionally dense region of this synthetic corpus)
+that were *fine* before the fix (25-26ms) got *dramatically worse* after it
+(287-298ms). Splitting the cause with parallelism forced off
+(`max_parallel_workers_per_gather=0`) for a clean, apples-to-apples read
+found two separate effects tangled together:
+
+1. **A genuine quality regression from the fix itself**, non-parallel:
+   226ms (direct) vs 317ms (refine, fixed) for query 64 -- the dry-streak
+   cap cuts off refinement too early in some cases, leaving a covering with
+   more false-positive rows than either the original refine algorithm or
+   direct produced there. `SC_COVER_MAX_DRY_STREAK=2` is not correctly
+   calibrated against more than the single query that motivated it --
+   exactly the mistake this file's own rounds two and fifteen already
+   warned against (never trust a fix measured on one query or one metric).
+2. **A separate, likely bigger effect, independent of the fix or the
+   density-only-fallback bug entirely**: direct's covering shape
+   parallelizes beautifully (226ms -> 55ms, a 4x speedup from
+   `max_parallel_workers_per_gather`'s default) while refine's -- fixed or
+   not -- barely parallelizes at all (317ms -> 298ms, ~6%). This is about
+   how PostgreSQL's parallel bitmap heap scan divides work across workers
+   relative to range *shape*, not about false-positive count or range
+   count at all, and it was invisible in the Phase 0 numbers above because
+   those never isolated parallel from non-parallel execution.
+
+**Parked, not shipped.** The dry-streak fix is a real, correctly-targeted
+fix for a real, precisely diagnosed bug (verified at the mechanism level:
+it does exactly what it was built to do), but it is not a validated
+improvement to net query time, and it was never checked against the
+refine path's actual existing callers (polygon coverings) at all this
+round -- shipping it as-is risked trading one under-tested regression for
+another. Reverted rather than merged, matching this file's standing
+practice for anything that does not clear its own bar (rounds nine, twelve,
+fourteen, fifteen). What's worth keeping from this round is not the patch
+but the two findings: the precise mechanism behind unbounded density-driven
+fragmentation (documented here and in the reverted diff's own commit
+history), and the previously-unknown parallel-bitmap-scan sensitivity to
+covering shape, which looks like a bigger lever than anything in the
+original 3deg-gap question and is completely unexplored. See
+`SPATIAL_INDEXING_HANDOFF.md` for this round folded into the open-questions
+list.

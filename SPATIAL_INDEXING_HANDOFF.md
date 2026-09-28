@@ -155,33 +155,87 @@ skycell wins at every radius except the largest tested. The likely mechanism
 advantage is locality-preserving ranges being cheap to scan; at large query
 sizes the covering needs more/coarser ranges and the scan becomes more
 scattered, while pgSphere's balanced GiST R-tree keeps doing compact
-descents regardless of query size. **Nobody has profiled *why* specifically**
-(is it range count, false-positive rate, page scatter, something else?) —
-this is a concrete, scoped, still-open question distinct from everything in
-§3/§4.
+descents regardless of query size.
+
+**Round sixteen dug into this directly** (prompted by an external proposal
+to build a new "adaptive density-aware covering" -- worth reading in full in
+`GIST_REGION_DESIGN.md`, summarized here). First finding, before any code:
+the proposed mechanism already exists. `cover.c`'s `sc_cover_compute()` has
+always had a `refine:` heap-based path (currently used only for polygons,
+or when the cone fast path bails) that already does real per-cell
+adaptive KEEP-vs-SPLIT decisions using the density map -- the *default*
+cone path (`cover_cone_direct()`, used at every radius including 3°)
+instead picks one global target order and subdivides uniformly. Testing
+whether routing cones through the existing adaptive path already closes
+the gap (10M rows, 40 real 3° queries, `EXPLAIN (ANALYZE, BUFFERS)`) found:
+a wash on 39 of 40 queries, but one query (an exceptional density overlap,
+137,535 true matches) was 5-7x worse under the adaptive path (62-71ms ->
+393-436ms), from generating 50 ranges against the direct path's 21 for a
+similar candidate volume.
+
+Traced with `cover.c`'s own pre-existing `SC_COVER_TRACE` facility directly
+against the failing query and found a precise, real bug: of 362 split
+decisions, 85 (23%) excluded *zero* false-positive area yet were accepted
+anyway, through a `delta <= 0 && pot > range_cost` fallback ("no extra
+ranges now, worth looking deeper") that scores a cell by expected row count
+alone, with no signal for whether real boundary uncertainty remains --
+inside a dense cluster's interior, where density stays high at every order,
+this cascades many levels deep for zero benefit. A targeted fix (cap
+consecutive "no progress" levels a lineage is allowed to chase on density
+alone) verified the mechanism exactly (zero-gain splits and range count
+both dropped substantially for the failing query) but did **not** validate
+as a net win: two *nearby* query centers that were fine before the fix
+regressed badly after it (25-26ms -> 287-298ms), and splitting that
+regression apart (parallelism forced off for a clean read) surfaced a
+second, separate, arguably bigger effect entirely independent of the
+density-fallback bug: **the direct path's covering shape parallelizes
+beautifully (4x speedup from PostgreSQL's parallel bitmap heap scan) while
+the adaptive path's -- fixed or not -- barely parallelizes at all (~6%)**.
+That's about how ranges of a given shape divide across parallel workers,
+not about false-positive count or range count, and it was invisible in the
+39-of-40-queries-are-fine read above because that never isolated parallel
+from non-parallel execution. Parked: the fix was reverted (not validated,
+and never checked against the adaptive path's actual existing callers --
+polygon coverings -- at all), but both findings (the precise density-vs-
+boundary-uncertainty conflation, and the parallel-scan shape sensitivity)
+are now on record. **Nobody has profiled the parallel-scan-sensitivity
+finding further** -- it looks like the more promising lead of the two.
 
 ## 6. Open questions and concrete untried directions
 
 In rough order of how well-scoped/promising they seem from this history,
 not in priority order — pick what matches the actual goal:
 
-1. **Diagnose the B-tree-vs-pgSphere 3°+ gap directly** (§5). Nobody has
-   run `EXPLAIN (ANALYZE, BUFFERS)` specifically comparing the B-tree
-   covering's range count/scatter against pgSphere's descent at large
-   radii. This is the most concretely scoped, least-explored item here.
-2. **A sub-quadratic overlap test for the region GiST multi-cap key**
+1. **Why does covering shape affect parallel bitmap-scan speedup so much?**
+   (§5, round sixteen's own standout finding.) The direct cone path's
+   covering (21 ranges, one query center) parallelized 4x; the adaptive
+   path's covering (37-50 ranges, same query) barely parallelized at all
+   (~6%), independent of false-positive rate or absolute range count being
+   "better" or "worse." Nobody has looked at *why* -- whether it's
+   per-range row-count balance across workers, how PostgreSQL's bitmap
+   scan partitions page ranges among workers, or something else. This now
+   looks like a bigger lever on the original 3°+ gap (§5) than covering
+   *quality* does, and it's completely unexplored.
+2. **Recalibrate `SC_COVER_MAX_DRY_STREAK`** (round sixteen's reverted fix,
+   `cover.c`) against a broad query set, not one failing query -- the
+   underlying bug (density alone justifying unbounded speculative
+   refinement in a cell with no boundary nearby) is real and precisely
+   diagnosed; the specific cap chosen (2) demonstrably regressed a nearby
+   case. Also untested against the adaptive path's actual existing callers
+   (polygon coverings) at all.
+3. **A sub-quadratic overlap test for the region GiST multi-cap key**
    (§3, round fifteen's own conclusion). The O(MAX_SUBCAPS²) all-pairs
    check is what capped the profitable cap count at ~4. A key whose own
    sub-caps are spatially sorted/indexed (even something as simple as
    sorting by one coordinate and using it to skip non-overlapping pairs)
    could let MAX_SUBCAPS grow without paying the full quadratic cost —
    untried.
-3. **A `min_area` field for `CONTAINED_BY_REGION` (`<@`)**, the mirror of
+4. **A `min_area` field for `CONTAINED_BY_REGION` (`<@`)**, the mirror of
    round fourteen's reverted `max_area` idea — except `<@` already wins
    against pgSphere at both scales tested (round seven), so this is lower
    priority; worth checking only if a future benchmark finds `<@` losing
    somewhere round seven didn't test.
-4. **A bulk-loaded, statically-packed structure for the point predicate**,
+5. **A bulk-loaded, statically-packed structure for the point predicate**,
    instead of the point SP-GiST's incremental `choose`/`picksplit`
    construction (flagged, not attempted, when round twelve/thirteen closed
    out — see the "so, the conclusion is that SP-GiST is a dead end?"
@@ -190,7 +244,7 @@ not in priority order — pick what matches the actual goal:
    risks converging on "just reimplement the B-tree as an index AM" —
    flagged as the one idea with a real mechanism behind it that hasn't
    been measured, not as something expected to obviously win.
-5. **Real survey-footprint sparsity** for the point SP-GiST's covering-walk
+6. **Real survey-footprint sparsity** for the point SP-GiST's covering-walk
    idea (round thirteen's own caveat): the corpus used throughout this
    whole investigation is synthetic with a substantial uniform-sky
    component, so it has no true coverage gaps. A real archive's actual
@@ -198,7 +252,7 @@ not in priority order — pick what matches the actual goal:
    low-density sky) might make round thirteen's "0% empty cells" result
    corpus-specific rather than general — untested, no corpus available in
    this repo to test it with.
-6. **`skycell.probe_orders`** (`cover.c`): an existing, off-by-default GUC
+7. **`skycell.probe_orders`** (`cover.c`): an existing, off-by-default GUC
    for scoring several candidate covering orders instead of trusting the
    closed-form choice — its own code comment says forcing a finer order
    directly measures a real 30-48% win at 6'-30' that the *scored* probe
@@ -217,5 +271,9 @@ not in priority order — pick what matches the actual goal:
   negative result (`SPLIT_WIDTH=1`, effectively single-order splits; the
   bytea-prefix/explicit-width fix from round twelve is real and kept even
   though wide splitting itself isn't used).
+- B-tree covering path (`cover.c`): shipped as-is (`p->direct=1`, the
+  non-adaptive cone fast path, unchanged for every radius). Round sixteen's
+  dry-streak fix to the adaptive fallback path was reverted, not validated
+  as a net win — see §5.
 - `GIST_REGION_DESIGN.md` is the source of truth for exact numbers, code
   reasoning, and anything this summary compressed or left out.
