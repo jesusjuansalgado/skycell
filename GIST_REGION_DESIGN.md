@@ -1230,3 +1230,168 @@ behaviour, `spgSplitTuple` in particular, which no other opclass in this
 file exercises. Prefix compression is real and load-bearing for correctness
 here, not merely an efficiency add-on the way it would be for a plain radix
 tree -- see `ext/src/spgist_region.c`'s file header for the full account.
+
+## Round eleven: three more correctness bugs found at scale, and the
+## planning-cost verdict at 10M rows
+
+Round ten's SP-GiST opclass was correctness-verified at 50,000 rows (a
+6-million-pair stress test, then a dedicated sorted-insertion reproduction
+of the bug it found). Asked to test it at 10M rows -- the scale the
+planning-cost argument for building it in the first place was actually
+about -- `CREATE INDEX ... USING spgist (pos)` failed outright:
+`ERROR: cannot add a node to an allTheSame inner tuple`. Three more real
+bugs, found by bisecting the reproduction down from 10M rows to as few as
+500,000 (dense clusters, not raw row count, are what triggers them -- the
+scale that matters is "how many points end up sharing a very deep common
+ancestor", not table size) and instrumenting `choose()`/`picksplit()`
+directly. All three are now fixed, and `ext/src/spgist_region.c`'s file
+header has the permanent account; summarised here for the record:
+
+1. **`in->level` drift past `SC_MAX_ORDER`.** `picksplit`'s
+   longest-common-prefix search started from `in->level`, trusting it as a
+   lower bound on the batch's already-guaranteed-common order. `spgSplitTuple`
+   breaks that trust: a split inserts an extra tree hop whose own decision
+   can land at a much shallower order than the hop implies, so hop count and
+   true order permanently diverge once enough splits accumulate -- in
+   either direction. Un-clamped, this fed an order past 29 straight into
+   `sc_vec2pix()`, out of its valid domain. Clamping the start to
+   `SC_MAX_ORDER` stopped the crash but not the bug: the opposite drift
+   (hop count *undershooting* the true order) made the search start already
+   past a point the batch genuinely disagreed on, silently manufacturing a
+   bogus "all-the-same" tuple. Fixed by not trusting `in->level` at all --
+   the search now always starts fresh at order 0, which costs at most 30
+   harmless re-checks of orders every ancestor already confirmed, negligible
+   next to one page read.
+
+2. **A split's upper tuple was created with only one node.** `spgSplitTuple`
+   handed the new upper tuple the old content's single label, planning to
+   `spgAddNode` the new point's (necessarily different) label on the
+   re-invocation `choose()` gets right after a split. That re-invocation hit
+   the exact wall this whole design exists to work around: the SP-GiST core
+   marks *any* freshly created `nNodes==1` inner tuple all-the-same, whether
+   `picksplit` or `spgSplitTuple` created it, and then refuses `spgAddNode`
+   against it. Fixed by giving the new upper tuple both labels atomically
+   (`prefixNNodes = 2`) from the start.
+
+3. **The SP-GiST core synthesises its own all-the-same placeholders.** Even
+   with (1) and (2) fixed, the crash persisted. `elog` tracing caught the
+   actual cause directly: a node freshly created by `spgAddNode`, on
+   receiving its first leaves, gets wrapped by the *core* in a placeholder
+   inner tuple -- also marked all-the-same, also refusing `spgAddNode` --
+   without ever calling this opclass's `picksplit`. Observed with 8 node
+   slots, all labelled 0, a shape this opclass's own `picksplit` can never
+   produce (every real split emits genuinely distinct labels only). Since
+   neither this placeholder's prefix nor its labels reflect real content,
+   the only universally safe response is the one the access method actually
+   documents: whenever `in->allTheSame` is set, match the single existing
+   node unconditionally, without inspecting its prefix or labels at all, and
+   trust that the next real overflow on that bucket -- now driven by a true
+   from-scratch search, not a per-level guess -- untangles whatever
+   accumulated there. `choose()` and `inner_consistent()` both check
+   `in->allTheSame` first, ahead of every other branch.
+
+All three were invisible at 50,000 rows -- small enough that no bucket ever
+accumulated the density needed to exercise them -- and reliably reproduced
+between 500,000 and 1,000,000 rows once real clusters (this benchmark
+corpus's own `\sigma \le 0.02\deg` cores) got dense enough. Re-verified after
+the fix: full regression suite, the sorted-insertion stress test from round
+ten (0 mismatches), and a fresh one at genuine 10M-row scale --
+10,000,000 points x 80 mixed circle/polygon regions (deliberately
+including near-pole clusters, RA=0/360 wraparound, sizes spanning three
+orders of magnitude), 2,496 true matches, 0 false positives, 0 false
+negatives in either direction against `skycell_pos_in_region` run directly.
+
+### The planning-cost question, answered
+
+Round ten's opclass exists to test one specific claim from the paper
+(`response-to-referee-2.md`, `body.tex` \S\ref{sec:phase}): that
+`skycell`'s planning cost -- computing a cost-based covering before every
+query -- is "the whole of skycell's disadvantage at 6 arcmin" against
+pgSphere, and that an SP-GiST index descent would remove it architecturally
+rather than amortise it. Tested directly, at 10M rows, with
+`EXPLAIN (ANALYZE, BUFFERS)` splitting planning from execution
+(`bench/03_cone.sql`'s own harness, extended with a `skycell_spg` arm):
+
+| radius | method | plan ms | exec ms | plan % | buffers |
+|---|---|---|---|---|---|
+| 1" | pgSphere | 0.019 | 0.037 | 33% | 5.9 |
+| 1" | skycell (B-tree rewrite) | 0.032 | 0.017 | **66%** | 4.2 |
+| 1" | **skycell_spg (this opclass)** | 0.022 | 0.175 | **11%** | 14.3 |
+| 1' | skycell | 0.035 | 0.023 | 60% | 5.0 |
+| 1' | skycell_spg | 0.021 | 0.218 | 9% | 14.7 |
+| 30' | skycell | 0.084 | 0.251 | 25% | 32.3 |
+| 30' | skycell_spg | 0.034 | 0.988 | 3% | 46.7 |
+| 1\deg | skycell | 0.156 | 0.806 | 16% | 68.1 |
+| 1\deg | skycell_spg | 0.037 | 2.343 | 2% | 98.7 |
+
+**The architectural claim is confirmed exactly as stated**: this SP-GiST
+opclass cuts skycell's planning share from 60-66% down to 9-11% at the
+smallest radii, and its absolute planning time is consistently the lowest
+of the three PostgreSQL-native methods measured (0.022ms vs pgSphere's
+0.019-0.040ms and skycell's 0.032-0.245ms) -- a single index qual really
+is cheaper to plan than either a GiST predicate or a cost-based covering.
+
+**It does not translate into a win**, and the same table says why:
+`skycell_spg`'s *execution* time is 5-10x its own planning saving, and 3-10x
+pgSphere's or skycell's execution at the same radius -- 14-99 buffer touches
+against skycell's 4-68 and pgSphere's 6-471 at the same radii. The wall-clock
+comparison across all five tested radii (1", 1', 30', 1\deg, 3\deg):
+
+| method | 1" | 1' | 30' | 1\deg | 3\deg |
+|---|---|---|---|---|---|
+| pgSphere | 0.070 ms | 0.070 ms | 0.363 ms | 1.026 ms | 6.314 ms |
+| skycell (B-tree rewrite) | 0.061 ms | 0.064 ms | 0.293 ms | 0.661 ms | 9.976 ms |
+| **skycell_spg** | 0.205 ms | 0.231 ms | 1.199 ms | 2.608 ms | 13.578 ms |
+| Q3C | 3.271 ms | 3.085 ms | 3.270 ms | 3.673 ms | 14.829 ms |
+
+skycell_spg is slower than both pgSphere and skycell's own existing path at
+every radius tested (2.9-3.6x pgSphere, 3.2-3.9x skycell at the small end,
+narrowing to ~1.4x and ~1.0x at 3\deg where execution dominates and
+skycell's own B-tree-range approach is doing more scattered I/O than
+pgSphere's compact GiST). It remains well ahead of Q3C throughout (2.7-16x).
+
+**Why the saved planning time doesn't show up as a win**: skycell's
+existing B-tree rewrite was never planning-bound in absolute terms -- 0.02-
+0.16ms of planning bought a *very* cheap execution (4-68 buffers, mostly
+sequential B-tree range scans against a pre-computed, density-tuned
+covering). This opclass removes that 0.02-0.16ms, correctly, but pays for
+it with a tree descent that costs more buffers than the covering it
+replaced (14-99 against skycell's 4-68) -- a PATRICIA trie over 10M points'
+worth of HEALPix structure is simply a taller, more scattered structure to
+walk than a handful of pre-computed, contiguous B-tree ranges. The
+architecture the paper proposed genuinely removes the cost it targeted;
+what it does not do, at least in this first implementation, is replace it
+with something cheaper than what a good *B-tree* covering already was.
+
+**Index build, at the same 10M-row scale** (table already sorted along the
+HEALPix curve for all four, so this isolates the index step alone):
+
+| method | build time | index size |
+|---|---|---|
+| Q3C | 6.1 s | 214.2 MB |
+| skycell (B-tree) | 4.4 s | 214.2 MB |
+| **skycell_spg** | 28.6 s | 449.3 MB |
+| pgSphere (GiST) | 90.9 s | 684.7 MB |
+
+Consistent with round ten's 50,000-row numbers: smaller and roughly 3x
+faster to build than pgSphere, but bigger and slower than the B-tree this
+opclass was hoping to make unnecessary.
+
+**Where this leaves the opclass**: correctness is now solid at the scale
+that matters (10M rows, dense clusters, verified both by construction --
+regression suite, two independent stress tests -- and by the specific
+condition that broke it originally). The architectural hypothesis behind
+building it is *confirmed*, not just plausible: planning cost really can be
+removed this way, and the measurement proving that is now real, not
+proposed. But the net result at 10M rows is unchanged from round ten's
+50,000-row read: this is not (yet) a win over either incumbent path, and
+the reason is now precisely located -- in the execution cost of the
+descent itself, not in planning, which is exactly where round ten's own
+50,000-row numbers already pointed (plan_pct was never the whole story
+there either). Any further work on this opclass should target *that*: a
+shallower or better-cached tree (real prefix compression already helps;
+whether it helps enough, or whether the fundamental shape of a PATRICIA
+trie over a skewed density field is the limit, as this file's rounds two,
+five, nine and ten found for the GiST opclass's own fanout, is untested)
+rather than the planning side, which is now a solved problem for this
+predicate.

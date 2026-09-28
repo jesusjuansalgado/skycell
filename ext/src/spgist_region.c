@@ -32,66 +32,84 @@
  * mechanism (a bucket the index genuinely cannot resolve further).
  *
  * WHY A PLAIN "ONE ORDER PER LEVEL, NO PREFIX" TREE IS UNSOUND (not just
- * slower) for this opclass, found empirically before it was reasoned out: a
- * physically HEALPix-sorted table missed 2 of 3 true matches on a cone
- * query that an unsorted build of the identical rows answered correctly.
- * SP-GiST's own core marks a freshly created inner tuple "all-the-same"
- * whenever picksplit reports only one node, and once marked, the core
- * refuses to let choose() add a new node to it (spgAddNode on an
- * all-the-same tuple is a hard error) -- choose() is instead expected to
- * dump anything that arrives there into that one node regardless of its
- * real label, on the documented assumption that "the eventual PickSplit
- * call will re-sort things out". That assumption only holds if "one node"
- * genuinely means "provably indistinguishable forever", which a *fixed*
- * one-order-at-a-time split cannot promise: a small overflow batch at some
- * deep order is often locally homogeneous (one digit) purely because of
- * insertion order or a dense cluster, not because every point that could
- * ever land there shares that digit. A later, genuinely different point
- * then has no legal way to be routed correctly, and is forced into that
- * node's subtree anyway -- inner_consistent's classify() calls downstream
- * of that node then run against the WRONG assumed pixel and can prune a
- * leaf a correct pixel would not have pruned.
+ * slower) for this opclass, found empirically before any of this was
+ * reasoned out: a physically HEALPix-sorted table missed 2 of 3 true
+ * matches on a cone query that an unsorted build of the identical rows
+ * answered correctly. SP-GiST's own core marks a freshly created inner
+ * tuple "all-the-same" whenever picksplit reports only one node, and once
+ * marked, the core refuses to let choose() add a new node to it (spgAddNode
+ * against an all-the-same tuple is a hard error). A *fixed* one-order-at-a-
+ * time split cannot avoid reporting "one node" for batches that are not
+ * genuinely indistinguishable: a small overflow batch at some deep order is
+ * often locally homogeneous (one digit) purely by chance of insertion order
+ * or a dense cluster, not because every point that could ever land there
+ * shares that digit -- and once that happens, a later, genuinely different
+ * point has no legal way to be routed correctly.
  *
- * The real, general fix is exactly the standard PATRICIA-trie discipline
- * (the same one the built-in inet_ops spgist opclass uses for address
- * bits): a tuple is only ever created at a point where the current batch
- * *actually* branches (picksplit searches forward, order by order, for the
- * first point of real disagreement, however far that is -- see below), so
- * "one node" is only ever reported when the batch is truly identical all
- * the way to SC_MAX_ORDER. That in turn means choose() must be able to
- * detect a later point whose true ancestor diverges from a tuple's stored
- * prefix *before* reaching its decision order, and split the prefix itself
- * (spgSplitTuple) rather than just picking a node -- the part a "no
- * compression" design gets to skip, and the part that turned out not to be
- * optional.
+ * The general fix is the standard PATRICIA-trie discipline the built-in
+ * inet_ops spgist opclass uses for address bits: picksplit always finds a
+ * batch's true first point of disagreement, however deep that is (a
+ * longest-common-prefix search -- see PICKSPLIT below), so "one node" is
+ * only reported when a batch is genuinely identical all the way to
+ * SC_MAX_ORDER, and choose() can split a tuple's own prefix (spgSplitTuple)
+ * when a later point's true ancestor diverges from it before reaching its
+ * decision order.
+ *
+ * That still isn't the whole story. Even with a fully correct picksplit,
+ * the SP-GiST core will, on its own, synthesise a placeholder one-node
+ * inner tuple -- also marked all-the-same, also refusing spgAddNode -- to
+ * hold a freshly spgAddNode-created node's first leaf(ves), without ever
+ * calling this opclass's picksplit. This is invisible at small scale (an
+ * empty node rarely accumulates enough leaves to matter before the whole
+ * page splits some other way) and was only caught at 10M rows, where dense
+ * clusters make it common: elog tracing showed such a tuple with 8 node
+ * slots, all labelled 0, a shape this opclass's own picksplit can never
+ * produce (it only ever emits nodes with genuinely distinct labels). Since
+ * neither its (order, pix) prefix nor its node labels can be trusted in
+ * this case, the only universally safe response -- covering both this and
+ * the genuine SC_MAX_ORDER-exhausted case identically -- is the one the
+ * access method's own documentation describes: whenever in->allTheSame is
+ * set, match the (single) existing node unconditionally and trust that the
+ * next real picksplit call on that bucket, now a true from-scratch
+ * longest-common-prefix search rather than a per-level guess, will untangle
+ * whatever accumulated there. choose() and inner_consistent() both check
+ * in->allTheSame before touching the prefix or node labels at all, ahead of
+ * every other branch.
  *
  * PICKSPLIT: given a batch of points that must be organised under a new
- * inner tuple, start at `candidate_order = in->level` and compute each
- * point's digit there. If they all agree, that digit is common to the
- * whole batch and gives no information; bump candidate_order and try
- * again, until either two points disagree (the real branch point) or
- * SC_MAX_ORDER is exhausted (true duplicates, one node, all-the-same is
- * correct). This is an ordinary longest-common-prefix search, computed
- * fresh from the batch's actual coordinates each time -- no state carried
- * in from the caller. Starting from in->level (rather than reading a
- * parent prefix picksplit's own arguments have no room for) can only ever
- * *under*-estimate how much is already guaranteed common to this batch,
- * since prefixes only ever get deeper: any such slack just means a few of
- * the loop's early iterations re-confirm agreement the caller already
- * established, before it reaches the real branch point. Never wrong, just
- * occasionally a few redundant sc_vec2pix() calls.
+ * inner tuple, always start the search at order 0 -- never at in->level,
+ * which is a hop count, not an order, and the two permanently diverge once
+ * spgSplitTuple is in play (a split inserts an extra hop whose own decision
+ * can land at a much shallower common order than one hop's worth of
+ * progress would suggest, so hop count can run ahead of, or fall behind,
+ * the batch's true established order after enough splits -- both
+ * directions were tried and both produced this same "cannot add a node"
+ * failure, at large enough scale for the drift to matter). Compute each
+ * point's digit at the current candidate order; if they all agree, that
+ * digit is common to the whole batch and gives no information, so bump the
+ * order and try again, until either two points disagree (the real branch
+ * point) or SC_MAX_ORDER is exhausted (true duplicates, one node,
+ * all-the-same is correct). A full from-scratch search costs at most
+ * SC_MAX_ORDER+1 harmless re-checks of orders every ancestor already
+ * confirmed the batch agrees on -- negligible next to one page read -- and
+ * is the only version of this immune to however in->level has drifted.
  *
  * CHOOSE: reads the current tuple's own (order, pix) prefix directly
- * (never from in->level, which is only a hop counter once prefixes can
- * span more than one order) and checks the incoming point's ancestor at
- * that prefix against the stored pix. A match proceeds exactly like the
- * fixed-order design (compute the next digit, look up or add a node -- now
- * always legal, since a real branch point never has only one label). A
+ * (never from in->level, for the same reason picksplit no longer does) and
+ * checks the incoming point's ancestor at that prefix against the stored
+ * pix. A match proceeds exactly like the fixed-order design (compute the
+ * next digit, look up or add a node -- always legal here, since every
+ * non-all-the-same tuple was created with genuinely distinct labels). A
  * mismatch means this point's true ancestor diverges from the prefix
  * somewhere shallower than expected: find the deepest order the two still
  * agree on and issue spgSplitTuple, inserting a new, shorter-prefixed tuple
- * above the existing one at exactly that point -- the framework re-invokes
- * choose() on the result, which then adds the new point as a sibling node.
+ * above the existing one at exactly that point. Its one real subtlety: the
+ * new upper tuple must be given *both* labels atomically (the old content's
+ * digit and this new point's own, necessarily different one) rather than
+ * created with just the old one and a plan to spgAddNode the new one on the
+ * re-invocation choose() gets right after -- a fresh nNodes==1 tuple is
+ * all-the-same whether picksplit or spgSplitTuple created it, so that
+ * second call would hit the exact same wall this whole design works around.
  *
  * PRUNING (inner_consistent): each candidate child's (order, pix) is
  * classified against the query region with the exact same sc_region_classify
@@ -177,20 +195,41 @@ spg_healpix_choose(PG_FUNCTION_ARGS)
 	int64		pix;
 	int16		label;
 
-	Assert(in->hasPrefix);
-	order = UNPACK_ORDER(in->prefixDatum);
-	pix = UNPACK_PIX(in->prefixDatum);
-	v = skycell_pos_from_datum(in->datum);
-
-	if (order >= TERMINAL_ORDER)
+	/*
+	 * allTheSame covers two cases, and neither one's (order, pix, node
+	 * labels) can be trusted: the genuine one this opclass asks for
+	 * (picksplit's own SC_MAX_ORDER-exhausted branch, real duplicates,
+	 * order packed as TERMINAL_ORDER) and one this opclass never asked
+	 * for -- observed directly (elog tracing) at 10M rows: a freshly
+	 * spgAddNode-created node's first leaf(ves), represented as a
+	 * placeholder inner tuple the core synthesises on its own, marked
+	 * allTheSame by default with node labels that do not reflect real
+	 * content (seen as literally 8 copies of label 0). Trying to read a
+	 * digit out of this tuple's own prefix, or search its node labels for
+	 * a match, is meaningless in the second case; spgAddNode against it is
+	 * a hard error in both. The only universally safe move is the
+	 * documented one: match whatever single node is there and trust
+	 * picksplit -- now a real, from-scratch longest-common-prefix search,
+	 * not a per-level guess -- to untangle any resulting mixture the next
+	 * time that bucket actually overflows.
+	 */
+	if (in->allTheSame)
 	{
-		/* genuinely exhausted: nothing left to distinguish, ever */
 		out->resultType = spgMatchNode;
 		out->result.matchNode.nodeN = 0;
 		out->result.matchNode.levelAdd = 1;
 		out->result.matchNode.restDatum = in->leafDatum;
 		PG_RETURN_VOID();
 	}
+
+	Assert(in->hasPrefix);
+	order = UNPACK_ORDER(in->prefixDatum);
+	pix = UNPACK_PIX(in->prefixDatum);
+	v = skycell_pos_from_datum(in->datum);
+
+	/* this tuple's own prefix order must be < SC_MAX_ORDER (see picksplit's
+	 * from-scratch-search comment) so order+1 below stays in-bounds. */
+	Assert(order < SC_MAX_ORDER);
 
 	if (order >= 0 && sc_vec2pix(order, v) != pix)
 	{
@@ -202,6 +241,8 @@ spg_healpix_choose(PG_FUNCTION_ARGS)
 		 */
 		int32		common_order;
 		int64		common_pix = 0;
+		int16		old_label;
+		int16		new_label;
 
 		for (common_order = order - 1; common_order >= 0; common_order--)
 		{
@@ -215,14 +256,31 @@ spg_healpix_choose(PG_FUNCTION_ARGS)
 		}
 		/* common_order is now the deepest match, or -1 if none */
 
+		/*
+		 * The new upper tuple must carry BOTH labels from the start (the
+		 * old content's digit, and this new point's own, necessarily
+		 * different one -- that's what "common_order" means) rather than
+		 * just the old one with a plan to spgAddNode the new one on the
+		 * re-invocation choose() gets right after a split: the framework
+		 * marks *any* freshly created nNodes==1 inner tuple all-the-same,
+		 * spgSplitTuple-created ones included, and then refuses spgAddNode
+		 * against it exactly as it would a picksplit-created singleton --
+		 * caught at 10M rows, where dense clusters make this path common
+		 * enough to hit (a smaller/sparser test can pass for a long time
+		 * without ever exercising a real split at all).
+		 */
+		old_label = pix_digit_at(pix, order, common_order + 1);
+		new_label = healpix_digit(common_order + 1, v);
+		Assert(new_label != old_label);
+
 		out->resultType = spgSplitTuple;
 		out->result.splitTuple.prefixHasPrefix = true;
 		out->result.splitTuple.prefixPrefixDatum =
 			Int64GetDatum(PACK_PREFIX(common_order, common_pix));
-		out->result.splitTuple.prefixNNodes = 1;
-		out->result.splitTuple.prefixNodeLabels = (Datum *) palloc(sizeof(Datum));
-		out->result.splitTuple.prefixNodeLabels[0] =
-			Int16GetDatum(pix_digit_at(pix, order, common_order + 1));
+		out->result.splitTuple.prefixNNodes = 2;
+		out->result.splitTuple.prefixNodeLabels = (Datum *) palloc(sizeof(Datum) * 2);
+		out->result.splitTuple.prefixNodeLabels[0] = Int16GetDatum(old_label);
+		out->result.splitTuple.prefixNodeLabels[1] = Int16GetDatum(new_label);
 		out->result.splitTuple.childNodeN = 0;
 		out->result.splitTuple.postfixHasPrefix = true;
 		out->result.splitTuple.postfixPrefixDatum =
@@ -245,12 +303,12 @@ spg_healpix_choose(PG_FUNCTION_ARGS)
 	}
 
 	/*
-	 * Not found: legal here (unlike a fixed-order-per-level design) because
-	 * a tuple only ever reaches this point with nNodes==1 via the genuine
-	 * SC_MAX_ORDER exhaustion above, which never falls through to here --
-	 * every other tuple was created (by picksplit or spgSplitTuple) at an
-	 * order where the batch that built it actually disagreed, so it is
-	 * never marked all-the-same and spgAddNode against it is always valid.
+	 * Not found: legal here because the allTheSame check above has already
+	 * returned for every tuple the core could refuse spgAddNode against --
+	 * anything reaching this line has nNodes >= 2 (a real picksplit or
+	 * spgSplitTuple decision, both of which only ever create tuples whose
+	 * batch actually disagreed) or is a core-synthesised placeholder that
+	 * was already handled by matching, not falling through to here.
 	 */
 	out->resultType = spgAddNode;
 	out->result.addNode.nodeLabel = Int16GetDatum(label);
@@ -264,7 +322,28 @@ spg_healpix_picksplit(PG_FUNCTION_ARGS)
 {
 	spgPickSplitIn *in = (spgPickSplitIn *) PG_GETARG_POINTER(0);
 	spgPickSplitOut *out = (spgPickSplitOut *) PG_GETARG_POINTER(1);
-	int32		candidate_order = in->level;
+	/*
+	 * Always start the longest-common-prefix search from scratch at order 0,
+	 * never from in->level. in->level is a hop count, not an order, and
+	 * spgSplitTuple makes the two permanently diverge: a split inserts an
+	 * extra tree level (+1 hop) whose own decision can land at a much
+	 * shallower common order than 1 real order's worth of progress, so hop
+	 * count can run ahead of the true established order after enough
+	 * splits -- both directions were tried and both are real bugs, not just
+	 * a performance nuance: clamping in->level to SC_MAX_ORDER stopped an
+	 * out-of-bounds sc_vec2pix() call (hop count overshooting order) but
+	 * left the opposite case -- hop count *undershooting*, so this search
+	 * starts already past an order the batch actually disagrees on -- to
+	 * silently manufacture a bogus "all identical" tuple no real duplicate
+	 * data justified, which is exactly what later collides with a genuinely
+	 * different point routed there by an ancestor and produces "cannot add
+	 * a node to an all-the-same inner tuple". A full from-scratch search
+	 * costs at most SC_MAX_ORDER+1 harmless re-checks of orders every
+	 * ancestor already confirmed the batch agrees on -- negligible next to
+	 * one page read -- and is the only version of this that cannot be
+	 * fooled by however in->level has drifted.
+	 */
+	int32		candidate_order = 0;
 	int16	   *labels;
 	int16		first_label;
 	bool		diverged = false;
@@ -364,10 +443,16 @@ spg_healpix_inner_consistent(PG_FUNCTION_ARGS)
 	int		   *keep;
 	int			nkeep = 0;
 
+	/*
+	 * allTheSame tuples' (order, pix, node labels) cannot be trusted -- see
+	 * choose()'s comment on the same point -- so treat them exactly like
+	 * this opclass's own genuine SC_MAX_ORDER-exhausted case: visit every
+	 * node, unconditionally, with no classify()-based pruning.
+	 */
 	Assert(in->hasPrefix);
 	order = UNPACK_ORDER(in->prefixDatum);
 	pix = UNPACK_PIX(in->prefixDatum);
-	terminal = (order >= TERMINAL_ORDER);
+	terminal = in->allTheSame || (order >= TERMINAL_ORDER);
 
 	if (!terminal && in->nkeys > 0)
 	{
