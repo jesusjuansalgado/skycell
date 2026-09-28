@@ -1813,3 +1813,65 @@ covering shape, which looks like a bigger lever than anything in the
 original 3deg-gap question and is completely unexplored. See
 `SPATIAL_INDEXING_HANDOFF.md` for this round folded into the open-questions
 list.
+
+## Round seventeen: the parallel-scan sensitivity from round sixteen, run
+## down to a precise, general cause -- PostgreSQL's own JIT, not covering
+## quality
+
+Round sixteen closed with a real, unexplained finding: direct's covering
+shape parallelized 4x on a heavy query, the density-adaptive path's --
+fixed or not -- barely parallelized at all (~6%), independent of
+false-positive rate or absolute range count reading as "better" or
+"worse." Dug into it directly rather than leaving it as an open question.
+
+**A controlled experiment, isolating range count from any covering
+algorithm entirely**: one contiguous ~200,000-row cell range, split into 2
+equal OR'd sub-ranges vs. 50 equal OR'd sub-ranges -- byte-for-byte the
+same rows scanned either way, only the number of `BETWEEN` arms in the
+`WHERE` clause differs.
+
+| | 2 ranges | 50 ranges |
+|---|---|---|
+| parallel execution, JIT on (default) | 57.6ms | **535.4ms (9.3x worse)** |
+| parallel execution, JIT off | 27.2ms | 26.6ms (parity) |
+| non-parallel, JIT on | -- | 320.0ms (264ms of it *is* JIT compilation) |
+
+Turning JIT off made the 9.3x gap disappear entirely -- 2 and 50 ranges
+landed within noise of each other. That isolates the cause completely:
+**PostgreSQL JIT-compiles the `Recheck Cond`/`Filter` expression once the
+plan cost crosses `jit_above_cost`, that expression is one OR-branch per
+range, and JIT's inlining/optimization/emission cost scales steeply with
+branch count** (21ms total JIT time for 2 branches, 264ms+ for 50, even in
+a single process -- 83% of that query's entire execution time). Under
+*parallel* execution specifically, every worker process independently
+JIT-compiles its own copy of the same expression, so a cost that is already
+real serially gets paid two or three times over, and that redundant
+compilation tax outweighs whatever the extra workers save on the actual
+scan. This is not a property of either covering algorithm, the density
+fallback bug, or anything this file's own code produces -- it is a generic
+PostgreSQL behavior that any sufficiently wide OR'd-range predicate would
+hit, direct path included, once range count and parallel worker count are
+both large enough.
+
+**Why this matters beyond round sixteen**: `cover.c`'s own cost model
+(`range_cost`, calibrated in `skycell.c`'s `auto_range_cost()` from B-tree
+descent cost) has no term for this at all -- it prices a range by its
+index-descent cost, never by what the *executor* pays to JIT-compile and
+multiply across parallel workers. That is a real, previously-unknown gap
+in the covering's own cost model, not specific to round sixteen's adaptive-
+covering experiment: it would apply to the shipped `cover_cone_direct()`
+path too, at whatever range count and parallelism combination crosses the
+same threshold. Untested here: whether `p->max_ranges` (64, the existing
+budget) is already routinely producing enough ranges at real production
+radii to trigger meaningful JIT cost even on the shipped default path --
+if so, this is not a hypothetical concern for a reverted experiment, it is
+live in production today.
+
+**Left open, not attempted**: two candidate directions, neither tried.
+(1) Add a range-count-and-parallelism-aware term to the covering's own cost
+model (something like `range_cost` scaling with expected parallel worker
+count, not staying flat), so the covering computation itself prices in
+what a wide OR expression will cost to execute, not just to descend.
+(2) Investigate whether raising `jit_above_cost`/`jit_inline_above_cost`
+for skycell's own wide-OR query shape, or disabling JIT for it specifically,
+is a cheap win independent of any covering-algorithm change at all.

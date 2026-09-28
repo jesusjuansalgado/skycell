@@ -198,44 +198,78 @@ from non-parallel execution. Parked: the fix was reverted (not validated,
 and never checked against the adaptive path's actual existing callers --
 polygon coverings -- at all), but both findings (the precise density-vs-
 boundary-uncertainty conflation, and the parallel-scan shape sensitivity)
-are now on record. **Nobody has profiled the parallel-scan-sensitivity
-finding further** -- it looks like the more promising lead of the two.
+are now on record.
+
+**Round seventeen ran the parallel-scan sensitivity down to a precise,
+general cause: PostgreSQL's own JIT compilation, not covering quality at
+all.** A controlled experiment (one contiguous ~200,000-row cell range,
+split into 2 vs. 50 equal OR'd sub-ranges -- identical data, only range
+*count* differs) found a 9.3x gap under default (parallel, JIT-on)
+execution that vanished entirely (27.2ms vs. 26.6ms) with `SET jit = off`.
+The mechanism: PostgreSQL JIT-compiles the `Recheck Cond`/`Filter`
+expression once plan cost crosses `jit_above_cost`, that expression is one
+OR-branch per range, and compilation cost scales steeply with branch count
+(21ms total for 2 branches, 264ms+ for 50, even serially -- 83% of that
+query's whole execution time). Under parallel execution specifically,
+*every worker independently JIT-compiles its own copy*, so an already-real
+serial cost gets paid two or three times over, outweighing whatever the
+extra workers save on the actual scan. This is not specific to either
+covering algorithm or round sixteen's density-fallback bug -- it's generic
+PostgreSQL behavior any sufficiently wide OR'd-range predicate would hit,
+**including the shipped `cover_cone_direct()` path**, at whatever range
+count and worker count combination crosses the threshold. `cover.c`'s own
+cost model (`range_cost`) has no term for this at all -- it prices a range
+by index-descent cost, never by what the executor pays to JIT-compile and
+multiply across parallel workers. Untested: whether `p->max_ranges=64`'s
+existing budget already routinely produces enough ranges at real
+production radii to trigger this on the default, shipped path today.
 
 ## 6. Open questions and concrete untried directions
 
 In rough order of how well-scoped/promising they seem from this history,
 not in priority order — pick what matches the actual goal:
 
-1. **Why does covering shape affect parallel bitmap-scan speedup so much?**
-   (§5, round sixteen's own standout finding.) The direct cone path's
-   covering (21 ranges, one query center) parallelized 4x; the adaptive
-   path's covering (37-50 ranges, same query) barely parallelized at all
-   (~6%), independent of false-positive rate or absolute range count being
-   "better" or "worse." Nobody has looked at *why* -- whether it's
-   per-range row-count balance across workers, how PostgreSQL's bitmap
-   scan partitions page ranges among workers, or something else. This now
-   looks like a bigger lever on the original 3°+ gap (§5) than covering
-   *quality* does, and it's completely unexplored.
-2. **Recalibrate `SC_COVER_MAX_DRY_STREAK`** (round sixteen's reverted fix,
+1. **Give `cover.c`'s cost model a JIT-aware term** (§5, round seventeen).
+   Round sixteen's parallel-scan sensitivity is now precisely explained:
+   PostgreSQL JIT-compiles the OR'd range predicate once plan cost crosses
+   `jit_above_cost`, that compile cost scales steeply with range count, and
+   parallel workers each pay it independently, so it multiplies rather than
+   amortizes. `range_cost` (the covering's own per-range price, calibrated
+   from B-tree descent cost) has no term for this at all. Two concrete,
+   untried options: (a) add a range-count-and-expected-parallel-worker-count
+   term to the cost model so the covering computation itself prices in
+   execution-side JIT cost, not just descent cost; (b) check whether
+   raising `jit_above_cost`/`jit_inline_above_cost` for skycell's own
+   wide-OR query shape, or disabling JIT for it specifically, is a cheap
+   win with no covering-algorithm change needed at all.
+2. **Check whether this is already live on the shipped path, not just the
+   reverted experiment.** `cover_cone_direct()` (the default, unchanged by
+   round sixteen) can produce up to `p->max_ranges=64` ranges. Nobody has
+   checked whether real production radii/densities already routinely
+   generate enough ranges, combined with default parallelism, to pay this
+   same JIT tax today. If so, this is not a hypothetical concern from a
+   reverted experiment — it is a live, uninvestigated cost on the
+   already-shipped B-tree path.
+3. **Recalibrate `SC_COVER_MAX_DRY_STREAK`** (round sixteen's reverted fix,
    `cover.c`) against a broad query set, not one failing query -- the
    underlying bug (density alone justifying unbounded speculative
    refinement in a cell with no boundary nearby) is real and precisely
    diagnosed; the specific cap chosen (2) demonstrably regressed a nearby
    case. Also untested against the adaptive path's actual existing callers
    (polygon coverings) at all.
-3. **A sub-quadratic overlap test for the region GiST multi-cap key**
+4. **A sub-quadratic overlap test for the region GiST multi-cap key**
    (§3, round fifteen's own conclusion). The O(MAX_SUBCAPS²) all-pairs
    check is what capped the profitable cap count at ~4. A key whose own
    sub-caps are spatially sorted/indexed (even something as simple as
    sorting by one coordinate and using it to skip non-overlapping pairs)
    could let MAX_SUBCAPS grow without paying the full quadratic cost —
    untried.
-4. **A `min_area` field for `CONTAINED_BY_REGION` (`<@`)**, the mirror of
+5. **A `min_area` field for `CONTAINED_BY_REGION` (`<@`)**, the mirror of
    round fourteen's reverted `max_area` idea — except `<@` already wins
    against pgSphere at both scales tested (round seven), so this is lower
    priority; worth checking only if a future benchmark finds `<@` losing
    somewhere round seven didn't test.
-5. **A bulk-loaded, statically-packed structure for the point predicate**,
+6. **A bulk-loaded, statically-packed structure for the point predicate**,
    instead of the point SP-GiST's incremental `choose`/`picksplit`
    construction (flagged, not attempted, when round twelve/thirteen closed
    out — see the "so, the conclusion is that SP-GiST is a dead end?"
@@ -244,7 +278,7 @@ not in priority order — pick what matches the actual goal:
    risks converging on "just reimplement the B-tree as an index AM" —
    flagged as the one idea with a real mechanism behind it that hasn't
    been measured, not as something expected to obviously win.
-6. **Real survey-footprint sparsity** for the point SP-GiST's covering-walk
+7. **Real survey-footprint sparsity** for the point SP-GiST's covering-walk
    idea (round thirteen's own caveat): the corpus used throughout this
    whole investigation is synthetic with a substantial uniform-sky
    component, so it has no true coverage gaps. A real archive's actual
@@ -252,7 +286,7 @@ not in priority order — pick what matches the actual goal:
    low-density sky) might make round thirteen's "0% empty cells" result
    corpus-specific rather than general — untested, no corpus available in
    this repo to test it with.
-7. **`skycell.probe_orders`** (`cover.c`): an existing, off-by-default GUC
+8. **`skycell.probe_orders`** (`cover.c`): an existing, off-by-default GUC
    for scoring several candidate covering orders instead of trusting the
    closed-form choice — its own code comment says forcing a finer order
    directly measures a real 30-48% win at 6'-30' that the *scored* probe
