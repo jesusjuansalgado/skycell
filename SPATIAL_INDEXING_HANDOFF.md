@@ -597,6 +597,20 @@ not in priority order — pick what matches the actual goal:
   own cone-search path needs; BRIN is a real option for skycell users who
   need wide, low-selectivity cone queries or plain rectangular RA/Dec
   range queries, neither of which skycell's own operators currently
-  provide dedicated support for (no `sbox`-equivalent region type).
+  provide dedicated support for (no `sbox`-equivalent region type). Round
+  thirty-five closed out this line of investigation by checking pgSphere's
+  actual exact per-row distance math (`spoint_dist()`, Vincenty's formula
+  on stored `(lat,lng)` — six trig calls and a sqrt per comparison,
+  re-derived every call) against skycell's own (Cartesian unit vectors
+  computed once, so a point-in-cap test is one dot product against a
+  cached `cos(radius)`, zero trig calls) — confirmation that skycell is
+  already ahead here, not a gap. Three rounds of mining pgSphere's source
+  (index architecture/query-key caching originally; BRIN's real scope in
+  rounds thirty-two through thirty-four; this round's exact-math check)
+  land on the same pattern throughout: pgSphere sometimes wins on the
+  *indexing-structure* axis for specific query shapes it's actually built
+  for, but skycell's per-comparison math is already ahead or matched
+  everywhere checked. No further pgSphere-mining planned without a new,
+  more specific lead.
 - `GIST_REGION_DESIGN.md` is the source of truth for exact numbers, code
   reasoning, and anything this summary compressed or left out.

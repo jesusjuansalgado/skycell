@@ -3047,3 +3047,61 @@ here -- adding a dedicated box region type would only be worth it if the
 plain-column approach's lack of HEALPix integration (no single covering
 codepath shared with the cone/polygon operators) becomes a real
 maintenance or composability problem, which hasn't been shown yet.
+
+## Round thirty-five: one more pgSphere check -- the exact per-row
+## distance math itself -- and this one goes skycell's way already
+
+Three rounds of mining pgSphere's source (architecture/caching in the
+original investigation, BRIN in rounds thirty-two through thirty-four)
+raised one more candidate worth checking directly rather than assuming:
+the actual exact-recheck math pgSphere runs on a surviving candidate row
+-- the per-row cost that mattered so much in round thirty-four's finding
+(a box query's recheck is free, a circle's costs a real trig call).
+
+pgSphere stores points as `(lat, lng)` (`SPoint`), and its distance
+function is Vincenty's formula, computed fresh on every call:
+
+```c
+float8
+spoint_dist(const SPoint *p1, const SPoint *p2)
+{
+	float8	dl = p1->lng - p2->lng;
+	float8	f = atan2(norm2(cos(p2->lat) * sin(dl),
+						cos(p1->lat) * sin(p2->lat)
+							- sin(p1->lat) * cos(p2->lat) * cos(dl)),
+					sin(p1->lat) * sin(p2->lat)
+						+ cos(p1->lat) * cos(p2->lat) * cos(dl));
+	...
+}
+```
+
+Six trigonometric calls (four `cos`, two `sin`) plus a `sqrt` (inside
+`norm2`) and an `atan2`, every single time two points are compared --
+because `SPoint` stores angles, not vectors, so `sin`/`cos` of both
+coordinates get re-derived on every comparison.
+
+skycell stores points as Cartesian unit vectors from the moment they're
+parsed (`sc_radec2vec()`, once), so `sin`/`cos` of RA/Dec happen exactly
+once per value, not once per *comparison*. A point-in-cap test (the
+direct analogue of what `spoint_dist()` would be used for) is round
+twenty-seven's `cap_contains_point()`: `dot(center, point) >=
+cos(radius)` -- one dot product, zero trig calls, since `cos(radius)`
+was already cached at cap-construction time. Where pgSphere pays six
+trig calls and a sqrt per comparison, skycell pays none.
+
+**No action needed -- this is confirmation, not a gap.** This is the
+third source-level pgSphere investigation this file has done (index
+architecture and per-scan query-key caching in the original rounds;
+BRIN's actual scope in rounds thirty-two through thirty-four; this
+round's exact-math check), and the pattern holds throughout: pgSphere
+sometimes wins on the *indexing-structure* axis (a cheaper aggregate
+index for specific low-selectivity or box-shaped query regimes,
+per round thirty-three/four), but on the *per-comparison math* axis --
+query-key caching, trig-free point tests, storing vectors instead of
+re-deriving them -- skycell's existing design is already ahead or
+matched everywhere checked. Nothing further to mine here without
+diminishing returns; the remaining unexamined pgSphere source
+(`epochprop.c`'s proper-motion propagation, `gnomo.c`'s projection math,
+the sparse MOC storage) is either unrelated to spatial-indexing
+performance or already covered in substance by what `skyregion`'s own
+multi-cap representation does.
