@@ -2075,3 +2075,81 @@ loses information MAX_SUBCAPS+1 items in). Round twenty only tested one
 narrow fix (reseed the same lossy algorithm) and found it backfires
 specifically because of penalty()'s incremental-build role -- it says
 nothing about whether a *different* kind of fix (below) would do better.
+
+## Round twenty-one: decoupling penalty() from merge_caps_greedy -- also a
+## regression, and it falsifies round twenty's own hypothesis
+
+Round twenty's best explanation for its regression was that `penalty()`
+calling the same (reseeded) `merge_caps_greedy` union() uses made the
+*placement* signal noisy across thousands of incremental inserts. The
+natural next experiment: stop `penalty()` from calling `merge_caps_greedy`
+at all. `GistMultiCap` already carries an `overall` cap -- a plain,
+already-computed two-cap union, exact and O(1), currently used only for
+`picksplit`'s axis-sort heuristic. Swapped `multicap_penalty()` to score by
+overall-cap area growth (`cap_area_proxy(union(orig, new).radius) -
+cap_area_proxy(orig.radius)`) instead of flattening both sides' sub-caps
+and running a full greedy merge every call. No seeding involved at all
+this time -- a single deterministic cap union, cheaper than what it
+replaced, `consistent()` untouched.
+
+**Measured with the same true-A/B discipline** (same database, same
+50,000-row corpus/500-probe set, index dropped and rebuilt under each
+binary, back-to-back in the same session to control for machine-load
+drift after round twenty's cross-session numbers turned out noisier than
+expected -- see below):
+
+| direction | before (original `penalty()`) | after (overall-cap growth) | pgSphere |
+|---|---|---|---|
+| `@>`(region,region) | 87-88ms | **243-256ms (2.9x worse)** | 15-16ms |
+| `<@`(region,region) | 172-197ms (beats pgSphere 1.3-1.5x) | **435-446ms (now loses 1.08-1.11x)** | 257-262ms |
+
+**Worse than round twenty's own regression, not better.** This falsifies
+the hypothesis that motivated it: it wasn't specifically farthest-point
+seeding's noise -- a fully deterministic, non-clustering, cheaper metric
+hurt *more*. The real explanation, visible in hindsight: `overall` is a single
+bounding cap -- exactly round one's original key design, which round two's
+own history already found too coarse to scale as a *pruning* key ("the key
+itself, not the split algorithm, is the bottleneck"). Using it for
+`penalty()`'s placement decisions throws away the same fine-grained
+sub-cap shape information round three's multi-cap redesign exists to
+capture in the first place. `consistent()` still prunes against the full
+stored multi-cap regardless of how the tree was built, but if placement
+decisions during the incremental build could only see one coarse cap per
+candidate subtree, the resulting tree shape is worse no matter how sharp
+the final pruning test is once you're at a (badly-placed) leaf. The full
+sub-cap merge, imperfect as its own comment admits, is apparently
+load-bearing for placement quality -- impoverishing that signal, whether
+by bad reseeding (round twenty) or by outright simplifying it away (round
+twenty-one), hurts either way. **Reverted** (stashed, working tree and
+installed extension back to the original `multicap_penalty()`).
+
+**A methodological note worth recording**: this round's baseline pass
+(same database, same code, rerun immediately after the "after" pass) 
+measured `@>`/`<@` gist/pgsphere times both meaningfully different from
+round twenty's own separately-run baseline on a *different* freshly-built
+database with the same seeds and row counts (round twenty: `@>` 80-83ms,
+`<@` gist 160-174ms/pgsphere 232-252ms; this round's baseline: `@>`
+87-88ms, `<@` gist 172-197ms/pgsphere 257-262ms -- consistent in relative
+terms, both confirming `<@` beats pgSphere, but not identical in absolute
+terms). Cross-database absolute wall-clock numbers in this file should be
+read as directionally consistent, not bit-for-bit reproducible; every A/B
+comparison in this file that matters is a same-database, same-session,
+back-to-back comparison for exactly this reason, and this round is a
+concrete example of why that discipline matters, not just a stated
+principle.
+
+**Where this leaves the placement/union question**: two different attempts
+to change how `merge_caps_greedy` (or what replaces it) feeds `penalty()`
+have both regressed, for what looks like the same underlying reason --
+placement quality needs the same rich sub-cap information pruning does,
+so anything that simplifies or perturbs that signal for `penalty()`
+specifically has hurt so far. Untried: leaving `penalty()`'s use of
+`merge_caps_greedy` completely alone (proven, by omission, not to be the
+problem on its own) and instead improving *only* the key actually written
+to disk at split time -- i.e. scoping any future seeding/clustering
+improvement to `multicap_union_many()` alone, via a separate function, so
+it never touches `penalty()`'s signal at all. Neither of this round's two
+experiments tested that -- round twenty's reseeding change hit both call
+sites at once (so its regression can't be blamed on the union-time path
+in isolation), and this round's change touched only `penalty()`. See §6
+for how this is written up as an open direction.
