@@ -325,6 +325,32 @@ cap_overlaps(GistCap a, GistCap b)
 	return sc_angle(cap_center(a), cap_center(b)) <= a.radius + b.radius;
 }
 
+/*
+ * Round twenty-seven: a point-in-cap test that never computes an actual
+ * angle. cap_overlaps(cap, cap_make(p, 0.0)) -- the pattern multicap_
+ * contains_point() used until now -- calls sc_angle(), which for two
+ * general caps needs the true angular distance (a cross product, a sqrt,
+ * and an atan2) so it can be compared against a *sum* of two radii. A
+ * point is a zero-radius cap, so that sum is just the cap's own radius,
+ * and "angle(centre, point) <= radius" is exactly equivalent to
+ * "dot(centre, point) >= cos(radius)" (cos is monotonic decreasing on
+ * [0, pi]) -- one dot product and one cosine, no cross product, no sqrt,
+ * no atan2. Round four's own diagnosis for why @>(region,point) trails
+ * pgSphere by a wide, unmoved-by-any-tree-tightness-fix margin was this
+ * exact per-comparison cost (a "flat sub-cap-loop cost" pgSphere's native
+ * point test doesn't pay); this targets that directly, leaving the stored
+ * key format, cap_overlaps() itself (still needed for genuine cap-vs-cap
+ * tests, which don't reduce this way), and every seeding/union/penalty
+ * function untouched.
+ */
+static bool
+cap_contains_point(GistCap cap, sc_vec3 p)
+{
+	if (cap.radius < 0)
+		return false;
+	return sc_dot(cap_center(cap), p) >= cos(cap.radius);
+}
+
 /* how much two caps overlap, not just whether they do: 0 when disjoint (or
  * merely touching), growing with how far the sum of radii exceeds the
  * centre distance -- a cheap angular proxy, not a real lens-shaped overlap
@@ -555,9 +581,7 @@ multicap_overlaps(const GistMultiCap *a, const GistMultiCap *b)
 static bool
 multicap_contains_point(const GistMultiCap *m, sc_vec3 p)
 {
-	GistCap		pc = cap_make(p, 0.0);
-
-	if (!cap_overlaps(m->overall, pc))
+	if (!cap_contains_point(m->overall, p))
 		return false;
 	if (multicap_is_single_cap(m))
 		return true;
@@ -565,7 +589,7 @@ multicap_contains_point(const GistMultiCap *m, sc_vec3 p)
 	{
 		if (m->sub[i].radius < 0)
 			continue;
-		if (cap_overlaps(m->sub[i], pc))
+		if (cap_contains_point(m->sub[i], p))
 			return true;
 	}
 	return false;

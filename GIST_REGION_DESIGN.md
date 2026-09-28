@@ -2481,3 +2481,67 @@ touching round twenty-two's proven seeding logic again, which this
 file's own track record (four reverted attempts, rounds twenty through
 twenty-four, all centered on this exact function family) suggests
 doing carefully, not as a quick follow-up.
+
+## Round twenty-seven: a trig-free point-in-cap test -- a real, kept win
+## on the one strategy nothing had touched
+
+Every round from fourteen through twenty-six targeted `@>`/`<@`(region,
+region) -- tree/key quality for the CONTAINS_REGION/CONTAINED_BY_REGION
+strategies. `@>`(region,point) (CONTAINS_POINT) had sat untouched since
+round four's own diagnosis: a wide, scale-independent gap to pgSphere
+("pgSphere's cheap native point-in-shape test pulls further ahead...
+than pgSphere's own `&&` does of its own"), confirmed still wide and
+unmoved by round twenty-two's key-tightening fix (round twenty-five).
+That diagnosis pointed at *per-comparison cost*, not tree shape -- a
+genuinely different kind of lever from anything tried in rounds
+fourteen through twenty-six.
+
+`multicap_contains_point()` tested each sub-cap via `cap_overlaps(cap,
+cap_make(p, 0.0))`, which calls `sc_angle()` -- a cross product, a
+`sqrt`, and an `atan2`, computing the true angular distance so it can be
+compared against a *sum* of two radii (needed for genuine cap-vs-cap
+tests). A point is a zero-radius cap, so that sum collapses to just the
+cap's own radius, and `angle(centre, point) <= radius` is exactly
+`dot(centre, point) >= cos(radius)` (`cos` monotonic decreasing on
+`[0, pi]`) -- one dot product and one cosine, no cross product, no
+`sqrt`, no `atan2`. Added `cap_contains_point()` implementing exactly
+that, used only inside `multicap_contains_point()`; `cap_overlaps()`
+itself, the stored key format, and every seeding/union/penalty function
+are untouched.
+
+**Correctness held at both scales** (brute-force count matches GiST and
+pgSphere exactly: 209 at 5,000 rows, 765 at 50,000). **Buffer counts
+came back nearly identical** (25,050 vs 25,557 at 50,000 rows, +2.0%,
+almost certainly GiST build non-determinism rather than a real
+algorithmic difference -- expected, since this change can't alter any
+`consistent()` boolean answer, hence can't alter tree-traversal
+decisions). **Wall-clock, same-database same-session, both scales**:
+
+| scale | before | after | speedup |
+|---|---|---|---|
+| 5,000 rows | 5.10-6.21ms | 3.06-3.27ms | ~1.6-1.9x |
+| 50,000 rows | 83-85ms | 47-50ms | ~1.7-1.8x |
+
+**A real, consistent, mechanism-precise win -- kept.** The gap to
+pgSphere narrows sharply: at 5,000 rows, from ~1.7-2.1x slower to
+~1.1-1.2x slower, nearly closing it entirely; at 50,000 rows, from
+~4.0-4.6x (round twenty-five) to roughly ~3.4-3.9x (pgSphere's own
+13-15ms unchanged, skycell's gist time dropped from 73-95ms to 47-50ms).
+Not fully closed -- pgSphere's own native point test is presumably doing
+something comparably cheap already, so this narrows the gap rather than
+flipping it -- but the largest single-round improvement to this specific
+strategy since it was first measured in round four, achieved without
+touching anything in the fragile seeding/merge family six of the last
+seven rounds have been about.
+
+**What's left for `@>`(region,point)**: the remaining gap is most likely
+still about comparison *count* (how many sub-caps/nodes get visited),
+not comparison *cost* anymore -- i.e. back to a tree-tightness question,
+same family as `@>`(region,region)'s remaining gap. Untried: checking
+whether round twenty-two's `merge_caps_greedy_fp()` fix, measured only
+for `@>`/`<@`(region,region) and (round twenty-five) `&&`, also
+meaningfully tightened the tree `@>`(region,point) walks -- if the
+comparison-count side is already about as good as it gets, the
+remaining multiplier is likely structural (pgSphere's index descent
+shape vs. skycell's), which would make this gap's floor close to
+already reached.
