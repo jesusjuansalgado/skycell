@@ -224,52 +224,70 @@ multiply across parallel workers. Untested: whether `p->max_ranges=64`'s
 existing budget already routinely produces enough ranges at real
 production radii to trigger this on the default, shipped path today.
 
+**Round eighteen answered that directly: yes, it's already live.** 300
+production-representative queries (60 each at 1″/1′/30′/1°/3°, mixed real-
+data/uniform centers) against the unmodified, shipped
+`cover_cone_direct()` path found `p->max_ranges=64` nowhere close to
+binding (max seen: 26 ranges, at the largest radius tested) -- but 3 of
+300 (1%, all at 3° in dense regions, 21-22 ranges each) crossed
+`jit_above_cost` anyway. Measured those 3 directly with `SET jit =
+on/off`: 3.1-6.0x slower with JIT on (133.0ms/58.2ms/61.6ms vs.
+22.2ms/18.7ms/19.1ms), JIT compile time (all Emission, `Inlining: 0.000ms`
+in every case since cost stays under `jit_inline_above_cost`) eating
+68-83% of total execution time, `Workers Launched: 2` confirming the
+per-worker redundant-compilation mechanism from round seventeen. Not a
+hypothetical edge case from a reverted experiment -- a real, currently-
+uninvestigated cost on the already-shipped path, for realistic large-
+radius/high-density queries. Neither of round seventeen's two candidate
+fixes has been attempted yet.
+
 ## 6. Open questions and concrete untried directions
 
 In rough order of how well-scoped/promising they seem from this history,
 not in priority order — pick what matches the actual goal:
 
-1. **Give `cover.c`'s cost model a JIT-aware term** (§5, round seventeen).
-   Round sixteen's parallel-scan sensitivity is now precisely explained:
-   PostgreSQL JIT-compiles the OR'd range predicate once plan cost crosses
+1. **Give `cover.c`'s cost model a JIT-aware term** (§5, rounds seventeen
+   and eighteen). Round sixteen's parallel-scan sensitivity is now
+   precisely explained, and round eighteen confirmed it is already live on
+   the shipped, non-experimental `cover_cone_direct()` path (3/300
+   production-representative queries, 3.1-6.0x slower, 1% of the tested
+   distribution, concentrated at the largest radius tested): PostgreSQL
+   JIT-compiles the OR'd range predicate once plan cost crosses
    `jit_above_cost`, that compile cost scales steeply with range count, and
    parallel workers each pay it independently, so it multiplies rather than
    amortizes. `range_cost` (the covering's own per-range price, calibrated
-   from B-tree descent cost) has no term for this at all. Two concrete,
-   untried options: (a) add a range-count-and-expected-parallel-worker-count
-   term to the cost model so the covering computation itself prices in
-   execution-side JIT cost, not just descent cost; (b) check whether
-   raising `jit_above_cost`/`jit_inline_above_cost` for skycell's own
-   wide-OR query shape, or disabling JIT for it specifically, is a cheap
-   win with no covering-algorithm change needed at all.
-2. **Check whether this is already live on the shipped path, not just the
-   reverted experiment.** `cover_cone_direct()` (the default, unchanged by
-   round sixteen) can produce up to `p->max_ranges=64` ranges. Nobody has
-   checked whether real production radii/densities already routinely
-   generate enough ranges, combined with default parallelism, to pay this
-   same JIT tax today. If so, this is not a hypothetical concern from a
-   reverted experiment — it is a live, uninvestigated cost on the
-   already-shipped B-tree path.
-3. **Recalibrate `SC_COVER_MAX_DRY_STREAK`** (round sixteen's reverted fix,
+   from B-tree descent cost) has no term for this at all. `p->max_ranges=64`
+   itself is not the binding constraint (max seen in round eighteen's
+   benchmark: 26 ranges) — the JIT threshold is crossed well before the
+   range-count ceiling is. Two concrete, untried options: (a) add a
+   range-count-and-expected-parallel-worker-count term to the cost model so
+   the covering computation itself prices in execution-side JIT cost, not
+   just descent cost; (b) check whether raising
+   `jit_above_cost`/`jit_inline_above_cost` for skycell's own wide-OR query
+   shape, or disabling JIT for it specifically, is a cheap win with no
+   covering-algorithm change needed at all. This is now the best-evidenced
+   item on this list — the cost is measured and live, only the fix is
+   untried.
+2. **Recalibrate `SC_COVER_MAX_DRY_STREAK`** (round sixteen's reverted fix,
    `cover.c`) against a broad query set, not one failing query -- the
    underlying bug (density alone justifying unbounded speculative
    refinement in a cell with no boundary nearby) is real and precisely
    diagnosed; the specific cap chosen (2) demonstrably regressed a nearby
    case. Also untested against the adaptive path's actual existing callers
    (polygon coverings) at all.
-4. **A sub-quadratic overlap test for the region GiST multi-cap key**
+3. **A sub-quadratic overlap test for the region GiST multi-cap key**
    (§3, round fifteen's own conclusion). The O(MAX_SUBCAPS²) all-pairs
    check is what capped the profitable cap count at ~4. A key whose own
    sub-caps are spatially sorted/indexed (even something as simple as
    sorting by one coordinate and using it to skip non-overlapping pairs)
    could let MAX_SUBCAPS grow without paying the full quadratic cost —
    untried.
-5. **A `min_area` field for `CONTAINED_BY_REGION` (`<@`)**, the mirror of
+4. **A `min_area` field for `CONTAINED_BY_REGION` (`<@`)**, the mirror of
    round fourteen's reverted `max_area` idea — except `<@` already wins
    against pgSphere at both scales tested (round seven), so this is lower
    priority; worth checking only if a future benchmark finds `<@` losing
    somewhere round seven didn't test.
-6. **A bulk-loaded, statically-packed structure for the point predicate**,
+5. **A bulk-loaded, statically-packed structure for the point predicate**,
    instead of the point SP-GiST's incremental `choose`/`picksplit`
    construction (flagged, not attempted, when round twelve/thirteen closed
    out — see the "so, the conclusion is that SP-GiST is a dead end?"
@@ -278,7 +296,7 @@ not in priority order — pick what matches the actual goal:
    risks converging on "just reimplement the B-tree as an index AM" —
    flagged as the one idea with a real mechanism behind it that hasn't
    been measured, not as something expected to obviously win.
-7. **Real survey-footprint sparsity** for the point SP-GiST's covering-walk
+6. **Real survey-footprint sparsity** for the point SP-GiST's covering-walk
    idea (round thirteen's own caveat): the corpus used throughout this
    whole investigation is synthetic with a substantial uniform-sky
    component, so it has no true coverage gaps. A real archive's actual
@@ -286,7 +304,7 @@ not in priority order — pick what matches the actual goal:
    low-density sky) might make round thirteen's "0% empty cells" result
    corpus-specific rather than general — untested, no corpus available in
    this repo to test it with.
-8. **`skycell.probe_orders`** (`cover.c`): an existing, off-by-default GUC
+7. **`skycell.probe_orders`** (`cover.c`): an existing, off-by-default GUC
    for scoring several candidate covering orders instead of trusting the
    closed-form choice — its own code comment says forcing a finer order
    directly measures a real 30-48% win at 6'-30' that the *scored* probe
@@ -308,6 +326,10 @@ not in priority order — pick what matches the actual goal:
 - B-tree covering path (`cover.c`): shipped as-is (`p->direct=1`, the
   non-adaptive cone fast path, unchanged for every radius). Round sixteen's
   dry-streak fix to the adaptive fallback path was reverted, not validated
-  as a net win — see §5.
+  as a net win — see §5. Round eighteen confirmed a real, live, unaddressed
+  cost on this exact shipped path: ~1% of realistic large-radius/high-
+  density queries already cross PostgreSQL's `jit_above_cost` on range
+  count alone (nowhere near `p->max_ranges=64`) and pay a 3-6x parallel-
+  JIT tax as a result — measured, not yet fixed.
 - `GIST_REGION_DESIGN.md` is the source of truth for exact numbers, code
   reasoning, and anything this summary compressed or left out.

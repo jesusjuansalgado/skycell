@@ -1875,3 +1875,68 @@ what a wide OR expression will cost to execute, not just to descend.
 (2) Investigate whether raising `jit_above_cost`/`jit_inline_above_cost`
 for skycell's own wide-OR query shape, or disabling JIT for it specifically,
 is a cheap win independent of any covering-algorithm change at all.
+
+## Round eighteen: yes, it's already live on the shipped path -- not just a
+## reverted experiment's edge case
+
+Round seventeen's own closing question: does `cover_cone_direct()` (the
+default, unmodified path, `p->direct=1` for every radius) already produce
+enough ranges at real production radii/densities to pay the JIT tax today?
+Measured directly, no code changes involved.
+
+**Setup**: 10M-row corpus, 300 production-representative queries (60 each
+at 1″, 1′, 30′, 1°, 3°, mixed real-data-cluster and uniform-sky centers),
+default GUCs (`jit_above_cost=100000`, `jit_inline_above_cost=500000`,
+`max_parallel_workers_per_gather=2`), unmodified extension.
+
+| radius | avg ranges | max ranges | avg cost | max cost | JIT triggered |
+|---|---|---|---|---|---|
+| 1″ | 0.4 | 2 | 10 | 17 | 0/60 |
+| 1′ | 0.3 | 3 | 20 | 171 | 0/60 |
+| 30′ | 5.1 | 12 | 3,295 | 11,102 | 0/60 |
+| 1° | 7.9 | 19 | 9,163 | 46,008 | 0/60 |
+| 3° | 16.6 | 26 | 51,312 | 358,636 | **3/60** |
+
+Two findings, both clean:
+
+**`p->max_ranges=64` is nowhere close to binding.** The highest range count
+seen across all 300 queries, at the largest radius tested, was 26 -- well
+under the 64 ceiling. The covering algorithm is not running out of budget
+anywhere in this distribution; `max_ranges` is not the lever this question
+was really about.
+
+**But `jit_above_cost` (100,000) gets crossed anyway, on the shipped path,
+for real queries.** At 3° in dense regions, 3 of 300 queries (1%) crossed
+it with 21-22 ranges each -- no adaptive path, no reverted fix, no
+artificial range-splitting, just `cover_cone_direct()` doing what it always
+does. Measured those 3 directly with `SET jit = on/off`:
+
+| qid | ranges | JIT on | JIT off | slowdown | JIT compile time |
+|---|---|---|---|---|---|
+| 260 | 21 | 133.0ms | 22.2ms | 6.0x | 52.5ms |
+| 264 | 22 | 58.2ms | 18.7ms | 3.1x | 45.0ms |
+| 274 | 22 | 61.6ms | 19.1ms | 3.2x | 41.7ms |
+
+`Workers Launched: 2` in every case, `Inlining: 0.000ms` throughout (cost
+stays under `jit_inline_above_cost=500,000`, so only Generation+
+Optimization+Emission run) -- and Emission alone (35-45ms) makes up
+68-83% of total execution time. This matches round seventeen's mechanism
+exactly: the parallel leader and each worker independently JIT-compile
+their own copy of the same OR'd `Recheck Cond`, so the compile cost is
+paid 2-3x over rather than amortized, and it dominates the query.
+
+**Conclusion**: this is not a hypothetical concern scoped to a reverted
+experiment. At realistic large-radius, high-density queries -- about 1% of
+this benchmark's distribution, concentrated entirely at the largest radius
+tested -- the already-shipped, non-experimental `cover_cone_direct()` path
+produces enough ranges on its own to cross `jit_above_cost` and pay a
+3-6x wall-clock tax under default parallelism, with zero code changes
+anywhere in this investigation involved. `range_cost`'s calibration
+(`auto_range_cost()` in `skycell.c`, from B-tree descent cost alone) still
+has no term for this. Round seventeen's two untried directions -- a JIT-
+aware cost term, or tuning/disabling JIT for skycell's own wide-OR shape --
+are no longer speculative; this round establishes there is a real, live
+cost for them to address. Not attempted here: either fix. Also untested:
+whether a real (non-synthetic, non-uniform-sky) catalog would push this
+1% figure higher, since dense real surveys plausibly have more large-
+radius/high-density queries than this benchmark's mixed distribution.
