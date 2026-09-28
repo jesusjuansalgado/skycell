@@ -57,6 +57,7 @@
 #include "nodes/supportnodes.h"
 #include "optimizer/optimizer.h"
 #include "parser/parse_func.h"
+#include "parser/parse_oper.h"
 #include "parser/parsetree.h"
 #include "rewrite/rewriteManip.h"
 #include "utils/array.h"
@@ -795,6 +796,142 @@ density_for_expr(PlannerInfo *root, Node *arg, sc_density *d, Oid *statrel,
 		MemoryContextSwitchTo(old);
 	}
 	return found;
+}
+
+/*
+ * "Which of my regions contain this point" is the opposite direction from
+ * density_for_expr's own case (a point-catalog index answering many
+ * points against one region): here it's the *region* column that needs an
+ * index, over many candidate rows against one (or a few, per-row-joined)
+ * points. skycell_region_moc(region, max_cells, max_order) already gives
+ * every row a small array of covering cells (see skycell--0.11.sql's "MOC-
+ * in-a-B-tree" comment block); a plain GIN index on that expression
+ * indexes the array-overlap test the manual side-table recipe there
+ * computes by hand, so this is that same recipe, minus the side table.
+ *
+ * On success, *moc_expr is the actual indexed expression (copied, varno
+ * changed from the index's own convention back to rg's real range table
+ * entry, ready to embed in the caller's rewritten query -- it must match
+ * the index's stored expression exactly, or the planner won't recognise
+ * it as indexable), and *max_order is the max_order argument that
+ * expression's skycell_region_moc() call was actually built with.
+ *
+ * That max_order is used as an exact, safe upper bound on the ancestor
+ * lookup this enables (skycell_ancestors(point_cell, 0, max_order)): no
+ * row's covering can use a finer cell than the index's own max_order
+ * allows, so capping there cannot miss a match. The *lower* end is left
+ * at 0 deliberately, not narrowed to whatever coarsest order the data
+ * happens to use: that would depend on which regions actually exist in
+ * the table, which only a real scan (or a statistics sample, which is not
+ * guaranteed complete) can answer, and guessing wrong there risks a false
+ * negative -- silently dropping a genuine match -- with no recheck able
+ * to catch it, unlike a spurious candidate. A user who knows their own
+ * corpus never needs cells coarser than some order can already get that
+ * narrower range by hand, by passing a smaller max_order to
+ * skycell_region_moc() when creating the index; this function only ever
+ * reads back whatever was actually asked for.
+ */
+bool
+gin_moc_index_for_region(PlannerInfo *root, Node *rg, Node **moc_expr, int *max_order)
+{
+	List	   *vars = pull_var_clause(rg, 0);
+	ListCell   *lc;
+	Index		varno = 0;
+	RangeTblEntry *rte;
+	Relation	rel;
+	List	   *indexes;
+	Node	   *key;
+	bool		found = false;
+
+	foreach(lc, vars)
+	{
+		Var		   *v = (Var *) lfirst(lc);
+
+		if (!IsA(v, Var) || v->varlevelsup != 0 || (varno != 0 && v->varno != varno))
+			return false;
+		varno = v->varno;
+	}
+	if (varno == 0 || varno > list_length(root->parse->rtable))
+		return false;
+	rte = rt_fetch(varno, root->parse->rtable);
+	if (rte->rtekind != RTE_RELATION)
+		return false;
+
+	/* index expressions are stored with varno 1, same convention as
+	 * density_for_expr's own key above */
+	key = copyObject(rg);
+	ChangeVarNodes(key, varno, 1, 0);
+
+	rel = table_open(rte->relid, NoLock);	/* locked by the parser */
+	indexes = RelationGetIndexList(rel);
+	foreach(lc, indexes)
+	{
+		Oid			indexoid = lfirst_oid(lc);
+		Relation	irel = index_open(indexoid, AccessShareLock);
+
+		if (irel->rd_rel->relam == GIN_AM_OID &&
+			irel->rd_index->indnatts >= 1 && irel->rd_index->indkey.values[0] == 0)
+		{
+			List	   *exprs = RelationGetIndexExpressions(irel);
+
+			if (exprs != NIL && IsA(linitial(exprs), FuncExpr))
+			{
+				FuncExpr   *fe = (FuncExpr *) linitial(exprs);
+				char	   *name = get_func_name(fe->funcid);
+
+				if (name != NULL && strcmp(name, "skycell_region_moc") == 0 &&
+					list_length(fe->args) == 3 && equal(linitial(fe->args), key))
+				{
+					Node	   *mo = (Node *) lthird(fe->args);
+
+					if (IsA(mo, Const) && !((Const *) mo)->constisnull)
+					{
+						Node	   *out = copyObject((Node *) fe);
+
+						ChangeVarNodes(out, 1, varno, 0);
+						*moc_expr = out;
+						*max_order = DatumGetInt32(((Const *) mo)->constvalue);
+						found = true;
+					}
+				}
+			}
+		}
+		index_close(irel, AccessShareLock);
+		if (found)
+			break;
+	}
+	list_free(indexes);
+	table_close(rel, NoLock);
+	return found;
+}
+
+/*
+ * A plain int8[] && int8[] OpExpr -- the operator the GIN opclass built
+ * into every PostgreSQL install already indexes. Resolved with oper(),
+ * not OpernameGetOprid(): the catalog entry is the polymorphic anyarray
+ * && anyarray, not one specific to int8[], and only oper()'s parser-grade
+ * matching (the same logic "a && b" in a query goes through) recognises
+ * int8[] as a valid anyarray argument -- an exact-match OID lookup on
+ * (int8[], int8[]) finds nothing and this returns NULL.
+ */
+Expr *
+array_overlap_expr(Node *left, Expr *right)
+{
+	Operator	tup = oper(NULL, list_make1(makeString("&&")),
+						  INT8ARRAYOID, INT8ARRAYOID, true, -1);
+	Oid			opno;
+	Expr	   *e;
+
+	if (tup == NULL)
+		return NULL;
+	opno = oprid(tup);
+	ReleaseSysCache(tup);
+	if (!OidIsValid(opno))
+		return NULL;
+	e = make_opclause(opno, BOOLOID, false, (Expr *) copyObject(left), right,
+					  InvalidOid, InvalidOid);
+	set_opfuncid((OpExpr *) e);
+	return e;
 }
 
 /*

@@ -400,24 +400,33 @@ this benchmark's numbers above come from a database that ran a fresh
 no such step. Noted in `bench/23_region_contains.sql`'s own header for
 whoever hits this next.
 
-**A faster alternative exists for this exact query, and is deliberately not
-recommended.** The MOC-in-a-B-tree recipe already documented in
-`skycell--0.11.sql` (`skycell_region_moc` + `skycell_ancestors`, a manually
-built and maintained side table of MOC cells per stored region) answers
-"which regions contain this point" too. Run head-to-head against this
-opclass on the identical `fpr` fixture and probe points: ~2.5-4.8ms against
-this opclass's ~4.9-5.3ms at 5,000 rows/200 probes, and ~20-30ms against
+**A faster alternative exists for this exact query, and -- at the time this
+note was first written -- was deliberately not recommended.** The
+MOC-in-a-B-tree recipe already documented in `skycell--0.11.sql`
+(`skycell_region_moc` + `skycell_ancestors`, back then a manually built and
+maintained side table of MOC cells per stored region) answers "which
+regions contain this point" too. Run head-to-head against this opclass on
+the identical `fpr` fixture and probe points: ~2.5-4.8ms against this
+opclass's ~4.9-5.3ms at 5,000 rows/200 probes, and ~20-30ms against
 ~86-89ms at 50,000/500 -- roughly 2x faster at the smaller scale and 3-4x
 at the larger one, closing most of the gap to pgSphere's native `<@`
 (~2.5-2.6ms and ~12-14ms respectively) that this opclass does not.
-Correctness matches exactly at both scales. Not written up as a benchmark
-script or mentioned in README.md: it needs a hand-maintained side table and
-a hand-written join, exactly what the `skyregion` GiST opclass exists to
-make unnecessary, so recommending it here for one specific query shape
-would undercut the thing this whole file is trying to build. Recorded
-because it is true and someone chasing this opclass's remaining gap to
-pgSphere should know a faster path already exists, priced at the
-side-table cost skycell's single-index design is meant to avoid.
+Correctness matches exactly at both scales. At the time, this was not
+written up as a benchmark script or mentioned in README.md: it needed a
+hand-maintained side table and a hand-written join, exactly what the
+`skyregion` GiST opclass exists to make unnecessary, so recommending it for
+one specific query shape would have undercut the thing this whole file is
+trying to build.
+
+That objection is gone as of "Round eight" below: the same array this
+recipe stored by hand in a side table is exactly what `skycell_region_moc()`
+already returns, and PostgreSQL's own built-in GIN opclass for arrays
+indexes it directly -- no side table, no custom opclass, and (round eight's
+own numbers) faster still than this manual recipe's timings above. What was
+a deliberately-unrecommended aside is now the documented, automatic,
+README-recommended path; this note stays for the history (the manual
+recipe was the thing that pointed at what to automate) rather than as
+current guidance.
 
 ## Tried and rejected: MAX_SUBCAPS=8
 
@@ -715,6 +724,120 @@ competitive there. This is the first case in this file where the
 "reuse round three's test" strategy doesn't just win against sequential
 scan but against the native implementation too, without any tuning
 specific to this direction.
+
+## Round eight: an automatic GIN alternative for region @> point, and why
+## it isn't a GiST opclass strategy at all
+
+Round four's own gap to pgSphere (~2x at 5,000 rows, ~5.5x at 50,000) was
+never closed by tuning `consistent()` further -- `EXPLAIN (ANALYZE,
+BUFFERS)` there already showed the strategy's own absolute cost matching
+`&&`'s at the same scale, so the ceiling is the multi-cap tree traversal
+itself (round two's diagnosis, round five's picksplit only closing ~10-15%
+of it), not this strategy's pruning precision. Separately, an aside added
+to round six's own section after the fact noted a *manual* MOC-in-a-B-tree
+recipe already beats this opclass at the same query by 2-4x -- but flagged
+as a side-table recipe, deliberately not recommended, exactly the kind of
+manual join `skyregion`'s own GiST opclass exists to make unnecessary.
+
+The two findings point at the same fix: automate that recipe instead of
+tuning the tree it was built to route around. `skycell_region_moc(region,
+max_cells, max_order)` already gives every row a small `int8[]` of covering
+cells (skycell--0.11.sql's "MOC-in-a-B-tree" comment block); PostgreSQL's
+own built-in GIN opclass for arrays already indexes `&&`/`@>`/`<@` on any
+array type, `int8[]` included, with no custom opclass needed at all. A
+plain `CREATE INDEX ... USING gin (skycell_region_moc(region))` is
+therefore already a real index over exactly the array the manual recipe's
+side table stored one row at a time -- what was missing was the automatic
+rewrite that lets `region_col @> point`/`point <@ region_col` reach it
+without the user spelling out the array-overlap form themselves.
+
+**The rewrite.** `region_support_simplify` (`ext/src/adql.c`) already had
+exactly the right shape of gap to extend: its existing rewrite needs an
+index on the *point* side (`density_for_expr`) and gives up entirely
+(`return NULL`) when none exists. That gap is precisely "many regions, one
+point, no point-side index" -- the case this round is for. Added: when
+`density_for_expr` fails and the region argument is a column (not a
+constant -- a literal region has no column to carry an index on),
+`gin_moc_index_for_region()` (`ext/src/skycell.c`) checks for a GIN index
+on `skycell_region_moc(that column, ...)`, mirroring `density_for_expr`'s
+own var-extraction and `RelationGetIndexList` walk. On a match it returns
+the index's actual stored expression (so the rewritten query cites it
+verbatim, syntactically indexable) and the `max_order` that expression's
+`skycell_region_moc()` call was built with. The rewrite itself is then
+`moc_expr && skycell_ancestors(point_cell, 0, max_order) AND
+skycell_in_region(point, region)` -- `array_overlap_expr()` resolves the
+`&&` operator via `oper()`, not a plain OID lookup, since the catalog entry
+is the polymorphic `anyarray && anyarray`, not one specific to `int8[]`
+(an exact-match lookup silently finds nothing and the rewrite would never
+fire; caught immediately by testing before trusting any EXPLAIN output).
+
+**Why the order range is capped, not narrowed, and why that boundary was
+drawn deliberately.** The obvious further win -- narrow `skycell_ancestors`'
+own range to whatever *coarsest* order the data actually uses, not just
+capping the finest -- was tried by hand first (see below) and rejected as
+an automatic default: the coarse end depends on which regions exist in the
+table, knowable only from a real scan or a statistics sample, and a sample
+is not guaranteed to include a rare, unusually large region's actual
+order. Guessing that bound wrong risks a false negative -- a genuine match
+silently dropped, with no recheck able to catch it, unlike a spurious
+candidate. So `gin_moc_index_for_region` only ever reads the `max_order`
+argument the index's own `skycell_region_moc()` call was built with --
+exact, not sampled, since no row's covering can use a finer cell than that
+argument allows -- and leaves the coarse end at 0. A user who knows their
+own corpus's size distribution can still get the tighter range by hand, by
+passing a smaller `max_order` when creating the index; the rewrite reads
+back whatever was actually asked for rather than assuming a default.
+
+**Correctness.** 0 mismatches against `skycell_in_region` on 800 random
+query points (single-table form) and on the join form both spellings
+(`region @> point`, `point <@ region`) use, at 5,000 and 50,000 rows;
+`ext/test/sql/skycell.sql` gained a dedicated block confirming the rewrite
+fires for both spellings and that a user-supplied narrower `max_order` is
+read back and used verbatim (checked via the plan text, not just
+inferred). On the regression suite's own small fixture (~140 rows) the
+rewritten form still computes the right answer but a sequential scan
+legitimately beats either index there, the same scale caveat already noted
+for other tests in that file -- proving the rewrite fires and is correct
+does not require proving it wins at every scale.
+
+**Performance** (`bench/23_region_contains.sql`'s own fixture and probes,
+so directly comparable to round four's own numbers above), using the plain
+`@>`/`<@` spelling -- no manual query rewriting, this is what the automatic
+path actually produces:
+
+| approach | 200 probes x 5,000 footprints | 500 probes x 50,000 footprints |
+|---|---|---|
+| brute force (`skycell_in_region`) | ~600-643 ms | ~15.2-15.7 s |
+| this opclass, round four's `@>`/`<@` | ~5.2-6.3 ms | ~90-126 ms |
+| pgSphere native `<@` | ~2.7-2.9 ms | ~12.8-12.9 ms |
+| **this rewrite, default (`max_order` = index's own, here 29)** | **~4.2-4.8 ms** | **~15.1-17.2 ms** |
+| **this rewrite, user-narrowed `max_order` (= 14, matching the data)** | **~2.4-3.8 ms** | **~10.9-12.9 ms** |
+
+Even at the fully-automatic default (no tuning, whatever `max_order` the
+index was created with) this beats round four's own GiST strategy by
+**~1.3-1.5x at 5,000 rows and ~5.7-8x at 50,000** -- closing almost all of
+round four's own gap to pgSphere at the smaller scale and most of it at
+the larger one. With the one optional, user-supplied lever documented
+above, it goes further and **matches or slightly beats pgSphere outright at
+both scales** -- the second case in this file (after round seven) where an
+alternative to the GiST opclass beats the native implementation, not just
+sequential scan. Build cost and index size are comparable to the region
+GiST index at the same scale (measured at 50,000 rows: ~3.7s/18MB for this
+GIN index against ~2.25s/17MB for the GiST one) -- not the deciding factor
+either way.
+
+**Why this is not a fifth GiST strategy.** Every other round in this file
+extended `skyregion_gist_ops` itself -- one opclass, one index, every
+strategy sharing its consistent()/picksplit machinery. This one is a
+different *kind* of index (GIN, not GiST) reached through a planner
+rewrite (`SupportRequestSimplify`), the same mechanism the B-tree cell
+rewrite has always used, applied here to a case that mechanism's existing
+logic already gave up on. It coexists with the GiST opclass rather than
+replacing it: a table with only a GiST index still gets round four's own
+strategy exactly as before (this rewrite requires its own GIN index to
+apply at all), and a table with both gets this rewrite instead, since it
+unconditionally replaces the `@>`/`<@` clause once its own index exists --
+deliberate, given the numbers above, not an oversight to fix later.
 
 ## Spike scope
 
