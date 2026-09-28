@@ -1510,3 +1510,93 @@ here) that both made things worse, the more likely explanation is that a
 PATRICIA trie over this kind of skewed density field is close to its
 achievable shape already, the same conclusion this file's rounds two, five,
 nine and ten reached for the GiST opclass's own fanout.
+
+## Round thirteen: a coarse execution-time covering index, ruled out before
+## being built
+
+Round twelve closed off reshaping the SP-GiST tree itself. The next
+candidate for the opclass's remaining execution-cost problem was a
+different kind of change: leave the tree alone and instead attack
+`skycell`'s own B-tree-rewrite path, which round eleven had shown still
+pays a real, scaling planning cost (0.02-0.25ms at 10M rows) to compute its
+covering fresh on every query via `cover.c`'s `sc_cover_compute()`.
+
+**The idea**: replace that from-scratch, planning-time recursive
+subdivision with a small, coarse index -- built over occupied HEALPix cells
+or reusing the existing point-level SP-GiST tree's own inner structure --
+walked once at *execution* time via a set-returning function, handing the
+resulting ranges to the same cheap B-tree scan skycell already uses. The
+premise: `cover_cone_direct()`'s recursive `sc_region_classify_cap()` walk
+prunes only against the query's geometry, never against where data actually
+lives, so for a large query region it should be re-examining (and
+recursing into) plenty of cells that are empty of real data -- exactly the
+waste a density-aware structure could skip.
+
+**First, profiling the actual cost, before designing anything further**
+(direct in-process timing, not `perf` -- unavailable in this container --
+instrumented via the same temporary `elog`/`fprintf` technique used
+throughout this file, at 2M rows with a warm per-backend density-map cache,
+40 distinct queries per radius):
+
+| radius | density lookup | `choose_order` | `cover_cone_direct` | `merge_gaps` | total covering compute | classify() steps | ranges |
+|---|---|---|---|---|---|---|---|
+| 1" | 0.0us | 0.5us | 2.3us | 0.0us | 2.8us | 4 | 1 |
+| 1' | 0.0us | 0.5us | 2.6us | 0.0us | 3.2us | 4 | 1 |
+| 30' | 0.0us | 0.7us | 61.2us | 0.4us | 62.3us | 260 | 5 |
+| 1deg | 0.0us | 0.8us | 76.7us | 0.6us | 78.2us | 584 | 9 |
+| 3deg | 1.0us | 1.0us | 141.3us | 1.6us | 144.3us | 825 | 19 |
+
+This settled two things before any index work started. The per-backend
+density-model cache (`skycell.cache_coverings`'s sibling caches for the
+histogram and matching index, not the per-query covering memo itself, which
+never hits for distinct query centers) is genuinely free once warm, so
+"loading the density model costs more than computing the covering" (the
+comment in `skycell.c` this describes) is a cold-start-only cost, not a
+per-query one. And the covering computation itself is negligible at
+sub-arcminute radii (~3us against round eleven's ~32-35us measured total
+planning time -- the real cost there is generic planner/rewrite overhead no
+index would touch) but genuinely dominant and scaling at 30'+ (60-140us,
+60-75% of measured total planning time) -- exactly where an index-based
+replacement would have to earn its keep.
+
+**Then measuring the premise directly, rather than assuming it**: how much
+of `cover_cone_direct`'s work at 30'-3deg lands on cells with zero real
+rows. First attempt used the existing ANALYZE-histogram density map
+(`sc_density_rows`) as the "is this empty" oracle in a modified copy of the
+walk that short-circuits recursion into any cell the map reports as
+empty -- 0.0% of steps avoided, at every radius. That number turned out to
+be a false lead: reading `sc_density_rows()` shows it prorates an
+equi-depth histogram bucket's count across every sub-cell inside it
+("inside one map cell this is still an assumption of uniformity"), so it
+structurally cannot report exactly zero for any cell that overlaps a
+non-empty bucket, whatever the real occupancy inside that cell actually is.
+Redone against ground truth instead -- logging every one of the walk's
+2,116 distinct visited cells (16,318 total visits, orders 7-9) and checking
+each with a real `EXISTS(...)` against the actual table -- came back the
+same: **0.0% empty, exactly, weighted or unweighted.** Every cell the
+production code's covering walk touches at these radii contains at least
+one real row.
+
+**Why zero, not just small**: `choose_order()`'s own cost model already
+balances range count against expected false-positive rows, which pushes it
+to stop getting finer once cells are reasonably populated rather than
+continuing toward a resolution where emptiness would show up -- the
+algorithm is not wasting effort on sparsity because it is not, in this
+respect, looking in the wrong place. That, combined with this benchmark
+corpus's substantial uniform background component (its density spec is
+35% uniform sky, so no order-7-9 cell overlapping a plausible query is ever
+genuinely unpopulated), leaves nothing for a sparsity-aware structure to
+skip.
+
+**Ruled out before writing an index at all.** The hybrid's entire case was
+"the current walk wastes work a data-aware structure could avoid"; measured
+directly, it does not, at least for this catalogue. Combined with round
+twelve (reshaping the SP-GiST tree's own branching made large queries
+worse, not better) and the profiling above (small-radius planning cost
+isn't in the covering computation to begin with), there is no remaining
+version of "reuse an index to make the covering cheaper" left to try
+against this corpus. The one caveat worth keeping: this corpus has no true
+coverage gaps (unobserved sky, not just low density), which a real survey
+footprint might have and which this measurement cannot speak to -- but
+absent a concrete reason to expect that, this line of attack on the
+opclass's execution cost is closed.
