@@ -3168,3 +3168,84 @@ worth carrying. The open-questions list's own instinct -- that this
 mirror wasn't expected to close a gap that doesn't exist -- held up
 under actual measurement, not just prediction; worth having tried
 rather than left as a guess, but nothing to ship.
+
+## Round thirty-seven: a JIT-aware term in `cover.c`'s cost model --
+## structurally impossible, not just unmeasured
+
+The last open item from rounds seventeen through nineteen's own list:
+add a term to `cover.c`'s covering-choice cost model that prices in the
+execution-side JIT tax (§ round eighteen: the shipped, non-experimental
+`cover_cone_direct()` path already crosses `jit_above_cost` for ~1% of
+realistic large-radius/dense queries, paying a 3-6x parallel-JIT
+compile tax as a result), so the covering computation could route
+around the cliff itself rather than needing an operational GUC (round
+nineteen's confirmed but code-side-unreachable fix). Before writing any
+code, tested the load-bearing assumption directly: for an actual
+crossing query, does *any* alternative covering choice reduce the real,
+Postgres-reported plan cost below the threshold?
+
+**Setup**: 10M-row corpus, a genuine dense real-data-cluster centre
+(the kind round eighteen's own benchmark found crossing the threshold),
+radius pushed to 3.5 degrees to land just over `jit_above_cost`
+(default order 9: plan cost 99,165, `Finalize Aggregate`/`Gather` in the
+plan -- parallel, exactly the shape that pays the tax N times over).
+Swept `skycell.force_order` from 5 through 15 and read both `skycell_
+cover_info()`'s own numbers and the real `EXPLAIN` cost at each:
+
+| force_order | nranges | exp_rows | area_ratio | EXPLAIN cost |
+|---|---|---|---|---|
+| 5 | 8 | 176,905 | 1.83 | (not measured directly, strictly worse than 6) |
+| 6 | 12 | 135,142 | 1.46 | **262,125** |
+| 7-15 | 30 | 107,478 | 1.19 | 99,165 (order 9, the default) |
+
+**Two findings, both clean.** The covering already converges to its
+best available shape at the default choice: orders 7 through 15 all
+produce the *identical* 30-range, 107,478-row covering -- there is no
+finer order left to try that would reduce false positives further, the
+geometry's own boundary-cell count is already the limit. And every
+coarser alternative makes the real cost *worse*, sharply: order 6 (12
+ranges instead of 30) more than doubles the reported plan cost, to
+262,125 -- moving further over the threshold, not under it.
+
+**Why this isn't specific to this one query.** `rlist_score()`'s own
+`merge_gaps()` (called on every candidate before it is scored) already
+greedily merges every gap cheaper than `range_cost` -- by construction,
+whatever covering `choose_order()`/`merge_gaps()` settles on has already
+absorbed every merge that was a net win. Forcing *more* merging past
+that point (a coarser order, or a tighter `max_ranges`) necessarily
+merges gaps whose row-cost *exceeds* `range_cost` -- each such forced
+merge changes the total score by exactly `(gap's own rows) -
+(range_cost)`, which is positive by definition of it not already having
+been merged for free. This holds for any query, not just the one
+measured: past the point `merge_gaps()` already reaches, there is no
+direction left in which coarsening the covering reduces cost. A JIT-aware
+term added to `rlist_score()` would have nothing to select *for* -- the
+"duck under the JIT cliff" alternative it would need to prefer doesn't
+exist in the space of coverings `cover.c` can produce.
+
+**What this actually means for round eighteen's finding.** The queries
+that cross `jit_above_cost` aren't crossing it because of a covering
+*quality* problem skycell's cost model failed to price -- they cross it
+because they are genuinely expensive queries, matching genuinely large
+numbers of real rows in a dense region, which is exactly the situation
+where JIT compilation is normally *supposed* to help (amortizing a
+large scan's per-tuple evaluation cost). The defect is specifically that
+PostgreSQL's parallel workers each independently pay the compile cost
+with no amortization across them (round eighteen's own `Workers
+Launched: 2`, `Inlining: 0.000ms`, Emission alone at 68-83% of total
+time) -- an execution-side interaction between JIT and parallelism that
+happens entirely after any covering choice is finalized, in a part of
+PostgreSQL's own execution machinery `cover.c` has no visibility into or
+influence over. No covering-time cost term, however designed, can
+substitute for fixing (or working around) that interaction directly.
+
+**No code written -- this is a negative result established before
+implementation, not after.** Round nineteen's operational fix (raise
+`jit_above_cost` or disable JIT for the session/connection pool running
+this workload) remains the only actionable mitigation from this whole
+line of investigation; a `planner_hook` intervening after PostgreSQL's
+own cost is computed (not attempted, a materially bigger and different
+kind of change than anything else in this file) is the only remaining
+code-level lever, and this round's finding rules out the smaller,
+`cover.c`-scoped alternative that rounds seventeen through nineteen had
+left open as the more approachable option.

@@ -346,34 +346,37 @@ and at least as good as a blanket disable.
 In rough order of how well-scoped/promising they seem from this history,
 not in priority order — pick what matches the actual goal:
 
-1. **Give `cover.c`'s cost model a JIT-aware term** (§5, rounds seventeen
-   and eighteen). Round sixteen's parallel-scan sensitivity is now
-   precisely explained, and round eighteen confirmed it is already live on
-   the shipped, non-experimental `cover_cone_direct()` path (3/300
-   production-representative queries, 3.1-6.0x slower, 1% of the tested
-   distribution, concentrated at the largest radius tested): PostgreSQL
-   JIT-compiles the OR'd range predicate once plan cost crosses
-   `jit_above_cost`, that compile cost scales steeply with range count, and
-   parallel workers each pay it independently, so it multiplies rather than
-   amortizes. `range_cost` (the covering's own per-range price, calibrated
-   from B-tree descent cost) has no term for this at all. `p->max_ranges=64`
-   itself is not the binding constraint (max seen in round eighteen's
-   benchmark: 26 ranges) — the JIT threshold is crossed well before the
-   range-count ceiling is. **Round nineteen closed one of the two candidate
-   fixes**: raising `jit_above_cost`/disabling JIT for the session running
-   skycell's wide-OR queries is a confirmed, non-regressive, zero-code-
-   change win (matches or beats a blanket disable) — but it is an
-   *operational* fix (a GUC set by the application/connection pool), not
-   something skycell's own code can apply per-query, because PostgreSQL's
-   JIT decision is finalized at the end of planning, strictly before any
-   skycell C function executes; only a `planner_hook` (not implemented,
-   a materially bigger change than anything else in this file) could make
-   it automatic. The other option is still untried and is now the more
-   interesting remaining one: add a range-count-and-expected-parallel-
-   worker-count term to `cover.c`'s own cost model, so the covering
-   computation itself prices in execution-side JIT cost rather than just
-   descent cost — the only path to a fix skycell can ship without asking
-   every deployment to tune a PostgreSQL GUC by hand.
+1. ~~Give `cover.c`'s cost model a JIT-aware term~~ — tried (round
+   thirty-seven), structurally impossible to implement usefully, not just
+   unmeasured. Round nineteen already closed the operational half
+   (raising `jit_above_cost`/disabling JIT is a confirmed, non-regressive
+   fix, but not something skycell's own code can apply per-query). Round
+   thirty-seven tested the other half directly: for an actual
+   jit_above_cost-crossing query (10M rows, 3.5° radius, dense
+   real-data-cluster center, cost 99,165 at the default order),
+   systematically forcing every order from 5 through 15 showed the
+   covering already converges to its best available shape at the default
+   choice (orders 7-15 all produce the identical 30-range, 107,478-row
+   covering — no finer order helps further) and *every* coarser
+   alternative makes the real, Postgres-reported plan cost *worse*, not
+   better (order 6: 12 ranges but cost 262,125 — 2.6x higher, not lower).
+   The reason is structural, not specific to this query: `merge_gaps()`
+   already greedily merges every gap cheaper than `range_cost` before
+   `rlist_score()` ever compares candidates, so by the time a covering is
+   chosen, no cheaper-to-merge gap is left — forcing *more* merging past
+   that point necessarily absorbs gaps whose row-cost exceeds
+   `range_cost`, which can only raise total cost, for any query, not just
+   this one. There is no "duck under the JIT cliff by picking a coarser
+   covering" move available: the query's cost is a genuine, unavoidable
+   reflection of how many rows it truly matches, which is exactly the
+   case where JIT normally helps amortize a big scan — the real defect is
+   PostgreSQL's own parallel-JIT interaction (each worker independently
+   pays the compile cost with no amortization across workers), an
+   execution-side architectural gap a covering-time cost term in `cover.c`
+   cannot reach regardless of how it's designed. A `planner_hook` (or a
+   PostgreSQL core fix to that interaction) remains the only path to a
+   code-level fix; not attempted, and this round's finding makes clear no
+   scoped alternative exists inside `cover.c` itself.
 2. **Recalibrate `SC_COVER_MAX_DRY_STREAK`** (round sixteen's reverted fix,
    `cover.c`) against a broad query set, not one failing query -- the
    underlying bug (density alone justifying unbounded speculative
@@ -543,9 +546,19 @@ not in priority order — pick what matches the actual goal:
   `jit_above_cost`/disable JIT for the session) works cleanly with zero
   regressions, but it's a GUC applications must set themselves — skycell's
   own code has no hook into a decision PostgreSQL finalizes before any
-  skycell function runs. Still unshipped: either that documented
-  operational guidance, or a JIT-aware term in `cover.c`'s own cost model.
-  Round thirty attempted the other open `cover.c` item — calibrating
+  skycell function runs. Round thirty-seven then tested the other
+  candidate fix directly — a JIT-aware term in `cover.c`'s own cost model
+  — and found it structurally impossible, not just unmeasured: for an
+  actual crossing query, every order from 5 to 15 was tried directly, and
+  the covering was already at its best available shape (orders 7-15 all
+  converge to the same covering) while every coarser alternative made the
+  real, Postgres-reported cost *worse* (order 6: 2.6x higher, not lower)
+  — because `merge_gaps()` already greedily merges every gap cheaper than
+  `range_cost` before a covering is ever chosen, so forcing more merging
+  past that point can only raise cost, for any query. No scoped
+  `cover.c`-internal fix exists; the operational GUC guidance from round
+  nineteen is the only actionable mitigation shipped from this line of
+  investigation. Round thirty attempted the other open `cover.c` item — calibrating
   `split_cost` so `skycell.probe_orders`'s scored mechanism picks the
   already-proven-better finer covering order automatically — and found no
   net win: real buffer savings from lower `split_cost` are real but small
