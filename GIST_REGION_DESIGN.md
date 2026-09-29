@@ -3249,3 +3249,149 @@ kind of change than anything else in this file) is the only remaining
 code-level lever, and this round's finding rules out the smaller,
 `cover.c`-scoped alternative that rounds seventeen through nineteen had
 left open as the more approachable option.
+
+## Round thirty-eight: a bulk-loaded point SP-GiST structure -- the cheap
+## approximation works dramatically, and precisely diagnoses why the
+## expensive version wouldn't finish the job
+
+The last open item from the point SP-GiST opclass's own closing verdict
+(rounds nine through thirteen, §4): a bulk-loaded, statically-packed
+structure instead of the incremental `choose()`/`picksplit()` construction
+every `CREATE INDEX`/`INSERT` currently goes through. A genuine version of
+this -- a custom `ambuild` writing SP-GiST inner/leaf tuples directly,
+bypassing the per-row insertion API entirely -- means hand-rolling page
+layout and WAL-safety at the level PostgreSQL's own storage code operates
+at, a materially bigger and riskier undertaking than anything else in
+this file. Before committing to that, tested the load-bearing hypothesis
+cheaply: does *insertion order* alone, with the existing, unmodified
+opclass code, change tree quality enough to matter? If order doesn't
+matter, a full bulk-loader (which mainly buys a better-ordered
+construction sequence) has nothing to fix. If it does, the cheap version
+(sort the input, don't touch the opclass) already captures most of the
+same value a custom `ambuild` would work much harder for.
+
+**This wasn't a hypothetical risk to check casually.** The opclass's own
+header comment (top of `spgist_region.c`) documents a *real* correctness
+bug found the first time a HEALPix-sorted build was tried, pre-fix: "a
+physically HEALPix-sorted table missed 2 of 3 true matches on a cone
+query that an unsorted build of the identical rows answered correctly,"
+because a *fixed* one-order-per-level split can report a false
+"all-the-same" for a batch that's only locally homogeneous by chance of
+insertion order, not genuinely indistinguishable -- and once marked,
+SP-GiST's own core refuses to ever add a node to it again. The documented
+fix (rounds ten/eleven: always search for the true longest common prefix
+from scratch, never trust accumulated hop count) is specifically what's
+supposed to make sorted-order construction safe now. This round is the
+first time that exact scenario -- building against a fully HEALPix-sorted
+table -- has actually been tried against the current, fixed code.
+
+**Setup**: the same 10M-row corpus and radii round eleven/twelve
+established (1", 1', 30', 1deg, 3deg), two physical copies of the same
+`skypos` data -- `spg_pts_random` (natural/generation order, matching how
+every prior round in this opclass's history built it) and
+`spg_pts_sorted` (`ORDER BY skycell_ang2cell(ra, dec)` before the
+`CREATE INDEX`, the cheapest possible proxy for "the build saw
+HEALPix-local batches together" without touching a line of C). 60 query
+centers, a mix of real-data and uniform-sky (both kinds, all five radii,
+matching round nineteen's own resampling fix), `EXPLAIN (ANALYZE,
+BUFFERS)`.
+
+**Correctness first, given the specific documented risk**: brute-force
+count from both tables agreed exactly on the initial spot checks
+(including a near-pole query, `dec=89`), and a full sweep across all 60
+corpus queries came back **0 mismatches, 244,779 total matches identical
+both ways**. The from-scratch-prefix-search fix holds up under the exact
+stress case its own comment flags -- sorted-order construction is safe
+with the current code.
+
+**Buffer touches: a large, clean, and robust win.**
+
+| radius | random avg buffers | sorted avg buffers | ratio |
+|---|---|---|---|
+| 1" | 37.8 | 40.5 | 0.93x (noise) |
+| 1' | 42.6 | 42.2 | 1.01x (noise) |
+| 30' | 956.9 | 102.9 | **9.3x fewer** |
+| 1deg | 5,139.8 | 363.6 | **14.1x fewer** |
+| 3deg | 19,330.8 | 1,226.3 | **15.8x fewer** |
+
+Checked separately by centre kind (real-data-cluster vs. uniform-sky) to
+rule out the win being an artefact of one or the other: both show the
+same 4-17x reduction at every radius from 30' up, nothing close to it
+below. Index build time was *also* 2.3x faster for the sorted table
+(28.3s vs 64.8s) -- fewer, cheaper page reorganisations during
+construction, consistent with the same mechanism. This is the single
+largest buffer-count improvement measured anywhere in this whole
+investigation, region-GiST or SP-GiST.
+
+**Against skycell's own B-tree path -- the thing this opclass exists to
+replace -- the sorted build closes the buffer gap almost entirely, and at
+the largest radius, reverses it:**
+
+| radius | B-tree buffers | SP-GiST-sorted buffers | B-tree ms | SP-GiST-sorted ms |
+|---|---|---|---|---|
+| 1" | 14.0 | 40.5 | 0.31 | 0.21 |
+| 1' | 16.8 | 42.2 | 0.34 | 0.23 |
+| 30' | 87.0 | 102.9 | 0.75 | 0.87 |
+| 1deg | 265.7 | 363.6 | 1.84 | 3.42 |
+| 3deg | 1,314.5 | **1,226.3** | 5.78 | 13.45 |
+
+Round eleven's own verdict ("tree descent costs more buffer touches...
+at every radius tested [than the B-tree]") no longer holds at 3 degrees:
+SP-GiST-sorted touches *fewer* buffers there. Wall-clock, though, does
+not follow -- SP-GiST-sorted is faster at 1"/1' (lower fixed
+per-query overhead than the bitmap-scan machinery for a handful of
+matches) but 1.2-2.3x *slower* at 30'-3deg, widening with radius, despite
+comparable or better buffer counts.
+
+**Isolated why directly, rather than guessing parallelism or cache
+state.** First suspect: the B-tree path's plan is parallel (`Gather`,
+2 workers) while SP-GiST's Bitmap Index Scan plan has no `Gather` node at
+all -- PostgreSQL's SP-GiST access method doesn't implement parallel
+index scan the way B-tree does, so this opclass is structurally
+single-threaded regardless of tree quality. Tested by forcing the B-tree
+path serial too (`SET max_parallel_workers_per_gather = 0`) and comparing
+both, warm-cache, on the identical query: B-tree serial was *faster* than
+B-tree parallel here (8.8ms vs 10.9ms -- parallel overhead exceeded
+benefit at this row count), ruling out parallelism as the dominant
+factor. Warm-cache, serial-vs-serial, same query: B-tree 488 buffers/
+8.8ms vs SP-GiST-sorted 729 buffers/20.8ms -- SP-GiST touches 1.5x more
+buffers *and* costs about 1.6x more per buffer touched. The remaining gap
+is a genuinely higher **per-node CPU cost**: SP-GiST's `inner_consistent
+()`/`leaf_consistent()` run real geometric classification
+(`sc_region_classify()`, vector/trig math) at every node visited, where
+the B-tree's bitmap scan does plain integer range comparisons. Tree shape
+improved dramatically; the cost of evaluating each node the (now much
+smaller) tree still visits did not, because it was never the thing
+sorted-order construction could touch.
+
+**What this means for the original question.** The core hypothesis behind
+"try a bulk-loaded structure" is emphatically confirmed: insertion order,
+not some inherent ceiling on a PATRICIA trie's achievable shape (round
+twelve's own closing guess), was the dominant reason the unsorted-build
+tree performed as poorly as it did on buffer touches. A full custom
+`ambuild` would very plausibly refine tree shape further still (a global,
+one-pass balanced construction should beat "insert in sorted order and
+let incremental picksplit do its best," even if the gap between them is
+smaller than the gap this round already closed) -- but the *remaining*
+wall-clock deficit against the B-tree is now precisely diagnosed as a
+separate, orthogonal cost (per-node classification work, not tree
+topology), which no amount of *better shape* can fix on its own. That
+makes the expensive version of this idea a poor bet on its own: it would
+need to be paired with cheapening `inner_consistent()`/`leaf_consistent
+()` itself (a different, unexplored lever -- e.g. a cheaper coarse
+pre-filter before the full geometric test, mirroring what round
+twenty-seven did for the region GiST opclass's point predicate) to have
+a real chance at closing the remaining 1.2-2.3x gap, not tree
+construction on its own.
+
+**Shipped**: nothing -- this remains a research-only opclass, not
+recommended for production use, per round thirteen's own standing
+verdict. But the verdict itself is now sharper: if anyone does pick this
+opclass up again, building against a table already `CLUSTER`ed (or
+otherwise physically sorted) by HEALPix cell is a real, free, zero-code
+improvement over an unsorted build -- and the honest next step to close
+the remaining gap is cheapening the per-node consistent-function cost,
+not further chasing tree shape via a full custom bulk-loader, which this
+round's diagnosis suggests would be a much larger engineering bet for a
+smaller remaining return than the sorted-build experiment alone already
+captured.

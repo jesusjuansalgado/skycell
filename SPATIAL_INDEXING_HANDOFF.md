@@ -199,11 +199,32 @@ already uses for the B-tree covering).
 
 **Where this leaves the point SP-GiST opclass**: correctness-verified and
 architecturally validated (the planning-cost hypothesis is confirmed), but
-a net loss against the B-tree-rewrite path it was meant to replace, and
-three independent, targeted attempts to close the execution-cost gap
-(rounds nine's underlying lesson, twelve, thirteen) all failed for
-different, specific, measured reasons. **Not recommended for use**; kept in
-the repo as a correctness-verified, well-documented negative result.
+a net loss against the B-tree-rewrite path it was meant to replace.
+Rounds nine, twelve, and thirteen all failed to close the execution-cost
+gap for different, specific, measured reasons. **Round thirty-eight then
+found the one lever that actually moves it substantially**: building the
+index against a table pre-sorted by HEALPix cell (a `CLUSTER`, no C code
+changed) rather than natural/insertion order cuts buffer touches
+4-17x at 30'-3 degrees (verified safe against the exact correctness risk
+the opclass's own header comment documents for sorted-order builds, 0
+mismatches across a 60-query corpus) and closes the buffer-count gap to
+skycell's own B-tree almost entirely — even reversing it at 3 degrees
+(1,226 vs 1,314). Wall-clock does not follow, though: isolated away from
+parallelism (confirmed not the cause via a serial-vs-serial comparison)
+and cache-warmth confounds, SP-GiST-sorted still costs about 1.6x more
+per buffer touched than the B-tree, because its `inner_consistent()`/
+`leaf_consistent()` run real geometric classification at every node
+where the B-tree's bitmap scan does plain integer comparisons — a
+separate, orthogonal cost that better tree shape cannot fix. This
+precisely explains why a full custom bulk-loading `ambuild` (materially
+bigger and riskier than anything else attempted here — hand-rolled page
+layout and WAL-safety, not an opclass callback) would be a poor bet on
+its own: it would refine tree shape further, which this round shows is
+no longer the dominant remaining cost. **Still not recommended for
+use**, but the verdict is sharper now: a sorted-order build is a real,
+free improvement if anyone does pick this up, and the actual next lever
+would be cheapening the per-node consistent-function cost itself, not
+further tree-shape work.
 
 ## 5. The other, separate open gap: skycell's own B-tree path vs. pgSphere
 ## at large radii
@@ -437,15 +458,20 @@ not in priority order — pick what matches the actual goal:
    — the overlap test already rejects almost everything the area test
    would additionally catch, the same redundancy round fourteen found in
    the other direction.
-8. **A bulk-loaded, statically-packed structure for the point predicate**,
-   instead of the point SP-GiST's incremental `choose`/`picksplit`
-   construction (flagged, not attempted, when round twelve/thirteen closed
-   out — see the "so, the conclusion is that SP-GiST is a dead end?"
-   exchange in this session's own transcript, or just the closing
-   paragraph of round thirteen). Bigger undertaking, uncertain payoff, and
-   risks converging on "just reimplement the B-tree as an index AM" —
-   flagged as the one idea with a real mechanism behind it that hasn't
-   been measured, not as something expected to obviously win.
+8. ~~A bulk-loaded, statically-packed structure for the point
+   predicate~~ — the cheap version tried (round thirty-eight): building
+   against a table pre-sorted by HEALPix cell, no C code changed. Confirms
+   the core hypothesis emphatically (4-17x fewer buffer touches, closing
+   the gap to the B-tree almost entirely) but also precisely diagnoses why
+   the *expensive* version (a real custom `ambuild`, hand-rolled page/WAL
+   layout — a materially bigger undertaking than anything else in this
+   file) wouldn't finish the job: the remaining wall-clock gap is a
+   separate, orthogonal per-node CPU cost (`inner_consistent()`/
+   `leaf_consistent()`'s real geometric classification vs. the B-tree's
+   plain integer comparisons), not tree shape, which is the only thing a
+   full bulk-loader would additionally improve. Not attempted, and this
+   round's finding makes it a poor bet on its own — closing the remaining
+   gap needs cheapening the per-node consistent-function cost instead.
 9. **Real survey-footprint sparsity** for the point SP-GiST's covering-walk
    idea (round thirteen's own caveat): the corpus used throughout this
    whole investigation is synthetic with a substantial uniform-sky
