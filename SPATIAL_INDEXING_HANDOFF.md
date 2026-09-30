@@ -60,7 +60,7 @@ their results is the single easiest way to misread this history:
 | | indexes | predicates | file | status |
 |---|---|---|---|---|
 | **Region GiST (multi-cap)** | the *region* column (`skyregion`) | `&&`, `@>`(region,point), `@>`(region,region), `<@`(region,region) | `ext/src/gist_region.c` | shipped, default opclass for `skyregion` |
-| **Region GiST (box)** | the *region* column (`skyregion`), alternate opclass | same four strategies | `ext/src/gist_region_box.c` | experimental, correctness-verified, `skyregion_box_gist_ops`, non-default — beats the multi-cap opclass at realistic catalog-footprint radii (arcsec-few degrees), loses it back from ~20° on; see round forty-two in §3 |
+| **Region GiST (box)** | the *region* column (`skyregion`), alternate opclass | same four strategies | `ext/src/gist_region_box.c` | shipped (`ext/sql/skycell--0.12--0.13.sql`, default_version 0.13) as `skyregion_box_gist_ops`, non-default, EXPERIMENTAL — opt-in for realistic catalog-footprint radii (arcsec-few degrees), loses back to the multi-cap opclass from ~20° on; documented in README.md; see round forty-two in §3 |
 | **Point SP-GiST** | the *point* column (`skypos`) | `<@`(point,region) | `ext/src/spgist_region.c` | experimental, correctness-verified, **not recommended** — see §4 |
 
 The region GiST opclass answers "many candidate regions/footprints, probe

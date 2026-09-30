@@ -311,6 +311,34 @@ region-region `@>` predates `<@` by several versions and had no commutator of
 its own until `<@` was added — both directions are indexed now, and either
 spelling reaches the index regardless of which one you write.
 
+**For a `skyregion` column you know holds small, catalogue-scale footprints**
+(arcseconds to a few degrees — the common case for a source's own
+footprint, as opposed to a survey tile or an all-sky query region), a
+second, opt-in opclass is worth pointing at instead:
+
+```sql
+CREATE INDEX ON t USING gist (region skyregion_box_gist_ops);
+```
+
+`skyregion_box_gist_ops` (`ext/src/gist_region_box.c`) is a plain
+axis-aligned 3D box key, no spherical caps — smaller and faster than the
+default multi-cap opclass above at that scale (roughly a third of the
+index size, and a clear win on `&&` and both containment strategies,
+closing a gap to pgSphere the default opclass doesn't close), because a
+box is cheaper to test per candidate than a multi-cap key is. That
+advantage is real but not universal: it reverses once regions get large
+— a circle's *multi-cap* key is the circle itself, exact at any radius,
+while a box's looseness around a circle grows through the medium-to-large
+radius range and doesn't recover until close to a hemisphere. Past
+roughly 20° radius the default opclass wins back. So this is a deliberate
+choice to make per column based on what it actually stores, not a
+drop-in replacement — see `GIST_REGION_DESIGN.md`'s "Round forty-two"
+(and its two addenda, on pole proximity and on large radii) for the
+numbers behind both directions of that tradeoff. Same EXPERIMENTAL
+caveat as the default opclass above applies, with less scrutiny behind
+it (this opclass is new; the default one has had forty-plus rounds of
+hardening).
+
 For "which of my regions contain this point" specifically, a plain
 `CREATE INDEX ON t USING gin (skycell_region_moc(region))` — an ordinary
 PostgreSQL GIN index over the array `skycell_region_moc()` already returns, no

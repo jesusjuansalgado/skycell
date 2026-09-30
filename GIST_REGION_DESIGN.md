@@ -3930,3 +3930,18 @@ This is a real, radius-dependent tradeoff between the two opclasses, not
 a flaw in either -- and a concrete argument, on top of round forty-two's
 own closing note, for keeping both available rather than picking one
 over the other.
+
+**Shipped**: the decision landed on keep-both, not promote-and-replace.
+`skyregion_box_gist_ops` is now registered in the extension's own
+versioned SQL (`ext/sql/skycell--0.12--0.13.sql`, folded into
+`ext/sql/skycell--0.13.sql`, `default_version` bumped to `0.13`) rather
+than the ad-hoc `splitcost_test`-only registration this round started
+with -- both the `ALTER EXTENSION ... UPDATE TO '0.13'` upgrade path and
+a fresh `CREATE EXTENSION` land on it, verified directly against a real
+database rather than assumed. Still not `DEFAULT` (`skyregion_gist_ops`
+keeps that): select it explicitly with `USING gist (col
+skyregion_box_gist_ops)`. Documented in `README.md`'s "Operators -- the
+indexable spelling" section as the opt-in choice for columns known to
+hold small, catalogue-scale footprints (arcsec-few degrees) specifically
+-- not a general recommendation, given the large-radius reversal just
+above.
