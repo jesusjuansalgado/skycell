@@ -197,34 +197,43 @@ already uses for the B-tree covering).
 | 12 | Wide-radix splitting: combine several HEALPix orders into one node-selection decision, to shrink tree depth | Exposed a **fourth correctness bug** while implementing: `split_width()` derived a tuple's decision width from `order` alone, but `spgSplitTuple`'s upper tuple can be capped narrower than that by the old tuple's own established order, with nothing distinguishing a capped tuple from a normal one later — 2,869 false negatives at 50,000 rows before the fix. Fixed by storing the actual width explicitly per tuple (never re-deriving it). Also fixed a **latent bit-packing bug** found while designing that fix: the old `(order, pix)` int8 packing capped `pix` at 58 bits, but a full HEALPix id needs up to 62 at deep orders — silent truncation, never triggered by any prior shallow reproduction. Fixed by switching the prefix to a small `bytea` (`order, width, pix` verbatim, no bit-squeezing). **Once correctness was solid, the performance measurement was negative**: wide-radix (`SPLIT_WIDTH=3`) made buffer touches *worse*, not better — 1.1-3.4x more, growing with query radius. Likely cause: a PATRICIA trie's branching already tracks exactly where data disagrees; forcing every decision to span extra orders regardless inflates node count past what the data needs, and that extra breadth costs more for boundary-crossing range queries than the shallower depth saves. **`SPLIT_WIDTH` left at 1** (single-order splits); the bytea/explicit-width infrastructure kept since it's what makes revisiting wide splitting safe later. |
 | 13 | A coarse, execution-time covering index: reuse the tree (or a dedicated shallow structure) to answer "which coarse cell ranges does this region touch" as an index descent, replacing `cover.c`'s from-scratch planning-time recursive walk, feeding the same cheap B-tree range scan skycell already uses | **Ruled out before being built**, via two measurement passes. First, profiled the actual planning-time cost directly (in-process timing, `perf` unavailable): negligible under 1 arcminute (~3μs against ~32-35μs total planning time — bottleneck is elsewhere, generic planner overhead), genuinely dominant at 30'+ (60-140μs, 60-75% of measured planning time) — so the idea could only possibly help at larger radii. Second, tested its core premise directly: does the covering walk waste work on cells with no real data? Measured against *exact* table occupancy (not the ANALYZE-histogram density map, which turned out to structurally never report zero due to equi-depth-bucket proration — a false lead caught by reading its own implementation before trusting the number): **0.0% of 16,318 visited cells were empty.** `choose_order()`'s own cost model already stops refining once cells are reasonably populated, and this synthetic corpus has a substantial uniform background component with no true coverage gaps — so there's no sparsity for a data-aware structure to exploit, at least on this corpus. |
 
-**Where this leaves the point SP-GiST opclass**: correctness-verified and
-architecturally validated (the planning-cost hypothesis is confirmed), but
-a net loss against the B-tree-rewrite path it was meant to replace.
-Rounds nine, twelve, and thirteen all failed to close the execution-cost
-gap for different, specific, measured reasons. **Round thirty-eight then
-found the one lever that actually moves it substantially**: building the
-index against a table pre-sorted by HEALPix cell (a `CLUSTER`, no C code
-changed) rather than natural/insertion order cuts buffer touches
+**Where this leaves the point SP-GiST opclass**: the standing "not
+recommended for use, a net loss against the B-tree at every radius"
+verdict (rounds nine through thirteen) **no longer holds**, as of rounds
+thirty-eight and thirty-nine together. Round thirty-eight found building
+the index against a table pre-sorted by HEALPix cell (a `CLUSTER`, no C
+code changed) rather than natural/insertion order cuts buffer touches
 4-17x at 30'-3 degrees (verified safe against the exact correctness risk
 the opclass's own header comment documents for sorted-order builds, 0
-mismatches across a 60-query corpus) and closes the buffer-count gap to
-skycell's own B-tree almost entirely — even reversing it at 3 degrees
-(1,226 vs 1,314). Wall-clock does not follow, though: isolated away from
-parallelism (confirmed not the cause via a serial-vs-serial comparison)
-and cache-warmth confounds, SP-GiST-sorted still costs about 1.6x more
-per buffer touched than the B-tree, because its `inner_consistent()`/
-`leaf_consistent()` run real geometric classification at every node
-where the B-tree's bitmap scan does plain integer comparisons — a
-separate, orthogonal cost that better tree shape cannot fix. This
-precisely explains why a full custom bulk-loading `ambuild` (materially
-bigger and riskier than anything else attempted here — hand-rolled page
-layout and WAL-safety, not an opclass callback) would be a poor bet on
-its own: it would refine tree shape further, which this round shows is
-no longer the dominant remaining cost. **Still not recommended for
-use**, but the verdict is sharper now: a sorted-order build is a real,
-free improvement if anyone does pick this up, and the actual next lever
-would be cheapening the per-node consistent-function cost itself, not
-further tree-shape work.
+mismatches across a 60-query corpus) — closing the buffer-count gap to
+skycell's own B-tree almost entirely, even reversing it at 3 degrees
+(1,226 vs 1,314) — but wall-clock didn't follow on its own, isolated to
+a genuinely higher per-node CPU cost in `inner_consistent()`/
+`leaf_consistent()` (real geometric classification vs. the B-tree's
+plain integer comparisons), not tree shape. Round thirty-nine then found
+that per-node cost was itself mostly avoidable waste: both functions
+were re-parsing the query region **from scratch on every node visited**
+(for a cone, `sc_region_cone()` alone is ~120 transcendental calls,
+repeated dozens of times per query instead of once), the same shape
+`gist_region.c`'s own `consistent()` already solved at round one of
+that opclass. Applying the identical `fn_extra` query-cache fix (same
+value-based, not pointer-based, cache-key discipline; verified safe
+under a dedicated 200-region single-statement join stress test built
+specifically to exercise the stale-cache risk that discipline guards
+against) cut wall-clock 1.2-3.6x across the board with buffer counts
+provably unchanged. **Combined with round thirty-eight's sorted build,
+this reverses the verdict**: re-run three times for reproducibility,
+SP-GiST-sorted-plus-cached now beats skycell's own B-tree path outright
+at 30' through 3 degrees (1.2-2.5x, every run), with the two roughly
+tied at 1"/1' (fixed per-query overhead dominates there regardless).
+Neither fix alone was sufficient — sorted build without caching still
+lost on wall-clock; caching without sorted build would still carry the
+unsorted build's 4-17x worse buffer counts. This doesn't make the
+opclass production-ready on its own (still marked EXPERIMENTAL in the
+extension's SQL, the sorted-build discipline needs documenting or
+enforcing rather than left to the caller, untested beyond this
+investigation's corpus/radii), but it is no longer accurate to call it
+a net loss.
 
 ## 5. The other, separate open gap: skycell's own B-tree path vs. pgSphere
 ## at large radii
@@ -460,18 +469,27 @@ not in priority order — pick what matches the actual goal:
    the other direction.
 8. ~~A bulk-loaded, statically-packed structure for the point
    predicate~~ — the cheap version tried (round thirty-eight): building
-   against a table pre-sorted by HEALPix cell, no C code changed. Confirms
+   against a table pre-sorted by HEALPix cell, no C code changed. Confirmed
    the core hypothesis emphatically (4-17x fewer buffer touches, closing
-   the gap to the B-tree almost entirely) but also precisely diagnoses why
-   the *expensive* version (a real custom `ambuild`, hand-rolled page/WAL
-   layout — a materially bigger undertaking than anything else in this
-   file) wouldn't finish the job: the remaining wall-clock gap is a
-   separate, orthogonal per-node CPU cost (`inner_consistent()`/
-   `leaf_consistent()`'s real geometric classification vs. the B-tree's
-   plain integer comparisons), not tree shape, which is the only thing a
-   full bulk-loader would additionally improve. Not attempted, and this
-   round's finding makes it a poor bet on its own — closing the remaining
-   gap needs cheapening the per-node consistent-function cost instead.
+   the gap to the B-tree almost entirely) and precisely diagnosed the
+   remaining wall-clock gap as a separate, orthogonal per-node CPU cost
+   (`inner_consistent()`/`leaf_consistent()` re-parsing the query region
+   from scratch on every node visited — ~120 transcendental calls per
+   node for a cone, repeated dozens of times per query), not tree shape —
+   making a full custom `ambuild` (hand-rolled page/WAL layout, materially
+   bigger than anything else in this file) a poor bet on its own, since it
+   would only improve the thing that was no longer the bottleneck. Round
+   thirty-nine then closed that exact gap instead: the same `fn_extra`
+   query-caching fix `gist_region.c` already used (round one of that
+   opclass), applied here, cut wall-clock 1.2-3.6x with buffer counts
+   unchanged, verified safe under a dedicated join-based stale-cache
+   stress test. Combined, this **reverses** the opclass's standing
+   verdict — SP-GiST-sorted-plus-cached now beats skycell's own B-tree
+   path outright at 30' through 3 degrees (1.2-2.5x, reproduced across
+   three independent runs), not just "closes the gap." See §4's rewritten
+   closing verdict. The expensive custom-`ambuild` version remains
+   untried and is now even less clearly worth it, given the cheap
+   combination already wins.
 9. **Real survey-footprint sparsity** for the point SP-GiST's covering-walk
    idea (round thirteen's own caveat): the corpus used throughout this
    whole investigation is synthetic with a substantial uniform-sky

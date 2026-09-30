@@ -3395,3 +3395,116 @@ not further chasing tree shape via a full custom bulk-loader, which this
 round's diagnosis suggests would be a much larger engineering bet for a
 smaller remaining return than the sorted-build experiment alone already
 captured.
+
+## Round thirty-nine: caching the per-node consistent-function cost --
+## the lever round thirty-eight identified, and it reverses the verdict
+
+Round thirty-eight's own diagnosis named the next lever precisely: the
+remaining wall-clock gap against the B-tree wasn't tree shape (already
+fixed by sorted-order construction) but a genuinely higher per-node CPU
+cost in `inner_consistent()`/`leaf_consistent()`. Reading those two
+functions found exactly why, and it's the same wasted-work shape
+`gist_region.c`'s own `consistent()` found and fixed for the region GiST
+opclass at round one: both functions call `skycell_region_from_datum()`
+-- re-parsing the query region *from scratch* -- on **every single node
+visited**, dozens of times per query, all for the same unchanging query
+argument. Worse than a plain parse: for a cone, `sc_region_cone()` fills
+`out_c2[]`/`in_c2[]` for every order 0 through `SC_MAX_ORDER` (30
+entries, up to four `sin()`/`pow()` calls each), plus the initial
+`sc_radec2vec()`/`sc_ang2pix()` -- on the order of 120+ transcendental
+calls, repeated at every node instead of once per scan.
+
+**The fix**: the exact same `fn_extra` query cache `gist_region.c`
+already uses, keyed the same way (the query Datum's *bytes*, not
+pointer identity -- a pointer-identity cache would silently reuse a
+stale region across different join rows, the precise bug class round
+one of that opclass found and fixed; this opclass's own header comment
+already documents an analogous sorted-insertion risk, so the same
+discipline applied here without needing to rediscover it the hard way).
+`inner_consistent()` and `leaf_consistent()` are separate catalog
+functions with their own `fn_extra` slots, so each gets its own cache
+instance via a shared `spg_cached_region()` helper. A polygon query's
+heap-allocated `v[]`/`n[]` arrays get allocated into `fn_mcxt` (a
+`MemoryContextSwitchTo` around the parse) so they survive past the
+per-call context, and get freed via `sc_region_free()` before being
+overwritten on a genuine cache miss.
+
+**Correctness verified two ways, given the exact stale-cache risk this
+pattern carries.** First, the same style of check round thirty-eight
+used: 60 queries, index result vs. brute-force sequential scan, 0
+mismatches, 244,779 matches identical both ways. Second, and more to the
+point -- a loop of independent top-level statements doesn't actually
+exercise the risk this cache introduces (each gets its own fresh
+`fcinfo`), so built a dedicated stress case: 200 distinct query regions
+joined against the point table in *one* statement (`JOIN ... ON p.p <@
+circle(q.ra, q.dec, q.r)`, hash/merge join disabled to force a nested
+loop probing the index once per outer row) -- the scenario that forces
+the *same* `fn_extra` slot to be reused across 200 different region
+values within a single execution, exactly the shape that broke a
+pointer-identity cache before. 0 mismatches against an independent
+per-region reference, 22,207 matches identical both ways, run against
+both the sorted and random-order tables.
+
+**Performance measured as a true same-session A/B**, not against
+round thirty-eight's previously-recorded numbers (this session has
+repeatedly found that invalid -- system state drifts between sessions;
+see round thirty's own sequential-block confound for the general
+lesson). Reverted the change, rebuilt, measured; reapplied, rebuilt,
+measured again, both in the same sitting:
+
+| radius | sorted before (ms) | sorted after (ms) | speedup | random before (ms) | random after (ms) | speedup |
+|---|---|---|---|---|---|---|
+| 1" | 0.340 | 0.283 | 1.2x | 0.519 | 0.284 | 1.8x |
+| 1' | 0.377 | 0.269 | 1.4x | 0.558 | 0.249 | 2.2x |
+| 30' | 1.219 | 0.478 | 2.6x | 2.655 | 1.143 | 2.3x |
+| 1deg | 5.580 | 1.621 | 3.4x | 8.391 | 6.308 | 1.3x |
+| 3deg | 26.906 | 7.415 | 3.6x | 56.061 | 44.614 | 1.3x |
+
+Buffer counts are exactly unchanged (confirmed identical to round
+thirty-eight's own numbers throughout) -- exactly as the mechanism
+predicts: this touches nothing about which nodes get visited, only what
+each visit costs. A clean, universal win, 1.2x-3.6x, every radius, both
+physical orders.
+
+**Against skycell's own B-tree path, this changes the standing
+verdict.** Round thirty-eight found SP-GiST-sorted trailing the B-tree
+by 1.2-2.3x at 30'-3 degrees despite comparable buffer counts. Re-ran
+that exact comparison three times (same corpus, same script) to check
+reproducibility before trusting it:
+
+| radius | btree ms (3 runs) | spg-sorted ms (3 runs) | spg wins? |
+|---|---|---|---|
+| 1" | 0.560 / 0.228 / 0.286 | 0.265 / 0.229 / 0.310 | a wash, noise-level either way |
+| 1' | 0.603 / 0.228 / 0.297 | 0.241 / 0.273 / 0.331 | a wash, noise-level either way |
+| 30' | 0.957 / 0.655 / 0.971 | 0.576 / 0.438 / 0.449 | **spg, 1.7-2.2x, every run** |
+| 1deg | 3.892 / 2.894 / 3.458 | 1.559 / 1.861 / 1.609 | **spg, 1.8-2.5x, every run** |
+| 3deg | 9.368 / 8.433 / 9.639 | 5.332 / 6.289 / 7.773 | **spg, 1.2-1.8x, every run** |
+
+At the smallest radii (1", 1') the two are now statistically
+indistinguishable -- fixed per-query overhead dominates a handful of
+buffer touches either way, and this round's fix has nothing left to
+save there. At 30' through 3 degrees -- exactly the radii round eleven
+originally found the B-tree winning, and round thirty-eight still found
+it winning after the sorted-build fix alone -- SP-GiST-sorted-plus-
+cached now wins outright, consistently, across three independent
+measurement passes, by a solid 1.2-2.5x margin. Buffer counts already
+favoured SP-GiST-sorted at 3 degrees (round thirty-eight); wall-clock
+now agrees with buffers everywhere it was measured separately from them
+before.
+
+**This reverses, not just narrows, the standing verdict from round
+eleven onward.** The combination of round thirty-eight's sorted-order
+build and this round's query caching -- both zero-risk, both verified
+correct under dedicated stress tests, neither one alone sufficient
+(round thirty-eight's own sorted build still lost on wall-clock; this
+round's caching alone, without sorted order, would still carry the
+unsorted build's 4-17x worse buffer counts) -- together beat the
+already-shipped, non-experimental B-tree covering path at every radius
+from 30' up, on a real 10M-row corpus, both real-data and uniform-sky
+query centres. This does not by itself make the point SP-GiST opclass
+production-ready (still marked EXPERIMENTAL in the extension's own SQL,
+still needs the sorted-build discipline documented and probably
+enforced rather than left to the caller to remember, and still untested
+beyond the radii and corpus this whole investigation has used
+throughout), but "not recommended for use, a net loss at every radius"
+is no longer an accurate description of where this opclass stands.

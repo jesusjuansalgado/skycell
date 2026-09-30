@@ -586,6 +586,71 @@ spg_healpix_picksplit(PG_FUNCTION_ARGS)
 	PG_RETURN_VOID();
 }
 
+/*
+ * inner_consistent()/leaf_consistent() are each called once per node/leaf
+ * visited during a single index descent -- dozens of times per query, all
+ * with the *same* query argument (one scan's skyregion, unchanged for the
+ * scan's lifetime) -- yet each was re-parsing it from scratch on every call
+ * via skycell_region_from_datum(), the same wasted-work shape gist_region.c's
+ * consistent() found and fixed for the region GiST opclass (round one of
+ * that opclass; see GIST_REGION_DESIGN.md). Here it's worse than a parse:
+ * sc_region_cone() alone fills out_c2[]/in_c2[] for every order 0..SC_MAX_
+ * ORDER (30 entries, up to 4 sin()/pow() calls each) plus the initial
+ * sc_radec2vec()/sc_ang2pix() -- on the order of 120+ transcendental calls,
+ * repeated at every one of a query's node visits rather than once per scan.
+ * Cached here in fn_extra, the same value-based cache-key discipline
+ * gist_region.c's own fix established: keyed on the query Datum's *bytes*,
+ * not pointer identity, because a join's per-tuple memory context is reset
+ * and reused between outer rows, so two different rows' regions can
+ * legitimately land at the same address -- a pointer-identity cache would
+ * silently reuse a stale, wrong region and prune (inner_consistent) or
+ * reject (leaf_consistent) incorrectly, with nothing downstream to catch
+ * either mistake (this opclass has no recheck to fall back on at all).
+ * inner_consistent() and leaf_consistent() are separate catalog functions,
+ * each with their own fn_extra slot, so each gets its own cache instance;
+ * they are never called from the same fcinfo.
+ */
+typedef struct
+{
+	bytea	   *last_query;		/* palloc'd copy in fn_mcxt, or NULL */
+	Size		last_query_size;
+	sc_region	reg;			/* reg.v/reg.n, if set, also live in fn_mcxt */
+}			spg_region_query_cache;
+
+static sc_region *
+spg_cached_region(FunctionCallInfo fcinfo, Datum queryDatum)
+{
+	spg_region_query_cache *qcache = (spg_region_query_cache *) fcinfo->flinfo->fn_extra;
+	bytea	   *qb = DatumGetByteaP(queryDatum);
+	Size		qsz = VARSIZE(qb);
+
+	if (qcache == NULL)
+	{
+		qcache = MemoryContextAllocZero(fcinfo->flinfo->fn_mcxt, sizeof(spg_region_query_cache));
+		fcinfo->flinfo->fn_extra = qcache;
+	}
+	if (qcache->last_query == NULL || qcache->last_query_size != qsz ||
+		memcmp(qcache->last_query, qb, qsz) != 0)
+	{
+		MemoryContext oldcxt = MemoryContextSwitchTo(fcinfo->flinfo->fn_mcxt);
+
+		if (qcache->last_query != NULL)
+			sc_region_free(&qcache->reg);	/* frees the old poly v[]/n[], if any */
+		skycell_region_from_datum(queryDatum, &qcache->reg);
+		MemoryContextSwitchTo(oldcxt);
+
+		if (qcache->last_query == NULL || qcache->last_query_size < qsz)
+		{
+			if (qcache->last_query != NULL)
+				pfree(qcache->last_query);
+			qcache->last_query = MemoryContextAlloc(fcinfo->flinfo->fn_mcxt, qsz);
+		}
+		memcpy(qcache->last_query, qb, qsz);
+		qcache->last_query_size = qsz;
+	}
+	return &qcache->reg;
+}
+
 PG_FUNCTION_INFO_V1(spg_healpix_inner_consistent);
 Datum
 spg_healpix_inner_consistent(PG_FUNCTION_ARGS)
@@ -596,8 +661,7 @@ spg_healpix_inner_consistent(PG_FUNCTION_ARGS)
 	int32		width;
 	int64		pix;
 	bool		terminal;
-	sc_region	reg;
-	bool		have_reg = false;
+	sc_region  *reg = NULL;
 	int		   *keep;
 	int			nkeep = 0;
 
@@ -612,10 +676,7 @@ spg_healpix_inner_consistent(PG_FUNCTION_ARGS)
 	terminal = in->allTheSame || (order >= TERMINAL_ORDER);
 
 	if (!terminal && in->nkeys > 0)
-	{
-		skycell_region_from_datum(in->scankeys[0].sk_argument, &reg);
-		have_reg = true;
-	}
+		reg = spg_cached_region(fcinfo, in->scankeys[0].sk_argument);
 
 	keep = (int *) palloc(sizeof(int) * in->nNodes);
 
@@ -639,13 +700,13 @@ spg_healpix_inner_consistent(PG_FUNCTION_ARGS)
 
 		for (int i = 0; i < in->nNodes; i++)
 		{
-			if (!terminal && have_reg)
+			if (!terminal && reg != NULL)
 			{
 				int64		child_pix = (order < 0)
 					? DatumGetInt16(in->nodeLabels[i])
 					: (pix << shift) | DatumGetInt16(in->nodeLabels[i]);
 				double		fo;
-				sc_class	cls = sc_region_classify(&reg, to_order, child_pix, &fo);
+				sc_class	cls = sc_region_classify(reg, to_order, child_pix, &fo);
 
 				if (cls == SC_OUT)
 					continue;
@@ -666,8 +727,6 @@ spg_healpix_inner_consistent(PG_FUNCTION_ARGS)
 		}
 	}
 
-	if (have_reg)
-		sc_region_free(&reg);
 	pfree(keep);
 	PG_RETURN_VOID();
 }
@@ -678,7 +737,7 @@ spg_healpix_leaf_consistent(PG_FUNCTION_ARGS)
 {
 	spgLeafConsistentIn *in = (spgLeafConsistentIn *) PG_GETARG_POINTER(0);
 	spgLeafConsistentOut *out = (spgLeafConsistentOut *) PG_GETARG_POINTER(1);
-	sc_region	reg;
+	sc_region  *reg;
 	sc_vec3		v;
 	bool		res;
 
@@ -688,9 +747,8 @@ spg_healpix_leaf_consistent(PG_FUNCTION_ARGS)
 	if (in->nkeys == 0)
 		PG_RETURN_BOOL(true);
 
-	skycell_region_from_datum(in->scankeys[0].sk_argument, &reg);
+	reg = spg_cached_region(fcinfo, in->scankeys[0].sk_argument);
 	v = skycell_pos_from_datum(in->leafDatum);
-	res = sc_region_contains(&reg, v) != 0;
-	sc_region_free(&reg);
+	res = sc_region_contains(reg, v) != 0;
 	PG_RETURN_BOOL(res);
 }
