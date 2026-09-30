@@ -3809,3 +3809,56 @@ this round's measurement alone settles -- but the measurement itself is
 unambiguous: on this corpus, at this scale, across all four strategies,
 the box key is smaller and faster than both the opclass it sits next to
 and the competitor it was built to match.
+
+**Addendum: does the box key hold up near the poles?** Worth asking
+directly, since pole-proximity is a real, well-known failure mode for
+spherical indexing -- round thirty-four's own BRIN(ra,dec) recipe is
+exactly that class of bug, RA becoming meaningless as lines of constant
+RA converge to a point. The `fpr` corpus every number above used never
+actually tests this: `least(greatest(dec, -85), 85)`-style clamping
+(visible in several `bench/*.sql` scripts) keeps every row at
+`|dec| <= 85`, so round forty-two's headline numbers say nothing about
+what happens closer in.
+
+Built a dedicated declination-stratified corpus to check: 6,000 rows,
+2,000 each at `|dec| < 10` (equator), `40 <= |dec| <= 50` (mid-
+latitude), and `85 <= |dec| <= 89.9` (near-pole), same 0.02-0.3 degree
+radius range as `fpr`, 300 stratified probes (~100/band), both opclasses
+built fresh.
+
+**Correctness held exactly in all three bands, near-pole included**:
+brute force, box-indexed, and multicap-indexed all agree precisely --
+105/105/105 matches (equator), 115/115/115 (mid-lat), 1,012/1,012/1,012
+(near-pole; the much higher near-pole count is itself expected and a
+good sanity check -- fixed-angular-radius circles overlap far more
+easily as RA lines converge).
+
+**And the box key's relative advantage over multi-cap doesn't erode near
+the pole**:
+
+| band | box buffers | multi-cap buffers | box's advantage |
+|---|---|---|---|
+| equator | 336 | 454 | 1.35x fewer |
+| mid-latitude | 329 | 464 | 1.41x fewer |
+| near-pole | 1,361 | 1,767 | 1.30x fewer |
+
+If anything the margin narrows very slightly at the pole (1.30x vs.
+1.35-1.41x elsewhere) -- noise-level, not a breakdown.
+
+**Why this design doesn't have the classic pole bug**: the key is built
+in Cartesian (x, y, z) unit-vector space, never RA/Dec, so there's no
+coordinate singularity to hit in the first place -- the same reason this
+extension's own multi-cap key and pgSphere's native Box3D don't have it
+either; it's specifically schemes built directly on RA/Dec (like round
+thirty-four's BRIN recipe) that do. `cap_to_box3d()`'s own pole-
+swallowing special case ("BUILDING THE BOX" in `gist_region_box.c`'s
+header) makes this exact, not just incidentally fine: when a cap's
+radius is large enough to fully contain a pole, that axis's extent is
+set to precisely +-1 rather than computed from the boundary-circle
+formula, so a cap centred at or straddling a pole is bounded exactly on
+that axis, not approximated. The box's real, generic source of slack
+(any cap whose centre direction doesn't line up with a coordinate axis
+gets some circle-in-a-square looseness, and a polygon's box comes from
+its *bounding cap*, round forty-two's own caveat, not its own vertices)
+is present everywhere on the sphere depending on shape and orientation,
+not specifically worse at the poles.
