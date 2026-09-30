@@ -3659,3 +3659,153 @@ better), but it does rule out this specific one, and confirms round
 twenty-six's own warning that this function family "needs real care,
 not a quick follow-up" -- a fourth attempt now, after rounds twenty
 through twenty-two and this one, three of which regressed.
+
+## Round forty-two: a separate box-only opclass, and it wins everything
+
+Round forty-one closed `@>`(region,region) and `@>`(region,point) as an
+accepted structural floor: pgSphere's win there came entirely from its
+box-shaped index key giving cheap, coarse pruning that the multi-cap
+key's richer per-sub-cap test doesn't reproduce as cheaply, and every
+attempt to cut the multi-cap key's own redundancy (`max_area`/`min_area`
+in rounds fourteen/thirty-six, order-independent seeding in round
+forty-one) either washed or regressed. The next question, not about
+fixing the multi-cap key but about replacing it: "is there a way to
+generate a cheaper index (forget, if needed, our own region indexes)."
+
+**The idea**: build a second, genuinely separate, non-default GiST
+opclass for `skyregion` -- `skyregion_box_gist_ops` in a new file,
+`gist_region_box.c` -- using a plain axis-aligned 3D box key (six
+doubles: `xmin, ymin, zmin, xmax, ymax, zmax`) instead of the multi-cap
+key's spherical caps. This directly mirrors pgSphere's own key shape
+(the thing round thirty-two through thirty-five kept confirming is the
+*only* place pgSphere has a genuine structural edge), so the experiment
+asks the question as directly as possible: strip the multi-cap key's
+richness down to the same shape pgSphere uses, on the *same* unified
+`skyregion` type, and measure what's actually gained and lost.
+
+**Deriving the box, exactly, not by sampling**: a spherical cap with
+unit-vector centre `c` and angular radius `r` has, on each Cartesian
+axis `k`, a provable closed-form extent rather than needing corner
+sampling. Parameterise the cap's boundary circle in an orthonormal frame
+built from `c`: boundary points are `c*cos(r) + (u*cos(t) +
+v*sin(t))*sin(r)` for `t` in `[0, 2*pi)`, where `u, v` are any two unit
+vectors completing an orthonormal basis with `c`. Axis `k`'s component
+of this is `c_k*cos(r) + (u_k*cos(t) + v_k*sin(t))*sin(r)`, and
+`u_k*cos(t) + v_k*sin(t)` ranges over exactly `[-sqrt(u_k^2+v_k^2),
+sqrt(u_k^2+v_k^2)] = [-sqrt(1-c_k^2), sqrt(1-c_k^2)]` (since `u, v, c`
+are orthonormal, `u_k^2 + v_k^2 = 1 - c_k^2`). So axis `k`'s extent is
+exactly `c_k*cos(r) +/- sqrt(1-c_k^2)*sin(r)` -- with one correction:
+when the cap fully swallows the axis's positive or negative pole
+(`c_k >= cos(r)` or `-c_k >= cos(r)`), the true extent on that side is
+the pole itself (`+1` or `-1`), wider than the boundary-circle formula
+alone would give, since the cap's *interior* then crosses the pole.
+`region_to_box3d()` gets a region's box by calling the existing,
+already-tested `sc_region_bounding_cap()` (safe for both CONE and
+POLYGON, no new per-kind bounding logic) and running this conversion on
+the result -- deliberately reusing the existing bounding-cap step rather
+than computing a tighter polygon-specific box, so the box is a safe
+over-approximation of the bounding cap, not necessarily the tightest
+box obtainable from the raw region.
+
+**Kept deliberately simple everywhere else**, to keep the comparison
+honest about what a plain box key costs rather than measuring some
+other change bundled in: `box3d_union/volume/overlaps/contains_point()`
+are pure interval arithmetic, no trig at all. `picksplit` is a
+widest-spread-axis sort-and-median-split -- not `gist_region.c`'s own
+R*-tree-style sweep -- and `penalty` is volume-increase, the textbook
+R-tree choice. `consistent()` dispatches all three containment-shaped
+strategies (`&&`, `@>`(region,region), `<@`(region,region)) through
+`box3d_overlaps()`, same as pgSphere's own box-level pruning and the
+multi-cap opclass's own reuse of overlap as a containment proxy;
+`@>`(region,point) uses `box3d_contains_point()`. `*recheck = true`
+always -- this key is lossy on every strategy, unlike the multi-cap
+key's exact `&&`/`<@` tests. A query-side `fn_extra` cache
+(`box_cached_query()`) reuses round thirty-nine's pattern, just over a
+much smaller cached value (a 48-byte box instead of a full `sc_region`).
+
+Registered ad hoc against `splitcost_test` (not touching the extension's
+own versioned SQL -- this stays fully disposable pending a verdict):
+`CREATE INDEX fpr_box_gist ON fpr USING gist (s_region
+skyregion_box_gist_ops)`, alongside the existing default `fpr_region_gist`
+multi-cap index, same 50,000-row `fpr` corpus rounds twenty-two through
+forty-one all used.
+
+**Correctness held exactly**, recheck and all: all four strategies,
+run against the box-only index (the multi-cap index dropped so the
+planner had no other choice), reproduced the brute-force reference
+counts on this corpus/probe combination precisely --
+
+| strategy | brute-force | box-indexed |
+|---|---|---|
+| `&&` | 286 | 286 |
+| `@>`(region,point) | 222 | 222 |
+| `@>`(region,region) | 217 | 217 |
+| `<@`(region,region) | 4,900 | 4,900 |
+
+**Then the size and performance numbers, all three opclasses measured
+in the same session against the identical probe tables** (`rox_probe`,
+`rox_probe_pts`, `rox_probe_tiny`, `rox_probe_big`, unchanged since round
+twenty-four), each index freshly rebuilt this round so none carries
+stale bloat from earlier rounds' rebuilds, buffers confirmed
+reproducible by rerunning the full box-opclass pass a second time after
+a full index drop/rebuild (1,172 -> 1,163; 1,034 -> 1,039; 1,056 ->
+1,061; 8,293 -> 8,301 -- noise-level, buffers deterministic):
+
+| strategy | box (buffers / ms) | multi-cap (buffers / ms) | pgSphere (buffers / ms) |
+|---|---|---|---|
+| `&&` | 1,172 / 8.2 | 8,375 / 34.3 | 1,193 / 44.5 |
+| `@>`(region,point) | 1,034 / 7.0 | 7,505 / 22.2 | 1,082 / 16.2 |
+| `@>`(region,region) | 1,056 / 6.1 | 7,588 / 24.6 | 1,083 / 12.6 |
+| `<@`(region,region) | 8,293 / 25.4 | 15,614 / 49.4 | 9,520 / 65.7 |
+
+The box key **wins every strategy against both competitors, on both
+buffers and wall-clock** -- including the two strategies (`@>`
+region/point and region/region) round forty-one had just closed out as
+an accepted structural loss to pgSphere. Buffers against pgSphere are
+essentially tied (box is marginally lower on all four, as expected: two
+box-shaped keys pruning the same way should cost about the same
+buffers), but wall-clock isn't tied at all -- box beats pgSphere
+2.1-8.4x, because `box3d_overlaps()`/`box3d_contains_point()` are
+interval comparisons while pgSphere's own exact recheck still calls
+`spoint_dist()`'s Vincenty formula per candidate (the same per-
+comparison cost gap rounds thirty-two through thirty-five kept finding,
+now showing up downstream of an equivalently-shaped index rather than
+being masked by it). Against the multi-cap opclass the win is larger
+still and entirely expected in direction (fewer, larger caps merged
+away all the precision a box never had to begin with) -- 1.9-7.3x fewer
+buffers, 1.9-4.2x faster -- including on `&&` and `<@`, the two
+strategies the multi-cap key was already winning against pgSphere; the
+box key simply wins them by more.
+
+**Size**, same corpus, all freshly built: box-only index 5,472 kB, vs.
+the multi-cap index's 17 MB (box is ~0.32x the size) and pgSphere's
+combined `rox_fpr_circ_gist` + `rox_fpr_poly_gist` at 3,024 kB (box is
+~1.8x pgSphere's combined footprint, but is one index over one unified
+type where pgSphere needs two indexes split by shape).
+
+**Why this reverses round forty-one's "structural floor" framing**: that
+framing was correct about the multi-cap *key* -- no amount of picking
+which caps to merge or how to seed the merge closes the gap, because
+the key's expressiveness is exactly what makes its `consistent()` test
+more expensive per candidate than a box overlap check, however the caps
+are chosen. What round forty-one didn't test is dropping that
+expressiveness altogether. It turns out skycell doesn't need the multi-
+cap key's tighter pruning to *beat* pgSphere on `@>`; it needs a key
+*at least as cheap to test* as pgSphere's, and a plain box is that key,
+available on the exact same unified `skyregion` type pgSphere needs two
+types to cover. The multi-cap key remains real and useful on its own
+terms (tighter index-level pruning, exact `&&`/`<@` without recheck) --
+but as a pruning-plus-cost-reduction package for these four strategies
+specifically, the box key dominates it, not just pgSphere.
+
+**Status**: `gist_region_box.c` is new, measured, and correct, but not
+yet the shipped default for anything -- it exists as a second,
+explicitly-named opclass (`skyregion_box_gist_ops`) a user can opt into,
+the same non-default posture `skyregion_gist_ops` and `skypos_spgist_ops`
+already have. Whether it's worth promoting over the multi-cap key as
+*the* region GiST default, keeping both for different use cases, or some
+other disposition is a decision for whoever ships this, not something
+this round's measurement alone settles -- but the measurement itself is
+unambiguous: on this corpus, at this scale, across all four strategies,
+the box key is smaller and faster than both the opclass it sits next to
+and the competitor it was built to match.

@@ -59,7 +59,8 @@ their results is the single easiest way to misread this history:
 
 | | indexes | predicates | file | status |
 |---|---|---|---|---|
-| **Region GiST** | the *region* column (`skyregion`) | `&&`, `@>`(region,point), `@>`(region,region), `<@`(region,region) | `ext/src/gist_region.c` | shipped, default opclass for `skyregion` |
+| **Region GiST (multi-cap)** | the *region* column (`skyregion`) | `&&`, `@>`(region,point), `@>`(region,region), `<@`(region,region) | `ext/src/gist_region.c` | shipped, default opclass for `skyregion` |
+| **Region GiST (box)** | the *region* column (`skyregion`), alternate opclass | same four strategies | `ext/src/gist_region_box.c` | experimental, correctness-verified, `skyregion_box_gist_ops`, non-default — beats the multi-cap opclass on every strategy; see round forty-two in §3 |
 | **Point SP-GiST** | the *point* column (`skypos`) | `<@`(point,region) | `ext/src/spgist_region.c` | experimental, correctness-verified, **not recommended** — see §4 |
 
 The region GiST opclass answers "many candidate regions/footprints, probe
@@ -182,11 +183,25 @@ doesn't have a matching answer for — rather than a further fix left
 unfound in this file's code.
 
 **Both region-GiST losses to pgSphere are now closed as accepted,
-structural gaps, not open questions.** `&&` and `<@` remain solid wins;
-`@>`(region,region) and `@>`(region,point) remain real, understood, and
-no longer being chased.
+structural gaps for the *multi-cap key specifically*, not open questions
+about that key — but not the last word on the region GiST opclass as a
+whole.** `&&` and `<@` remain solid multi-cap wins; `@>`(region,region)
+and `@>`(region,point) remain real, understood multi-cap losses, and no
+further multi-cap fix is being chased. Round forty-two then asked a
+different question — not "how do we fix the multi-cap key" but "is a
+different key altogether cheaper" — and built `skyregion_box_gist_ops`,
+a genuinely separate, non-default opclass using a plain axis-aligned
+3D box key (same shape as pgSphere's own), on the same unified
+`skyregion` type. Measured against both the multi-cap opclass and
+pgSphere, same corpus, same probes, same session: the box key **wins
+all four strategies against both**, closing the two gaps this section
+just called structural and *also* beating the multi-cap key on the two
+strategies it already won, while using ~0.32x the multi-cap key's index
+size. See round forty-two in full below — the "structural floor" stands
+for the multi-cap key, not for skycell's region GiST as an architecture.
 
 | 29 | Extended round twenty-seven's trig-avoidance idea to genuine cap-vs-cap tests: `cap_overlaps()` (backing `&&`/`@>`/`<@`(region,region) via `multicap_overlaps()`) compares against a radius *sum*, not one radius, but the angle-sum identity `cos(ra+rb)=cos(ra)cos(rb)-sin(ra)sin(rb)` gives the same shortcut if `cos(radius)` is cached per cap. Added `cos_radius` to `GistCap` (computed once in `cap_make()`), rewrote `cap_overlaps()` to use it (with an explicit `ra+rb >= pi` guard — the identity's monotonic range, and a real case here since `cover.c` allows a single cone's own radius up to `pi`, not just `pi/2`), and got `cap_area_proxy()`'s existing `1-cos(radius)` sped up for free from the same cache. | **Exact and correct — verified two ways, including a dedicated 400-region, 30-179°-radius stress test built specifically to exercise the `pi` guard, brute force matching GiST exactly throughout — but a net loss anyway.** The cache costs 40 bytes/key (5 caps × 8 bytes); confirmed directly via index size, 17MB→21MB (~24% bigger, matching the key growth almost exactly). Same-database buffers: `&&` +13.9%, `@>`(region,region) +12.9%, `<@`(region,region) +7.8%, all worse; wall-clock mixed, not a clean win. **Reverted.** The same fanout-cost mechanism rounds two, fifteen, and twenty-four all hit — not a bad proxy this time (the computed values are provably identical to the original), just a bigger key; round twenty-seven's win avoided this entirely by needing zero new storage. |
+| 42 | Not a multi-cap fix — a genuinely separate, non-default opclass (`skyregion_box_gist_ops`, new file `gist_region_box.c`) using a plain axis-aligned 3D box key (six doubles, exact closed-form cap→box conversion, no trig for union/overlap), directly mirroring pgSphere's own key shape, to test whether the multi-cap key's two structural losses (round forty-one) are inherent to skycell's region GiST or specific to that one key design. | **Wins all four strategies against both the multi-cap opclass and pgSphere** — buffers and wall-clock, same 50,000-row corpus/probes, same session, all three opclasses freshly rebuilt: `&&` 1,172/8.2ms vs multi-cap's 8,375/34.3ms vs pgSphere's 1,193/44.5ms; `@>`(region,point) 1,034/7.0ms vs 7,505/22.2ms vs 1,082/16.2ms; `@>`(region,region) 1,056/6.1ms vs 7,588/24.6ms vs 1,083/12.6ms; `<@`(region,region) 8,293/25.4ms vs 15,614/49.4ms vs 9,520/65.7ms. Correctness exact (286/222/217/4,900 matches, all four strategies matching brute force precisely) and buffer counts reproduced on a full index rebuild. Index size 5,472kB vs the multi-cap key's 17MB (~0.32x) and pgSphere's combined 3,024kB (~1.8x, but one index over one type vs pgSphere's two). Not reverted — kept as a second, non-default opclass pending a shipping decision; see "Round forty-two" in `GIST_REGION_DESIGN.md` for the full derivation and analysis. |
 
 A methodological note from round twenty-one, carried forward and validated
 twice since: round twenty-one's same-database baseline (rerun immediately
@@ -626,11 +641,18 @@ not in priority order — pick what matches the actual goal:
   (+5-7% buffers) before even reaching the overlap test — reverted, and
   both `@>`(region,region) and `@>`(region,point)'s gaps are now closed
   out as this opclass's accepted structural floor, not open questions.
-  **Final scorecard vs. pgSphere, both scales**: `&&` and `<@` win
-  outright; `@>`(region,region) loses but the gap narrowed substantially
-  (~4.9-5.2x → ~2.3-2.9x at 50,000 rows); `@>`(region,point) loses by a
-  margin cut sharply by rounds twenty-seven and twenty-eight together
-  (~4.0-4.6x → ~3.4-3.9x), nearly closed at the smaller scale.
+  **Final scorecard for the multi-cap key vs. pgSphere, both scales**:
+  `&&` and `<@` win outright; `@>`(region,region) loses but the gap
+  narrowed substantially (~4.9-5.2x → ~2.3-2.9x at 50,000 rows);
+  `@>`(region,point) loses by a margin cut sharply by rounds twenty-seven
+  and twenty-eight together (~4.0-4.6x → ~3.4-3.9x), nearly closed at the
+  smaller scale. **Superseded by round forty-two**: a separate box-key
+  opclass (`skyregion_box_gist_ops`, `gist_region_box.c`) wins all four
+  strategies against both the multi-cap opclass and pgSphere, on both
+  buffers and wall-clock, at ~0.32x the multi-cap key's index size — not
+  a further multi-cap fix, but proof the multi-cap key's own gaps aren't
+  inherent to skycell's region GiST architecture. Not yet shipped as the
+  default; see round forty-two in §3 for the full numbers and status.
 - Point SP-GiST opclass: shipped as a correctness-verified, documented
   negative result (`SPLIT_WIDTH=1`, effectively single-order splits; the
   bytea-prefix/explicit-width fix from round twelve is real and kept even
