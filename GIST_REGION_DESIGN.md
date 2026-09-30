@@ -3586,3 +3586,76 @@ production-ready.
 `spoint` took 118-141s for pgSphere against this SP-GiST opclass's 28s
 sorted build (round thirty-eight) -- a data point on build cost, not
 just query cost, though not chased further here.
+
+## Round forty-one: order-independent seeding, to unblock round twenty-
+## six's sub-quadratic overlap test -- regresses on its own, not attempted
+
+Round twenty-six's own postmortem named the precise reason its
+mathematically sound sub-quadratic overlap test regressed: `out[0] =
+caps[0]` in `merge_caps_greedy_fp()` hardcodes the first seed to
+whichever cap happens to land at array index 0, so sorting a stored
+`sub[]` for query-time benefit silently reseeds every future re-merge of
+that same key -- a real, diagnosed coupling, not a vague guess. Two
+fixes were named but neither attempted: carry a second, sorted-only copy
+of `sub[]` (doubling that part of the key, the exact key-bloat tax this
+file has paid for and regretted every time it's been tried), or make the
+farthest-point seeding itself order-independent. Took the second path.
+
+**The idea**: replace the hardcoded `caps[0]` first seed with a
+deterministic, array-position-independent choice -- the cap whose centre
+has the smallest dot product with the centroid direction of the whole
+batch (i.e. the outlier farthest from the set's own "middle"). Summing
+vectors and taking a minimum don't depend on scan order, so two calls
+given the same caps in different array orders now provably pick the same
+first seed, and since every later seed is chosen purely from the seeds
+picked so far, the same full seed sequence and final clustering
+throughout -- exactly what round twenty-six's fix needed, with no new
+storage (the centroid is computed and discarded within the call, never
+persisted). Everything after seed selection -- the greedy
+farthest-point loop for the remaining seeds, the final absorption pass
+-- untouched.
+
+**Correctness held**: `@>`(region,region) (217 matches) and
+`<@`(region,region) (4,900 matches) both matched their established
+reference counts exactly, same 50,000-row corpus round twenty-two/
+twenty-five/twenty-eight all used.
+
+**But the seeding change alone -- before even re-adding round twenty-
+six's overlap test -- already regresses the two strategies it was meant
+to help, not neutral as hoped:**
+
+| strategy | buffers before | buffers after | change |
+|---|---|---|---|
+| `@>`(region,region) | 7,721 | 8,294 | +7.4% worse |
+| `<@`(region,region) | 15,625 | 16,433 | +5.2% worse |
+
+`&&` and `@>`(region,point) came back a wash either way (109-113ms vs
+110-111ms, and 24-27ms vs 26-27ms -- both within this file's usual
+wall-clock noise band, no clear direction). Buffer counts are
+deterministic, so the `@>`/`<@`(region,region) regression is real, not
+noise.
+
+**Reverted before attempting round twenty-six's overlap test on top**,
+matching this file's own standing practice: no reason to compound a
+second change onto an already-regressed baseline hoping the two effects
+net out favourably rather than measuring each independently. `caps[0]`
+remains the first seed, exactly as shipped since round twenty-two.
+
+**Why, in hindsight**: `caps[0]` isn't as arbitrary in practice as its
+name suggests. `multicap_union_many()` flattens `entries[i]->sub[j]` in
+entry order, and entries arrive from GiST's own page-level grouping --
+which, by construction (R-tree-style splits group spatially nearby
+items onto the same page), tends to make `caps[0]` a locally
+representative starting point already, an emergent property of how data
+flows through the tree rather than a genuinely uninformative default.
+"Farthest from the batch's centroid," while cleanly order-independent,
+is a *different* seeding heuristic outright -- deliberately picking a
+geometric outlier rather than a locally-typical point -- and this round
+measures that it clusters this data's actual sub-cap distributions
+worse, not just differently. This doesn't rule out every order-
+independent seeding choice (a different deterministic criterion closer
+in spirit to what `caps[0]` already achieves in practice might do
+better), but it does rule out this specific one, and confirms round
+twenty-six's own warning that this function family "needs real care,
+not a quick follow-up" -- a fourth attempt now, after rounds twenty
+through twenty-two and this one, three of which regressed.

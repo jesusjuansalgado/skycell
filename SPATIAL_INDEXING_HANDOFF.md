@@ -145,11 +145,26 @@ overlapping bounding caps at internal/leaf pages — still applies to
 whatever the tighter merge doesn't catch for `@>`(region,region). Every
 tree/key-quality direction on this file's own original open-questions
 list for that specific gap (a sub-quadratic overlap test, the
-pgSphere-style exact box) has now been tried and found wanting; the two
-live directions going forward there are both bigger/riskier than anything
-tried so far: decoupling `sub[]`'s stored order from `merge_caps_greedy_
-fp()`'s clustering input (round twenty-six's own closing note), or
-accepting the current gap as this opclass's likely floor. For
+pgSphere-style exact box) has now been tried and found wanting. Round
+forty-one then tried the specific fix round twenty-six's own closing
+note proposed — decoupling `sub[]`'s stored order from `merge_caps_
+greedy_fp()`'s clustering input, by making the first seed a
+deterministic, order-independent choice (farthest cap from the batch's
+own centroid) instead of the hardcoded `caps[0]` — and it regresses
+`@>`/`<@`(region,region) on its own (+5-7% buffers, deterministic, not
+noise), before even re-adding the overlap test it was meant to unblock.
+Reverted without compounding a second change onto an already-worse
+baseline. `caps[0]` isn't as arbitrary as it looks — GiST's own
+page-level grouping tends to make it a locally representative seed
+already — so "farthest from centroid" is a genuinely different
+heuristic, not a neutral de-biasing of the same one, and this specific
+choice clusters worse. Doesn't rule out every order-independent
+criterion, but rules out this one; four attempts at this function
+family now (rounds twenty, twenty-one, twenty-two, forty-one), three
+regressions and one kept win. The live directions going forward are
+narrower than before: a different order-independent seeding rule (
+untried), or accepting the current gap as this opclass's likely floor.
+For
 `@>`(region,point), round twenty-eight settled round twenty-seven's own
 closing question directly: round twenty-two's key-tightening fix *did*
 also meaningfully tighten this strategy's tree (buffers -23.7% to -25.7%
