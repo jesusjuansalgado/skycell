@@ -161,9 +161,12 @@ heuristic, not a neutral de-biasing of the same one, and this specific
 choice clusters worse. Doesn't rule out every order-independent
 criterion, but rules out this one; four attempts at this function
 family now (rounds twenty, twenty-one, twenty-two, forty-one), three
-regressions and one kept win. The live directions going forward are
-narrower than before: a different order-independent seeding rule (
-untried), or accepting the current gap as this opclass's likely floor.
+regressions and one kept win. **Closed as of round forty-one**: rather
+than guess at a second order-independent criterion, this gap is now
+accepted as the opclass's structural floor — `@>`(region,region) stays
+slower than pgSphere (~2.3-2.9x at 50,000 rows), not because a fix is
+sitting unfound, but because every tree/key-quality direction this
+file's original open-questions list named has now actually been tried.
 For
 `@>`(region,point), round twenty-eight settled round twenty-seven's own
 closing question directly: round twenty-two's key-tightening fix *did*
@@ -172,10 +175,16 @@ across both scales, isolated by temporarily reverting just that one
 change) — it just barely showed up in round twenty-five's wall-clock
 numbers because round twenty-seven's per-comparison cost was the
 dominant term at the time. Both known levers for this strategy have now
-been pulled; whatever gap remains is more likely structural (something
-about pgSphere's own point-in-shape descent) than a further fix sitting
-in this file's code — an inference from elimination, not independently
-confirmed.
+been pulled. **Closed alongside `@>`(region,region)**: whatever gap
+remains (~3.4-3.9x at 50,000 rows) is accepted as structural — something
+about pgSphere's own point-in-shape descent this opclass's cap-based key
+doesn't have a matching answer for — rather than a further fix left
+unfound in this file's code.
+
+**Both region-GiST losses to pgSphere are now closed as accepted,
+structural gaps, not open questions.** `&&` and `<@` remain solid wins;
+`@>`(region,region) and `@>`(region,point) remain real, understood, and
+no longer being chased.
 
 | 29 | Extended round twenty-seven's trig-avoidance idea to genuine cap-vs-cap tests: `cap_overlaps()` (backing `&&`/`@>`/`<@`(region,region) via `multicap_overlaps()`) compares against a radius *sum*, not one radius, but the angle-sum identity `cos(ra+rb)=cos(ra)cos(rb)-sin(ra)sin(rb)` gives the same shortcut if `cos(radius)` is cached per cap. Added `cos_radius` to `GistCap` (computed once in `cap_make()`), rewrote `cap_overlaps()` to use it (with an explicit `ra+rb >= pi` guard — the identity's monotonic range, and a real case here since `cover.c` allows a single cone's own radius up to `pi`, not just `pi/2`), and got `cap_area_proxy()`'s existing `1-cos(radius)` sped up for free from the same cache. | **Exact and correct — verified two ways, including a dedicated 400-region, 30-179°-radius stress test built specifically to exercise the `pi` guard, brute force matching GiST exactly throughout — but a net loss anyway.** The cache costs 40 bytes/key (5 caps × 8 bytes); confirmed directly via index size, 17MB→21MB (~24% bigger, matching the key growth almost exactly). Same-database buffers: `&&` +13.9%, `@>`(region,region) +12.9%, `<@`(region,region) +7.8%, all worse; wall-clock mixed, not a clean win. **Reverted.** The same fanout-cost mechanism rounds two, fifteen, and twenty-four all hit — not a bad proxy this time (the computed values are provably identical to the original), just a bigger key; round twenty-seven's win avoided this entirely by needing zero new storage. |
 
@@ -610,11 +619,18 @@ not in priority order — pick what matches the actual goal:
   that round twenty-two's tree-tightening fix *also* helped this strategy
   all along (buffers -23.7% to -25.7%, both scales) — both known levers
   for `@>`(region,point) are now pulled, so its remaining gap is more
-  likely structural than a further fix waiting in this file's code.
-  **Current scorecard vs. pgSphere, both scales**: `&&` and `<@` win
-  outright; `@>`(region,region) loses but the gap narrowed substantially;
-  `@>`(region,point) loses by a margin cut sharply by rounds twenty-seven
-  and twenty-eight together, nearly closed at the smaller scale.
+  likely structural than a further fix waiting in this file's code. Round
+  forty-one tried the one concretely-diagnosed remaining lever for
+  `@>`(region,region) (order-independent seeding, to unblock round
+  twenty-six's reverted overlap test) and it regressed on its own
+  (+5-7% buffers) before even reaching the overlap test — reverted, and
+  both `@>`(region,region) and `@>`(region,point)'s gaps are now closed
+  out as this opclass's accepted structural floor, not open questions.
+  **Final scorecard vs. pgSphere, both scales**: `&&` and `<@` win
+  outright; `@>`(region,region) loses but the gap narrowed substantially
+  (~4.9-5.2x → ~2.3-2.9x at 50,000 rows); `@>`(region,point) loses by a
+  margin cut sharply by rounds twenty-seven and twenty-eight together
+  (~4.0-4.6x → ~3.4-3.9x), nearly closed at the smaller scale.
 - Point SP-GiST opclass: shipped as a correctness-verified, documented
   negative result (`SPLIT_WIDTH=1`, effectively single-order splits; the
   bytea-prefix/explicit-width fix from round twelve is real and kept even
