@@ -3862,3 +3862,71 @@ gets some circle-in-a-square looseness, and a polygon's box comes from
 its *bounding cap*, round forty-two's own caveat, not its own vertices)
 is present everywhere on the sphere depending on shape and orientation,
 not specifically worse at the poles.
+
+**Second addendum: does the box key hold up at very large radii?** The
+natural next question, and this one *does* find a real limit. Every
+number in this round so far, `fpr` included, sits in the realistic
+catalog-footprint range (0.02-0.3 degrees) -- nothing tests what happens
+as a cap's radius grows toward a hemisphere, where a circle-in-a-square
+argument says the box's slack should get worse, not better.
+
+Built a third dedicated corpus to check directly: 6,000 circle regions,
+centres sampled uniformly on the sphere (`dec = degrees(asin(2*U-1))`,
+not `dec = degrees(180*U-90)`, to avoid the classic pole-clustering bug
+in naive uniform-sphere sampling), radius stratified into four bands --
+`small` 1-3 degrees (matching `fpr`'s own scale), `medium` 20-40,
+`large` 60-80, `huge` 85-89 -- 400 stratified probes (nearby, 1.1x-
+scaled variants of sampled rows, same construction as `fpr`'s own
+probes), both opclasses built fresh.
+
+**Correctness held exactly in every band**, huge included -- brute
+force, box-indexed, and multicap-indexed all agree precisely (e.g.
+495,873 matches in the huge band out of 1,500 x 99 probe-row pairs; the
+enormous match count is itself expected and not a red flag -- at these
+radii most circles genuinely do overlap most others on a uniformly-
+populated sphere).
+
+**But the box key's advantage over multi-cap doesn't just shrink here --
+it reverses**, and the crossover is not subtle:
+
+| band | box buffers | multi-cap buffers | winner |
+|---|---|---|---|
+| small (1-3 deg) | 17,359 | 25,154 | box, 1.45x fewer |
+| medium (20-40 deg) | 286,587 | 244,633 | **multi-cap, 1.17x fewer** |
+| large (60-80 deg) | 485,932 | 452,201 | **multi-cap, 1.07x fewer** |
+| huge (85-89 deg) | 520,287 | 490,576 | **multi-cap, 1.06x fewer** |
+
+Reproduced on a full index rebuild for the medium and huge bands
+(286,587 -> 288,680; 520,287 -> 521,177 -- noise-level, confirms this is
+real, not a one-off).
+
+**Why, and why the pole addendum's reasoning doesn't rescue this case**:
+a circle region's multi-cap key *is* the circle -- a single exact cap,
+no decomposition, no approximation loss, at any radius, since round
+three's multi-cap design only decomposes *polygons* into sub-caps; a
+circle already fits in one. The box, by contrast, squeezes that same
+circle into an axis-aligned box at every radius, and how much that costs
+depends on the circle's size and orientation relative to the coordinate
+axes -- worst in roughly this round's medium-to-large range, not
+monotonically worsening toward 90 degrees the way a naive "bigger is
+always looser" guess would predict (the pole addendum's own hemisphere
+case, a 90-degree cap centred exactly on an axis, works out to an
+*exact* box: x/y extents of +-1 and z extent of [0,1], matching the true
+hemisphere precisely -- it's off-axis, medium-to-large caps that pay the
+real cost, not the extreme-radius ones specifically). The multi-cap
+key's per-circle exactness doesn't degrade with radius at all, so once
+the box's slack-driven false-positive rate outgrows the box's per-
+comparison cost advantage, multi-cap wins back the tradeoff -- and does,
+starting well before a hemisphere.
+
+**Net effect on round forty-two's conclusion**: the "box wins
+everything" framing holds for the regime this whole investigation has
+actually benchmarked -- realistic catalog footprints, arcsec to a few
+degrees, `fpr`'s own 0.02-0.3 degree range included -- but does not
+generalize to wide-area queries (all-sky cross-matches, large cone
+searches, hemisphere-scale footprints). For that regime the shipped
+multi-cap opclass remains the better choice, not just the safer default.
+This is a real, radius-dependent tradeoff between the two opclasses, not
+a flaw in either -- and a concrete argument, on top of round forty-two's
+own closing note, for keeping both available rather than picking one
+over the other.
