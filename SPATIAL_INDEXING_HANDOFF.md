@@ -233,7 +233,23 @@ opclass production-ready on its own (still marked EXPERIMENTAL in the
 extension's SQL, the sorted-build discipline needs documenting or
 enforcing rather than left to the caller, untested beyond this
 investigation's corpus/radii), but it is no longer accurate to call it
-a net loss.
+a net loss. Round forty then re-measured against pgSphere directly —
+round eleven's original reference point, not just skycell's own B-tree
+— and closes essentially all of that gap too (2.9-3.9x slower originally,
+narrowing to ~1.4x at 3 degrees): the sorted-build-plus-cached opclass
+now runs within a tight band of pgSphere at every radius, with pgSphere
+slightly ahead at 1"-30' and skycell's SP-GiST slightly ahead from 1
+degree on (~1.1-1.6x). The first attempt at this measurement produced an
+implausible 4.5-12.5x pgSphere loss and was correctly not trusted at
+face value: `EXPLAIN (ANALYZE, BUFFERS)` showed pathological heap
+locality (`Heap Blocks: exact=3407` for ~7,450 rows) traced to a real
+bug in the comparison's own setup — a `JOIN` used to build the `spoint`
+comparison table hadn't preserved the intended HEALPix-sorted physical
+row order (nothing about a join's output order follows either input's
+physical order without an explicit `ORDER BY`), crippling heap-fetch
+locality for any index regardless of its own quality. Fixed with an
+explicit `ORDER BY ctid`; the same single query dropped from 35ms to
+3.2ms from that fix alone, nothing about pgSphere's own GiST changed.
 
 ## 5. The other, separate open gap: skycell's own B-tree path vs. pgSphere
 ## at large radii
@@ -370,6 +386,15 @@ changes: document that applications running skycell cone/region queries
 at large radii on dense catalogs should raise `jit_above_cost` (or
 disable JIT) for that session/connection pool — confirmed non-regressive
 and at least as good as a blanket disable.
+
+This section's own gap (B-tree losing to pgSphere at large radii) is
+still open on the B-tree path itself — nothing here has changed that.
+But round forty's fresh 3-way measurement (§4) found the same direction
+holds now too (B-tree trailing pgSphere at 1 degree and up on this
+session's corpus), and that the point SP-GiST opclass (§4), once given
+a sorted build and query caching, closes this exact gap from the *other*
+structure — not by making the B-tree path faster, but by giving skycell
+a second index that doesn't have this weakness at large radii at all.
 
 ## 6. Open questions and concrete untried directions
 

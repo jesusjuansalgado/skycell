@@ -3508,3 +3508,81 @@ enforced rather than left to the caller to remember, and still untested
 beyond the radii and corpus this whole investigation has used
 throughout), but "not recommended for use, a net loss at every radius"
 is no longer an accurate description of where this opclass stands.
+
+## Round forty: back to pgSphere, the original reference point -- and a
+## real methodology bug caught and fixed before trusting the result
+
+Rounds thirty-eight/nine measured against skycell's own B-tree, but
+round eleven's original question was about pgSphere specifically (2.9-
+3.9x slower at small radii, narrowing to ~1.4x at 3 degrees, back when
+this opclass had neither the sorted build nor the query cache). Worth
+re-measuring directly now, on the same corpus, rather than assuming the
+B-tree comparison implies anything about pgSphere.
+
+**First attempt produced an implausible result, and it was right to be
+suspicious of it rather than write it up.** Built an `spoint` table via
+`SELECT ... FROM spg_pts_sorted r JOIN src s ON s.id = r.id` (intending
+to inherit `spg_pts_sorted`'s HEALPix-cell-sorted physical order for a
+fair comparison) and got pgSphere losing by 4.5-12.5x at 1-3 degrees --
+an order of magnitude worse than round eleven's own recorded number for
+the same operator on (presumably) the same shape of corpus. That gap was
+too large to just accept. `EXPLAIN (ANALYZE, BUFFERS)` on one query
+showed why it was worth checking further: `Heap Blocks: exact=3407` for
+~7,450 candidate rows -- barely better than one heap page per row, and a
+`written=1283` in the buffer line (a spill, not a hint-bit fluke).
+Checked directly whether the table actually inherited the sort order
+intended: `(ctid, id)` on the first few physical rows of `spg_pts_sorted`
+vs. the new `spg_pts_pgsphere` table showed completely different
+orderings -- the `JOIN` had not preserved `spg_pts_sorted`'s scan order
+at all (unsurprising in hindsight: nothing about a join's output order is
+guaranteed to follow either input's physical order without an explicit
+`ORDER BY`). The new table was build in something close to `id` order,
+unrelated to sky position, so *any* index's matching rows for a given
+query were scattered across the whole table's physical extent --
+crippling heap-fetch locality for pgSphere's GiST regardless of how good
+its own tree is, and nothing to do with pgSphere's actual index quality.
+
+**Rebuilt with `ORDER BY r.ctid`** (verified this time: first-five
+`(ctid, id)` pairs identical to `spg_pts_sorted`'s own), re-indexed, and
+the same single query dropped from `Heap Blocks: exact=3407`/35ms to
+`exact=67`/3.2ms -- an order of magnitude from fixing physical layout
+alone, nothing about pgSphere's own GiST changed at all.
+
+**With that fixed, the three-way comparison is coherent and closely
+matched, run twice for reproducibility:**
+
+| radius | btree ms | pgsphere ms | spg-sorted-cached ms |
+|---|---|---|---|
+| 1" | 0.19-0.22 | 0.15-0.20 | 0.22-0.25 |
+| 1' | 0.20-0.21 | 0.15 | 0.24 |
+| 30' | 0.63-0.66 | 0.40-0.41 | 0.42-0.44 |
+| 1deg | 1.94-2.54 | 1.75-1.90 | 1.45-1.55 |
+| 3deg | 9.53-9.69 | 7.70-8.19 | 5.11-7.09 |
+
+pgSphere has a modest edge at 1"-30' (where skycell's B-tree also does
+relatively worse). From 1 degree on, skycell's cached-and-sorted
+SP-GiST takes over as the fastest of the three, by a real if not huge
+margin over pgSphere (about 1.1-1.6x), with the B-tree trailing both at
+every radius from 30' up. All three are within a tight band of each
+other throughout -- nothing like the original 2.9-3.9x gap round eleven
+measured, or the false 4.5-12.5x gap the row-order bug produced here
+before it was caught.
+
+**What this means, put together with rounds thirty-eight/nine**: the
+combination of a sorted-order build and query caching doesn't just beat
+skycell's own B-tree path (already established) -- it also closes round
+eleven's original gap to pgSphere essentially completely, and edges
+ahead of it at the radii skycell's own B-tree was already weakest at (1
+degree and up). Both zero-risk, both independently verified correct
+under dedicated stress tests (rounds thirty-eight/nine), neither
+sufficient alone. This is now a genuinely competitive index, not a
+research curiosity that happens to have an interesting planning-cost
+story -- though see rounds thirty-eight/nine's own caveats (still marked
+EXPERIMENTAL, sorted-build discipline needs documenting or enforcing,
+untested beyond this investigation's corpus/radii) before treating it as
+production-ready.
+
+**One more thing worth recording**: `CREATE INDEX ... USING gist` on
+`spoint` took 118-141s for pgSphere against this SP-GiST opclass's 28s
+sorted build (round thirty-eight) -- a data point on build cost, not
+just query cost, though not chased further here.
