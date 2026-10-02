@@ -4261,3 +4261,186 @@ threshold is empirically chosen from this one corpus's measured
 crossover, not derived from a general cost model, and is a GUC
 specifically so it can be retuned (or set arbitrarily high to recover
 every prior version's always-rewrite behaviour) per deployment.
+
+## Round forty-four: chasing an old "26% faster" cold-cache number --
+## not reproducible, and why, plus what a real per-radius-group cold
+## run actually shows
+
+A much earlier part of this same investigation (this whole document's
+branch is one long-running session, just repeatedly summarised) had
+quoted a comparison table with a "26% faster" cold-cache figure for
+skycell vs pgSphere at 3 degrees. Asked to explain the method behind it,
+nothing in-context reproduced it, which is itself worth recording rather
+than quietly re-deriving a number and presenting it as settled.
+
+**Finding the actual historical methodology.** This entire investigation
+turns out to be one continuous Claude Code session going back to the
+project's early history, not a series of separate ones -- its own
+transcript (`~103 MB` of JSONL) is searchable, and grepping it for the
+leftover `cold_probe` table's name in `paper_bench` found the exact
+commands that built it: a single `sudo service postgresql restart`,
+followed by looping over *all seven* radius labels and both methods (2
+loops, 1,456 query pairs) in one uninterrupted pass, never restarting or
+dropping caches again in between. That means only the earliest-run label
+(1") was ever genuinely cold; by the time the loop reached 3 degrees --
+last in the ordering, and the smallest group at only 16 pairs -- roughly
+1,440 other queries had already run, substantially rewarming the cache
+the "cold" label was nominally measuring against.
+
+**Two hypotheses tested directly, neither explained it.** The surviving
+`cold_probe` rows still exist in `paper_bench`; recomputing from them
+with different aggregations gave 36.3% (ratio of means) and 5.1% (ratio
+of medians) -- neither close to 26%, and no principled reason to prefer
+one over the other without knowing which the original number used.
+Separately, asked whether disabling `skycell.use_stats` (no density
+correction, pure uniform-sky covering) might explain the gap: tested
+directly at 3 degrees, same corpus, same session -- it made the B-tree
+path *faster in absolute terms* (3.291ms median vs 6.285ms with stats)
+but it was still ~2.4x slower than pgSphere's 1.346ms, moving in the
+wrong direction to explain a 26%-faster result.
+
+**The aggregation that came closest, and why it still isn't trustworthy.**
+The mean of *per-trial paired ratios* `(1 - sky_ms/pg_ms)`, matching
+REPRODUCING.md's own stated protocol ("every comparison is... analysed
+paired"), gave 28.2% at 3 degrees for the historical data -- close to 26%
+-- but applying the identical formula to the smaller radii in the same
+table produced nonsense: -326%, -1,116%, -1,863%. A ratio denominator
+that happens to be small on a single noisy trial makes `1 - x/small`
+blow up, and cold-cache timing is exactly the kind of noisy, heavy-tailed
+data where that happens. So this statistic is not a generally trustworthy
+aggregation; its apparent 28.2%-vs-26% closeness at 3 degrees specifically
+is more likely a coincidence of scale (large radius, larger, more stable
+per-query times) than a hint at the real underlying number.
+
+**The deeper problem: `/proc/sys/vm/drop_caches` is a no-op here.**
+Tested directly rather than assumed. A query was run cold (1211ms, 76
+disk reads), repeated immediately (0.87ms, all cache hits -- expected),
+then `echo 3 > /proc/sys/vm/drop_caches` (exit 0, no error) was followed
+by a full `postgres` restart and the *same* query a third time: 10ms,
+with the identical 76 "read" (not "hit") count PostgreSQL's own
+`shared_buffers` correctly reported as cleared -- but 120x faster than
+the original cold run. The pages were still being served from a page
+cache that never actually got dropped; the write to `drop_caches`
+silently succeeds at the file-permission level without the host-level
+privilege to do anything, a known container limitation. A second test
+with a brand-new, never-before-touched region confirmed the other half
+of this: first touch after a fresh restart+drop was genuinely slow
+(903ms, real reads), and the immediate repeat was fast (2ms) -- so a
+first-ever cold touch is real and measurable here, it is *re-cooling
+already-touched data* that silently fails. A more disciplined version of
+the *same* restart+drop_caches technique (e.g. per radius group instead
+of once) would therefore inherit the identical flaw -- the fix has to
+route around the broken primitive, not use it more carefully.
+
+**The fix: fresh, never-queried coordinates per radius group, restarted
+before each.** `shared_buffers`-clearing via a full `service postgresql
+restart` works reliably (confirmed above); what doesn't is reusing
+previously-touched coordinates and expecting a cache drop to re-cool
+them. So: 1,456 brand-new probe centres were generated (`bench_centers`,
+`qid` 10001-11456, matching `bench/03_cone.sql`'s own generation formula,
+sample sizes per label, and `kind` mix exactly, just reseeded), and a
+driver script restarts PostgreSQL before *each* of the seven labels in
+turn, running only that label's (fresh) pairs before moving to the next
+-- reusing the project's own existing `cone_sql()`/`cat_cell`/
+`cat_sphere` methodology unchanged, so this is directly comparable to
+`bench/03_cone.sql`'s own headline numbers. One bug on the way, the exact
+one this investigation's own history already named once before (a label
+containing an apostrophe, `1'`, breaking a hand-built SQL string literal)
+-- recurred because this script was written fresh rather than reusing the
+earlier fix, fixed the same way (double the embedded quote before
+interpolating), and recovered without re-running (and so re-warming) the
+two labels that had already completed successfully before the crash.
+
+**The result, and it is clean: under genuine cold-cache conditions,
+skycell beats pgSphere at every single radius**, on both buffers and
+wall-clock:
+
+| radius | skycell buffers | pgSphere buffers | skycell mean ms | pgSphere mean ms | skycell faster by |
+|---|---|---|---|---|---|
+| 1" | **4.2** | 5.7 | **88.6** | 118.7 | 25% |
+| 10" | **4.7** | 5.8 | **25.8** | 29.7 | 13% |
+| 1' | **6.4** | 7.7 | **20.5** | 25.8 | 20% |
+| 6' | **9.1** | 12.8 | **9.1** | 22.2 | 59% |
+| 30' | **28.6** | 72.9 | **13.9** | 26.1 | 47% |
+| 1 deg | **57.9** | 193.1 | **18.0** | 32.9 | 45% |
+| 3 deg | **196.5** | 327.8 | **34.5** | 72.4 | 52% |
+
+skycell touches fewer pages than pgSphere at every radius tested here
+(confirmed, not assumed -- these buffer counts are deterministic and
+reproduce exactly across repeated runs), and when each uncached page
+costs real disk latency, that page-count advantage is the whole story:
+it wins uniformly. This is a genuine reversal of the warm-cache picture
+measured earlier in round forty-three, where pgSphere often won at
+medium-large radii because of skycell's own exact-filter CPU cost on
+false-positive candidates -- a cost that is irrelevant when I/O, not CPU,
+is the bottleneck.
+
+**"What happens without a cold buffer?"** -- the identical, freshly-
+generated query set was run again immediately afterward (shared_buffers
+now warm, double-pass with the first discarded to avoid measuring
+PostgreSQL's own cold start), giving a direct cold-vs-warm comparison on
+the same queries rather than a different historical sample:
+
+| radius | warm pgSphere ms | warm skycell ms | cold pgSphere ms | cold skycell ms | pgSphere cold/warm | skycell cold/warm |
+|---|---|---|---|---|---|---|
+| 1" | 0.031 | 0.018 | 118.70 | 88.60 | 3851x | 4888x |
+| 10" | 0.028 | 0.023 | 29.70 | 25.75 | 1079x | 1116x |
+| 1' | 0.031 | 0.035 | 25.78 | 20.52 | 823x | 593x |
+| 6' | 0.051 | 0.064 | 22.16 | 9.07 | 431x | 142x |
+| 30' | 0.305 | 0.294 | 26.09 | 13.90 | 85x | 47x |
+| 1 deg | 0.948 | 0.729 | 32.90 | 17.97 | 35x | 25x |
+| 3 deg | 3.327 | 2.391 | 72.41 | 34.46 | 22x | 14x |
+
+Two things stand out. First, the cold penalty is enormous at small radii
+(nearly 4,000-4,900x at 1 arcsecond) and shrinks steadily with radius
+(down to 14-22x at 3 degrees) -- not because cold reads get cheaper, but
+because warm per-query cost grows with radius too (more rows touched even
+when every page is a cache hit), while the absolute cold penalty per page
+stays roughly constant, so the *ratio* compresses as the warm baseline
+rises. Second, and more telling: **the warm-cache verdict is not
+uniform the way cold was.** pgSphere wins at 1' and 6' when warm (0.031
+vs 0.035, 0.051 vs 0.064) -- skycell loses there by the same mechanism
+round forty-three's `Rows Removed by Filter` diagnosis already
+identified (false-positive candidates from the covering's overshoot cost
+real per-row CPU once I/O is free) -- while skycell wins everywhere else,
+cold or warm. Buffers were identical between the cold and warm runs for
+every radius (deterministic, as expected), which is exactly what makes
+the contrast informative: the *only* thing that changed between these
+two tables is whether those buffer reads cost real I/O latency or a
+cache hit, and that alone decides whether skycell's fewer-pages advantage
+or its exact-filter CPU tax is the one that matters.
+
+**Synthesis, tying this round to round forty-three's own lesson.** Buffer
+counts predict performance cleanly in an I/O-bound (cold) regime, where
+this round found skycell wins everywhere because it touches fewer pages
+everywhere. They predict nothing reliable in a CPU-bound (warm) regime,
+where round forty-three already found the cap-GiST opclass could win on
+buffers and still lose on wall-clock, and where this round finds
+skycell's own B-tree rewrite can do the same -- both traceable to the
+same root cause, a real per-candidate CPU cost (an exact geometric test
+for the B-tree rewrite, `cap_overlaps()`'s trig for the cap-GiST opclass)
+that a page count does not capture. Neither "buffers" nor "wall-clock"
+alone tells the whole story in general; which one dominates depends on
+whether the pages in question are likely to be resident, which depends
+on the deployment's actual cache-to-data-size ratio -- not something
+either number alone can report.
+
+**STATUS**: a measurement round, no production code changed. The old
+"26% faster" figure is retired -- not reproducible under controlled
+conditions, traced to an uncontrolled, partially-rewarmed cache state
+from a single historical restart plus a numerically fragile aggregation
+method that happened to land close by coincidence of scale. In its
+place: a real, reproducible cold-cache methodology (fresh coordinates
+restarted per radius group, sidestepping a confirmed-broken `drop_caches`
+rather than trusting it) and a clean result from it -- skycell beats
+pgSphere at every radius when genuinely cold, loses at 1'-6' when warm,
+for the same mechanistic reason round forty-three already diagnosed for
+a different opclass. `skycell.rewrite_max_waste` (round forty-three) was
+tuned from warm-cache measurements; this round's warm re-measurement
+reproduces that same crossover independently, which is some corroboration
+that the threshold is measuring a real effect and not an artifact of the
+corpus it was first tuned on -- though a deployment that is reliably
+I/O-bound (a cold-cache-dominated workload, or a dataset much larger than
+available cache) would want a much more permissive threshold than one
+tuned warm, since this round shows the two regimes can disagree about
+which strategy wins at the same radius.
