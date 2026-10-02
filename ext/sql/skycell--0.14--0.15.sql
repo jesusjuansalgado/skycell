@@ -1,0 +1,39 @@
+\echo Use "ALTER EXTENSION skycell UPDATE TO '0.15'" to load this file. \quit
+
+-- ------------------------------------------------------------------
+-- No new SQL objects: this version tracks a C-level behaviour change to
+-- the B-tree rewrite gate (ext/src/adql.c's region_support_simplify(),
+-- ext/src/skycell.c's rewrite_waste_threshold()), introduced after 0.14
+-- shipped and not previously given its own version:
+--
+--   * skycell.rewrite_max_waste (0.14) -- decline the rewrite past this
+--     many expected wasted exact-test rows -- is now scaled by how much
+--     of the relation the server's actual cache capacity can hold,
+--     instead of applying unconditionally: cache_frac = min(1, NBuffers /
+--     relpages), threshold = skycell.rewrite_max_waste / cache_frac.
+--     NBuffers (the real, already-allocated shared buffer pool size) is
+--     read directly, not effective_cache_size (an admin-set estimate
+--     with no guarantee it reflects anything the server actually holds).
+--     See GIST_REGION_DESIGN.md's "Round forty-four" for the cold-cache
+--     measurements this scaling is based on.
+--
+--   * New GUC skycell.rewrite_waste_scale_cap (default 10.0): caps that
+--     scaling at this many times skycell.rewrite_max_waste, rather than
+--     letting it grow without bound. GIST_REGION_DESIGN.md's "Round
+--     forty-five" measured the unbounded version able to force the
+--     rewrite at the largest query radii on a table whose rows are not
+--     physically ordered by cell -- the realistic, unclustered case --
+--     exactly where it was measured losing to a GiST-family alternative
+--     even under genuinely cold cache. The default sits between that
+--     round's measured waste at 1 degree (still reachable) and at 3
+--     degrees (no longer reachable), the same way skycell.rewrite_max_waste's
+--     own default was chosen: empirically, from this corpus's measured
+--     crossover, as a GUC so it can be retuned per deployment.
+--
+-- Both are process-wide server configuration, set once by this module's
+-- _PG_init() when skycell.so loads, independent of which extension
+-- version is CREATEd or ALTERed; there is nothing to CREATE or ALTER
+-- here. The version bump exists to give this behaviour change -- and the
+-- new tunable -- a place in this file's own changelog, the same as any
+-- other shipped change.
+-- ------------------------------------------------------------------
