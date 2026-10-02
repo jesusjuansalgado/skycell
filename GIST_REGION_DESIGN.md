@@ -4525,3 +4525,45 @@ threshold -- no manual GUC override at all, the scaling now driven purely
 by the server's real memory. `shared_buffers` was restored to 2GB and the
 server restarted again before re-running `make installcheck`, which still
 passes.
+
+**Checked, not adopted: a `pg_buffercache`-based variant.** `NBuffers`
+answers "how big is the pool," not "are *this relation's* pages actually
+in it" -- the latter is what `pg_buffercache` exists to answer, and it is
+available in this environment (`pg_buffercache--1.4`, contrib, already
+installed alongside core). Tried it directly against `paper_bench` rather
+than reasoning about it in the abstract:
+
+```
+CREATE EXTENSION pg_buffercache;
+SELECT count(*) FROM pg_buffercache;                                    -- 262144 rows, 55 ms
+SELECT count(*) FROM pg_buffercache WHERE relfilenode = ...('cat_pos');  -- 185 ms
+SELECT * FROM pg_buffercache_summary();                                  -- 2-4 ms, global only
+```
+
+Two real options, both rejected:
+
+- `pg_buffercache_pages()` (what the view is built on) gives true
+  per-relation residency, but it is an `O(NBuffers)` scan that
+  materializes one row per buffer -- 55-185ms here at a 2GB
+  (262144-buffer) pool that is small by production standards; it scales
+  linearly with `shared_buffers`, so a 32GB pool would cost on the order
+  of a full second. `rewrite_waste_threshold()` runs inside
+  `SupportRequestSimplify`, i.e. during planning, for every query whose
+  plan reaches this gate -- paying a scan that dwarfs the rest of
+  planning combined to decide a heuristic threshold is backwards, the
+  cost this gate exists to budget would be the smaller number.
+- `pg_buffercache_summary()` is cheap (2-4ms, no per-row materialization)
+  but only global (`buffers_used` out of `NBuffers`, pool-wide) -- it
+  cannot say whether `cat_pos` specifically is resident, which is the
+  only question that matters here. Not usable for this purpose at any
+  price.
+
+Either path also adds a hard dependency skycell does not otherwise have
+(`CREATE EXTENSION pg_buffercache` in every database that wants the
+scaling) plus an SPI call from inside a planner support function, a
+combination with its own reentrancy risk skycell does not take on
+anywhere else in this codebase. `NBuffers` stays: free (`O(1)`, already in
+memory, zero dependencies), and per this round's own data erring toward
+"assume less cache than there really is" is the direction that was
+already safe to err in. `pg_buffercache` extension dropped from
+`paper_bench` again after the measurement; no code changed.
