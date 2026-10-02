@@ -16,6 +16,7 @@ extern void current_params(sc_cover_params *p, int max_ranges, const sc_density 
 extern ArrayType *moc_for_region(const sc_region *r, int max_cells, int max_order);
 
 extern int	skycell_join_slots;
+extern double skycell_rewrite_max_waste;
 
 extern Const *int8_const(int64 v);
 extern Const *float8_const(double v);

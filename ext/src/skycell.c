@@ -84,6 +84,7 @@ static double skycell_max_area_ratio = 64.0;
 static int	skycell_max_ranges = 64;
 static int	skycell_max_steps = 4000;
 int			skycell_join_slots = 4;	/* adql.c's non-constant skyregion branch shares this */
+double		skycell_rewrite_max_waste = 100.0;	/* adql.c's region_support_simplify shares this */
 static bool skycell_use_stats = true;
 static bool skycell_cache_coverings = true;
 static bool skycell_exact_cells = true;
@@ -121,6 +122,20 @@ _PG_init(void)
 							"Number of range slots emitted for non-constant regions (joins).",
 							NULL, &skycell_join_slots, 4, 1, MAX_SLOTS,
 							PGC_USERSET, 0, NULL, NULL, NULL);
+	DefineCustomRealVariable("skycell.rewrite_max_waste",
+							 "Decline the B-tree range rewrite for a constant region when the "
+							 "covering's own cost model expects more than this many rows to be "
+							 "fetched and then rejected by the exact test (cov.exp_rows * "
+							 "(1 - sel)). A covering's overshoot is cheap in absolute rows at "
+							 "small radii and expensive at large ones; past this many wasted "
+							 "rows, leaving the original <@/@> clause unrewritten lets the "
+							 "planner cost a GiST-family index (skypos_spgist_ops, or an "
+							 "experimental opclass) against it instead, if one exists -- see "
+							 "GIST_REGION_DESIGN.md for the measured crossover. Set this very "
+							 "high to recover the always-rewrite behaviour every version before "
+							 "this one had.",
+							 NULL, &skycell_rewrite_max_waste, 100.0, 0.0, 1e12,
+							 PGC_USERSET, 0, NULL, NULL, NULL);
 	DefineCustomBoolVariable("skycell.use_stats",
 							 "Use the ANALYZE histogram of the cell column as a density map.",
 							 NULL, &skycell_use_stats, true,

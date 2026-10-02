@@ -875,6 +875,37 @@ region_support_simplify(SupportRequestSimplify *req, Oid funcid, Node *pt, Node 
 			sc_cover_compute(&reg, &dens, &p, &cov);
 		sel = (cov.area > 0) ? fmin(1.0, reg.area / cov.area) : 0.0;
 
+		/*
+		 * Decline the rewrite when the covering's own cost model expects
+		 * too many rows to be fetched from the heap only to be rejected by
+		 * the exact test below (skycell.rewrite_max_waste's own comment has
+		 * the full story). Measured directly, not guessed: at small radii
+		 * this waste is a handful of rows regardless of how poor the
+		 * covering's *ratio* looks (sel near 0 but cov.exp_rows tiny), and
+		 * the rewrite wins outright; past roughly a hundred wasted rows it
+		 * starts costing more in exact-test CPU than the ranges save in
+		 * heap I/O, and a GiST-family index (when one exists) wins instead.
+		 * Returning NULL here leaves the original <@/@> clause in place for
+		 * the planner's normal cost-based index selection to consider --
+		 * skycell_pos_region_sel/skycell_region_pos_sel give it a real,
+		 * non-default selectivity estimate for that clause either way.
+		 *
+		 * cov is NOT freed here (unlike reg): for a cone, cover_cached()
+		 * hands back entry->r, a pointer straight into its own long-lived
+		 * cache entry (skycell_cache_cxt), not a caller-owned copy -- the
+		 * existing success path below never frees cov either, for exactly
+		 * that reason. sc_cover_free() on it would pfree the cache's own
+		 * backing array out from under every future cache hit for this key,
+		 * corrupting that memory context (found the hard way: a segfault
+		 * several unrelated queries later, in whatever next allocation hit
+		 * the corrupted free list -- see GIST_REGION_DESIGN.md).
+		 */
+		if (cov.exp_rows * (1.0 - sel) > skycell_rewrite_max_waste)
+		{
+			sc_region_free(&reg);
+			return NULL;
+		}
+
 		exact = makeFuncExpr(lookup_sibling_func(funcid, "skycell_in_region", 3, exact_types),
 							 BOOLOID,
 							 list_make3(copyObject(pt), copyObject(rg), float8_const(sel)),
@@ -1013,4 +1044,136 @@ skycell_region_sel_support(PG_FUNCTION_ARGS)
 		PG_RETURN_POINTER(req);
 	}
 	PG_RETURN_POINTER(NULL);
+}
+
+/*
+ * Restriction selectivity for the raw, un-rewritten <@(skypos,skyregion) and
+ * @>(skyregion,skypos) operators -- the ones a GiST or SP-GiST index on
+ * skypos indexes directly (skypos_spgist_ops, gist_point_cap.c's
+ * experimental skypos_cap_gist_ops), with no B-tree rewrite in the picture
+ * to hand off to skycell_in_region/skycell_region_sel_support above.
+ *
+ * Both operators are declared with `RESTRICT = contsel` (see their CREATE
+ * OPERATOR), PostgreSQL's generic containment-operator fallback, which
+ * returns a flat default (effectively ~0.001 of the table) regardless of
+ * the actual query radius. A SupportRequestSelectivity handler on the
+ * backing function cannot fix this -- per PostgreSQL's own documented rule
+ * (nodes/supportnodes.h), a function's support function is never consulted
+ * for selectivity when that function is invoked as an operator's
+ * implementation, only the operator's own RESTRICT/JOIN estimator is. The
+ * fix has to be a plain oprrest-shaped C function assigned via RESTRICT=,
+ * the same mechanism contsel itself uses.
+ *
+ * This was found, not assumed: it explained a real, measured planner
+ * misbehaviour -- cat_pos_capgist (58 actual matching rows at a given
+ * probe) was costed at a flat 10000-row estimate, which pushed the planner
+ * onto a Bitmap Index Scan + Bitmap Heap Scan (built for an estimated-large,
+ * low-selectivity result) where pgSphere's own spoint<@scircle, selectivity-
+ * aware, got a cheap plain Index Scan instead for the same 58-row result,
+ * at a fraction of the wall-clock cost despite touching more buffer pages.
+ * See GIST_REGION_DESIGN.md for the numbers.
+ *
+ * ROUND TWO -- DENSITY-AWARE: a first version of this fix used only
+ * area(region)/4pi, a uniform-sky estimate. Measured against a real,
+ * 60%-clustered corpus, it was a clear win for ordinary (sparse-sky)
+ * queries but a real regression for queries landing in or near a genuine
+ * density cluster: a uniform-sky estimate understates their true row count,
+ * which flipped some medium-radius probes from a (correct, needed) Bitmap
+ * Scan to a (wrong, slower) plain Index Scan. The fix for that is exactly
+ * the machinery region_support_simplify() above already uses for the B-tree
+ * rewrite's own cost model: cell_expr_for_point() builds the skycell_cell
+ * (pos) expression a point column would be indexed by, density_for_expr()
+ * finds that expression index's real ANALYZE histogram (or skycell's own
+ * finer multi-order count map, when skycell_density_build() has made one)
+ * if the table has one, and sc_cover_compute()/cover_cached() turn that
+ * into cov.exp_rows -- an estimate that already reflects genuine clustering,
+ * not an assumption of uniformity. reg.area/cov.area narrows that from
+ * "rows in the covering" to "rows truly inside the region", the same ratio
+ * the rewrite's own exact-test selectivity hint already uses. Falls back to
+ * the round-one uniform-sky estimate when no such index exists on the
+ * table (this opclass needs no such index itself to function -- only this
+ * selectivity estimate benefits from one being present) or the region
+ * isn't a compile-time constant.
+ */
+static double
+region_pos_density_sel(Oid selfid, PlannerInfo *root, Node *pt, Node *rg)
+{
+	sc_region	reg;
+	double		fallback;
+	double		result;
+
+	if (!IsA(rg, Const) || ((Const *) rg)->constisnull)
+		return 1e-4;		/* non-constant or null region: no better guess */
+
+	skycell_region_from_datum(((Const *) rg)->constvalue, &reg);
+	fallback = fmin(1.0, fmax(reg.area / (4.0 * M_PI), 1e-12));
+	result = fallback;
+
+	if (root != NULL)
+	{
+		Node	   *cell = cell_expr_for_point(selfid, pt);
+
+		if (cell != NULL)
+		{
+			sc_density	dens;
+			Oid			statrel = InvalidOid;
+			bool		uses_cell_ops;
+
+			if (density_for_expr(root, cell, &dens, &statrel, &uses_cell_ops) &&
+				dens.ntotal > 0)
+			{
+				sc_cover_params p;
+				sc_cover	cov;
+				double		est;
+
+				current_params(&p, 64, &dens);
+				if (reg.kind == SC_REGION_CONE)
+				{
+					double		ra0 = atan2(reg.center.y, reg.center.x) * RAD2DEG;
+					double		dec0 = asin(fmax(-1.0, fmin(1.0, reg.center.z))) * RAD2DEG;
+					double		radius = reg.radius * RAD2DEG;
+
+					cover_cached(&reg, &dens, &p, statrel, ra0, dec0, radius, &cov);
+				}
+				else
+					sc_cover_compute(&reg, &dens, &p, &cov);
+
+				est = cov.exp_rows * ((cov.area > 0) ? fmin(1.0, reg.area / cov.area) : 0.0);
+				result = fmin(1.0, fmax(est / dens.ntotal, 1e-12));
+				/* cov not freed: see region_support_simplify's identical
+				 * comment above -- cover_cached()'s cone branch aliases its
+				 * own long-lived cache entry, not a caller-owned copy. */
+			}
+		}
+	}
+	sc_region_free(&reg);
+	return result;
+}
+
+/* backs <@(skypos,skyregion): point is the left operand, region the right */
+PG_FUNCTION_INFO_V1(skycell_pos_region_sel);
+Datum
+skycell_pos_region_sel(PG_FUNCTION_ARGS)
+{
+	PlannerInfo *root = (PlannerInfo *) PG_GETARG_POINTER(0);
+	List	   *args = (List *) PG_GETARG_POINTER(2);
+
+	if (list_length(args) != 2)
+		PG_RETURN_FLOAT8(1e-4);
+	PG_RETURN_FLOAT8(region_pos_density_sel(fcinfo->flinfo->fn_oid, root,
+											 (Node *) linitial(args), (Node *) lsecond(args)));
+}
+
+/* backs @>(skyregion,skypos): region is the left operand, point the right */
+PG_FUNCTION_INFO_V1(skycell_region_pos_sel);
+Datum
+skycell_region_pos_sel(PG_FUNCTION_ARGS)
+{
+	PlannerInfo *root = (PlannerInfo *) PG_GETARG_POINTER(0);
+	List	   *args = (List *) PG_GETARG_POINTER(2);
+
+	if (list_length(args) != 2)
+		PG_RETURN_FLOAT8(1e-4);
+	PG_RETURN_FLOAT8(region_pos_density_sel(fcinfo->flinfo->fn_oid, root,
+											 (Node *) lsecond(args), (Node *) linitial(args)));
 }

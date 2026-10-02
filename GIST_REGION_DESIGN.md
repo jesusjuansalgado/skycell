@@ -3945,3 +3945,319 @@ indexable spelling" section as the opt-in choice for columns known to
 hold small, catalogue-scale footprints (arcsec-few degrees) specifically
 -- not a general recommendation, given the large-radius reversal just
 above.
+
+## Round forty-three: a Spherical-Cap GiST for *points* -- the mirror
+## image of round forty-two, a genuine win in part of its range, and a
+## bigger fix to the B-tree rewrite path found along the way
+
+Round forty-two's box opclass is for `skyregion`; everything in this round
+is instead about `skypos` -- a new, separate opclass (`gist_point_cap.c`,
+`skypos_cap_gist_ops`) competing directly with pgSphere's native `spoint`
+GiST and skycell's own SP-GiST (`skypos_spgist_ops`), not with the region
+opclasses above. First, pgSphere's own key was confirmed empirically
+rather than assumed: a one-row `spoint`-GiST index inspected with
+`pageinspect`'s `gist_page_items()` showed a leaf tuple's key as two
+identical 3-tuples (a degenerate min=max box around the single point),
+`itemlen=32` -- 24 bytes of payload, i.e. six *float* (not double)
+coordinates. So pgSphere's key is a box, lossy even at the leaf, at half
+the per-coordinate precision skycell's own double-precision opclasses use.
+
+**The idea** (the user's): leaves store the exact point as a zero-radius
+cap; internal nodes store a bounding `GistCap` (centre + angular radius);
+pruning is `cap_overlaps()` against the query region's own bounding cap;
+`picksplit()` minimises cap overlap, not bounding-box overlap. Structural
+motivation: for an isotropic point cluster (a globular cluster, a density
+peak, a HEALPix-sorted run of nearby catalogue sources -- the common case
+in a real catalogue), a bounding cap is tighter than pgSphere's bounding
+box, the same circle-in-a-square argument as round forty-two's own file
+header, just run in the opposite direction: there, a box beats a multi-cap
+at bounding an odd-shaped *region*; here, a cap beats a box at bounding an
+isotropic *cluster of points*.
+
+**Round one -- double precision, exact leaf test, no recheck at the
+leaf**: `GistCap` (four doubles, 32 bytes) reused from `gist_region.c`
+(duplicated, not exported, same reasoning as every prior round -- minimise
+blast radius on proven code). `picksplit()` is the single-cap analogue of
+`skyregion_gist_picksplit()`: the same R*-tree axis-sort/margin/overlap
+sweep, simpler throughout since each entry holds exactly one cap, not a
+multicap union of up to four. `consistent()` exploits the point being
+stored losslessly at the leaf: `sc_region_contains()` against the exact
+point, `recheck=false` -- a real structural edge pgSphere's own leaf
+lacks, which is always a lossy box even for one point.
+
+Correctness: 0 mismatches, 210 brute-force probes (1" to 3 degrees) against
+a 10M-row synthetic corpus (`cat_pos`, the same `src_designed` table used
+throughout the paper's own benchmarks). Measured against pgSphere's native
+GiST (`cat_sphere_idx`) and skycell's own SP-GiST (`cat_pos_spgist`),
+buffer counts (`EXPLAIN (ANALYZE, BUFFERS)`, warmed, 20 probes/radius):
+
+| radius | cap-GiST | pgSphere | skycell SP-GiST |
+|---|---|---|---|
+| 1" | 11.8 | **5.6** | 16.2 |
+| 10" | 11.9 | **5.6** | 13.4 |
+| 1' | 14.2 | **6.6** | 16.5 |
+| 6' | 14.1 | **6.6** | 16.3 |
+| 30' | **30.8** | 40.6 | 34.8 |
+| 1 deg | **74.2** | 161.4 | 83.6 |
+| 3 deg | **537.7** | 575.9 | 579.6 |
+
+Two findings, both clean: the new opclass beats skycell's own existing
+SP-GiST opclass at *every* radius tested (a strict improvement over what
+skycell already ships for this strategy). Against pgSphere, there's a
+sharp, monotonic crossover around 10'-30': pgSphere wins decisively below
+it (its smaller, lossy-anyway box key gives better fanout when few
+candidates matter regardless of pruning precision), the cap-GiST wins
+decisively above it (2.2x fewer buffers at 1 degree) -- the isotropic-
+cluster argument, actually paying off, in the regime it predicts. Costs:
+build time ~7-8.5 minutes (generic buffered GiST build, no bulk-load fast
+path) vs pgSphere's ~2 minutes and SP-GiST's ~28 seconds; index size 1031
+MB vs pgSphere's 683 MB and SP-GiST's 451 MB -- both traceable to the
+32-byte double-precision key against pgSphere's 24-byte float one.
+
+**A critical correction, found by checking median against mean**: buffer
+counts favoured the cap-GiST from 30' on, and an early wall-clock mean
+comparison seemed to agree (e.g. 4.3ms vs pgSphere's 7.2ms at 3 degrees).
+That mean was an artifact. `src_designed`'s corpus is 60% clustered
+(six clusters including both poles and RA=0); a handful of probes landing
+near real structure produced extreme per-probe outliers (one 3-degree
+probe: 28.8ms for the cap-GiST, dwarfing its other ~0.7-2ms probes) that
+dominated the average for *every* tag, pgSphere's own mean included
+(pgSphere's 3-degree mean of 7.2ms was itself outlier-inflated; its
+*median* was 1.346ms). Recomputing with medians throughout reverses the
+wall-clock verdict entirely: **pgSphere is faster at every single radius
+tested**, cap-GiST's buffer-count win notwithstanding. Mean vs median
+is not a stylistic choice here -- it changes which opclass "wins."
+
+**Round two -- float precision (reverted)**: shrinking `GistCap` to
+pgSphere's own 16-byte float layout shrank the index (1031 MB -> 711 MB)
+and *improved* buffer counts further at every radius from 1' on (-16% at
+3 degrees) -- the smaller-key hypothesis, confirmed. But it had to give up
+the exact, `recheck=false` leaf test: a float-rounded point has no slop
+margin `sc_region_contains()` can safely use (a true match rounded just
+outside the query boundary would be silently, unrecoverably dropped), so
+every leaf candidate needed `recheck=true` instead, re-invoking the real
+`<@` operator on every matching row. That cost scales with *result row
+count*, not buffer count, and at the radii where the pruning edge over
+pgSphere shows up, result counts are large enough that every query got
+3-5x slower in wall-clock despite touching fewer pages -- confirmed
+per-probe, not just in the average (a ~100-buffer probe: 0.7ms -> 2.5ms;
+the single densest probe measured: 28.8ms -> 141ms, the same ~5x ratio at
+both scales). Reverted; the double-precision, exact-leaf design is kept.
+
+**Round three -- a safer shrink (kept)**: the radius field, not the
+centre, was the real opportunity -- it is only ever used in the already-
+lossy, already-`recheck=true` internal-node test, and at a leaf it is
+always exactly 0 regardless of what precision could represent it in.
+Leaf tuples now store only `(cx, cy, cz)` as doubles (24 bytes, radius
+implicit 0 -- centre precision, and the exact leaf test, fully intact);
+internal tuples store double centres plus a *packed* float radius (28
+bytes; a naive `{double,double,double,float}` struct rounds up to 32
+under default alignment, silently erasing the saving -- caught by
+checking `sizeof()` directly before trusting it, not assumed). The format
+is self-describing via `VARSIZE`, since one `compress()`/`union()`/
+`same()`/`consistent()` must handle whichever shape a given page holds.
+Correctness: 0/210 again. Buffers improved 2.8%-11% across every radius
+(smaller internal keys, better fanout) with no recheck cost anywhere,
+widening the already-existing margin over pgSphere at 30'+ (e.g. 1.48x
+fewer buffers at 30' vs round one's 1.32x).
+
+**The trig-free `cap_overlaps()` fix**: with buffers improving, median
+wall-clock still showed pgSphere faster at *every* radius, including 30'
+(pgSphere 4.5x faster despite the cap-GiST's 33% fewer buffers) --
+confirming buffer counts, even accurate ones, don't capture everything.
+`cap_overlaps()` (every internal node visited, every query) used
+`sc_angle()`: a cross product, a `sqrt`, and an `atan2`. pgSphere's own
+internal box-vs-box test is six plain comparisons, no trig at all. Round
+twenty-seven's own precedent (`gist_region.c`'s `cap_contains_point`)
+already established the fix for this shape of test: `angle(a,b) <= sum`
+is exactly `dot(a,b) >= cos(sum)` for `sum` in `[0, pi]`, one dot product
+and one `cos()` instead of a cross product plus `atan2` (with `sum >= pi`
+handled as an unconditional true, since any two points are within pi of
+each other). Applied, correctness-verified again (0/210), measured: a
+modest, somewhat radius-dependent improvement (roughly -15% to -30% at
+small-to-medium radii, flat at 1 degree and 3 degrees) -- real, but far
+short of closing the gap to pgSphere, which remained faster at every
+radius by median even after this fix.
+
+**Selectivity: the actual dominant effect, and a real bug on the way
+there.** `EXPLAIN` on the cap-GiST plan showed the planner estimating
+10,000 rows for a query that actually matched 58 -- a 172x overestimate --
+which pushed it onto a `Bitmap Index Scan` + `Bitmap Heap Scan` (built for
+an estimated-large result) where pgSphere's own, well-estimated `<@` got a
+cheap plain `Index Scan` for the same 58 rows. This was *not* specific to
+the new opclass: skycell's existing, already-shipped SP-GiST opclass got
+the identical flat 10,000-row estimate and the identical plan shape, since
+both share the same `<@(skypos,skyregion)` operator, declared `RESTRICT =
+contsel` -- PostgreSQL's generic, statistics-free containment-operator
+default. `skycell_pos_in_region` (the operator's backing function) already
+carries a `SUPPORT skycell_region_support` clause, but per PostgreSQL's
+own documented rule (`nodes/supportnodes.h`): *"If the target function is
+being used as the implementation of an operator, the support function
+will not be used [for selectivity]; the operator's restriction or join
+estimator is consulted instead."* A `SupportRequestSelectivity` handler on
+that support function would be dead code for this operator's actual query
+shape -- confirmed, not assumed, by checking the header before writing
+any of it. The fix had to be the classic `oprrest`-shaped mechanism
+instead: new functions `skycell_pos_region_sel`/`skycell_region_pos_sel`
+(signature `(internal,oid,internal,int4) returns float8`, exactly
+`contsel`'s own shape), assigned via `ALTER OPERATOR ... SET (RESTRICT =
+...)`, reusing the `area(region)/4*pi` "uniform sky" estimate
+`skycell_region_sel_support` already computes for the post-rewrite exact
+test. Measured: row estimate corrected from 10,000 to 190 (actual: 58,
+matching pgSphere's own estimate almost exactly), plan correctly switches
+to a plain `Index Scan`. Clear win for ordinary (sparse-sky) queries at
+every radius.
+
+**But a real regression for queries landing in or near a genuine density
+cluster**, found directly, not hypothesised: per-probe buffer counts at
+30' showed a handful of extreme outliers (627, 446, 371, 249 buffers
+against a typical ~20-60) after the fix, where before the flat estimate
+had accidentally kept the (correct, needed) `Bitmap Scan` for exactly
+these probes. A uniform-sky estimate understates a cluster-hit query's
+true row count, flipping the plan to a plain `Index Scan` where the
+overshoot actually needed a bitmap's heap-page consolidation. Not a bug --
+the known, accepted limitation of ignoring real density -- but real on
+this 60%-clustered corpus. A density-aware refinement was built to fix it
+(`region_pos_density_sel()`, reusing `region_support_simplify()`'s own
+`cell_expr_for_point()`/`density_for_expr()`/`cover_cached()` machinery to
+get `cov.exp_rows` -- a histogram- or multi-order-count-map-based
+estimate, not a uniformity assumption) and confirmed working when a
+`skycell_cell(pos)` expression index exists. But it is **architecturally
+inert for the cap-GiST's own deployment shape**: the very same expression-
+index lookup also gates `skycell_region_support`'s unconditional
+`SupportRequestSimplify` rewrite, so the moment an index exists to make
+density-aware selectivity possible, the clause gets rewritten into B-tree
+range conditions before the GiST opclass's own selectivity -- or its
+index -- is ever consulted. Confirmed directly: creating the expression
+index changed the `EXPLAIN` plan from the GiST index to the B-tree rewrite
+outright, for both the old and new selectivity code. The density-aware
+function is correct and kept (harmless, falls back to the uniform-sky
+estimate when no such index exists, and it does narrow the B-tree
+rewrite's own cost model's blind spot -- see below), but closing this
+specific gap for real means deciding which strategy wins when both a
+cell index and a GiST index exist on the same table, which is the
+subject of the gate below, not this selectivity fix alone.
+
+**A direct B-tree-vs-pgSphere comparison, prompted by the discovery
+above, and an apparent inversion of an earlier finding, explained.**
+With a freshly-built `skycell_cell(pos)` expression index (plain
+`ANALYZE`, no `skycell_density_build()` multi-order map) enabling the
+classic rewrite, same corpus, same session:
+
+| radius | B-tree buffers | pgSphere buffers | B-tree median ms | pgSphere median ms |
+|---|---|---|---|---|
+| 1" | **4.0** | 5.6 | **0.009** | 0.016 |
+| 10" | **4.2** | 5.6 | **0.010** | 0.051 |
+| 1' | **7.0** | 6.6 | **0.028** | 0.037 |
+| 6' | 6.9 | 6.6 | 0.050 | **0.040** |
+| 30' | **23.1** | 40.6 | 0.269 | **0.056** |
+| 1 deg | **57.5** | 161.4 | 0.618 | **0.207** |
+| 3 deg | **357.8** | 575.9 | 6.285 | **1.346** |
+
+B-tree wins on buffers at *every* radius, and on wall-clock too below
+1' -- but loses badly from 30' on (4.8x slower at 30', 4.7x slower at 3
+degrees) despite fewer pages touched. `EXPLAIN (ANALYZE, BUFFERS)` at 3
+degrees showed why directly: `Rows Removed by Filter: 1696` out of 4092
+candidates -- the covering's overshoot means 41% of fetched rows are
+rejected by the exact `skycell_in_region` test, a real per-row CPU cost
+(plus six separate `BitmapOr`-combined ranges' own overhead) that scales
+with candidate count, not with pages touched. This looks like close to
+the *inverse* of a much earlier bootstrap-significance finding in this
+same investigation (tied at 1"/1 degree, confidently slower 10"-30',
+confidently faster at 3 degrees) -- flagged honestly as a likely artifact
+of comparing a quickly-built expression index with only a plain `ANALYZE`
+histogram against that earlier setup's probable use of
+`skycell_density_build()`'s finer multi-order density map (a cruder
+density picture picks a looser covering, which overshoots more at large
+radii) rather than a proven reversal of the underlying architecture --
+not confirmed by rebuilding the finer map and re-testing.
+
+**The gate: `skycell.rewrite_max_waste`, a conditional B-tree rewrite.**
+The B-tree-vs-pgSphere table's own mechanism is the fix: the covering's
+*ratio* (`sel = reg.area/cov.area`) doesn't predict the problem (sel was
+*lower* at 1" than at 3 degrees, yet 1" was the B-tree's best case) --
+what predicts it is the *absolute* expected waste, `cov.exp_rows * (1 -
+sel)`, measured directly across all seven standard radii: ~4, 4, 26, 87
+(all B-tree wins) vs ~223, 668, 2104 (all B-tree losses). `region_support_
+simplify()` already computes exactly this value for its own exact-test
+selectivity hint; it just never used it to gate whether to rewrite at
+all. New GUC `skycell.rewrite_max_waste` (default 100.0, a `DefineCustom
+RealVariable` alongside skycell's existing cost-model knobs): past this
+many expected wasted rows, `region_support_simplify()` returns `NULL`
+instead of rewriting, leaving the original `<@`/`@>` clause in place for
+the planner's own cost-based index selection -- which now has a real,
+non-default selectivity estimate for that clause either way, from the
+fix above.
+
+**A real bug, found by the crash it caused, not by inspection.** The
+first version of this gate called `sc_cover_free(&cov)` before returning
+`NULL`, matching the instinct that a function receiving a struct should
+clean it up. The existing `region_support_simplify()` success path has
+never freed `cov` -- for a reason this change didn't account for:
+`cover_cached()` (used for the cone branch) returns `entry->r`, a pointer
+*directly into its own long-lived cache entry* (`skycell_cache_cxt`), not
+a caller-owned copy. `sc_cover_free()` on it `pfree`s the cache's own
+backing array out from under every future hit on that key, corrupting the
+memory context. The failure mode was exactly as nasty as that implies:
+not an immediate crash, but a segfault several *unrelated* queries later
+(`terminated by signal 11`, PostgreSQL's own log), whichever later
+allocation from the corrupted context happened to hit the damage first.
+Found by reproducing a crash during a routine 20-probe benchmark loop,
+bisected to the exact probe (the 11th of 20) by replaying the identical
+loop with `RAISE NOTICE` markers between each statement, and root-caused
+by reading `cover_cached()`'s own source rather than guessing. Fixed by
+removing the `sc_cover_free()` call (both the new gate and a second,
+identical copy in the new `region_pos_density_sel()` selectivity
+function had the same bug) -- matching, not fighting, the existing code's
+own established convention of never freeing `cov`. Reproduced the exact
+crash before the fix and confirmed it gone after, on the same input, not
+just re-run-and-hope.
+
+**The gate, measured, with both an index and a GiST alternative present
+on the same table** (`cat_pos_cellexpr` B-tree + `cat_pos_capgist`, the
+default threshold of 100):
+
+| radius | adaptive ms | pure B-tree ms | pgSphere ms | adaptive buffers | chose |
+|---|---|---|---|---|---|
+| 1" | 0.015 | 0.009 | 0.016 | 4.0 | B-tree |
+| 10" | 0.020 | 0.010 | 0.051 | 4.2 | B-tree |
+| 1' | 0.027 | 0.028 | 0.037 | 7.5 | B-tree |
+| 6' | 0.071 | 0.050 | 0.040 | 8.9 | B-tree |
+| 30' | **0.211** | 0.269 | 0.056 | 125.6 | GiST |
+| 1 deg | **0.492** | 0.618 | 0.207 | 190.4 | GiST |
+| 3 deg | **1.581** | 6.285 | 1.346 | 496.9 | GiST |
+
+(median ms, 20 probes/radius.) At 3 degrees the gate is **4x faster than
+always-rewriting** (1.581ms vs 6.285ms) and lands within 17% of pgSphere,
+instead of 4.7x behind it -- automatically, per query, with no manual
+index choice. Small radii track pure B-tree closely (the gate correctly
+keeps the rewrite) and beat pgSphere as before. One soft spot: 6' came
+out slightly worse than both alternatives (0.071ms vs 0.050/0.040ms) --
+its estimated waste (~87 rows) sits just under the 100-row default, so
+the gate still rewrites there; a single borderline data point, plausibly
+tunable with a lower threshold, not investigated further this round. The
+gate does not fully close the 30'-1 degree gap to pgSphere (the available
+fallback, cap-GiST, is not as fast as pgSphere specifically in that
+window -- see the median-vs-mean correction above), but it does exactly
+what it was built for: removes the B-tree rewrite's large-radius blind
+spot automatically, while keeping its small-radius strength, without
+forcing a static per-table choice between the two strategies.
+
+**STATUS**: `gist_point_cap.c` (round three's double-precision/safer-
+shrink/trig-free design) is correctness-verified (0/210 at every stage)
+and measured as a strict improvement over skycell's shipped SP-GiST
+opclass, with a real, structurally-explained win over pgSphere from
+roughly 30' on and a real, structurally-explained loss below it -- not
+yet wired into any versioned SQL file; register ad hoc (`CREATE FUNCTION
+... AS 'MODULE_PATHNAME'; CREATE OPERATOR CLASS ...`) against a scratch
+database until a shipping decision is made. The selectivity fix
+(`skycell_pos_region_sel`/`skycell_region_pos_sel`, replacing `contsel`
+on the raw `<@`/`@>` operators) and the rewrite gate (`skycell.rewrite_
+max_waste`, defaulting to 100.0) touch skycell's existing, already-
+shipped B-tree rewrite path directly and are a more consequential change
+than anything else in this round -- correctness-verified via `make
+installcheck` and the same 210-probe brute-force suite, but the
+threshold is empirically chosen from this one corpus's measured
+crossover, not derived from a general cost model, and is a GUC
+specifically so it can be retuned (or set arbitrarily high to recover
+every prior version's always-rewrite behaviour) per deployment.
