@@ -299,6 +299,31 @@ footprint column (an ObsCore `s_region`, say) should carry. For a per-row region
 cross-matched against a plain point catalogue with no `skyregion` column of its
 own, use `skycell_cone()` or `skycell_cone_ranges()` instead.
 
+**Two alternative index types for a `skypos` column itself**, instead of the
+B-tree cell rewrite above, exist as opt-in opclasses — competitors to pgSphere's
+native `spoint` GiST, not to the rewrite path, which stays the default:
+
+```sql
+CREATE INDEX ON t USING spgist (pos);                       -- skypos_spgist_ops, DEFAULT for spgist
+CREATE INDEX ON t USING gist (pos skypos_cap_gist_ops);      -- opt-in
+```
+
+`skypos_spgist_ops` (`ext/src/spgist_region.c`) is a real SP-GiST descent of
+the HEALPix NESTED pixel hierarchy, exact (recheck always false). `skypos_
+cap_gist_ops` (`ext/src/gist_point_cap.c`) is a GiST opclass with a single
+spherical-cap key per entry — leaves store the point exactly (recheck false
+there too), internal nodes a bounding cap. Measured against pgSphere's native
+GiST and against each other: `skypos_cap_gist_ops` beats `skypos_spgist_ops`
+at every radius tested, and beats pgSphere on buffer counts from roughly 30
+arcminutes on, but loses to pgSphere on median wall-clock at every radius
+(the buffer-count win doesn't survive contact with pgSphere's cheaper native
+per-candidate test below ~1 degree). Both are **EXPERIMENTAL**: correctness-
+verified (brute-force comparisons in `ext/test/`), far less scrutiny than the
+rewrite path's own years of hardening, and neither is a drop-in win over it —
+see `GIST_REGION_DESIGN.md`'s "Round thirty-eight" onward and "Round
+forty-three" for the numbers before relying on either for anything beyond
+experimentation.
+
 The `skyregion` GiST opclass is new and not yet stress-tested under concurrent
 writes. Region-region `@>`/`<@` reuse `&&`'s own pruning test rather than a
 tighter one purpose-built for containment (see `ext/src/gist_region.c`'s "round
