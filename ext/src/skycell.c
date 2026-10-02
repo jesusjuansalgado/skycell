@@ -126,14 +126,20 @@ _PG_init(void)
 							 "Decline the B-tree range rewrite for a constant region when the "
 							 "covering's own cost model expects more than this many rows to be "
 							 "fetched and then rejected by the exact test (cov.exp_rows * "
-							 "(1 - sel)). A covering's overshoot is cheap in absolute rows at "
-							 "small radii and expensive at large ones; past this many wasted "
+							 "(1 - sel)), scaled by how much of the relation is expected to be "
+							 "cache-resident (see rewrite_waste_threshold(): this value applies "
+							 "as-is when the whole relation fits in effective_cache_size, and "
+							 "scales up as it doesn't, since that same wasted CPU work is cheap "
+							 "once I/O, not CPU, is the bottleneck -- measured directly in "
+							 "GIST_REGION_DESIGN.md's 'Round forty-four', not assumed). A "
+							 "covering's overshoot is cheap in absolute rows at small radii and "
+							 "expensive at large ones when cache-resident; past this many wasted "
 							 "rows, leaving the original <@/@> clause unrewritten lets the "
 							 "planner cost a GiST-family index (skypos_spgist_ops, or an "
 							 "experimental opclass) against it instead, if one exists -- see "
-							 "GIST_REGION_DESIGN.md for the measured crossover. Set this very "
-							 "high to recover the always-rewrite behaviour every version before "
-							 "this one had.",
+							 "GIST_REGION_DESIGN.md's 'Round forty-three' for the warm-cache "
+							 "crossover this value was tuned from. Set this very high to recover "
+							 "the always-rewrite behaviour every version before this one had.",
 							 NULL, &skycell_rewrite_max_waste, 100.0, 0.0, 1e12,
 							 PGC_USERSET, 0, NULL, NULL, NULL);
 	DefineCustomBoolVariable("skycell.use_stats",
@@ -205,6 +211,43 @@ auto_range_cost(const sc_density *d)
 	if (!(per_row > 0))
 		return 30.0;
 	return fmin(1e6, fmax(1.0, descent / per_row));
+}
+
+/*
+ * skycell.rewrite_max_waste scaled by how much of the relation PostgreSQL's
+ * own planner already expects to find in cache -- GIST_REGION_DESIGN.md's
+ * "Round forty-four" measured directly (fresh, restart-isolated probes,
+ * not guessed) that the rewrite's exact-test waste this GUC bounds is
+ * expensive only when it costs CPU with nothing to show for it, i.e. when
+ * the pages it touches are already cache-resident; the exact same waste is
+ * cheap -- cheaper than the alternative GiST-family descent it would
+ * otherwise fall back to -- when the pages are not resident, because CPU is
+ * negligible next to a real disk fetch. skycell's own GUC was tuned from
+ * warm-cache measurements alone (a fully cache-resident table), so it is
+ * scaled up here in proportion to how far the relation's own size exceeds
+ * the planner's effective_cache_size, the same ratio PostgreSQL's own
+ * Mackert-Lohman-style cache-hit heuristic (index_pages_fetched() in
+ * costsize.c) exists to estimate for exactly this reason: how much of a
+ * relation a backend can expect to find resident, not whether any one
+ * specific page happens to be warm right now.
+ *
+ * This is deliberately the same level of approximation as auto_range_cost()
+ * above (a simple ratio, not a reproduction of PostgreSQL's own, considerably
+ * more elaborate formula): cache_frac = 1 when the whole relation is
+ * expected to fit in effective_cache_size (no change from the tuned
+ * default), falling toward 0 as the relation grows far past it (the
+ * threshold grows without bound as a relation's reads become reliably
+ * I/O-bound) -- not a precise cost-model derivation, an explicit choice to
+ * stay as legible as this file's other heuristics.
+ */
+double
+rewrite_waste_threshold(const sc_density *d)
+{
+	double		relpages = (d && d->relpages > 0) ? d->relpages : 0;
+	double		cache_frac = (relpages > 0)
+		? fmin(1.0, (double) effective_cache_size / relpages) : 1.0;
+
+	return skycell_rewrite_max_waste / fmax(cache_frac, 1e-6);
 }
 
 void

@@ -4444,3 +4444,45 @@ I/O-bound (a cold-cache-dominated workload, or a dataset much larger than
 available cache) would want a much more permissive threshold than one
 tuned warm, since this round shows the two regimes can disagree about
 which strategy wins at the same radius.
+
+**Follow-up, same round: made the threshold cache-state-aware instead of
+asking for a manual choice between the two.** The first instinct this
+round's own closing note raised -- "a cold-cache-dominated deployment
+would want a much more permissive threshold" -- was nearly implemented
+backwards (lowering the threshold, which would have made the gate
+abandon the B-tree rewrite even more readily, exactly wrong given cold
+cache is where it wins most broadly here). Caught before writing any
+code by walking through this round's own table again: at 30'/1 degree/3
+degrees, the radii with the *most* estimated waste, skycell still won
+under cold cache by 45-52%, meaning a cold-dominated deployment wants the
+gate to tolerate *more* waste there, not less.
+
+PostgreSQL's own planner already has a GUC for exactly the signal this
+needed -- `effective_cache_size`, the planner's own estimate of how much
+of a relation's data a backend can expect to find resident, used
+internally the same way (`index_pages_fetched()` in `costsize.c`'s
+Mackert-Lohman-style heuristic) to decide how many of a scan's pages will
+be cache hits versus real I/O. `rewrite_waste_threshold()` (`skycell.c`)
+reuses it directly: `cache_frac = min(1, effective_cache_size / relpages)`,
+`threshold = skycell.rewrite_max_waste / cache_frac`. When the relation
+comfortably fits in `effective_cache_size` (`cache_frac` = 1), the
+threshold is exactly the tuned default, unchanged from round forty-three;
+as the relation grows past it, the threshold scales up without bound,
+the same direction this round's cold-cache table demands. Deliberately
+the same level of approximation as `auto_range_cost()`'s own existing
+heuristic -- a simple ratio, not a reproduction of PostgreSQL's actual,
+more elaborate formula -- for the same reason: legibility over precision
+for a GUC whose own threshold was already an empirical choice, not a
+derived one.
+
+Verified directly, not just by inspection: with `cat_pos_capgist` valid
+and `effective_cache_size` left at its default (5GB, comfortably above
+`cat_pos`'s own size), a 3-degree query still chose the cap-GiST index,
+identical to round forty-three's own finding -- no behavioural change at
+realistic settings. Setting `effective_cache_size = '1MB'` (simulating a
+relation far larger than available cache) on the *same* query flipped the
+plan straight to the B-tree rewrite (`BitmapOr` over `cat_pos_cellexpr`,
+the `skycell_in_region` exact-test filter) -- the threshold scaling
+working exactly as designed, confirmed by watching the actual plan change
+rather than trusting the arithmetic alone. `make installcheck` passes
+unchanged.

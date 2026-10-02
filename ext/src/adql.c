@@ -882,9 +882,12 @@ region_support_simplify(SupportRequestSimplify *req, Oid funcid, Node *pt, Node 
 		 * the full story). Measured directly, not guessed: at small radii
 		 * this waste is a handful of rows regardless of how poor the
 		 * covering's *ratio* looks (sel near 0 but cov.exp_rows tiny), and
-		 * the rewrite wins outright; past roughly a hundred wasted rows it
-		 * starts costing more in exact-test CPU than the ranges save in
-		 * heap I/O, and a GiST-family index (when one exists) wins instead.
+		 * the rewrite wins outright; past roughly a hundred wasted rows
+		 * (when the table is expected to be cache-resident -- see
+		 * rewrite_waste_threshold()'s own comment for why that qualifier
+		 * matters and how the threshold scales when it isn't) it starts
+		 * costing more in exact-test CPU than the ranges save in heap I/O,
+		 * and a GiST-family index (when one exists) wins instead.
 		 * Returning NULL here leaves the original <@/@> clause in place for
 		 * the planner's normal cost-based index selection to consider --
 		 * skycell_pos_region_sel/skycell_region_pos_sel give it a real,
@@ -900,7 +903,7 @@ region_support_simplify(SupportRequestSimplify *req, Oid funcid, Node *pt, Node 
 		 * several unrelated queries later, in whatever next allocation hit
 		 * the corrupted free list -- see GIST_REGION_DESIGN.md).
 		 */
-		if (cov.exp_rows * (1.0 - sel) > skycell_rewrite_max_waste)
+		if (cov.exp_rows * (1.0 - sel) > rewrite_waste_threshold(&dens))
 		{
 			sc_region_free(&reg);
 			return NULL;

@@ -17,6 +17,7 @@ extern ArrayType *moc_for_region(const sc_region *r, int max_cells, int max_orde
 
 extern int	skycell_join_slots;
 extern double skycell_rewrite_max_waste;
+extern double rewrite_waste_threshold(const sc_density *d);
 
 extern Const *int8_const(int64 v);
 extern Const *float8_const(double v);
