@@ -4567,3 +4567,106 @@ memory, zero dependencies), and per this round's own data erring toward
 "assume less cache than there really is" is the direction that was
 already safe to err in. `pg_buffercache` extension dropped from
 `paper_bench` again after the measurement; no code changed.
+
+## Round forty-five: re-running the per-radius-group cold benchmark against
+the NBuffers change -- wrong table re-run would have proven nothing, the
+right one found a real boundary case
+
+Asked to re-run "the full per-radius-group benchmark" against the
+`NBuffers` change. That benchmark -- `cold_probe_v2`/`warm_probe_v2`, round
+forty-four's `cat_cell` (`skycell_cone()`) vs `cat_sphere` (pgSphere)
+comparison -- turns out not to exercise this change at all: `skycell_cone()`
+is a plain function with no `SupportRequestSimplify` hook, so it never
+calls `region_support_simplify()` or `rewrite_waste_threshold()`. Only
+`<@`/`@>` on `cat_pos` go through the gate this round changed. Re-running
+the literal benchmark would have reproduced round forty-four's numbers
+byte-for-byte and told us nothing about this change -- so the right
+re-run is the one that actually exercises it: `cat_pos`'s adaptive gate
+(`cat_pos_cellexpr` B-tree + `cat_pos_capgist`, `cat_pos_spgist` disabled
+for a clean two-way choice) against a forced-rewrite control
+(`skycell.rewrite_max_waste = 1e9`), using the same fresh-coordinates-plus-
+restart-per-label methodology as round forty-four, on two new disjoint
+2912-row-total center batches (`qid` 20001+ for 'adaptive', 30001+ for
+'purebtree' -- never queried against `cat_pos` before, and disjoint from
+each other so probing one doesn't warm the other's reads) so neither
+mode contaminates the other's coldness. 14 restarts (one per mode per
+radius label), `shared_buffers` left at its working 2GB default (`NBuffers`
+= 262144 pages, comfortably above `cat_pos`'s 93504).
+
+| label | n | adaptive median ms | pure-rewrite median ms | adaptive median buffers | pure-rewrite median buffers | adaptive's actual pick |
+|---|---|---|---|---|---|---|
+| 1" | 400 | 0.687 | 0.440 | 4.0 | 4.0 | rewrite (gate agrees) |
+| 10" | 400 | 0.450 | 0.346 | 4.0 | 4.0 | rewrite |
+| 1' | 300 | 0.559 | 0.748 | 4.0 | 4.0 | rewrite |
+| 6' | 200 | 1.672 | 1.041 | 10.0 | 8.0 | rewrite (mostly) |
+| 30' | 100 | 15.926 | 1.944 | 60.5 | 19.0 | cap-GiST (96/100) |
+| 1 deg | 40 | 9.068 | 3.857 | 171.0 | 43.5 | cap-GiST (30/40) |
+| 3 deg | 16 | 2.696 | 68.190 | 106.0 | 438.5 | cap-GiST (16/16) |
+
+(median ms and median buffers; mean ms is not shown -- it is wildly
+skewed by rare, very slow first-ever-touch outliers here, the same
+instability already flagged in round forty-four.)
+
+**First result: this specific run can't show the `NBuffers` change doing
+anything, and that is itself informative, not a null result.**
+`cat_pos` (93504 pages) comfortably fits under both the old
+`effective_cache_size` (5GB) and the new `NBuffers` (2GB here) at this
+box's actual settings -- `cache_frac = 1` either way, so the gate's
+decision above is identical to what the pre-`NBuffers` code would have
+produced. The only way to see the two implementations disagree is to
+make `shared_buffers` itself smaller than the relation, which is exactly
+what the direct `EXPLAIN` check two sections up already did (`shared_buffers
+= '16MB'`) -- this per-radius-group run was never going to add evidence on
+top of that one, and didn't.
+
+**Second, unplanned result: cold cache does not uniformly favour the
+rewrite on `cat_pos`, unlike round forty-four's `cat_cell` table -- and the
+reason is physical layout, not algorithm.** At 30' and 1deg, the forced
+rewrite wins decisively even cold (8x and 2.3x faster, touching a third to
+a quarter the buffers) -- the gate's cap-GiST pick there is wrong under
+cold cache, the same direction round forty-four already found for
+`cat_cell`. But at 3 degrees the result inverts: the forced rewrite is
+*25x slower* and touches *4x more buffers* than cap-GiST, which is what
+the gate actually picks there (correctly, by luck of `cache_frac = 1`
+leaving the default threshold's existing verdict untouched). Checked why:
+`pg_stats.correlation` for `cat_cell.cell` is exactly `1` -- that table's
+physical row order already matches cell order, the ideal case for a
+B-tree range scan, because its rows happen to have been loaded that way.
+`cat_pos` was never laid out that way; its rows matching a given cell
+range are scattered across the heap, so the rewrite's `BitmapOr` arms at 3
+degrees (the radius with the most and widest ranges) pull far more
+scattered heap pages than cap-GiST's own structured descent touches. This
+is a real difference between the two tables' on-disk layout, not a flaw
+in either query strategy -- round forty-four's "skycell wins everywhere
+cold" was true for a favourably-clustered table and does not automatically
+generalize to an ordinary, unclustered one, which is what `cat_pos`
+deliberately is (round forty-three built the gate against `cat_pos`
+specifically because it is the realistic case, not `cat_cell`).
+
+**Why this matters for the `NBuffers` scaling specifically, not just as a
+general caveat.** `rewrite_waste_threshold()` scales *without bound* as
+`cache_frac` shrinks, on the sole justification that wasted CPU rows are
+cheap once I/O dominates -- true of the waste term itself, but silent
+about the rewrite's *own* I/O footprint, which this round's 3-degree row
+shows can grow *faster* than cap-GiST's on an unclustered table. A
+deployment with `shared_buffers` genuinely far below `cat_pos`'s size
+(the exact regime this scaling targets) would scale the threshold well
+past the ~2104-row waste estimate round forty-three measured at 3 degrees,
+forcing the rewrite there too -- and, per this round's measurement, that
+would be the *wrong* call on an unclustered table, for a reason the
+waste-based model does not see at all. Not reachable on `paper_bench` at
+its current settings (`cache_frac = 1` here throughout), but reachable on
+a real deployment whose working set exceeds `shared_buffers`, which is
+precisely the case the scaling exists for. Flagged, not fixed: a bound on
+how far the threshold is allowed to scale, or a second term accounting
+for the rewrite's own expected page count (not just its wasted rows),
+would close this, but deciding which is a design choice worth its own
+round rather than a reflexive patch on top of this one.
+
+**STATUS**: a measurement round, no code changed. Confirms `NBuffers` is
+wired correctly (by showing where it can and can't matter) and surfaces a
+genuine, reachable boundary case in the unbounded-scaling design: correct
+at small-to-mid radii even cold, silent about the rewrite's own I/O
+footprint at the largest radius on an unclustered table, where this
+round's measurement shows that footprint -- not cache state -- is what
+decides the winner.
