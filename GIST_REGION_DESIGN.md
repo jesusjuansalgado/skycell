@@ -4486,3 +4486,42 @@ the `skycell_in_region` exact-test filter) -- the threshold scaling
 working exactly as designed, confirmed by watching the actual plan change
 rather than trusting the arithmetic alone. `make installcheck` passes
 unchanged.
+
+**Second follow-up, same round: `effective_cache_size` swapped for
+`NBuffers`, an actual measurement instead of an admin guess.**
+`effective_cache_size` is not tied to anything the server actually holds --
+it is a standalone GUC an admin sets (often left at build-in defaults, or
+sized for a machine the server no longer runs on), with no mechanism
+keeping it truthful. `NBuffers` (`miscadmin.h`, already included) is the
+real, already-allocated size of the shared buffer pool: a measurement, not
+a configured guess. `rewrite_waste_threshold()` now reads `cache_frac =
+min(1, NBuffers / relpages)` in its place -- same formula, same shape,
+grounded in memory PostgreSQL actually has rather than memory an admin
+said it should assume.
+
+The tradeoff: `NBuffers` only counts `shared_buffers`, not the OS page
+cache behind it, so a relation can be fully OS-cached and still read as
+"past cache" here, scaling the threshold up more readily than
+`effective_cache_size` (conventionally sized at 50-75% of system RAM,
+covering the OS cache too) would have. That is the same direction round
+forty-four's own table already argued for, not a new risk: the regime
+this makes the gate more tolerant of waste in (big-relative-to-
+shared_buffers) is exactly the regime this round measured skycell's
+rewrite winning most broadly in, and the one case this scaling leaves
+alone -- `cache_frac` = 1, relation fits in `shared_buffers` -- is the
+fully-warm case the original tuned default was already measured against.
+
+Verified the same way as the first follow-up, but driving a real
+`shared_buffers` change rather than a session-local GUC override (`NBuffers`
+is fixed at postmaster start, so this needs an actual restart):
+`shared_buffers` at its working default (2GB, far above `cat_pos`'s 93504
+pages) left the 3-degree query choosing the cap-GiST index at the
+unmodified default `skycell.rewrite_max_waste` (100) -- `effective_cache_size`
+sitting untouched at 5GB the whole time, confirming the old GUC is no
+longer read. Setting `shared_buffers = '16MB'` (2048 pages, far below
+`cat_pos`'s size) in `postgresql.auto.conf` and restarting flipped the
+*same* query to the B-tree rewrite with that *same* unmodified default
+threshold -- no manual GUC override at all, the scaling now driven purely
+by the server's real memory. `shared_buffers` was restored to 2GB and the
+server restarted again before re-running `make installcheck`, which still
+passes.

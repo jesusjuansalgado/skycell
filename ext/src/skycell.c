@@ -128,14 +128,14 @@ _PG_init(void)
 							 "fetched and then rejected by the exact test (cov.exp_rows * "
 							 "(1 - sel)), scaled by how much of the relation is expected to be "
 							 "cache-resident (see rewrite_waste_threshold(): this value applies "
-							 "as-is when the whole relation fits in effective_cache_size, and "
-							 "scales up as it doesn't, since that same wasted CPU work is cheap "
-							 "once I/O, not CPU, is the bottleneck -- measured directly in "
-							 "GIST_REGION_DESIGN.md's 'Round forty-four', not assumed). A "
-							 "covering's overshoot is cheap in absolute rows at small radii and "
-							 "expensive at large ones when cache-resident; past this many wasted "
-							 "rows, leaving the original <@/@> clause unrewritten lets the "
-							 "planner cost a GiST-family index (skypos_spgist_ops, or an "
+							 "as-is when the whole relation fits in the shared buffer pool "
+							 "(NBuffers), and scales up as it doesn't, since that same wasted "
+							 "CPU work is cheap once I/O, not CPU, is the bottleneck -- measured "
+							 "directly in GIST_REGION_DESIGN.md's 'Round forty-four', not "
+							 "assumed). A covering's overshoot is cheap in absolute rows at small "
+							 "radii and expensive at large ones when cache-resident; past this "
+							 "many wasted rows, leaving the original <@/@> clause unrewritten lets "
+							 "the planner cost a GiST-family index (skypos_spgist_ops, or an "
 							 "experimental opclass) against it instead, if one exists -- see "
 							 "GIST_REGION_DESIGN.md's 'Round forty-three' for the warm-cache "
 							 "crossover this value was tuned from. Set this very high to recover "
@@ -225,16 +225,28 @@ auto_range_cost(const sc_density *d)
  * negligible next to a real disk fetch. skycell's own GUC was tuned from
  * warm-cache measurements alone (a fully cache-resident table), so it is
  * scaled up here in proportion to how far the relation's own size exceeds
- * the planner's effective_cache_size, the same ratio PostgreSQL's own
- * Mackert-Lohman-style cache-hit heuristic (index_pages_fetched() in
- * costsize.c) exists to estimate for exactly this reason: how much of a
- * relation a backend can expect to find resident, not whether any one
- * specific page happens to be warm right now.
+ * the server's actual cache capacity.
+ *
+ * That capacity is read from NBuffers -- the real, already-allocated size of
+ * the shared buffer pool (shared_buffers converted to pages) -- rather than
+ * from effective_cache_size. effective_cache_size is not a measurement of
+ * anything: it is a standalone GUC the admin may set to any value (commonly
+ * left at its build-in default, or sized for a machine the server no longer
+ * runs on), with nothing tying it to the memory PostgreSQL actually holds.
+ * NBuffers is that memory. The tradeoff is that NBuffers, unlike
+ * effective_cache_size, counts only shared_buffers and not the OS page
+ * cache behind it, so this reads as more conservative (a relation is
+ * treated as exceeding cache sooner) whenever the OS cache is doing real
+ * work the shared buffer pool alone would not reflect -- the same direction
+ * Round forty-four already measured as the safer one to err towards: it
+ * found skycell's rewrite winning most broadly exactly where cache pressure
+ * is underestimated (cold, I/O-bound reads), and losing only in the fully
+ * warm case this scaling leaves untouched (cache_frac = 1).
  *
  * This is deliberately the same level of approximation as auto_range_cost()
  * above (a simple ratio, not a reproduction of PostgreSQL's own, considerably
  * more elaborate formula): cache_frac = 1 when the whole relation is
- * expected to fit in effective_cache_size (no change from the tuned
+ * expected to fit in the shared buffer pool (no change from the tuned
  * default), falling toward 0 as the relation grows far past it (the
  * threshold grows without bound as a relation's reads become reliably
  * I/O-bound) -- not a precise cost-model derivation, an explicit choice to
@@ -245,7 +257,7 @@ rewrite_waste_threshold(const sc_density *d)
 {
 	double		relpages = (d && d->relpages > 0) ? d->relpages : 0;
 	double		cache_frac = (relpages > 0)
-		? fmin(1.0, (double) effective_cache_size / relpages) : 1.0;
+		? fmin(1.0, (double) NBuffers / relpages) : 1.0;
 
 	return skycell_rewrite_max_waste / fmax(cache_frac, 1e-6);
 }
