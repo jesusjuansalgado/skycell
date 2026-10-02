@@ -85,6 +85,7 @@ static int	skycell_max_ranges = 64;
 static int	skycell_max_steps = 4000;
 int			skycell_join_slots = 4;	/* adql.c's non-constant skyregion branch shares this */
 double		skycell_rewrite_max_waste = 100.0;	/* adql.c's region_support_simplify shares this */
+static double skycell_rewrite_waste_scale_cap = 10.0;
 static bool skycell_use_stats = true;
 static bool skycell_cache_coverings = true;
 static bool skycell_exact_cells = true;
@@ -141,6 +142,22 @@ _PG_init(void)
 							 "crossover this value was tuned from. Set this very high to recover "
 							 "the always-rewrite behaviour every version before this one had.",
 							 NULL, &skycell_rewrite_max_waste, 100.0, 0.0, 1e12,
+							 PGC_USERSET, 0, NULL, NULL, NULL);
+	DefineCustomRealVariable("skycell.rewrite_waste_scale_cap",
+							 "Upper bound, as a multiple of skycell.rewrite_max_waste, on how far "
+							 "rewrite_waste_threshold() may scale the gate up for a relation far "
+							 "bigger than the shared buffer pool. The scaling itself only prices "
+							 "in the exact-test's wasted CPU rows getting cheaper as I/O comes to "
+							 "dominate -- it has no term for the rewrite's own page count, which "
+							 "GIST_REGION_DESIGN.md's 'Round forty-five' measured growing faster "
+							 "than a GiST-family alternative's at the largest radii on a table "
+							 "whose rows are not physically ordered by cell, even cold. Left "
+							 "unbounded, a deployment with a small enough buffer pool relative to "
+							 "the table could scale past that radius's own waste estimate and force "
+							 "the rewrite exactly where this was measured to lose. This caps the "
+							 "scaling before that point without touching small-to-mid radii, where "
+							 "scaling up was measured correct even cold.",
+							 NULL, &skycell_rewrite_waste_scale_cap, 10.0, 1.0, 1e12,
 							 PGC_USERSET, 0, NULL, NULL, NULL);
 	DefineCustomBoolVariable("skycell.use_stats",
 							 "Use the ANALYZE histogram of the cell column as a density map.",
@@ -248,9 +265,26 @@ auto_range_cost(const sc_density *d)
  * more elaborate formula): cache_frac = 1 when the whole relation is
  * expected to fit in the shared buffer pool (no change from the tuned
  * default), falling toward 0 as the relation grows far past it (the
- * threshold grows without bound as a relation's reads become reliably
- * I/O-bound) -- not a precise cost-model derivation, an explicit choice to
- * stay as legible as this file's other heuristics.
+ * threshold scaling up as a relation's reads become reliably I/O-bound) --
+ * not a precise cost-model derivation, an explicit choice to stay as
+ * legible as this file's other heuristics.
+ *
+ * The scaling is capped, not unbounded, at skycell.rewrite_waste_scale_cap
+ * times the base threshold (cache_frac floored at 1/cap rather than at a
+ * value close to zero). The scaling's whole justification is that the
+ * waste it bounds -- wasted CPU rows from the exact test -- gets cheaper
+ * as I/O comes to dominate; it says nothing about the rewrite's *own*
+ * expected page count, which GIST_REGION_DESIGN.md's "Round forty-five"
+ * measured growing faster than a GiST-family alternative's at the largest
+ * radii specifically, on a relation whose rows are not physically ordered
+ * by cell (an ordinary, unclustered table -- not a special case). Past
+ * some point a low cache_frac stops meaning "the waste is cheap" and
+ * starts meaning "the whole rewrite, waste included, is expensive, for a
+ * reason this ratio was never modelling" -- the cap keeps the scaling in
+ * the regime "Round forty-four" and "Round forty-five" both measured it
+ * correct in (small-to-mid radii, even cold) without reaching into the
+ * regime "Round forty-five" measured it wrong in (the largest radii, an
+ * unclustered table, even cold).
  */
 double
 rewrite_waste_threshold(const sc_density *d)
@@ -258,8 +292,9 @@ rewrite_waste_threshold(const sc_density *d)
 	double		relpages = (d && d->relpages > 0) ? d->relpages : 0;
 	double		cache_frac = (relpages > 0)
 		? fmin(1.0, (double) NBuffers / relpages) : 1.0;
+	double		min_frac = 1.0 / fmax(skycell_rewrite_waste_scale_cap, 1.0);
 
-	return skycell_rewrite_max_waste / fmax(cache_frac, 1e-6);
+	return skycell_rewrite_max_waste / fmax(cache_frac, min_frac);
 }
 
 void

@@ -4670,3 +4670,38 @@ at small-to-mid radii even cold, silent about the rewrite's own I/O
 footprint at the largest radius on an unclustered table, where this
 round's measurement shows that footprint -- not cache state -- is what
 decides the winner.
+
+**Follow-up, same round: bounded the scaling instead of leaving it
+unbounded.** Picked the simpler of the two options this round's own
+STATUS left open (a cap on the scaling, not a second cost term for the
+rewrite's own page count -- that would need `region_support_simplify()`'s
+own `cov`/`sel` numbers threaded into `rewrite_waste_threshold()`, a
+bigger interface change for a problem a cap already closes). New GUC,
+`skycell.rewrite_waste_scale_cap` (`DefineCustomRealVariable`, default
+10.0): `rewrite_waste_threshold()` now floors `cache_frac` at `1 / cap`
+instead of at a value close to zero, so the threshold can scale up to at
+most `cap` times `skycell.rewrite_max_waste` (1000 at both defaults), not
+without bound.
+
+The default (10x) is chosen the same way `skycell.rewrite_max_waste`
+itself was (this corpus's own measured crossover, a GUC specifically so
+it can be retuned per deployment, not a derived constant): it sits
+between round forty-three's measured waste at 1 degree (~668, so a
+cache-constrained deployment can still correctly reach the rewrite
+there) and at 3 degrees (~2104, so the same deployment can no longer
+reach past 3 degrees's own waste estimate and force the rewrite this
+round measured losing there). A cap any looser than roughly 21x would
+let 3 degrees's own waste back in reach; any tighter than roughly 7x
+would start giving up 1 degree's correct cold-cache win too -- 10x
+leaves comfortable margin on both sides without being read as a precise
+derivation.
+
+Verified directly, reproducing round forty-five's own 16MB-`shared_buffers`
+setup (`cat_pos_spgist` disabled, `cat_pos_cellexpr` + `cat_pos_capgist`
+valid): at `shared_buffers = 16MB` (`cache_frac` = 0.0219, below the new
+0.1 floor), the 3-degree query now stays on `cat_pos_capgist` -- the
+regression this round measured as reachable is closed -- while the
+1-degree and 30-arcminute queries still flip to the B-tree rewrite
+exactly as before the cap, confirming the cap sits where intended rather
+than clamping away the scaling's actual benefit. `shared_buffers` and
+`cat_pos_spgist` restored afterward; `make installcheck` passes.
