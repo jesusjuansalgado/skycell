@@ -5343,3 +5343,52 @@ state); `rc_results` reproduces round forty-nine's exact warm outcome,
 zero outliers in every band, `box` winning at `small`, sequential scans
 elsewhere, matching `rc_cold_results` in everything but raw timing.
 `make installcheck` passes.
+
+**Third follow-up, same round: correctness of `&&`/`@>`/`<@` on the
+region-crossover corpus, against the brute-force oracle -- never checked
+before.** Every prior round here measured plan shape and timing for these
+operators; none had confirmed the operators actually return the right
+rows. Checked directly, on both `rc_probe` (warm, queried repeatedly
+across rounds forty-seven through forty-nine) and `rc_probe_cold`
+(round fifty's own fresh batch, above), against `rc_corpus`, for every
+radius band.
+
+`&&` (overlap) against `intersects(a, b)`: exact match, every band, both
+probe batches. On `rc_probe_cold`: small 165,177; medium 292,028; large
+493,751; huge 571,131 -- identical whether counted via `&&` or via
+`intersects()`.
+
+`@>`/`<@` (containment) needed a brute-force oracle, `contains(a
+skyregion, b skyregion)`, which hadn't been exercised this way before
+either. The first attempt at wiring it up gave a wild mismatch --
+`contains(p.region, c.region) = 1` counted only 15 rows against `p.region
+@> c.region`'s 128,018 on the `huge` band. Didn't shrug this off as a bug
+in the operator; built the smallest possible sanity check instead:
+`contains(circle('ICRS', 0, 0, 10), circle('ICRS', 0, 0, 1))` returns 0,
+and the reverse, `contains(circle('ICRS', 0, 0, 1), circle('ICRS', 0, 0,
+10))`, returns 1. So `contains(a, b)` means **a is contained within
+b** -- the reverse of what the plain-English function name suggests, but
+exactly the IVOA ADQL standard's own `CONTAINS(s1, s2)` convention (s1
+enclosed in s2), which this project deliberately mirrors throughout (see
+the `ivo_epoch_prop` naming elsewhere). `@>`/`<@` themselves were never
+wrong -- the brute-force query had the oracle's argument order backwards.
+Corrected mapping: `p.region @> c.region` (p contains c) and `c.region <@
+p.region` (c is inside p) are the same fact, both verified against
+`contains(c.region, p.region) = 1`.
+
+With the corrected oracle, exact matches everywhere:
+
+| band | `rc_probe` (warm) | `rc_probe_cold` (fresh) |
+|---|---|---|
+| small | 9 | 6 |
+| medium | 12,071 | 10,824 |
+| large | 80,180 | 75,773 |
+| huge | 128,018 | 127,939 |
+
+**STATUS**: `&&`, `@>`, and `<@` all return exactly the rows the
+brute-force oracle says they should, in every radius band, on both the
+long-queried warm probe set and a probe set that had never been touched
+before this round. The one real finding is about `contains()`'s argument
+convention, not about any of skycell's own operators: `contains(a, b)`
+reads as "a contained within b" (ADQL/IVOA order), not "a contains b" --
+worth remembering before reaching for it as an oracle again.
