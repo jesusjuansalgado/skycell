@@ -5174,3 +5174,95 @@ the cheapest available plan with zero exceptions across 240 probes.
 `SET enable_indexscan = off` remains available for anyone who wants a
 guarantee independent of estimate quality, but is no longer needed to
 avoid the specific regression these three rounds chased.
+
+## Round fifty: reproducing rounds forty-four and forty-five's cold-cache
+numbers after `paper_bench` was rebuilt from scratch
+
+`paper_bench` was wiped down to 36MB by an (explicitly confirmed, not
+accidental) `make installcheck` run pointed at it instead of the
+disposable `contrib_regression` database. `src`, `cat_q3c`/`cat_sphere`/
+`cat_cell` (10M rows each, `bench/01_data.sql`/`02_build.sql`), `cat_pos`
+with its three point indexes (`bench/25_cat_pos.sql`, new this round),
+`bench_centers`, and the region-crossover corpus (`bench/26_region_
+crossover.sql`) were all rebuilt and correctness-reverified before this
+round started -- see the session notes for that recovery. What hadn't
+been re-measured yet was the cold-cache numbers themselves: rounds
+forty-four and forty-five's own `cold_probe_v2`/`cold_catpos_v1` tables,
+and the fresh probe coordinates they need (`bench/27_cold_probes.sql`,
+also new this round, generating the same three reseeded batches --
+qid 10001-11456, 20001-21456, 30001-31456 -- those rounds used).
+
+**Didn't assume the cold-cache premise still held on a freshly-rebuilt
+corpus -- checked it, the same way round forty-four insisted on checking
+`drop_caches` rather than trusting it.** A real concern going in: table
+and index *construction* itself does a lot of sequential I/O (building
+`cat_pos`'s three indexes alone moved multiple GB through the OS page
+cache minutes before this round), so "freshly rebuilt" is not obviously
+the same thing as "genuinely cold." Checked directly rather than
+assumed: after a real restart, a coordinate touched earlier in *this*
+session (not this round) came back with a real mix of `hit`/`read`
+buffers and an 855ms execution time -- evidence enough intervening I/O
+(rebuilding `bench_centers`, the region corpus, writing this round's own
+new scripts) had already evicted it from OS cache, despite having been
+queried before. Then the actual test: a brand-new, qid-10001 coordinate
+read cold the first time (529ms, real `read` buffers) and instantly on
+an immediate repeat (0.049ms, all `hit`, zero `read`) -- better than a
+10,000x gap, confirming both halves directly: genuinely fresh
+coordinates are still genuinely cold here, and a touched page does get
+cached. Proceeded only after seeing this.
+
+**Round forty-four, reproduced** (`cat_cell`/`cat_sphere`, all seven
+labels run fresh this time, not resuming a partial prior run):
+
+| radius | skycell buffers | pgSphere buffers | skycell mean ms | pgSphere mean ms |
+|---|---|---|---|---|
+| 1" | **4.2** | 5.7 | **62.76** | 85.99 |
+| 10" | **4.6** | 5.8 | **18.68** | 26.35 |
+| 1' | **5.6** | 6.5 | 18.25 | **16.12** |
+| 6' | **9.9** | 15.4 | **5.78** | 12.03 |
+| 30' | **29.3** | 73.3 | **14.03** | 22.19 |
+| 1 deg | **59.1** | 195.7 | **13.71** | 23.23 |
+| 3 deg | **284.9** | 495.2 | **69.24** | 155.32 |
+
+Buffers favour skycell at every radius, same as the original round;
+wall-clock favours skycell at every radius except 1' (16.12ms vs
+18.25ms, a near-tie reversed by a small margin) -- a fresh random seed
+and genuinely different probe coordinates were never going to reproduce
+the original numbers exactly, and weren't expected to; the qualitative
+story (skycell wins broadly under real cold-cache conditions) reproduces
+cleanly regardless.
+
+**Round forty-five, reproduced** (`cat_pos` adaptive gate vs forced
+rewrite, `cat_pos_spgist` disabled for the clean two-way comparison, the
+same as that round's own setup):
+
+| radius | adaptive median ms | forced-rewrite median ms | adaptive's actual pick |
+|---|---|---|---|
+| 1" | 1.072 | **0.373** | rewrite |
+| 10" | 0.709 | **0.358** | rewrite |
+| 1' | 0.820 | **0.365** | rewrite |
+| 6' | 2.254 | **0.654** | rewrite (mostly) |
+| 30' | 29.651 | **1.425** | cap-GiST (96/100) |
+| 1 deg | 14.349 | **2.821** | cap-GiST (30/40) |
+| 3 deg | **15.345** | 57.114 | cap-GiST (16/16) |
+
+Reproduces the exact qualitative structure the fix in rounds forty-six
+through forty-nine was built around: the fixed-threshold gate still
+declines the rewrite at 30'/1deg (losing to a forced rewrite there under
+genuine cold cache, same direction round forty-four already found,
+unchanged here because `cache_frac = 1` on this box's actual
+`shared_buffers` -- the `NBuffers`-based scaling from round forty-eight
+has nothing to engage on this specific machine, exactly as round
+forty-five's own first measurement found), but correctly keeps the
+cap-GiST pick at 3 degrees, where this round's own numbers confirm the
+forced rewrite is still the *wrong* choice (15.345ms / cap-GiST vs
+57.114ms / forced rewrite) -- the unclustered-table scattered-I/O effect
+round forty-five discovered and round forty-eight's cap (`skycell.
+rewrite_waste_scale_cap`) was built to stay clear of.
+
+**STATUS**: a reproduction round, no new code or findings -- both prior
+rounds' qualitative conclusions hold on a fresh build of the corpus with
+fresh random coordinates, confirming they describe something real about
+this environment and these opclasses, not an artifact of one particular
+corpus instance. `cat_pos_spgist` restored to valid afterward;
+`make installcheck` passes.
