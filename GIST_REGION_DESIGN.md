@@ -5266,3 +5266,62 @@ fresh random coordinates, confirming they describe something real about
 this environment and these opclasses, not an artifact of one particular
 corpus instance. `cat_pos_spgist` restored to valid afterward;
 `make installcheck` passes.
+
+**Follow-up, same round: the region-crossover corpus (rounds forty-seven
+through forty-nine), under genuine cold cache for the first time -- every
+prior measurement of it was warm.** Checked the premise first, the same
+way as above, because `rc_corpus` plus all three of its indexes together
+are under 7MB -- tiny next to the 10M-row catalogues, so "cold matters
+here too" was a real question, not an assumption: a fresh circle's first
+touch after a restart read 268 buffers, all `read`, in 23.9ms; an
+immediate repeat read the same 268 buffers, all `hit`, in 5.05ms. A real,
+measurable gap (4.7x), just a smaller one than the 10,000x seen on the
+10M-row tables -- expected, since the total bytes at stake here are
+themselves far smaller. Worth measuring properly, not worth skipping.
+
+New fresh probe circles (`rc_probe_cold`, `bench/28_region_cold_probes.sql`,
+reseeded, same four-band structure as `rc_probe`, not reusing its rows --
+those have been queried repeatedly across rounds forty-seven through
+forty-nine already) against the existing `rc_corpus`, 12 restarts (four
+bands x three conditions -- `box`-only, `multicap`-only, `both`, matching
+round forty-seven/forty-nine's own setup), 60 probes run per restart:
+
+| band | box median buf | multicap median buf | both median buf | pathological plan anywhere? |
+|---|---|---|---|---|
+| small | 273 | 113 (seq scan) | 273 | no |
+| medium | 113 | 113 | 113 | no |
+| large | 113 | 113 | 113 | no |
+| huge | 113 | 113 | 113 | no |
+
+Every band and condition reproduces the exact plan-choice pattern round
+forty-nine's warm measurement already found: `box` winning over
+`multicap`'s own seq-scan fallback at `small` (matching round forty-two's
+original small-radius finding, same as round forty-nine's warm run), and
+all three conditions agreeing on a plain sequential scan at medium/large/
+huge. Checked directly across all 720 cold measurements (4 bands x 3
+conditions x 60 probes) for the one thing that actually mattered here --
+whether the pathological plain-Index-Scan plan rounds forty-seven/
+forty-eight chased could reappear under genuine cold-cache conditions
+specifically, not just warm: it did not, anywhere; buffers stayed bounded
+(max 300, `small`'s own `box` ceiling) throughout.
+
+One honest methodological limitation, not swept past: because `rc_corpus`
+is so small, a sequential scan (the plan every medium/large/huge
+probe gets) touches the *entire* table, so the first probe in each
+60-probe restart batch warms the whole table for the remaining 59 -- only
+genuinely cold for roughly the first probe or two per batch, not all 60.
+This does not undermine the conclusion above (the planner picks its plan
+*before* execution, from cost estimates, not from whether this particular
+run happens to be warm or cold, so the plan-choice results are unaffected),
+but it does mean the *wall-clock* numbers for those three bands are a mix
+of a few genuinely cold reads and many already-rewarmed ones within each
+batch, not a clean 60-probe cold timing distribution the way `cat_pos`/
+`cat_sphere`/`cat_cell`'s much larger corpus allowed in round fifty's main
+measurement above. Getting a strictly cold wall-clock reading for every
+single probe at these bands would need a restart before each of the 720
+individual queries rather than each of the 12 batches -- not attempted
+this round, since the question that actually mattered (does the fix hold,
+does the pathology reappear) is already answered cleanly by the plan-
+choice and buffer-count data, which carries no such caveat.
+
+Indexes restored to valid afterward; `make installcheck` passes.
