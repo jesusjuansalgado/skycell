@@ -125,7 +125,7 @@ region_poly(int nv, const double *coords)
 			ra[i] = coords[2 * i];
 			dec[i] = coords[2 * i + 1];
 		}
-		check_err(sc_region_poly(&probe, nv, ra, dec));
+		check_err(sc_region_poly(&probe, nv, ra, dec, true));
 		sc_region_free(&probe);
 		pfree(ra);
 		pfree(dec);
@@ -143,13 +143,13 @@ skycell_pos_from_datum(Datum d)
 }
 
 /* a skyregion datum as the covering code understands it */
-void
-skycell_region_from_datum(Datum d, sc_region *out)
+static void
+region_from_datum_ex(Datum d, sc_region *out, bool need_covering)
 {
 	SkyRegion  *r = DatumGetSkyRegion(d);
 
 	if (r->kind == SKY_CONE)
-		check_err(sc_region_cone(out, r->v[0], r->v[1], r->v[2]));
+		check_err(sc_region_cone(out, r->v[0], r->v[1], r->v[2], need_covering));
 	else
 	{
 		int			nv = SKYREGION_NVERT(r);
@@ -161,8 +161,28 @@ skycell_region_from_datum(Datum d, sc_region *out)
 			ra[i] = r->v[2 * i];
 			dec[i] = r->v[2 * i + 1];
 		}
-		check_err(sc_region_poly(out, nv, ra, dec));
+		check_err(sc_region_poly(out, nv, ra, dec, need_covering));
 	}
+}
+
+void
+skycell_region_from_datum(Datum d, sc_region *out)
+{
+	region_from_datum_ex(d, out, true);
+}
+
+/*
+ * Same, but skips out_c2[]/in_c2[]/sin_rho[] -- the ~90%-of-the-cost tables
+ * that only an index/covering descent via sc_region_classify_cap() reads
+ * (see cover.h). For a call site that only ever reaches sc_region_contains(),
+ * sc_region_contains_region() or sc_region_overlaps() -- the exact test
+ * region_region() below runs -- building those tables is pure waste, repeated
+ * on every row.
+ */
+void
+skycell_region_from_datum_lite(Datum d, sc_region *out)
+{
+	region_from_datum_ex(d, out, false);
 }
 
 /* ------------------------------------------------------------------ */
@@ -528,18 +548,80 @@ skycell_contains(PG_FUNCTION_ARGS)
 	PG_RETURN_INT32(pos_in_region(PG_GETARG_SKYPOS(0), PG_GETARG_DATUM(1)) ? 1 : 0);
 }
 
+/*
+ * region_region()'s own per-argument cache, one slot per argument position.
+ * A plain two-argument predicate like this has no fixed "query" side the
+ * way a GiST/SP-GiST support function does -- either argument, or both, can
+ * be the same value across a run of calls (a cross join's outer row, a
+ * literal probe region in a WHERE clause) -- so both get a slot, and
+ * whichever side turns out constant is the one that stops paying to
+ * rebuild.  If neither side repeats, this costs one extra memcmp per call
+ * and nothing is worse off than before.
+ *
+ * Keyed on byte content, not pointer identity, for exactly the reason
+ * spg_cached_region (spgist_region.c, same fix for the SP-GiST support
+ * functions) already documented there: a short-lived per-tuple memory
+ * context is reset and reused across calls, so two genuinely different
+ * rows' region datums can legitimately land at the same address. fn_extra
+ * lives in fn_mcxt for the query's duration, so the cached sc_region (and
+ * any poly v[]/n[] it owns) has to live there too, not in the per-tuple
+ * context the argument datum itself arrived in.
+ */
+typedef struct
+{
+	bytea	   *last_datum;		/* palloc'd copy in fn_mcxt, or NULL */
+	Size		last_size;
+	sc_region	reg;
+} region_arg_cache;
+
+typedef struct
+{
+	region_arg_cache arg[2];
+} region_pair_cache;
+
+static sc_region *
+cached_region_arg(FunctionCallInfo fcinfo, int argno, Datum arg_datum)
+{
+	region_pair_cache *c = (region_pair_cache *) fcinfo->flinfo->fn_extra;
+	region_arg_cache *slot;
+	bytea	   *b = DatumGetByteaP(arg_datum);
+	Size		sz = VARSIZE(b);
+
+	if (c == NULL)
+	{
+		c = MemoryContextAllocZero(fcinfo->flinfo->fn_mcxt, sizeof(region_pair_cache));
+		fcinfo->flinfo->fn_extra = c;
+	}
+	slot = &c->arg[argno];
+	if (slot->last_datum == NULL || slot->last_size != sz ||
+		memcmp(slot->last_datum, b, sz) != 0)
+	{
+		MemoryContext oldcxt = MemoryContextSwitchTo(fcinfo->flinfo->fn_mcxt);
+
+		if (slot->last_datum != NULL)
+			sc_region_free(&slot->reg);	/* frees the old poly v[]/n[], if any */
+		skycell_region_from_datum_lite(arg_datum, &slot->reg);
+		MemoryContextSwitchTo(oldcxt);
+
+		if (slot->last_datum == NULL || slot->last_size < sz)
+		{
+			if (slot->last_datum != NULL)
+				pfree(slot->last_datum);
+			slot->last_datum = MemoryContextAlloc(fcinfo->flinfo->fn_mcxt, sz);
+		}
+		memcpy(slot->last_datum, b, sz);
+		slot->last_size = sz;
+	}
+	return &slot->reg;
+}
+
 static int
 region_region(PG_FUNCTION_ARGS, bool contains)
 {
-	sc_region	a,
-				b;
-	int			res;
+	sc_region  *a = cached_region_arg(fcinfo, 0, PG_GETARG_DATUM(0));
+	sc_region  *b = cached_region_arg(fcinfo, 1, PG_GETARG_DATUM(1));
+	int			res = contains ? sc_region_contains_region(a, b) : sc_region_overlaps(a, b);
 
-	skycell_region_from_datum(PG_GETARG_DATUM(0), &a);
-	skycell_region_from_datum(PG_GETARG_DATUM(1), &b);
-	res = contains ? sc_region_contains_region(&a, &b) : sc_region_overlaps(&a, &b);
-	sc_region_free(&a);
-	sc_region_free(&b);
 	return res ? 1 : 0;
 }
 
@@ -589,15 +671,10 @@ skycell_region_covers(PG_FUNCTION_ARGS)
 	 * reuses; the only regression test for this function,
 	 * skycell_region_covers(p, p), is symmetric and could never catch a
 	 * reversed argument order. */
-	sc_region	a,
-				b;
-	int			res;
+	sc_region  *a = cached_region_arg(fcinfo, 0, PG_GETARG_DATUM(0));
+	sc_region  *b = cached_region_arg(fcinfo, 1, PG_GETARG_DATUM(1));
+	int			res = sc_region_contains_region(b, a);
 
-	skycell_region_from_datum(PG_GETARG_DATUM(0), &a);
-	skycell_region_from_datum(PG_GETARG_DATUM(1), &b);
-	res = sc_region_contains_region(&b, &a);
-	sc_region_free(&a);
-	sc_region_free(&b);
 	PG_RETURN_BOOL(res != 0);
 }
 

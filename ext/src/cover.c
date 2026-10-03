@@ -60,7 +60,8 @@ vnormalize(sc_vec3 a)
 /* ------------------------------------------------------------------ */
 
 const char *
-sc_region_cone(sc_region *r, double ra_deg, double dec_deg, double radius_deg)
+sc_region_cone(sc_region *r, double ra_deg, double dec_deg, double radius_deg,
+			   bool need_covering)
 {
 	memset(r, 0, sizeof(*r));
 	if (!isfinite(ra_deg) || !isfinite(dec_deg) || !isfinite(radius_deg))
@@ -75,6 +76,9 @@ sc_region_cone(sc_region *r, double ra_deg, double dec_deg, double radius_deg)
 	if (r->radius > M_PI)
 		r->radius = M_PI;
 	r->area = (r->radius < 0) ? 0.0 : 4.0 * M_PI * pow(sin(r->radius / 2.0), 2);
+
+	if (!need_covering)
+		return NULL;				/* out_c2[]/in_c2[]: only sc_region_classify_cap() reads these */
 
 	for (int k = 0; k <= SC_MAX_ORDER; k++)
 	{
@@ -108,7 +112,8 @@ poly_setup(sc_region *r)
 }
 
 const char *
-sc_region_poly(sc_region *r, int nv, const double *ra_deg, const double *dec_deg)
+sc_region_poly(sc_region *r, int nv, const double *ra_deg, const double *dec_deg,
+			   bool need_covering)
 {
 	sc_vec3		g = {0, 0, 0};
 	double		orient = 0;
@@ -179,6 +184,9 @@ sc_region_poly(sc_region *r, int nv, const double *ra_deg, const double *dec_deg
 
 		r->area += 2.0 * atan2(num, den);
 	}
+
+	if (!need_covering)
+		return NULL;				/* sin_rho[]: only sc_region_classify_cap() reads this */
 
 	for (int k = 0; k <= SC_MAX_ORDER; k++)
 		r->sin_rho[k] = sin(sc_pixrad(k) + SC_ANG_EPS);

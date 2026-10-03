@@ -5392,3 +5392,138 @@ before this round. The one real finding is about `contains()`'s argument
 convention, not about any of skycell's own operators: `contains(a, b)`
 reads as "a contained within b" (ADQL/IVOA order), not "a contains b" --
 worth remembering before reaching for it as an oracle again.
+
+## Round fifty-one: pgSphere beat skycell 3-5x on the region crossover --
+chased it to a wasted computation, not an inherent cost, and fixed it
+
+Asked a question round fifty never had a baseline for: on the identical
+`rc_corpus`/`rc_probe` crossover, how does skycell's `skyregion` compare
+to pgSphere's `scircle` -- the same circles, mirrored into a second table
+(`rc_corpus_pg`/`rc_probe_pg`, parsed straight out of `skyregion`'s own
+STC-S text so it is the exact same geometry, not a re-sampled one) with
+its own GiST index. Correctness first, not assumed: `&&`/`@>`/`<@`
+against the `scircle` equivalents, forced through both systems' GiST
+indexes, matched exactly on every one of ~4.3M row-pairs checked (both
+probe batches, all four bands). One genuinely interesting aside, not a
+bug: pgSphere's own `@>`/`<@`-backing functions (`scircle_contains_circle`/
+`scircle_contained_by_circle`) are *not* reversed the way skycell's
+`contains()` is -- they read in plain English, matching their operators
+1:1. The reversal round fifty's own follow-up tripped on is specific to
+skycell choosing to name its oracle after the ADQL spec; it is not
+something inherent to spherical-region libraries.
+
+**Performance was not close.** Measured with `EXPLAIN (ANALYZE, BUFFERS,
+TIMING OFF)` per probe, median over 60 probes/band, warm cache, both
+systems' indexes left to the planner's own natural choice:
+
+| band | op | skycell ms | skycell buf | pgSphere ms | pgSphere buf |
+|---|---|---|---|---|---|
+| small | overlap | 5.29 | 277 | 1.46 | 169 |
+| small | contained_by | 5.58 | 3594 | 1.34 | 169 |
+| medium | overlap | 13.29 | 113 | 2.15 | 193 |
+| medium | contained_by | 8.91 | 312 | 1.93 | 193 |
+| large | overlap | 13.63 | 113 | 2.84 | 209 |
+| large | contained_by | 12.71 | 320 | 2.64 | 209 |
+| huge | overlap | 13.94 | 113 | 3.14 | 213 |
+| huge | contained_by | 14.40 | 320 | 2.93 | 213 |
+
+3-5x slower almost everywhere, and not an I/O story: at medium/large/huge,
+skycell's `overlap` seq-scans the *whole* 113-page table (fewer buffers
+than pgSphere's 193-213) and still loses on wall clock by 4-6x -- CPU-bound,
+not I/O-bound. The `small`/`contained_by` row is its own, narrower problem:
+confirmed via `EXPLAIN` that skycell picks a plain (non-bitmap) `Index Scan
+using rc_corpus_box`, re-visiting the same ~113 heap pages thousands of
+times (`Rows Removed by Index Recheck: 3704`, 3594 buffer hits on average,
+consistent across all 60 probes in the band). Forcing a Bitmap Heap Scan by
+hand (`enable_indexscan = off`) cut buffers 13x (3747 -> 293) but barely
+moved wall time (6.39ms -> 6.11ms) -- proof the buffer count was not the
+real cost either.
+
+**Chased the CPU cost to its root, not just its symptom.** `region_region()`
+(adql.c -- the exact test behind `&&`/`@>`/`<@`/`contains()`/`intersects()`)
+calls `skycell_region_from_datum()` on *both* arguments, every row, which
+for a circle calls `sc_region_cone()` (cover.c). Reading `cover.c` before
+changing anything: for a cone-cone pair, `sc_region_overlaps()` reduces to
+one `sc_angle()` call and `sc_region_contains_region()` to one
+`region_farthest()` call -- neither ever reads `out_c2[]`/`in_c2[]`, the
+30-entry (one per HEALPix order), up-to-4-`sin()`/`pow()`-calls-each table
+`sc_region_cone()` fills on *every* construction. Confirmed by grep: those
+arrays are read in exactly one place in the whole codebase,
+`sc_region_classify_cap()` (cover.c:338/343/354), the pixel classifier a
+GiST/SP-GiST descent or a planner covering runs -- never an exact test.
+
+Quantified with a standalone microbenchmark (`cover.c`/`healpix.c` build
+outside Postgres by design -- confirmed in Round thirty-eight's own
+`make selftest`):
+
+| call | ns/call | what it does |
+|---|---|---|
+| `sc_region_cone()` (as shipped in 0.18) | ~375-411 | center + center_pix + area + the 30-level table |
+| same, table skipped | ~31-32 | everything the exact test actually reads |
+| `sc_region_overlaps()` alone | ~24-26 | the actual geometry test |
+| `sc_region_contains_region()` alone | ~26 | the actual geometry test |
+
+~90% of every construction was spent on data the exact-test path never
+looks at, and `region_region()` built two per row -- one for the corpus
+row (unavoidable, it varies) and one for the probe (avoidable: the same
+value on all 12,000 rows, rebuilt from scratch every time anyway). Back
+of envelope, 12,000 rows x (~400ns x 2 + ~25ns) ~= 9.9ms, close enough to
+the observed ~13-14ms (plus normal per-row call overhead) to call this the
+dominant cost, not a guess.
+
+**The fix, two parts, both measured before shipping:**
+
+1. `sc_region_cone()`/`sc_region_poly()` (cover.h/cover.c) take a new
+   `need_covering` argument gating the 30-level table; every index/
+   covering call site (gist_region.c, gist_region_box.c, spgist_region.c,
+   gist_point_cap.c, skycell.c's cone/MOC/ranges functions, cover_selftest.c)
+   keeps passing `true`, unchanged. A new `skycell_region_from_datum_lite()`
+   (adql.c, declared in skycell_internal.h) passes `false`, used only by
+   the exact-test call sites.
+2. `region_region()` and `skycell_region_covers()` (adql.c, the `@>`
+   function, which built its own regions directly rather than going
+   through `region_region()`) now cache each argument's built `sc_region`
+   in `fn_extra`, one slot per argument position, keyed on the argument
+   datum's *bytes* -- the same cache-key discipline `spg_cached_region`
+   (spgist_region.c, an earlier round's identical fix for the SP-GiST
+   support functions) already established, for the documented reason: a
+   short-lived per-tuple memory context is reused across calls, so
+   pointer identity alone cannot distinguish two different rows' regions.
+   Two slots, not one keyed on a fixed "query" side, because a plain
+   two-argument predicate (unlike a GiST support function) has no fixed
+   constant argument position -- either side, or neither, can repeat
+   across a run of calls, and whichever one does stops paying to rebuild.
+
+Correctness re-checked after the fix, not assumed preserved: `make
+installcheck` (both `skycell` and `adql` regression suites) passes, and
+the exact `&&`/`@>`/`<@` vs. brute-force-oracle check from round fifty's
+own follow-up was re-run against both `rc_probe` and `rc_probe_cold` --
+still an exact match in every band.
+
+**Measured again, same methodology, after the fix:**
+
+| band | op | before (ms) | after (ms) | speedup | pgSphere (ms) | remaining gap |
+|---|---|---|---|---|---|---|
+| small | overlap | 5.29 | 2.26 | 2.3x | 1.46 | 1.5x |
+| small | contained_by | 5.58 | 2.48 | 2.3x | 1.34 | 1.8x |
+| medium | overlap | 13.29 | 3.52 | 3.8x | 2.15 | 1.6x |
+| medium | contained_by | 8.91 | 3.51 | 2.5x | 1.93 | 1.8x |
+| large | overlap | 13.63 | 3.52 | 3.9x | 2.84 | 1.2x |
+| large | contained_by | 12.71 | 4.38 | 2.9x | 2.64 | 1.7x |
+| huge | overlap | 13.94 | 3.58 | 3.9x | 3.14 | 1.1x |
+| huge | contained_by | 14.40 | 4.78 | 3.0x | 2.93 | 1.6x |
+
+**STATUS**: shipped as skycell 0.19 (`ext/sql/skycell--0.18--0.19.sql`).
+No SQL-visible change -- same function names and signatures -- a pure
+C-level fix, same changelog-via-version-bump convention as 0.17/0.18. The
+`small`/`contained_by` plain-Index-Scan plan-choice question from the
+earlier measurement is untouched by this fix (same plan, same buffer
+count, just a cheaper per-row test underneath it) and is left for a
+separate round if it is worth chasing. One related, adjacent finding not
+yet fixed: `pos_in_region()` (adql.c, backing `skycell_contains`/
+`skycell_pos_in_region`/`skycell_intersects_pos` -- the point-in-region
+ADQL `CONTAINS`, skycell's actual headline cone-search workload) has the
+identical shape, a full `skycell_region_from_datum()` rebuild of the
+region argument on every point tested, for exactly the same reason this
+round just fixed. Not touched here because it was outside what was asked
+this round; flagged for a follow-up.

@@ -348,7 +348,7 @@ poly_from_array(ArrayType *arr, sc_region *r)
 		ra[i] = DatumGetFloat8(elems[2 * i]);
 		dec[i] = DatumGetFloat8(elems[2 * i + 1]);
 	}
-	check_err(sc_region_poly(r, n / 2, ra, dec));
+	check_err(sc_region_poly(r, n / 2, ra, dec, true));
 }
 
 /* ------------------------------------------------------------------ */
@@ -1345,7 +1345,8 @@ simplify_cone(PlannerInfo *root, FuncExpr *fexpr)
 		check_err(sc_region_cone(&reg,
 								 DatumGetFloat8(((Const *) list_nth(args, 3))->constvalue),
 								 DatumGetFloat8(((Const *) list_nth(args, 4))->constvalue),
-								 DatumGetFloat8(((Const *) list_nth(args, 5))->constvalue)));
+								 DatumGetFloat8(((Const *) list_nth(args, 5))->constvalue),
+								 true));
 		current_params(&p, skycell_max_ranges, &dens);
 		cover_cached(&reg, &dens, &p, dens_statrel,
 					 DatumGetFloat8(((Const *) list_nth(args, 3))->constvalue),
@@ -1954,7 +1955,7 @@ skycell_cone_bound(PG_FUNCTION_ARGS)
 		int			s;
 
 		slot_cache.valid = false;
-		check_err(sc_region_cone(&reg, ra0, dec0, radius));
+		check_err(sc_region_cone(&reg, ra0, dec0, radius, true));
 		current_params(&p, nslots, &d);
 		sc_cover_compute(&reg, &d, &p, &cov);
 		for (s = 0; s < cov.n && s < nslots; s++)
@@ -2242,7 +2243,7 @@ skycell_cone_ranges(PG_FUNCTION_ARGS)
 		InitMaterializedSRF(fcinfo, MAT_SRF_USE_EXPECTED_DESC);
 		return (Datum) 0;
 	}
-	check_err(sc_region_cone(&reg, PG_GETARG_FLOAT8(0), PG_GETARG_FLOAT8(1), PG_GETARG_FLOAT8(2)));
+	check_err(sc_region_cone(&reg, PG_GETARG_FLOAT8(0), PG_GETARG_FLOAT8(1), PG_GETARG_FLOAT8(2), true));
 	dens = density_from_args(fcinfo, 3);
 	current_params(&p, skycell_max_ranges, dens);
 	sc_cover_compute(&reg, dens, &p, &cov);
@@ -2292,7 +2293,7 @@ skycell_cover_info(PG_FUNCTION_ARGS)
 
 	if (PG_ARGISNULL(0) || PG_ARGISNULL(1) || PG_ARGISNULL(2))
 		PG_RETURN_NULL();
-	check_err(sc_region_cone(&reg, PG_GETARG_FLOAT8(0), PG_GETARG_FLOAT8(1), PG_GETARG_FLOAT8(2)));
+	check_err(sc_region_cone(&reg, PG_GETARG_FLOAT8(0), PG_GETARG_FLOAT8(1), PG_GETARG_FLOAT8(2), true));
 	dens = density_from_args(fcinfo, 3);
 	current_params(&p, skycell_max_ranges, dens);
 	sc_cover_compute(&reg, dens, &p, &cov);
@@ -2530,7 +2531,7 @@ skycell_cone_moc(PG_FUNCTION_ARGS)
 {
 	sc_region	reg;
 
-	check_err(sc_region_cone(&reg, PG_GETARG_FLOAT8(0), PG_GETARG_FLOAT8(1), PG_GETARG_FLOAT8(2)));
+	check_err(sc_region_cone(&reg, PG_GETARG_FLOAT8(0), PG_GETARG_FLOAT8(1), PG_GETARG_FLOAT8(2), true));
 	PG_RETURN_ARRAYTYPE_P(moc_for_region(&reg, Max(PG_GETARG_INT32(3), 4),
 										 Min(Max(PG_GETARG_INT32(4), 0), SC_MAX_ORDER)));
 }

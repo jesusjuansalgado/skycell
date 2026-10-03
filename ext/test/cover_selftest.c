@@ -99,7 +99,7 @@ main(void)
 				else if (q % 3 == 1) { qra = 360 * urand(); qde = asin(2 * urand() - 1) * 180 / M_PI; }
 				else { qra = (urand() < 0.5) ? 0.0 : 45.0 * (int) (8 * urand()); qde = (urand() < 0.5) ? 90 - 1e-4 * urand() : 41.8103148958; }
 
-				sc_region_cone(&r, qra, qde, radii[ri]);
+				sc_region_cone(&r, qra, qde, radii[ri], true);
 				t0 = clock();
 				for (int rep = 0; rep < 5; rep++)
 				{
@@ -152,7 +152,7 @@ main(void)
 				pra[v] = cra + size * cos(ang) / fmax(cos(cde * M_PI / 180), 1e-3);
 				if (pde[v] > 90) pde[v] = 90;
 			}
-			if ((err = sc_region_poly(&r, nv, pra, pde)) != NULL) { fp_q++; sc_region_free(&r); continue; }
+			if ((err = sc_region_poly(&r, nv, pra, pde, true)) != NULL) { fp_q++; sc_region_free(&r); continue; }
 			sc_cover_compute(&r, &dens_hist, &p, &c);
 			for (int i = 0; i < NPTS; i++)
 			{
@@ -218,7 +218,7 @@ main(void)
 				if (pde[v] > 90) pde[v] = 90;
 				if (pde[v] < -90) pde[v] = -90;
 			}
-			if (sc_region_poly(&r, nv, pra, pde) != NULL)
+			if (sc_region_poly(&r, nv, pra, pde, true) != NULL)
 				continue;				/* degenerate or non-convex: not our case */
 			built++;
 			sc_cover_compute(&r, &dens_hist, &p, &c);
@@ -318,7 +318,7 @@ main(void)
 			}
 			if (cde > 90) cde = 90;
 			if (cde < -90) cde = -90;
-			sc_region_cone(&reg, cra, cde, r);
+			sc_region_cone(&reg, cra, cde, r, true);
 			t0 = clock();
 			sc_cover_compute(&reg, &dens_u, &p, &c);
 			us += (double) (clock() - t0) / CLOCKS_PER_SEC * 1e6;

@@ -45,5 +45,6 @@ extern Expr *array_overlap_expr(Node *left, Expr *right);
 /* adql.c: a skypos/skyregion datum, as cover.c understands it */
 extern sc_vec3 skycell_pos_from_datum(Datum d);
 extern void skycell_region_from_datum(Datum d, sc_region *r);
+extern void skycell_region_from_datum_lite(Datum d, sc_region *r);
 
 #endif
