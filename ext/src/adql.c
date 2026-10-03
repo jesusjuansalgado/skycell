@@ -1211,78 +1211,86 @@ skycell_region_pos_sel(PG_FUNCTION_ARGS)
  * true value (by hand, for that diagnosis only) made it choose the
  * correct plan on its own.
  *
- * The fix: typical_region_area() (skycell.c) answers "what's a typical
- * stored region's own area," the region-size analogue of
- * region_pos_density_sel()'s point-density lookup, when a plain
- * `CREATE INDEX ... (area(region_col))` expression index exists with
- * ANALYZE statistics on it. region_angle_est() converts whichever
- * information is available for a given operand -- exact, from .area,
- * for a constant; typical_region_area()'s estimate for a plain column
- * with such an index; otherwise "unknown" -- into an angular radius
- * (area = 2*pi*(1-cos(theta)), inverted), and reports whether it found
- * anything at all. && sums both operands' angles (two circles of radius
- * theta_a, theta_b overlap roughly whenever their centres are within
- * theta_a+theta_b of each other) and keeps the old, exact area(const)/4pi
- * behaviour whenever the *other* side has no such index (angle 0, i.e.
- * point-like, exactly Tier 1's own assumption) -- this is a strict
- * generalisation of Tier 1, not a replacement of it: identical output
- * when no area() index exists anywhere, strictly more accurate when one
- * does.
+ * The fix, "Round forty-eight": typical_region_area() (skycell.c)
+ * answered "what's a typical stored region's own area" with a single
+ * number pulled from a `CREATE INDEX ... (area(region_col))` expression
+ * index's ANALYZE histogram when one exists, converted to an angular
+ * radius (area = 2*pi*(1-cos(theta)), inverted) and combined with the
+ * other operand's own angle (summed for &&, subtracted for @>/<@). That
+ * closed the regression it was built for, but round forty-eight's own
+ * STATUS flagged a residual: a single summary number, however chosen,
+ * represents a genuinely mixed-scale column poorly, and the pathology
+ * it was fixing (a plain Index Scan narrowly, wrongly, beating a Bitmap
+ * Heap Scan on the planner's own cost estimate) can still trigger
+ * whenever that one number is off by enough -- which it will be for
+ * *some* rows whenever the real distribution is wide.
  *
- * @>/<@ need the *container* side's angle specifically (LEFTARG for @>,
- * RIGHTARG for <@) to compute anything at all -- falling back to the
- * flat default when that side offers no information, exactly as Tier 1
- * did for a non-constant container with nothing better available. Once
- * the container's angle is known, the *contained* side's own angle (if
- * available, from a constant or its own area() index -- previously only
- * usable when it happened to be the constant Tier 1 checked) now shrinks
- * the effective containing cap instead of being ignored: a container of
- * angle theta_a can only contain a (same-order-of-magnitude) region of
- * angle theta_b if their centres are within theta_a-theta_b of each
- * other, clamped at 0 (a contained region at least as big as the
- * container is effectively never fully inside it, under this estimate).
- * This also answers what Tier 1 could only shrug at: a constant on the
- * *contained* side with the *container* column itself having an area()
- * index now gets a real estimate instead of the flat default, because
- * the geometric question ("how often does a container like this
- * particular distribution of sizes happen to cover this one fixed
- * region") is exactly what theta_a - theta_b was already computing.
+ * "Round forty-nine" removes the single-number step: region_area_
+ * histogram() (skycell.c) now returns the *whole* histogram, and
+ * node_angles() below converts every one of its bounds to an angle
+ * instead of picking one. combine_angles_avg() then averages the
+ * selectivity formula itself over the cross product of both operands'
+ * angle sets -- exact under an equal-frequency histogram's own implicit
+ * model (each bound stands for an equal share of the rows), not a
+ * best-guess single point standing in for a population that may have no
+ * single typical member at all. A constant operand's "distribution" is
+ * just its own one exact angle, so this reduces to round forty-eight's
+ * own formula whenever the non-constant side has no matching index
+ * (folded in as a single angle of 0, point-like, exactly Tier 1's
+ * original assumption) -- another strict generalisation, not a
+ * replacement: identical output in every case round forty-eight already
+ * got right, closer to the true distribution in the cases it didn't.
+ *
+ * && sums each pair of angles across both operands' sets (two circles
+ * overlap roughly whenever their centres are within the sum of their
+ * radii) and averages area(cap of that sum)/4pi over every pair.
+ * @>/<@ need the *container* side to offer at least one angle (a
+ * constant, or a column with an area() index) to compute anything --
+ * falling back to the flat default otherwise, same rule as round forty-
+ * eight. Once it does, the *contained* side's own angle set (if any)
+ * shrinks the effective containing cap pair by pair, clamped at 0, and
+ * averaged the same way -- including, as round forty-eight's own bonus
+ * still holds, the "wrong direction" case (contained side constant,
+ * container column has an area() index) now answering a real question
+ * instead of shrugging at it.
  */
 static bool
-region_angle_est(Oid selfid, PlannerInfo *root, Node *n, double *angle)
+node_angles(Oid selfid, PlannerInfo *root, Node *n, double **angles, int *count)
 {
-	double		area;			/* steradians throughout this function */
-
 	if (IsA(n, Const))
 	{
 		sc_region	reg;
+		double	   *a;
 
 		if (((Const *) n)->constisnull)
 			return false;
 		skycell_region_from_datum(((Const *) n)->constvalue, &reg);
-		area = reg.area;
+		a = palloc(sizeof(double));
+		a[0] = acos(fmax(-1.0, fmin(1.0, 1.0 - reg.area / (2.0 * M_PI))));
 		sc_region_free(&reg);
+		*angles = a;
+		*count = 1;
+		return true;
 	}
 	else
 	{
-		/*
-		 * typical_region_area() reports whatever unit the area() SQL
-		 * function itself returns -- square degrees (skycell_area()
-		 * multiplies the steradian-valued sc_region.area by RAD2DEG
-		 * twice), not the steradians the Const branch above reads
-		 * directly off sc_region.area. Converting back here, not in
-		 * typical_region_area() itself, keeps that function's contract
-		 * ("whatever area() would return") matching the expression a
-		 * user would actually index -- CREATE INDEX ... (area(region)) --
-		 * rather than some internal-only unit nothing else uses.
-		 */
-		if (!typical_region_area(selfid, root, n, &area))
-			return false;
-		area /= RAD2DEG * RAD2DEG;
-	}
+		double	   *areas;		/* square degrees, region_area_histogram()'s
+								 * own unit -- see that function's header
+								 * comment for why not steradians */
+		int			n_areas;
 
-	*angle = acos(fmax(-1.0, fmin(1.0, 1.0 - area / (2.0 * M_PI))));
-	return true;
+		if (!region_area_histogram(selfid, root, n, &areas, &n_areas))
+			return false;
+		for (int i = 0; i < n_areas; i++)
+		{
+			double		area_sr = areas[i] / (RAD2DEG * RAD2DEG);
+
+			areas[i] = acos(fmax(-1.0, fmin(1.0, 1.0 - area_sr / (2.0 * M_PI))));
+		}
+		*angles = areas;		/* same buffer, now holding angles */
+		*count = n_areas;
+		return true;
+	}
 }
 
 /* area(cap of this angular radius)/4pi, clamped to a sane selectivity range */
@@ -1293,25 +1301,56 @@ cap_frac(double angle)
 	return fmin(1.0, fmax((1.0 - cos(angle)) / 2.0, 1e-12));
 }
 
-/* backs &&(skyregion,skyregion): symmetric, combine both sides' angles */
+/*
+ * cap_frac(a[i] +/- b[j]), averaged over every pair -- a's or b's own
+ * angle set standing in for "unknown" (no constant, no area() index) is
+ * a single 0 (point-like), not zero pairs, so an entirely-unknown
+ * operand degrades to exactly the other operand's own area(.)/4pi
+ * rather than to no estimate at all.
+ */
+static double
+combine_angles_avg(double *a, int na, double *b, int nb, bool subtract)
+{
+	double		zero = 0.0;
+	double		sum = 0;
+
+	if (na == 0)
+	{
+		a = &zero;
+		na = 1;
+	}
+	if (nb == 0)
+	{
+		b = &zero;
+		nb = 1;
+	}
+	for (int i = 0; i < na; i++)
+		for (int j = 0; j < nb; j++)
+			sum += cap_frac(subtract ? (a[i] - b[j]) : (a[i] + b[j]));
+	return sum / ((double) na * (double) nb);
+}
+
+/* backs &&(skyregion,skyregion): symmetric, average over both sides' angle sets */
 PG_FUNCTION_INFO_V1(skycell_region_overlap_sel);
 Datum
 skycell_region_overlap_sel(PG_FUNCTION_ARGS)
 {
 	PlannerInfo *root = (PlannerInfo *) PG_GETARG_POINTER(0);
 	List	   *args = (List *) PG_GETARG_POINTER(2);
-	double		a = 0,
-				b = 0;
+	double	   *a = NULL,
+			   *b = NULL;
+	int			na = 0,
+				nb = 0;
 	bool		have_a,
 				have_b;
 
 	if (list_length(args) != 2)
 		PG_RETURN_FLOAT8(1e-4);
-	have_a = region_angle_est(fcinfo->flinfo->fn_oid, root, (Node *) linitial(args), &a);
-	have_b = region_angle_est(fcinfo->flinfo->fn_oid, root, (Node *) lsecond(args), &b);
+	have_a = node_angles(fcinfo->flinfo->fn_oid, root, (Node *) linitial(args), &a, &na);
+	have_b = node_angles(fcinfo->flinfo->fn_oid, root, (Node *) lsecond(args), &b, &nb);
 	if (!have_a && !have_b)
 		PG_RETURN_FLOAT8(1e-4);
-	PG_RETURN_FLOAT8(cap_frac(a + b));
+	PG_RETURN_FLOAT8(combine_angles_avg(a, na, b, nb, false));
 }
 
 /* backs @>(skyregion,skyregion): LEFTARG is the container, RIGHTARG the contained */
@@ -1321,15 +1360,17 @@ skycell_region_covers_sel(PG_FUNCTION_ARGS)
 {
 	PlannerInfo *root = (PlannerInfo *) PG_GETARG_POINTER(0);
 	List	   *args = (List *) PG_GETARG_POINTER(2);
-	double		container,
-				contained = 0;
+	double	   *container = NULL,
+			   *contained = NULL;
+	int			ncontainer = 0,
+				ncontained = 0;
 
 	if (list_length(args) != 2)
 		PG_RETURN_FLOAT8(1e-4);
-	if (!region_angle_est(fcinfo->flinfo->fn_oid, root, (Node *) linitial(args), &container))
+	if (!node_angles(fcinfo->flinfo->fn_oid, root, (Node *) linitial(args), &container, &ncontainer))
 		PG_RETURN_FLOAT8(1e-4);
-	(void) region_angle_est(fcinfo->flinfo->fn_oid, root, (Node *) lsecond(args), &contained);
-	PG_RETURN_FLOAT8(cap_frac(container - contained));
+	(void) node_angles(fcinfo->flinfo->fn_oid, root, (Node *) lsecond(args), &contained, &ncontained);
+	PG_RETURN_FLOAT8(combine_angles_avg(container, ncontainer, contained, ncontained, true));
 }
 
 /* backs <@(skyregion,skyregion): RIGHTARG is the container, LEFTARG the contained */
@@ -1339,13 +1380,15 @@ skycell_region_covered_by_sel(PG_FUNCTION_ARGS)
 {
 	PlannerInfo *root = (PlannerInfo *) PG_GETARG_POINTER(0);
 	List	   *args = (List *) PG_GETARG_POINTER(2);
-	double		container,
-				contained = 0;
+	double	   *container = NULL,
+			   *contained = NULL;
+	int			ncontainer = 0,
+				ncontained = 0;
 
 	if (list_length(args) != 2)
 		PG_RETURN_FLOAT8(1e-4);
-	if (!region_angle_est(fcinfo->flinfo->fn_oid, root, (Node *) lsecond(args), &container))
+	if (!node_angles(fcinfo->flinfo->fn_oid, root, (Node *) lsecond(args), &container, &ncontainer))
 		PG_RETURN_FLOAT8(1e-4);
-	(void) region_angle_est(fcinfo->flinfo->fn_oid, root, (Node *) linitial(args), &contained);
-	PG_RETURN_FLOAT8(cap_frac(container - contained));
+	(void) node_angles(fcinfo->flinfo->fn_oid, root, (Node *) linitial(args), &contained, &ncontained);
+	PG_RETURN_FLOAT8(combine_angles_avg(container, ncontainer, contained, ncontained, true));
 }

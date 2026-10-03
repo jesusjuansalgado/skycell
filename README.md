@@ -377,20 +377,25 @@ out to have a real gap of its own: it assumed the *other* side of the
 clause was point-like, zero-area, which badly underestimated selectivity
 — and led to a severe planner regression — whenever the indexed column's
 own stored regions have real area (not the small-catalogue-footprint case
-0.16 was scoped for). **Fixed in `skycell` 0.17** (`GIST_REGION_DESIGN.md`'s
-"Round forty-eight"): a `CREATE INDEX ... (area(region_col))` expression
+0.16 was scoped for). A `CREATE INDEX ... (area(region_col))` expression
 index, when present, lets the planner use a real, data-driven estimate of
-the column's typical region size instead of assuming zero. Measured
-directly on the same corpus that found the regression: it's fully closed
-at large and small radii, and reduced (not eliminated) at medium radii,
-where a residual, much less frequent version persists — a generic
-PostgreSQL planner cost-model edge case (a plain Index Scan badly
-underestimating its own cost on an unclustered table) this extension
-cannot override, confirmed fixable with `SET enable_indexscan = off` if
-you want zero exposure to it. Picking one opclass explicitly per column,
-per the guidance above, is still the simplest safe default — but running
-both together, with a `CREATE INDEX ... (area(region_col))` alongside
-them, is now a much more solid option than it was.
+the column's typical region size instead of assuming zero — first with a
+single representative value (0.17, `GIST_REGION_DESIGN.md`'s "Round
+forty-eight"), then, once that left a smaller residual on mixed-scale
+columns, averaged properly over the index's whole size distribution
+instead of collapsed to one number (0.18, "Round forty-nine"). **As of
+0.18**, measured directly on the same corpus that found the original
+regression: all four radius bands land on the cheapest available plan
+with zero exceptions across 240 probes — no residual left. The one thing
+0.18 does not change: the planner's own plain-Index-Scan-vs-Bitmap-Heap-
+Scan cost model is still a generic PostgreSQL limitation this extension
+cannot override, so a sufficiently adversarial corpus could in principle
+still land close enough to that boundary to trip it; `SET enable_indexscan
+= off` remains available for anyone who wants a guarantee independent of
+estimate quality. Picking one opclass explicitly per column, per the
+guidance above, is still the simplest default — but running both
+together, with a `CREATE INDEX ... (area(region_col))` alongside them, is
+now a genuinely solid option, not just a measured-safe-enough one.
 
 For "which of my regions contain this point" specifically, a plain
 `CREATE INDEX ON t USING gin (skycell_region_moc(region))` — an ordinary

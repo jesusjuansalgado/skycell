@@ -5067,3 +5067,110 @@ this extension's reach. README's existing caveat (from round forty-seven)
 still correctly describes the overall posture -- picking one opclass
 explicitly remains the safer default -- but the magnitude of the known gap
 is now much smaller than it was.
+
+## Round forty-nine: closing the medium-band residual properly, not
+leaving it as a documented limitation
+
+Asked to address round forty-eight's own residual rather than leave it
+as "a real, generic PostgreSQL limitation this extension cannot
+override." That framing was correct about the *mechanism* (the plain-
+Index-Scan-vs-Bitmap-Heap-Scan cost tie really is outside this
+extension's reach -- confirmed again this round) but wrong to treat the
+residual as therefore unfixable: the actual lever still available is
+making the selectivity estimate feeding that cost model accurate enough
+that fewer queries land close enough to the tie to trip it at all, and
+round forty-eight's own fix left real room there.
+
+**The gap round forty-eight left**: `typical_region_area()` collapsed
+a whole column's area histogram down to one number (its median) before
+handing it to the geometry. On `round forty-seven`'s own test corpus --
+four radius bands mixed in one column *by construction*, with no single
+characteristic scale -- any one number is a poor stand-in for rows that
+don't look like it, and the column-wide median for a mixed small/medium/
+large/huge distribution sits well above what an actual "medium" row
+looks like, which is exactly why 13/60 medium probes still tripped the
+knife-edge: the single-number estimate for *those* queries specifically
+was still off by enough.
+
+**The fix**: stop collapsing the histogram at all. `region_area_
+histogram()` (`skycell.c`, replacing `typical_region_area()`) now
+returns the *whole* histogram instead of one representative value.
+`node_angles()` (`adql.c`, replacing `region_angle_est()`) converts
+every one of its bounds to an angle, not just one. `combine_angles_avg()`
+averages the selectivity formula -- `cap_frac(angle_a +/- angle_b)` --
+over the full cross product of both operands' angle sets, rather than
+evaluating it once on two single numbers. This is exact under an
+equal-frequency histogram's own implicit model (each bound represents
+an equal share of the rows), not a best guess at which single bound
+speaks for all of them -- the natural conclusion of "don't assume the
+other side has zero area," taken all the way rather than half way. A
+constant operand is just a one-element set, so this still reduces
+exactly to round forty-eight's own formula whenever the non-constant
+side has no matching `area()` index (folded in as a single angle of 0),
+and the "unknown operand" fallback is preserved by treating it as one
+angle of 0 rather than zero pairs -- an entirely-unknown operand still
+degrades to exactly the other operand's own `area(.)/4pi`, never to no
+estimate at all.
+
+**Measured on the identical corpus and methodology as rounds forty-
+seven and forty-eight** (`rc_corpus`/`rc_probe`, 60 probes/band, the
+same `rc_corpus_area` expression index, `box`/`multicap`/`both`
+conditions):
+
+| band | before (round forty-eight) | after | outliers (buffers > 1000) |
+|---|---|---|---|
+| small | 275.5 median, 0 outliers | 275.5 median, 0 outliers | 0 (unchanged -- already clean) |
+| medium | 113 median, mean 1435.3, max 6274, **13/60 outliers** | 113 median and mean, max 113 | **0/60** |
+| large | 113, 0 outliers | 113, 0 outliers | 0 (unchanged -- already clean) |
+| huge | 113, 0 outliers | 113, 0 outliers | 0 (unchanged -- already clean) |
+
+**The medium-band residual is gone**: all 60 probes in every band, under
+every condition, now land on exactly the plan their own buffers say is
+cheapest, with zero exceptions -- not a reduction in frequency this
+time, a clean sweep across all four bands simultaneously. Re-verified
+correctness against the *exact* query shape the benchmark runs (whole-
+table `&&`, not the band-restricted join an earlier check in round
+forty-seven had used by construction): brute force and indexed `&&`
+agree exactly (571,006 / 500,727 / 300,850 / 164,327 for huge/large/
+medium/small). The large totals here, incidentally, explain why even
+"small"-band queries now correctly favour a sequential scan on this
+particular corpus: with a quarter of the table's rows covering up to 89
+degrees each, even a 1-3 degree query genuinely matches a large fraction
+of the table, which the new estimate -- unlike round forty-eight's own
+single-number one -- now correctly reflects.
+
+Also re-verified the `@>`/`<@` containment path and the ordinary,
+single-characteristic-scale case (not this round's adversarial four-band
+corpus) still produce sensible, non-degenerate estimates on a realistic
+200,000-row footprints table (44 rows for `&&`, 10 for `@>`, both
+consistent with that table's actual 0.1-2.1 degree footprint range) --
+this round's fix is a strict generalisation, not a special case tuned to
+the one corpus that motivated it.
+
+**Why this was the right lever, not a workaround**: `SET enable_indexscan
+= off` (round forty-seven's own mitigation, still valid, still the
+complete answer for anyone who wants zero exposure to this class of risk
+regardless of estimate quality) sidesteps the cost-tie mechanism
+entirely. This round instead shrank how often an estimate lands close
+enough to that tie to matter, by using more of the real statistics
+already available rather than compressing them into one number first.
+Both are legitimate; this one was available, used data already being
+read for a different purpose (round forty-eight's own index), and left
+no case worse off than before (the cross-product average is a strict
+generalisation, confirmed by the small/large/huge bands' numbers not
+moving at all).
+
+**Shipped as skycell 0.18** (`ext/sql/skycell--0.18.sql`,
+`skycell--0.17--0.18.sql`) -- same operator signatures as 0.17, the
+backing `oprrest` functions' implementation changed; no new SQL
+objects. Verified the full `0.17 -> 0.18` upgrade chain on a fresh
+database. `make installcheck` passes.
+
+**STATUS**: the medium-band residual round forty-eight left as a
+documented limitation is closed, not just mitigated. Combined with
+round forty-eight's own large/huge fix and small's side-effect fix, all
+four radius bands in round forty-seven's original corpus now land on
+the cheapest available plan with zero exceptions across 240 probes.
+`SET enable_indexscan = off` remains available for anyone who wants a
+guarantee independent of estimate quality, but is no longer needed to
+avoid the specific regression these three rounds chased.
