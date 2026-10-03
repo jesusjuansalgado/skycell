@@ -4800,3 +4800,103 @@ now has an accurate selectivity signal to choose from -- that combined
 choice has not yet been measured end-to-end against real footprint data
 at the scale round forty-two's own box-vs-multi-cap crossover was
 measured at.
+
+## Round forty-seven: running both region opclasses together, measured --
+a mixed result, not the clean crossover round forty-six predicted
+
+Round forty-six's closing note said the combined choice "has not yet
+been measured end-to-end." Measured it directly: both
+`skyregion_box_gist_ops` and `skyregion_gist_ops` built on the same
+column of a fresh 12,000-row corpus (3,000 rows/band, radius-stratified
+the same way round forty-two's own large-radius addendum was: small
+1-3deg, medium 20-40, large 60-80, huge 85-89, uniform-on-sphere
+centres), 60 independently-sampled probe circles per band. Correctness
+first, as always: `intersects()` brute force vs the indexed `&&` agreed
+exactly in every band (204 / 46,985 / 158,934 / 179,465 matches for
+small/medium/large/huge) before trusting any buffer number.
+
+Then, per band, three conditions measured for all 60 probes each
+(`box` only, `multicap` only -- each via `UPDATE pg_index SET indisvalid`,
+not a drop/rebuild -- and `both` valid, the planner's free choice),
+comparing the free choice's buffers against whichever forced condition
+was actually cheaper for that exact query:
+
+| band | box median buffers | multicap median buffers | planner's free choice | correct? |
+|---|---|---|---|---|
+| small | 3267.5 | **2795.0** | box (matches the `box`-only column exactly, every probe) | **no** -- picks the ~17% more expensive one, consistently |
+| medium | **312.0** | 535.5 | box | yes |
+| large | 113 (median; mean 2316 -- see below) | 113 | box/multicap tied at seq scan for most probes | mostly yes, with a sharp exception |
+| huge | 113 | 113 | seq scan (index not used in any condition) | yes |
+
+**Small: not a subtle miss.** Every one of 60 probes, under `both`,
+reproduced the `box`-only column's number exactly -- the planner always
+picks box at this radius in this corpus, even on the probes (the
+majority) where multicap was measurably cheaper (e.g. 2890 vs 3737,
+2800 vs 3629, consistent across probes, not noise: these are warm
+buffer counts against GiST indexes neither toggle nor query touches
+physically, so they're deterministic by construction). Round forty-two's
+own "small: box wins" finding doesn't straightforwardly reproduce here
+reversed -- what reproduces instead is that the planner has no way to
+prefer the one that's actually cheaper either way, because both
+indexes' cost estimates are built from the *same* externally-supplied
+selectivity (round forty-six's own fix) and PostgreSQL's generic
+`gistcostestimate`, which has no notion of "opclass A's recheck rejects
+more false positives than opclass B's at this radius" -- the one real
+difference round forty-two's own numbers are actually about. Giving the
+planner an accurate *radius* signal was never going to give it an
+accurate *recheck-rate* signal; those are different things, and only
+the first was in scope for round forty-six's "Tier 1."
+
+**Large: a real, separate planner edge case, exposed, not caused, by
+having two closely-costed options.** The band-level median (113) hides
+a sharp split: roughly 40% of the 60 probes, under `box` or `both`,
+chose a *plain* `Index Scan` on `rc_corpus_box` touching **9,293 buffers**
+-- not a typo, confirmed directly on probe 11's exact circle -- against
+a plain sequential scan's 113-128. Diagnosed, not guessed: `SET
+enable_indexscan = off` on the identical query collapses that same probe
+to a `Bitmap Heap Scan` over the *same* `rc_corpus_box` index at 319
+buffers, 29x fewer. The planner's own cost estimate for the two paths was
+a near-tie (259.46 for the plain Index Scan vs 267.51 for the Bitmap
+Heap Scan) -- a generic PostgreSQL blind spot, not a bug in this
+extension or its new selectivity functions: a plain Index Scan's cost
+model doesn't account for revisiting the same heap page many times when
+a large number of matches are scattered across an unclustered table
+(exactly what this synthetic corpus is -- rows in generation order, not
+sorted by region). Multicap's own cost estimate at this same radius
+happened to land safely on the seq-scan side of that knife-edge instead,
+which is *why* the band-level numbers read as "mostly fine" rather than
+"uniformly broken" -- not because multicap's cost model is better
+calibrated, but because of where its estimate happens to fall relative
+to a threshold neither opclass's cost function is actually reasoning
+about. This specific failure mode predates this round and isn't
+specific to the box opclass -- any two GiST options whose cost estimates
+land close together near this boundary could trigger it -- but having
+*two* indexable options on the same clause is what gives the planner
+the opportunity to pick the worse side of that knife-edge at all; with
+only one opclass present, there's no choice to get wrong here, only the
+option that exists.
+
+**What this means for the originally-asked question.** Creating both
+opclasses on the same column and letting the planner choose is not a
+clean drop-in replacement for the documented per-column choice yet: it
+gets the headline direction right at medium and the no-index-needed
+case right at huge, but picks the measurably worse opclass consistently
+at small (a mild, ~17% cost, not correctness-threatening) and is exposed
+to a sharp, severe regression at large through a generic planner edge
+case unrelated to either opclass's own correctness. `SET enable_indexscan
+= off` is a workable, low-cost mitigation for the second problem (confirmed
+directly above) if someone wants to run both opclasses together today;
+there is no equivalently cheap mitigation yet for the first (small-band)
+one, since it would need the planner to know something about relative
+recheck rates that round forty-six's fix was never meant to supply.
+
+**STATUS**: measured, documented, nothing shipped this round. README's
+"both opclasses can also coexist... and the planner picks between them
+per query" (added alongside round forty-six) is accurate as far as it
+goes -- it does pick, automatically, in response to real selectivity --
+but should not be read as "and it always picks correctly": this round's
+own numbers are the honest caveat that sentence was missing. Keeping
+both opclasses registered but choosing one explicitly per column, per
+the existing README guidance, remains the safer default until either the
+small-band gap or the large-band knife-edge has an actual fix, not just
+a measured workaround.

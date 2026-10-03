@@ -364,16 +364,26 @@ caveat as the default opclass above applies, with less scrutiny behind
 it (this opclass is new; the default one has had forty-plus rounds of
 hardening).
 
-Both opclasses can also coexist on the same column — `CREATE INDEX` both,
-and PostgreSQL's ordinary cost-based planner picks between them per query,
-the same way it already does for `skypos_spgist_ops` and `skypos_cap_gist_ops`
-on a point column. That needs the region-region `&&`/`@>`/`<@` operators'
-selectivity estimates to actually reflect the query's own region size,
-which they didn't until `skycell` 0.16 (they used PostgreSQL's generic,
-radius-blind `areasel`/`contsel` defaults until then — see
-`GIST_REGION_DESIGN.md`'s "Round forty-six"); on 0.16 or later, letting
-both opclasses compete per query is a real option, not just a per-column
-choice.
+Both opclasses can also coexist on the same column — `CREATE INDEX` both —
+and PostgreSQL's ordinary cost-based planner will pick between them per
+query, the same way it already does for `skypos_spgist_ops` and
+`skypos_cap_gist_ops` on a point column. That needs the region-region
+`&&`/`@>`/`<@` operators' selectivity estimates to actually reflect the
+query's own region size, which they didn't until `skycell` 0.16 (they used
+PostgreSQL's generic, radius-blind `areasel`/`contsel` defaults until then
+— see `GIST_REGION_DESIGN.md`'s "Round forty-six"). **Measured directly on
+0.16** (`GIST_REGION_DESIGN.md`'s "Round forty-seven"), though, and the
+combined choice is not yet reliable enough to recommend over picking one
+opclass explicitly per column: it picks the right one at medium radii, but
+the measurably worse one consistently at small radii (a mild cost, not a
+correctness problem), and on a minority of large-radius queries it can hit
+a severe regression — a generic PostgreSQL planner cost-model edge case
+(a plain Index Scan badly underestimating its own cost on an unclustered
+table), exposed by having two similarly-costed indexable options rather
+than caused by either opclass. `SET enable_indexscan = off` was confirmed
+to fix that specific case if you want to try running both anyway. Picking
+one opclass explicitly per column, per the guidance above, stays the safer
+default for now.
 
 For "which of my regions contain this point" specifically, a plain
 `CREATE INDEX ON t USING gin (skycell_region_moc(region))` — an ordinary
