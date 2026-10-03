@@ -4705,3 +4705,98 @@ regression this round measured as reachable is closed -- while the
 exactly as before the cap, confirming the cap sits where intended rather
 than clamping away the scaling's actual benefit. `shared_buffers` and
 `cat_pos_spgist` restored afterward; `make installcheck` passes.
+
+## Round forty-six: the same selectivity bug, on the region-region
+operators -- "Tier 1" of letting skyregion_box_gist_ops and
+skyregion_gist_ops compete automatically
+
+Asked whether `skyregion_box_gist_ops` (round forty-two's box opclass)
+could fall back to `skyregion_gist_ops` (the default multi-cap opclass)
+the same way the B-tree rewrite falls back to a GiST-family index for
+points. Unlike that case, no custom gate is needed here at all: both are
+ordinary GiST opclasses on the same operators, so creating both indexes
+on the same `skyregion` column and letting PostgreSQL's own cost-based
+planner choose per query should already work -- *if* the operators'
+selectivity estimates are accurate enough to drive that choice. They
+were not: `&&`, `@>`, `<@` between two `skyregion` values were still
+declared `RESTRICT = areasel`/`contsel`, PostgreSQL's generic, radius-
+blind defaults -- the exact same bug round forty-three found and fixed
+for `<@(skypos,skyregion)`, just never ported to this family of
+operators.
+
+**The fix**, reusing round forty-three's own machinery rather than
+inventing a new mechanism: three new `oprrest`-shaped C functions
+(`skycell_region_overlap_sel`, `skycell_region_covers_sel`,
+`skycell_region_covered_by_sel`, `ext/src/adql.c`, next to
+`skycell_pos_region_sel`/`skycell_region_pos_sel`), assigned via
+`ALTER OPERATOR ... SET (RESTRICT = ...)`. Confirmed first, the same way
+as before: none of `skycell_region_overlap`/`_covers`/`_covered_by` has a
+`SUPPORT` clause, so there was no dead-code risk to rule out, just a
+straight `RESTRICT` swap. Each reuses `skycell_pos_region_sel`'s own
+"round one" formula -- `area(region)/4pi`, a uniform-sky estimate -- via
+a shared helper, `region_area_sel()`, applied to whichever operand is a
+compile-time `Const`.
+
+`&&` is symmetric (overlap doesn't care which side is "the query"), so
+either operand being constant gives a usable estimate; `region_area_sel()`
+is tried on the left first, falling back to the right. `@>`/`<@` are not
+symmetric: the ratio only answers the right question when the
+*container* side is the constant one (`@>`'s LEFTARG, `<@`'s RIGHTARG) --
+a constant on the *contained* side instead asks "how many of the table's
+regions contain this one," a different question the same ratio does not
+answer, so that direction keeps the flat default (1e-4, this file's
+existing "no better guess" convention) rather than apply it backwards.
+
+Verified directly against a 200,000-row synthetic `footprints` table
+(uniform random circles, radius 0.1-2.1 degrees, GiST on `region`),
+checking the planner's own row estimate against the hand-computed
+`area/4pi` value, not just that *a* number changed:
+
+| query | constant region area | expected rows (area/4pi x 200000) | `EXPLAIN` estimate |
+|---|---|---|---|
+| `region && circle(0.5deg)` | 2.4e-4 sr | 4 | **4** |
+| `region && circle(60deg)` | pi sr | 50000 | **50000** |
+| `circle(90deg) @> region` (container constant, correct direction) | 2pi sr | 100000 | **100000** |
+| `region <@ circle(60deg)` (container constant, correct direction) | pi sr | 50000 | **50000** |
+| `region @> circle(0.5deg)` (contained constant, wrong direction) | -- | flat default (20) | **20** |
+| `circle(0.5deg) <@ region` (contained constant, wrong direction) | -- | flat default (20) | **20** |
+
+The last two confirm the asymmetry handling: the wrong-direction cases
+correctly decline to apply `area/4pi` (which would have given 4, not 20,
+had it been misapplied) and fall back to the same flat default as before
+this round -- not a regression, a deliberate "don't guess" choice. The
+very last row also confirms, incidentally, that PostgreSQL's own
+commutator rewrite collapses `circle <@ region` into `region @> circle`
+before selectivity is ever consulted, landing on the identical
+fallback path as the direct `@>` wrong-direction case.
+
+Shipped as `skycell` 0.16 (`ext/sql/skycell--0.16.sql`,
+`skycell--0.15--0.16.sql`) -- pure selectivity functions, no new opclass,
+no catalog structure change. Verified the full `0.15 -> 0.16` upgrade
+chain on a fresh database and `make installcheck` on the fresh-install
+path; both clean.
+
+**What this does not do, by design (the Tier-1/Tier-2 split).** This has
+no analogue to `region_pos_density_sel()`'s own later round, which reads
+a real point-density histogram when a `skycell_cell(pos)` expression
+index exists instead of assuming uniformity. There is no equivalent
+statistics source for regions -- a histogram of the sizes and sky
+positions of the regions actually *stored* in a column -- so this stays
+a uniform-sky estimate throughout, same as round forty-three's own first
+round was before its density-aware refinement. The natural follow-up
+would reuse `density_for_expr()`'s own trick (reading whatever `ANALYZE`
+histogram already exists on a plain expression index -- `area(region_col)`,
+say -- the same way the point case piggybacks on a `skycell_cell(pos)`
+expression index) rather than a new `typanalyze` for `skyregion` from
+scratch, but that is a separate, bigger round, not bundled into this one.
+
+**STATUS**: shipped, correctness-verified by hand-computed row estimates
+against four real query shapes and two deliberate-fallback shapes, not
+just "the planner did something different." Enables, but does not by
+itself demonstrate, the originally-asked-about goal: creating both
+`skyregion_gist_ops` and `skyregion_box_gist_ops` on the same column and
+letting the ordinary cost-based planner choose between them per query
+now has an accurate selectivity signal to choose from -- that combined
+choice has not yet been measured end-to-end against real footprint data
+at the scale round forty-two's own box-vs-multi-cap crossover was
+measured at.

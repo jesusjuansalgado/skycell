@@ -1180,3 +1180,97 @@ skycell_region_pos_sel(PG_FUNCTION_ARGS)
 	PG_RETURN_FLOAT8(region_pos_density_sel(fcinfo->flinfo->fn_oid, root,
 											 (Node *) lsecond(args), (Node *) linitial(args)));
 }
+
+/*
+ * Selectivity for the region-region operators (&&, @>, <@ between two
+ * skyregion values) -- the same bug as skycell_pos_region_sel/
+ * skycell_region_pos_sel above, on a different set of operators:
+ * skycell_region_overlap/_covers/_covered_by are declared with
+ * RESTRICT = areasel/contsel, PostgreSQL's generic, radius-blind
+ * defaults, which cost a query region's own size out of the estimate
+ * entirely. The fix is the same shape -- an oprrest-shaped RESTRICT
+ * function, since none of these three backing functions has (or could
+ * usefully have) a SUPPORT clause consulted for selectivity, same rule
+ * as before -- reusing skycell_pos_region_sel's own "round one" formula:
+ * area(region)/4pi, a uniform-sky estimate, for whichever operand is a
+ * compile-time constant and the question that ratio actually answers.
+ *
+ * && is symmetric (overlap doesn't care which side is "the query"), so
+ * either operand being constant gives a usable estimate; this checks the
+ * left first, falling back to the right only when the left isn't one.
+ * @>/<@ are not symmetric: area(a)/4pi answers "how much of the sky does
+ * a cover", which is the right question only when a is the *container*
+ * (@>'s LEFTARG, <@'s RIGHTARG) and the query is implicitly "how often
+ * does a container this size happen to cover whatever's in the contained
+ * side's column". A constant on the *contained* side instead asks "how
+ * many of the table's regions contain this one", a genuinely different
+ * question area/4pi does not answer -- that case keeps the flat default
+ * rather than apply the wrong ratio.
+ *
+ * No region-size statistics exist to improve on this, the way
+ * region_pos_density_sel()'s own "round two" improves on its matching
+ * uniform-sky fallback using a point density map: there is nothing here
+ * analogous to that map (a histogram of the sizes and sky positions of
+ * the regions actually stored in a column), so this is deliberately only
+ * as good as skycell_pos_region_sel's *own* first round was, not a claim
+ * of parity with its current, density-aware state. See
+ * GIST_REGION_DESIGN.md for the follow-up this would take.
+ */
+static double
+region_area_sel(Node *rg)
+{
+	sc_region	reg;
+	double		s;
+
+	if (!IsA(rg, Const) || ((Const *) rg)->constisnull)
+		return -1;				/* not usable: caller falls back to the flat default */
+
+	skycell_region_from_datum(((Const *) rg)->constvalue, &reg);
+	s = fmin(1.0, fmax(reg.area / (4.0 * M_PI), 1e-12));
+	sc_region_free(&reg);
+	return s;
+}
+
+/* backs &&(skyregion,skyregion): symmetric, either side may be constant */
+PG_FUNCTION_INFO_V1(skycell_region_overlap_sel);
+Datum
+skycell_region_overlap_sel(PG_FUNCTION_ARGS)
+{
+	List	   *args = (List *) PG_GETARG_POINTER(2);
+	double		s;
+
+	if (list_length(args) != 2)
+		PG_RETURN_FLOAT8(1e-4);
+	s = region_area_sel((Node *) linitial(args));
+	if (s < 0)
+		s = region_area_sel((Node *) lsecond(args));
+	PG_RETURN_FLOAT8(s < 0 ? 1e-4 : s);
+}
+
+/* backs @>(skyregion,skyregion): LEFTARG (skycell_region_covers's 'a') is the container */
+PG_FUNCTION_INFO_V1(skycell_region_covers_sel);
+Datum
+skycell_region_covers_sel(PG_FUNCTION_ARGS)
+{
+	List	   *args = (List *) PG_GETARG_POINTER(2);
+	double		s;
+
+	if (list_length(args) != 2)
+		PG_RETURN_FLOAT8(1e-4);
+	s = region_area_sel((Node *) linitial(args));
+	PG_RETURN_FLOAT8(s < 0 ? 1e-4 : s);
+}
+
+/* backs <@(skyregion,skyregion): RIGHTARG (skycell_region_covered_by's 'b') is the container */
+PG_FUNCTION_INFO_V1(skycell_region_covered_by_sel);
+Datum
+skycell_region_covered_by_sel(PG_FUNCTION_ARGS)
+{
+	List	   *args = (List *) PG_GETARG_POINTER(2);
+	double		s;
+
+	if (list_length(args) != 2)
+		PG_RETURN_FLOAT8(1e-4);
+	s = region_area_sel((Node *) lsecond(args));
+	PG_RETURN_FLOAT8(s < 0 ? 1e-4 : s);
+}

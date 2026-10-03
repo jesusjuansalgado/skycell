@@ -364,6 +364,17 @@ caveat as the default opclass above applies, with less scrutiny behind
 it (this opclass is new; the default one has had forty-plus rounds of
 hardening).
 
+Both opclasses can also coexist on the same column — `CREATE INDEX` both,
+and PostgreSQL's ordinary cost-based planner picks between them per query,
+the same way it already does for `skypos_spgist_ops` and `skypos_cap_gist_ops`
+on a point column. That needs the region-region `&&`/`@>`/`<@` operators'
+selectivity estimates to actually reflect the query's own region size,
+which they didn't until `skycell` 0.16 (they used PostgreSQL's generic,
+radius-blind `areasel`/`contsel` defaults until then — see
+`GIST_REGION_DESIGN.md`'s "Round forty-six"); on 0.16 or later, letting
+both opclasses compete per query is a real option, not just a per-column
+choice.
+
 For "which of my regions contain this point" specifically, a plain
 `CREATE INDEX ON t USING gin (skycell_region_moc(region))` — an ordinary
 PostgreSQL GIN index over the array `skycell_region_moc()` already returns, no
