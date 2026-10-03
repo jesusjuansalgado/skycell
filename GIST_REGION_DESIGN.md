@@ -5325,3 +5325,21 @@ does the pathology reappear) is already answered cleanly by the plan-
 choice and buffer-count data, which carries no such caveat.
 
 Indexes restored to valid afterward; `make installcheck` passes.
+
+**Second follow-up, same round: the two warm comparison tables the cold
+regenerations above were always meant to sit next to.** `warm_probe_v2`
+(round forty-four's "what happens without a cold buffer" direct
+comparison -- the identical qid 10001-11456 query set as `cold_probe_v2`,
+run with no restart) and `rc_results` (rounds forty-seven through
+forty-nine's own warm `box`/`multicap`/`both` table) hadn't been
+regenerated after the rebuild; both now are. Checked against their cold
+counterparts rather than just assumed correct: `warm_probe_v2` reproduces
+round forty-four's own cold/warm structure exactly -- warm is faster at
+every radius, by a wide margin at small radii (85.99ms cold vs 0.28ms
+warm at 1", ~307x) narrowing but never closing at large ones (155.32ms
+cold vs 25.21ms warm at 3 degrees, ~6.2x, since a larger radius touches
+proportionally more pages that are cold regardless of overall cache
+state); `rc_results` reproduces round forty-nine's exact warm outcome,
+zero outliers in every band, `box` winning at `small`, sequential scans
+elsewhere, matching `rc_cold_results` in everything but raw timing.
+`make installcheck` passes.
