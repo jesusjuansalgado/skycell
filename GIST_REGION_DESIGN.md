@@ -5527,3 +5527,46 @@ identical shape, a full `skycell_region_from_datum()` rebuild of the
 region argument on every point tested, for exactly the same reason this
 round just fixed. Not touched here because it was outside what was asked
 this round; flagged for a follow-up.
+
+**Follow-up, same round: fixed `pos_in_region()` too.** It backs
+`skycell_contains`/`skycell_pos_in_region`/`skycell_region_has_pos`/
+`skycell_pos_in_region_sel`/`skycell_intersects_pos` -- the ADQL `CONTAINS`
+point form, `<@`/`@>` on `(skypos, skyregion)`, and `INTERSECTS(point,
+region)` -- and had the identical bug: a full `skycell_region_from_datum()`
+rebuild of the region argument on *every point tested*, typically the
+*same* region across a whole scan (one constant circle tested against
+many points, the normal shape of a cone search).
+
+Same two-part fix, reusing the exact machinery just built for
+`region_region()` rather than duplicating it: `pos_in_region()` now takes
+the calling `FunctionCallInfo` and fetches its region argument through
+`cached_region_arg()` (adql.c), the same `fn_extra` cache keyed on the
+argument's bytes; the five wrapper functions above now pass `fcinfo`
+through. `cached_region_arg()` and its backing structs moved earlier in
+adql.c, above `pos_in_region()`, purely so both call sites could share one
+implementation -- no behaviour change from the move itself.
+
+Measured the same way as the standalone numbers above, since this shape
+(N points against one constant region) is exactly what a standalone
+microbenchmark can isolate cleanly, unlike a real query against a 10M-row
+table on this container (whose OS page cache would not stay warm between
+runs, adding I/O noise that swamped the signal when tried directly):
+500,000 points against one constant region, 413.9ns/point before (full
+build every row) vs 30.8ns/point after (lite build once, reused) -- a
+~13.4x reduction in the raw construction-and-test cost. The end-to-end
+per-row win inside a real query is smaller once normal executor/
+function-call overhead is added back in, but it is the same mechanism
+already measured end-to-end on the region-region crossover above.
+
+Correctness re-checked, not assumed: a fresh brute-force angular-distance
+check (`2*asin(sqrt(haversine(...)))`  <=  radius, never run against
+`contains()` before) against a synthetic 500,000-point table, exact match
+(890 = 890); the `<@`, `@>` and `intersects()` operator spellings checked
+the same way, all three also exact (890 each). `make installcheck` (both
+`skycell` and `adql`) passes.
+
+**STATUS**: shipped as skycell 0.20 (`ext/sql/skycell--0.19--0.20.sql`).
+No SQL-visible change, same convention as 0.19. Between 0.19 and 0.20,
+every region-region and point-region exact-test call site in adql.c now
+goes through the same lite-build-plus-cache path; nothing in that family
+is known to still pay the full covering-table cost for a plain predicate.

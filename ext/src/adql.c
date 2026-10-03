@@ -507,65 +507,30 @@ pos_vec(SkyPos *p)
 	return sc_radec2vec(p->ra, p->dec);
 }
 
-static bool
-pos_in_region(SkyPos *p, Datum region)
-{
-	sc_region	reg;
-	bool		res;
-
-	skycell_region_from_datum(region, &reg);
-	res = sc_region_contains(&reg, pos_vec(p)) != 0;
-	sc_region_free(&reg);
-	return res;
-}
-
-PG_FUNCTION_INFO_V1(skycell_pos_in_region);
-Datum
-skycell_pos_in_region(PG_FUNCTION_ARGS)
-{
-	PG_RETURN_BOOL(pos_in_region(PG_GETARG_SKYPOS(0), PG_GETARG_DATUM(1)));
-}
-
-PG_FUNCTION_INFO_V1(skycell_region_has_pos);
-Datum
-skycell_region_has_pos(PG_FUNCTION_ARGS)
-{
-	PG_RETURN_BOOL(pos_in_region(PG_GETARG_SKYPOS(1), PG_GETARG_DATUM(0)));
-}
-
-/* the exact test the rewrite appends; the last argument is a selectivity hint */
-PG_FUNCTION_INFO_V1(skycell_pos_in_region_sel);
-Datum
-skycell_pos_in_region_sel(PG_FUNCTION_ARGS)
-{
-	PG_RETURN_BOOL(pos_in_region(PG_GETARG_SKYPOS(0), PG_GETARG_DATUM(1)));
-}
-
-PG_FUNCTION_INFO_V1(skycell_contains);
-Datum
-skycell_contains(PG_FUNCTION_ARGS)
-{
-	PG_RETURN_INT32(pos_in_region(PG_GETARG_SKYPOS(0), PG_GETARG_DATUM(1)) ? 1 : 0);
-}
-
 /*
- * region_region()'s own per-argument cache, one slot per argument position.
- * A plain two-argument predicate like this has no fixed "query" side the
- * way a GiST/SP-GiST support function does -- either argument, or both, can
- * be the same value across a run of calls (a cross join's outer row, a
- * literal probe region in a WHERE clause) -- so both get a slot, and
- * whichever side turns out constant is the one that stops paying to
- * rebuild.  If neither side repeats, this costs one extra memcmp per call
- * and nothing is worse off than before.
+ * A shared per-region-argument cache, one slot per argument position, used
+ * by every plain two-argument region predicate below (point-in-region and
+ * region-region alike): keyed on byte content, not pointer identity, for
+ * exactly the reason spg_cached_region (spgist_region.c, the same fix for
+ * the SP-GiST support functions) already documented there -- a short-lived
+ * per-tuple memory context is reset and reused across calls, so two
+ * genuinely different rows' region datums can legitimately land at the
+ * same address. fn_extra lives in fn_mcxt for the query's duration, so the
+ * cached sc_region (and any poly v[]/n[] it owns) has to live there too,
+ * not in the per-tuple context the argument datum itself arrived in.
  *
- * Keyed on byte content, not pointer identity, for exactly the reason
- * spg_cached_region (spgist_region.c, same fix for the SP-GiST support
- * functions) already documented there: a short-lived per-tuple memory
- * context is reset and reused across calls, so two genuinely different
- * rows' region datums can legitimately land at the same address. fn_extra
- * lives in fn_mcxt for the query's duration, so the cached sc_region (and
- * any poly v[]/n[] it owns) has to live there too, not in the per-tuple
- * context the argument datum itself arrived in.
+ * Built with two slots, not one keyed on a fixed "query" side, because
+ * unlike a GiST/SP-GiST support function, a plain predicate has no fixed
+ * constant argument position -- either argument, or both, can be the same
+ * value across a run of calls (a cross join's outer row, a literal region
+ * in a WHERE clause), and whichever one does is the one that stops paying
+ * to rebuild. A point-in-region caller below only ever uses slot 0 (there
+ * is only one region argument to cache); region_region() below uses both.
+ * The lite build (skycell_region_from_datum_lite(), skipping the 30-level
+ * out_c2[]/in_c2[]/sin_rho[] table sc_region_classify_cap() alone reads)
+ * is always safe here: nothing cached through this function ever reaches
+ * an index descent or covering, only sc_region_contains()/
+ * sc_region_contains_region()/sc_region_overlaps().
  */
 typedef struct
 {
@@ -615,6 +580,43 @@ cached_region_arg(FunctionCallInfo fcinfo, int argno, Datum arg_datum)
 	return &slot->reg;
 }
 
+static bool
+pos_in_region(FunctionCallInfo fcinfo, SkyPos *p, Datum region)
+{
+	sc_region *reg = cached_region_arg(fcinfo, 0, region);
+
+	return sc_region_contains(reg, pos_vec(p)) != 0;
+}
+
+PG_FUNCTION_INFO_V1(skycell_pos_in_region);
+Datum
+skycell_pos_in_region(PG_FUNCTION_ARGS)
+{
+	PG_RETURN_BOOL(pos_in_region(fcinfo, PG_GETARG_SKYPOS(0), PG_GETARG_DATUM(1)));
+}
+
+PG_FUNCTION_INFO_V1(skycell_region_has_pos);
+Datum
+skycell_region_has_pos(PG_FUNCTION_ARGS)
+{
+	PG_RETURN_BOOL(pos_in_region(fcinfo, PG_GETARG_SKYPOS(1), PG_GETARG_DATUM(0)));
+}
+
+/* the exact test the rewrite appends; the last argument is a selectivity hint */
+PG_FUNCTION_INFO_V1(skycell_pos_in_region_sel);
+Datum
+skycell_pos_in_region_sel(PG_FUNCTION_ARGS)
+{
+	PG_RETURN_BOOL(pos_in_region(fcinfo, PG_GETARG_SKYPOS(0), PG_GETARG_DATUM(1)));
+}
+
+PG_FUNCTION_INFO_V1(skycell_contains);
+Datum
+skycell_contains(PG_FUNCTION_ARGS)
+{
+	PG_RETURN_INT32(pos_in_region(fcinfo, PG_GETARG_SKYPOS(0), PG_GETARG_DATUM(1)) ? 1 : 0);
+}
+
 static int
 region_region(PG_FUNCTION_ARGS, bool contains)
 {
@@ -644,7 +646,7 @@ Datum
 skycell_intersects_pos(PG_FUNCTION_ARGS)
 {
 	/* a point has no area: intersecting one is being contained in it */
-	PG_RETURN_INT32(pos_in_region(PG_GETARG_SKYPOS(0), PG_GETARG_DATUM(1)) ? 1 : 0);
+	PG_RETURN_INT32(pos_in_region(fcinfo, PG_GETARG_SKYPOS(0), PG_GETARG_DATUM(1)) ? 1 : 0);
 }
 
 PG_FUNCTION_INFO_V1(skycell_region_overlap);
