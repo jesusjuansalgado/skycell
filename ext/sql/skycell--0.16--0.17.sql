@@ -1,0 +1,56 @@
+\echo Use "ALTER EXTENSION skycell UPDATE TO '0.17'" to load this file. \quit
+
+-- No new SQL objects: this version tracks a C-level fix to the
+-- region-region selectivity functions 0.16 shipped
+-- (skycell_region_overlap_sel/_covers_sel/_covered_by_sel,
+-- ext/src/adql.c), same names and signatures, corrected implementation.
+--
+-- GIST_REGION_DESIGN.md's "Round forty-seven" measured those functions'
+-- "Tier 1" formula (area(const)/4pi, assuming the *other* side of the
+-- operator is point-like) underestimating a region-region overlap's true
+-- selectivity by 2.2x whenever the indexed column's own stored regions
+-- have non-negligible area -- not a small-magnitude miss: on a corpus
+-- with large stored regions, it led the planner into a severe, confirmed
+-- plan regression (a plain Index Scan touching 9,293 buffers against
+-- 319 for a Bitmap Heap Scan over the identical index, for the identical
+-- query).
+--
+-- "Round forty-eight" fixes the root cause: a new function,
+-- typical_region_area() (skycell.c), looks for a plain
+-- `CREATE INDEX ... (area(region_col))` expression index and, when one
+-- exists with ANALYZE statistics, returns a real, data-driven estimate
+-- of that column's typical stored region size instead of assuming zero.
+-- region_angle_est() (adql.c) uses it for whichever operand isn't a
+-- compile-time constant, converting both operands' effective area into
+-- an angular radius and combining them geometrically (summed for &&,
+-- subtracted for @>/<@'s container-minus-contained) -- a strict
+-- generalisation of the 0.16 formula: identical output when no such
+-- index exists anywhere (exactly 0.16's own behaviour), measurably more
+-- accurate when one does.
+--
+-- Measured directly, not just by inspection: with a
+-- `CREATE INDEX ... (area(region_col))` present, the large-radius
+-- regression above closes completely (519 then 60 repeated probes, 0
+-- occurrences of the pathological plain Index Scan plan in either the
+-- "large" or "huge" radius band, both now uniformly matching the
+-- actual-cheapest plan) and a related, previously-undiagnosed issue
+-- inside round forty-seven's own "small" radius finding resolves as a
+-- side effect (both forced-opclass conditions now agree on using a
+-- Bitmap Heap Scan, the apples-to-apples comparison Tier 1's own
+-- selectivity inaccuracy was preventing, which was masking box's real,
+-- round-forty-two-consistent advantage at that radius). A smaller,
+-- residual version of the same *class* of risk (a plain Index Scan
+-- occasionally winning a near-tied cost estimate against a Bitmap Heap
+-- Scan on the same index) persists at medium radii on ~22% of probes in
+-- that same test corpus (down from ~40% at large radii before this fix)
+-- -- a real, generic PostgreSQL planner limitation this extension cannot
+-- remove (GiST's cost estimator is fixed at the access-method level, not
+-- overridable per opclass), confirmed by `SET enable_indexscan = off`
+-- eliminating it regardless of selectivity accuracy. See
+-- GIST_REGION_DESIGN.md's "Round forty-eight" for the full numbers and
+-- this residual's own honest accounting.
+--
+-- Process-wide C code, independent of which extension version is
+-- CREATEd or ALTERed; there is nothing to CREATE or ALTER here. The
+-- version bump exists to give this fix a place in this file's own
+-- changelog, the same as any other shipped change.

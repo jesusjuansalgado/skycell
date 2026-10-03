@@ -1191,86 +1191,161 @@ skycell_region_pos_sel(PG_FUNCTION_ARGS)
  * entirely. The fix is the same shape -- an oprrest-shaped RESTRICT
  * function, since none of these three backing functions has (or could
  * usefully have) a SUPPORT clause consulted for selectivity, same rule
- * as before -- reusing skycell_pos_region_sel's own "round one" formula:
- * area(region)/4pi, a uniform-sky estimate, for whichever operand is a
- * compile-time constant and the question that ratio actually answers.
+ * as before.
  *
- * && is symmetric (overlap doesn't care which side is "the query"), so
- * either operand being constant gives a usable estimate; this checks the
- * left first, falling back to the right only when the left isn't one.
- * @>/<@ are not symmetric: area(a)/4pi answers "how much of the sky does
- * a cover", which is the right question only when a is the *container*
- * (@>'s LEFTARG, <@'s RIGHTARG) and the query is implicitly "how often
- * does a container this size happen to cover whatever's in the contained
- * side's column". A constant on the *contained* side instead asks "how
- * many of the table's regions contain this one", a genuinely different
- * question area/4pi does not answer -- that case keeps the flat default
- * rather than apply the wrong ratio.
+ * ROUND TWO -- region_angle_est() below replaces the original "Tier 1"
+ * area(const)/4pi estimate (GIST_REGION_DESIGN.md's "Round forty-six")
+ * with one that no longer assumes the *other* operand is point-like.
+ * "Round forty-seven" measured directly why that assumption matters: on
+ * a corpus whose own stored regions have large areas (round forty-two's
+ * own large/huge radius bands, not the small-catalogue-footprint case
+ * Tier 1 was scoped for), area(const)/4pi underestimated a 67-degree
+ * probe's true overlap fraction by 2.2x (estimated 3685 rows, actual
+ * 8085), which in turn led the planner into a severe, confirmed-by-
+ * disabling-plain-index-scans regression (9,293 buffers via a plain
+ * Index Scan against 319 via Bitmap Heap Scan on the *same* index for
+ * the *same* query) -- not an inherent, unrelated PostgreSQL cost-model
+ * blind spot as that round's own first-pass diagnosis said, but a direct
+ * consequence of this selectivity estimate being wrong by over 2x.
+ * Confirmed directly: feeding the planner a selectivity close to the
+ * true value (by hand, for that diagnosis only) made it choose the
+ * correct plan on its own.
  *
- * No region-size statistics exist to improve on this, the way
- * region_pos_density_sel()'s own "round two" improves on its matching
- * uniform-sky fallback using a point density map: there is nothing here
- * analogous to that map (a histogram of the sizes and sky positions of
- * the regions actually stored in a column), so this is deliberately only
- * as good as skycell_pos_region_sel's *own* first round was, not a claim
- * of parity with its current, density-aware state. See
- * GIST_REGION_DESIGN.md for the follow-up this would take.
+ * The fix: typical_region_area() (skycell.c) answers "what's a typical
+ * stored region's own area," the region-size analogue of
+ * region_pos_density_sel()'s point-density lookup, when a plain
+ * `CREATE INDEX ... (area(region_col))` expression index exists with
+ * ANALYZE statistics on it. region_angle_est() converts whichever
+ * information is available for a given operand -- exact, from .area,
+ * for a constant; typical_region_area()'s estimate for a plain column
+ * with such an index; otherwise "unknown" -- into an angular radius
+ * (area = 2*pi*(1-cos(theta)), inverted), and reports whether it found
+ * anything at all. && sums both operands' angles (two circles of radius
+ * theta_a, theta_b overlap roughly whenever their centres are within
+ * theta_a+theta_b of each other) and keeps the old, exact area(const)/4pi
+ * behaviour whenever the *other* side has no such index (angle 0, i.e.
+ * point-like, exactly Tier 1's own assumption) -- this is a strict
+ * generalisation of Tier 1, not a replacement of it: identical output
+ * when no area() index exists anywhere, strictly more accurate when one
+ * does.
+ *
+ * @>/<@ need the *container* side's angle specifically (LEFTARG for @>,
+ * RIGHTARG for <@) to compute anything at all -- falling back to the
+ * flat default when that side offers no information, exactly as Tier 1
+ * did for a non-constant container with nothing better available. Once
+ * the container's angle is known, the *contained* side's own angle (if
+ * available, from a constant or its own area() index -- previously only
+ * usable when it happened to be the constant Tier 1 checked) now shrinks
+ * the effective containing cap instead of being ignored: a container of
+ * angle theta_a can only contain a (same-order-of-magnitude) region of
+ * angle theta_b if their centres are within theta_a-theta_b of each
+ * other, clamped at 0 (a contained region at least as big as the
+ * container is effectively never fully inside it, under this estimate).
+ * This also answers what Tier 1 could only shrug at: a constant on the
+ * *contained* side with the *container* column itself having an area()
+ * index now gets a real estimate instead of the flat default, because
+ * the geometric question ("how often does a container like this
+ * particular distribution of sizes happen to cover this one fixed
+ * region") is exactly what theta_a - theta_b was already computing.
  */
-static double
-region_area_sel(Node *rg)
+static bool
+region_angle_est(Oid selfid, PlannerInfo *root, Node *n, double *angle)
 {
-	sc_region	reg;
-	double		s;
+	double		area;			/* steradians throughout this function */
 
-	if (!IsA(rg, Const) || ((Const *) rg)->constisnull)
-		return -1;				/* not usable: caller falls back to the flat default */
+	if (IsA(n, Const))
+	{
+		sc_region	reg;
 
-	skycell_region_from_datum(((Const *) rg)->constvalue, &reg);
-	s = fmin(1.0, fmax(reg.area / (4.0 * M_PI), 1e-12));
-	sc_region_free(&reg);
-	return s;
+		if (((Const *) n)->constisnull)
+			return false;
+		skycell_region_from_datum(((Const *) n)->constvalue, &reg);
+		area = reg.area;
+		sc_region_free(&reg);
+	}
+	else
+	{
+		/*
+		 * typical_region_area() reports whatever unit the area() SQL
+		 * function itself returns -- square degrees (skycell_area()
+		 * multiplies the steradian-valued sc_region.area by RAD2DEG
+		 * twice), not the steradians the Const branch above reads
+		 * directly off sc_region.area. Converting back here, not in
+		 * typical_region_area() itself, keeps that function's contract
+		 * ("whatever area() would return") matching the expression a
+		 * user would actually index -- CREATE INDEX ... (area(region)) --
+		 * rather than some internal-only unit nothing else uses.
+		 */
+		if (!typical_region_area(selfid, root, n, &area))
+			return false;
+		area /= RAD2DEG * RAD2DEG;
+	}
+
+	*angle = acos(fmax(-1.0, fmin(1.0, 1.0 - area / (2.0 * M_PI))));
+	return true;
 }
 
-/* backs &&(skyregion,skyregion): symmetric, either side may be constant */
+/* area(cap of this angular radius)/4pi, clamped to a sane selectivity range */
+static double
+cap_frac(double angle)
+{
+	angle = fmin(M_PI, fmax(0.0, angle));
+	return fmin(1.0, fmax((1.0 - cos(angle)) / 2.0, 1e-12));
+}
+
+/* backs &&(skyregion,skyregion): symmetric, combine both sides' angles */
 PG_FUNCTION_INFO_V1(skycell_region_overlap_sel);
 Datum
 skycell_region_overlap_sel(PG_FUNCTION_ARGS)
 {
+	PlannerInfo *root = (PlannerInfo *) PG_GETARG_POINTER(0);
 	List	   *args = (List *) PG_GETARG_POINTER(2);
-	double		s;
+	double		a = 0,
+				b = 0;
+	bool		have_a,
+				have_b;
 
 	if (list_length(args) != 2)
 		PG_RETURN_FLOAT8(1e-4);
-	s = region_area_sel((Node *) linitial(args));
-	if (s < 0)
-		s = region_area_sel((Node *) lsecond(args));
-	PG_RETURN_FLOAT8(s < 0 ? 1e-4 : s);
+	have_a = region_angle_est(fcinfo->flinfo->fn_oid, root, (Node *) linitial(args), &a);
+	have_b = region_angle_est(fcinfo->flinfo->fn_oid, root, (Node *) lsecond(args), &b);
+	if (!have_a && !have_b)
+		PG_RETURN_FLOAT8(1e-4);
+	PG_RETURN_FLOAT8(cap_frac(a + b));
 }
 
-/* backs @>(skyregion,skyregion): LEFTARG (skycell_region_covers's 'a') is the container */
+/* backs @>(skyregion,skyregion): LEFTARG is the container, RIGHTARG the contained */
 PG_FUNCTION_INFO_V1(skycell_region_covers_sel);
 Datum
 skycell_region_covers_sel(PG_FUNCTION_ARGS)
 {
+	PlannerInfo *root = (PlannerInfo *) PG_GETARG_POINTER(0);
 	List	   *args = (List *) PG_GETARG_POINTER(2);
-	double		s;
+	double		container,
+				contained = 0;
 
 	if (list_length(args) != 2)
 		PG_RETURN_FLOAT8(1e-4);
-	s = region_area_sel((Node *) linitial(args));
-	PG_RETURN_FLOAT8(s < 0 ? 1e-4 : s);
+	if (!region_angle_est(fcinfo->flinfo->fn_oid, root, (Node *) linitial(args), &container))
+		PG_RETURN_FLOAT8(1e-4);
+	(void) region_angle_est(fcinfo->flinfo->fn_oid, root, (Node *) lsecond(args), &contained);
+	PG_RETURN_FLOAT8(cap_frac(container - contained));
 }
 
-/* backs <@(skyregion,skyregion): RIGHTARG (skycell_region_covered_by's 'b') is the container */
+/* backs <@(skyregion,skyregion): RIGHTARG is the container, LEFTARG the contained */
 PG_FUNCTION_INFO_V1(skycell_region_covered_by_sel);
 Datum
 skycell_region_covered_by_sel(PG_FUNCTION_ARGS)
 {
+	PlannerInfo *root = (PlannerInfo *) PG_GETARG_POINTER(0);
 	List	   *args = (List *) PG_GETARG_POINTER(2);
-	double		s;
+	double		container,
+				contained = 0;
 
 	if (list_length(args) != 2)
 		PG_RETURN_FLOAT8(1e-4);
-	s = region_area_sel((Node *) lsecond(args));
-	PG_RETURN_FLOAT8(s < 0 ? 1e-4 : s);
+	if (!region_angle_est(fcinfo->flinfo->fn_oid, root, (Node *) lsecond(args), &container))
+		PG_RETURN_FLOAT8(1e-4);
+	(void) region_angle_est(fcinfo->flinfo->fn_oid, root, (Node *) linitial(args), &contained);
+	PG_RETURN_FLOAT8(cap_frac(container - contained));
 }

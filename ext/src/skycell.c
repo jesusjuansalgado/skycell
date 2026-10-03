@@ -904,6 +904,141 @@ density_for_expr(PlannerInfo *root, Node *arg, sc_density *d, Oid *statrel,
 }
 
 /*
+ * The region-area analogue of density_for_expr(), for the region-region
+ * operator selectivity fix (adql.c's region_angle_est(), "Round forty-
+ * eight"): given a region expression (in practice almost always a bare
+ * column), looks for a plain btree expression index on area(<that same
+ * expression>) and, if ANALYZE has run on it, returns a representative
+ * value from its histogram -- in whatever unit the SQL area() function
+ * itself returns (square degrees: skycell_area() multiplies
+ * sc_region.area, in steradians, by RAD2DEG twice), not the steradians
+ * every other caller of sc_region.area in this file works in. This
+ * function's contract is "whatever area() would return for this
+ * expression," matching the index a user would actually write
+ * (CREATE INDEX ... (area(region_col))), not an internal-only unit
+ * nothing else here uses; converting back to steradians is the caller's
+ * job (region_angle_est() does it), not this function's.
+ *
+ * Deliberately a separate, simpler function rather than a generalisation
+ * of density_for_expr(): that function's statistics are a *point*-density
+ * model (a histogram of cell-id boundaries, optionally refined by
+ * skycell_density_build()'s own multi-order count map) -- meaningless for
+ * a plain distribution of float8 area values, which is all ANALYZE ever
+ * needs to have built for an ordinary expression index, no custom
+ * density map involved. No caching across calls within a plan either
+ * (density_for_expr()'s idx_cache is specific to its own cell-expression
+ * lookups) -- this runs only for region-region clauses, not the
+ * potentially-hot point-rewrite path, so the lookup cost was not worth
+ * the extra bookkeeping to avoid.
+ *
+ * The histogram's middle bound (its median -- see the comment at the
+ * actual lookup below for why not the mean) stands in for the "typical"
+ * area. Not a rigorous single-number summary of a whole distribution
+ * (it ignores most-common-values entirely, and ANALYZE's own histogram is
+ * itself a sample, not the true population), a deliberate approximation
+ * in keeping with this file's other selectivity heuristics: legibility
+ * over precision for a correction whose whole job is "don't assume the
+ * other side has zero area," not a load-bearing statistic.
+ */
+bool
+typical_region_area(Oid selfid, PlannerInfo *root, Node *region_expr, double *area)
+{
+	List	   *vars = pull_var_clause(region_expr, 0);
+	ListCell   *lc;
+	Index		varno = 0;
+	RangeTblEntry *rte;
+	Relation	rel;
+	List	   *indexes;
+	Node	   *probe;
+	Oid			regiontype;
+	Oid			one[1];
+	bool		found = false;
+
+	foreach(lc, vars)
+	{
+		Var		   *v = (Var *) lfirst(lc);
+
+		if (!IsA(v, Var) || v->varlevelsup != 0 || (varno != 0 && v->varno != varno))
+			return false;
+		varno = v->varno;
+	}
+	if (varno == 0 || varno > list_length(root->parse->rtable))
+		return false;
+	rte = rt_fetch(varno, root->parse->rtable);
+	if (rte->rtekind != RTE_RELATION)
+		return false;
+
+	regiontype = exprType(region_expr);
+	one[0] = regiontype;
+	probe = (Node *) makeFuncExpr(lookup_sibling_func(selfid, "area", 1, one),
+								  FLOAT8OID, list_make1(copyObject(region_expr)),
+								  InvalidOid, InvalidOid, COERCE_EXPLICIT_CALL);
+	/* index expressions are stored with varno 1 */
+	ChangeVarNodes(probe, varno, 1, 0);
+
+	rel = table_open(rte->relid, NoLock);	/* locked by the parser */
+	indexes = RelationGetIndexList(rel);
+	foreach(lc, indexes)
+	{
+		Oid			indexoid = lfirst_oid(lc);
+		Relation	irel = index_open(indexoid, AccessShareLock);
+
+		if (irel->rd_rel->relam == BTREE_AM_OID &&
+			irel->rd_index->indnatts >= 1 && irel->rd_index->indkey.values[0] == 0)
+		{
+			List	   *exprs = RelationGetIndexExpressions(irel);
+
+			if (exprs != NIL && equal(linitial(exprs), probe))
+			{
+				for (int inh = 0; inh <= 1 && !found; inh++)
+				{
+					HeapTuple	tp = SearchSysCache3(STATRELATTINH,
+													 ObjectIdGetDatum(indexoid),
+													 Int16GetDatum(1), BoolGetDatum(inh));
+
+					if (HeapTupleIsValid(tp))
+					{
+						AttStatsSlot sslot;
+
+						if (get_attstatsslot(&sslot, tp, STATISTIC_KIND_HISTOGRAM,
+											 InvalidOid, ATTSTATSSLOT_VALUES))
+						{
+							if (sslot.nvalues >= 2 && sslot.valuetype == FLOAT8OID)
+							{
+								/*
+								 * The histogram's own bounds are equal-
+								 * frequency quantile boundaries, so the
+								 * middle one is the distribution's real
+								 * median -- robust to a skewed or
+								 * multi-modal mix of region sizes (a
+								 * catalogue with both small source
+								 * footprints and a few huge survey tiles,
+								 * say) in a way a plain average of all the
+								 * bounds is not: that average is pulled
+								 * toward whichever tail has the most
+								 * extreme values, not whichever sizes most
+								 * rows actually have.
+								 */
+								*area = DatumGetFloat8(sslot.values[sslot.nvalues / 2]);
+								found = true;
+							}
+							free_attstatsslot(&sslot);
+						}
+						ReleaseSysCache(tp);
+					}
+				}
+			}
+		}
+		index_close(irel, AccessShareLock);
+		if (found)
+			break;
+	}
+	list_free(indexes);
+	table_close(rel, NoLock);
+	return found;
+}
+
+/*
  * "Which of my regions contain this point" is the opposite direction from
  * density_for_expr's own case (a point-catalog index answering many
  * points against one region): here it's the *region* column that needs an

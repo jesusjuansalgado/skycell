@@ -4900,3 +4900,170 @@ both opclasses registered but choosing one explicitly per column, per
 the existing README guidance, remains the safer default until either the
 small-band gap or the large-band knife-edge has an actual fix, not just
 a measured workaround.
+
+## Round forty-eight: fixing the large-radius regression -- the real
+root cause wasn't where round forty-seven's first pass said it was
+
+Asked to fix round forty-seven's large-radius plain-Index-Scan
+regression. Before building anything: fed the planner, by hand, a
+literal query region sized so its *own* `area/4pi` matched the *true*
+observed match fraction for the pathological probe (0.674, not the
+0.307 the formula actually produced) and watched it correctly choose a
+sequential scan instead. That settled it directly -- the regression
+traces to round forty-six's own selectivity estimate being wrong by
+2.2x (3685 estimated rows, 8085 actual), not to an inherent, opclass-
+independent PostgreSQL cost-model blind spot as round forty-seven's own
+first-pass diagnosis concluded. The generic plain-Index-Scan-vs-Bitmap-
+Heap-Scan cost tie that diagnosis described is real (confirmed again
+below), but it is the *mechanism* the wrong estimate tripped, not an
+independent cause.
+
+**Why the estimate was wrong, precisely**: `area(const)/4pi` (round
+forty-six's "Tier 1") implicitly assumes the *other* operand -- the
+column being matched against -- is point-like, zero-area. True for a
+small-catalogue-footprint column (what Tier 1 was scoped for), false for
+round forty-two's own large/huge radius bands, where the *stored* rows
+are themselves 60-89 degree circles. Two circles of comparable size
+overlap whenever their centres are within the *sum* of their radii, not
+within the query radius alone -- Tier 1 was computing `area(query)/4pi`
+when the real question needed something closer to
+`area(query_radius + stored_radius)/4pi`, and assumed `stored_radius = 0`
+because it had no way to know otherwise.
+
+**The fix**: a new function, `typical_region_area()` (`skycell.c`, next
+to `density_for_expr()`), looks for a plain `CREATE INDEX ...
+(area(region_col))` expression index and, when ANALYZE has run on it,
+reads a representative value from its histogram -- the region-size
+analogue of `density_for_expr()`'s own point-density lookup, deliberately
+a separate, simpler function rather than a generalisation of it (that
+one's statistics are a point-density model, cell-id buckets; this one
+needs nothing beyond what ANALYZE already builds for any ordinary
+float8 expression). `region_angle_est()` (`adql.c`) converts whichever
+information is available for an operand -- exact, from `.area`, for a
+constant; `typical_region_area()`'s estimate for a plain column with
+such an index; otherwise "unknown" (angle 0, exactly Tier 1's own
+assumption) -- into an angular radius (`area = 2*pi*(1-cos(theta))`,
+inverted) and reports whether it found anything at all. `&&` sums both
+operands' angles (two circles of radius `theta_a`, `theta_b` overlap
+roughly whenever their centres are within `theta_a+theta_b`);
+`@>`/`<@` subtract the contained side's angle from the container's,
+clamped at 0. This is a strict generalisation of Tier 1, not a
+replacement: identical output when no `area()` index exists anywhere
+(confirmed directly below), strictly more informed when one does --
+including, as a bonus nobody asked for yet, the "wrong direction"
+containment case Tier 1 could only shrug at (a constant on the
+*contained* side with the *container* column itself having an `area()`
+index now gets a real estimate instead of the flat default).
+
+**Two false starts on the way, both caught by verifying rather than
+assuming the fix worked**:
+
+1. First version averaged all of the histogram's bound values as the
+   "typical" area. On the round forty-seven corpus (four sharply
+   separated radius bands, 3,000 rows each, no single characteristic
+   scale by construction) this collapsed *every* band to a sequential
+   scan, including "small," where an index was clearly better -- the
+   huge/large bands' extreme area values dominate a plain average,
+   pulling the "typical" estimate far above what most rows actually
+   look like. Switched to the histogram's *median* bound (ANALYZE's own
+   bounds are equal-frequency quantiles, so the middle one is a real,
+   skew-resistant median) -- which changed nothing, because:
+2. The real bug was a unit mismatch, not a statistics-robustness
+   problem: `sc_region.area` (what the `Const` branch reads directly) is
+   steradians; the SQL-visible `area()` function -- what
+   `typical_region_area()` necessarily probes, since that is the
+   expression a user would actually index -- returns *square degrees*
+   (`skycell_area()` multiplies by `RAD2DEG` twice). Confirmed directly:
+   `area(circle(..., 180))` (the full sky) returns 41252.96, exactly
+   4pi steradians in square degrees, not 4pi. Feeding a square-degree
+   number into a formula written for steradians inflates it by a factor
+   of ~3283, clamping every angle to pi regardless of band -- the same
+   "collapse to seq scan everywhere" symptom the averaging false start
+   produced, for a completely different reason, which is exactly why
+   switching to the median alone didn't fix it. Fixed by converting
+   `typical_region_area()`'s result back to steradians in
+   `region_angle_est()` (the caller), not inside `typical_region_area()`
+   itself -- that function's contract stays "whatever `area()` would
+   return for this expression," matching the index a user would
+   actually write, and the unit conversion lives at the one place that
+   needs it.
+
+**Measured after both fixes, same corpus and methodology as round
+forty-seven** (`rc_corpus`/`rc_probe`, 60 probes/band, `box`/`multicap`/
+`both` conditions, plus a new `rc_corpus_area` expression index):
+
+| band | before (both/box median buffers) | after | plain-Index-Scan pathology |
+|---|---|---|---|
+| small | 3267.5 | 275.5 | gone -- both forced conditions now agree on Bitmap Heap Scan |
+| medium | 312.0 | 113 (median), mean 1435.3, max 6274 | reduced, not gone: 13/60 probes (22%) still hit it |
+| large | 113 (median) / mean 2316.2 (knife-edge present) | 113 (median and mean) | **gone: 0/60 probes** |
+| huge | 113 | 113 | none, before or after |
+
+**Large and huge: the regression round forty-seven measured is fully
+closed.** Every one of 60 probes in each band now lands on the correct
+(cheapest) plan with no exceptions -- a clean before/after on the exact
+corpus that found the problem, not a different, friendlier one.
+
+**Small: fixed, and it explains an unresolved thread from round
+forty-seven too.** Buffers dropped across the board, and -- unexpectedly
+-- re-checking the same probe round forty-seven used to show "the
+planner picks the measurably worse opclass" found that both forced
+conditions now use a `Bitmap Heap Scan` (before: box used a plain
+`Index Scan`, multicap a `Bitmap Heap Scan` -- different scan *shapes*,
+not just different opclasses, making the old "box vs multicap" buffer
+comparison an apples-to-oranges one). With both now on the same footing,
+box turns out to be the genuinely cheaper opclass at this radius (290 vs
+413 buffers) -- matching round forty-two's own original small-radius
+finding. Round forty-seven's "the planner picks the wrong one at small"
+was itself downstream of the same selectivity inaccuracy as the large-
+band regression, not an unrelated, separate miscalibration.
+
+**Medium: improved, not eliminated -- and the residual is a real,
+separate, generic limitation, not a loose end in this fix.** 13 of 60
+medium-band probes still hit the identical pathology (a plain `Index
+Scan` touching 5,000-6,300 buffers against a `Bitmap Heap Scan`'s 113-
+319 on the same index, same query), down from roughly 40% of probes at
+large radii before this round. Diagnosed directly, not assumed: on one
+such probe, the planner's own cost estimate was 251.46 for the plain
+scan against 258.42-259.72 for the bitmap scan -- a near-tie PostgreSQL's
+generic GiST cost model produces regardless of how accurate the
+selectivity feeding it is, because that model has no term for a plain
+Index Scan revisiting the same heap page many times on an unclustered
+table. `SET enable_indexscan = off` on the identical query collapses it
+to the cheap Bitmap Heap Scan every time, confirming the mechanism is
+unchanged from round forty-seven's own diagnosis of it -- what changed
+is only how *often* an estimate lands close enough to that knife-edge to
+trip it (the residual ~24% remaining selectivity error at medium radii,
+from using a column-wide median rather than a genuinely per-query
+estimate, is still occasionally enough). This is not fixable from
+within skycell: GiST's cost estimator is fixed at the access-method
+level in PostgreSQL itself, not something an opclass can override.
+`SET enable_indexscan = off` remains the complete mitigation for
+whoever wants zero exposure to this specific residual, exactly as round
+forty-seven already found.
+
+Correctness re-verified after both fixes, not just once at the start:
+`intersects()` brute force against the indexed `&&` agreed exactly in
+every band (same 204 / 46,985 / 158,934 / 179,465 counts as round
+forty-seven), and a separate check on a fresh `footprints` table
+confirmed the previously-flat-default "wrong direction" containment
+case now returns a real, hand-verified estimate (5 rows, matching the
+formula's own prediction from that table's actual median footprint
+size) instead of the old flat 20. `make installcheck` passes
+throughout.
+
+**Shipped as skycell 0.17** (`ext/sql/skycell--0.17.sql`,
+`skycell--0.16--0.17.sql`) -- same function names and signatures as
+0.16, corrected implementation; no new SQL objects. Verified the full
+`0.16 -> 0.17` upgrade chain on a fresh database.
+
+**STATUS**: the large-radius regression round forty-seven found and this
+round was asked to fix is fully closed, verified on the same corpus that
+found it. The combined-opclass picture from round forty-seven is now
+better than "not yet reliable" but still short of "always correct": small
+is fixed outright, large/huge are fully fixed, and medium carries a
+reduced but real residual risk from a PostgreSQL-core limitation outside
+this extension's reach. README's existing caveat (from round forty-seven)
+still correctly describes the overall posture -- picking one opclass
+explicitly remains the safer default -- but the magnitude of the known gap
+is now much smaller than it was.

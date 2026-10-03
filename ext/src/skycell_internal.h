@@ -34,6 +34,7 @@ extern void cover_cached(const sc_region *reg, const sc_density *d,
 						 double ra0, double dec0, double radius, sc_cover *out);
 extern bool density_for_expr(PlannerInfo *root, Node *arg, sc_density *d, Oid *statrel,
 							  bool *uses_cell_ops);
+extern bool typical_region_area(Oid selfid, PlannerInfo *root, Node *region_expr, double *area);
 extern void density_for_var(PlannerInfo *root, Node *arg, sc_density *d, Oid *statrel,
 							 bool *uses_cell_ops);
 extern bool gin_moc_index_for_region(PlannerInfo *root, Node *rg, Node **moc_expr,
