@@ -6004,3 +6004,99 @@ measurement. Open for whoever wants to chase it further: why does
 to mirror pgSphere's own `Box3D` as closely as possible (round forty-
 two's own stated goal), still lose to it on every corpus and scale
 tried here.
+
+## Round fifty-six: chased it down -- round forty-two measured against a
+degraded pgSphere index, not a real property of either opclass
+
+Asked to keep chasing round fifty-five's open question. `splitcost_test`
+-- the actual disposable database round forty-two's own text named --
+still exists on this machine, untouched since. Found it with a plain
+`psql -l` rather than assuming it was gone, and it still has `fpr`,
+`rox_probe`, `fpr_box_gist`, and pgSphere's own `rox_fpr_circ_gist`,
+exactly as that round described. The extension version recorded there
+(0.12) is old, but that only means the *catalog metadata* is old --
+PostgreSQL loads whichever `skycell.so` is currently installed
+regardless of which version string a database's `pg_extension` row
+remembers, and `gist_region_box.c` has not changed since round forty-
+two wrote it (0.19-0.23 touched `adql.c`, `gist_region.c`'s `MAX_
+SUBCAPS`, and SQL comments only), so querying `splitcost_test` right
+now runs today's box opclass code against that round's own, never-
+rebuilt data.
+
+**Ran the validated per-probe methodology directly against `splitcost_
+test`'s own `fpr`/`rox_probe` -- box won, 0.038ms vs pgSphere's 0.256ms,
+matching round forty-two's own 2.1-8.4x range almost exactly.** Not a
+measurement error this time; genuinely reproduced the original claim,
+on the original data, with current code. So the discrepancy is real,
+and it is about that specific data/environment, not about the opclass
+C code having changed.
+
+**Ruled out the data values themselves first.** `fpr`'s aggregate
+statistics (count, min/max/avg/stddev of `ra0`, `dec0`, `r`) are
+identical between `splitcost_test` and the `paper_bench` copy rebuilt
+this session, down to float precision -- both runs call `setseed(0.77)`
+before the same deterministic formula. Physical row *order* differs
+completely (checked directly: the first five rows by `fid` are totally
+different sets in each database, since `CREATE TABLE AS` without an
+`ORDER BY` doesn't guarantee which order a join materializes rows in,
+even with a fixed seed), which matters because GiST's incremental,
+one-tuple-at-a-time build is order-sensitive -- but copying `splitcost_
+test`'s exact row order into `paper_bench` (`\copy` preserves physical
+order) and rebuilding both indexes fresh still had box *losing*
+(0.037ms vs pgSphere's 0.016ms). Row order wasn't it either.
+
+**Found it by comparing `EXPLAIN` plans for the identical literal probe
+side by side.** `splitcost_test` picks a plain `Index Scan` on pgSphere's
+own `rox_fpr_circ_gist` (cost 29.38, 24 buffers); a fresh pgSphere index
+built on the same (bloaty, never-rebuilt) `fpr` heap in `paper_bench`
+picks a `Bitmap Heap Scan` instead (cost 56.44, only 4 buffers) --
+the exact plain-Index-Scan-vs-Bitmap-Heap-Scan plan-choice pathology
+this project has spent many rounds chasing for its *own* opclasses
+(rounds forty-seven/forty-eight), now showing up in pgSphere's index
+instead. Confirmed it explains the aggregate gap, not just this one
+probe: forcing Bitmap Heap Scan on `splitcost_test`'s own pgSphere index
+(`SET enable_indexscan = off`) dropped its median from 0.256ms to
+0.018ms -- a 14x speedup, landing right next to every other pgSphere
+number measured this session.
+
+**Then found the actual root cause with one command: `REINDEX INDEX
+rox_fpr_circ_gist`.** Page count barely changed (191 -> 189 -- not
+simple bloat), but the *natural*, unforced plan on that exact query
+flipped to fast: median dropped from 0.256ms to 0.015ms, a 17x
+speedup, with no `SET`, no forcing, nothing but rebuilding the index
+from its current heap scan order. Checked this wasn't just "REINDEX
+helps everything in a long-lived database": REINDEXing `fpr_box_gist`
+(skycell's own index, same database, same age) changed nothing (689 ->
+685 pages, 0.038ms -> 0.040ms, within noise). The degradation was
+specific to pgSphere's own index instance in this one disposable,
+heavily-reused database -- plausibly accumulated picksplit damage from
+however many rounds of ad hoc rebuilding happened in `splitcost_test`
+over this session's long history, never once REINDEXed since -- not a
+property of pgSphere's GiST implementation, box's, or anything this
+session's own 0.19-0.23 changes touched.
+
+**With `splitcost_test`'s pgSphere index healthy again, it beats box by
+the same margin every other measurement this session has found**
+(0.015ms vs 0.040ms, ~2.7x, right in line with round fifty-five's
+0.027-0.256ms range elsewhere). Round forty-two's own claim was real,
+reproducible, and entirely explained: it measured pgSphere against a
+degraded index in a database nobody thought to `REINDEX`, not against
+pgSphere's actual, healthy performance. Nothing about skycell's own
+code -- not `gist_region_box.c`, not the 0.19/0.20 exact-test fix, not
+anything in rounds fifty-three through fifty-five -- caused or
+explains the original number; it was always a benchmark-hygiene gap in
+one disposable test database.
+
+**STATUS**: mechanism fully identified, nothing further to chase.
+Updated both opclasses' `COMMENT ON OPERATOR CLASS` text (shipped as
+skycell 0.24, `ext/sql/skycell--0.23--0.24.sql`, comment text only) to
+state the resolved explanation rather than leave round fifty-five's
+open question hanging -- the retraction stands, but it is no longer a
+mystery. Lesson for this project's own benchmarking practice, worth
+stating plainly: an index that sits in a long-lived, heavily-reused
+test database and is never REINDEXed can silently degrade into a
+pathological plan choice, and a *single* comparison run against it
+(not repeated, not cross-checked against a fresh build) can produce a
+confidently-wrong number -- exactly what happened here, and exactly
+the kind of thing this file's own "measured, not assumed" discipline
+exists to catch, just one round later than it should have.
