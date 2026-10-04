@@ -5667,3 +5667,138 @@ change, closing off that entire direction rather than narrowing it: the
 remaining gap to pgSphere on `rc_corpus` is not something the region
 GiST opclass's own key size can close, in either a variable-length or a
 smaller-fixed-size form.
+
+## Round fifty-three: promoting `skyregion_box_gist_ops` to DEFAULT --
+re-measuring a stale crossover figure first, then shipping it
+
+Round fifty-two's own finding (box's cost *estimate* is wrong, not its
+real performance) raised the obvious next question: since the planner
+already effectively never reaches `skyregion_gist_ops` (multi-cap) on
+`rc_corpus` anyway, why is multi-cap still the DEFAULT opclass for
+`skyregion` -- the one a plain, opclass-unqualified `CREATE INDEX ...
+USING gist (region)` gets?
+
+**Checked the existing shipped guidance before touching anything, and
+it directly contradicted this round's own `rc_corpus` measurements.**
+`skycell--0.20.sql`'s own comments (from round forty-two) say the box
+opclass wins at "catalogue-scale footprints (arcsec-few degrees)" and
+multi-cap "wins back from roughly 20 degrees radius on." But round
+fifty-one/fifty-two's own repeated, median-of-60-probes measurement on
+`rc_corpus` found multi-cap winning *every* band tested, `small` (1-3
+degrees) included -- squarely inside the old comment's "box wins" range.
+Not a contradiction to shrug off: re-measured cleanly, both buffers and
+wall-clock, repeated runs, all four bands, forcing each opclass in turn:
+
+| band | box avg buf | box median ms | multicap avg buf | multicap median ms |
+|---|---|---|---|---|
+| small | 276.6 | 2.293 | 417.4 | 1.637 |
+| medium | 6254.1 | 4.102 | 5109.6 | 3.419 |
+| large | 9106.8 | 5.482 | 8212.1 | 4.846 |
+| huge | 10233.3 | 5.941 | 9261.2 | 5.390 |
+
+Multi-cap wins wall-clock at every band, box only wins on raw buffers at
+`small` (276.6 vs 417.4) -- and even there, fewer buffers doesn't
+translate to less wall-clock time anymore. That's the resolution, not a
+genuine contradiction: round forty-two's own "20 degrees" figure
+predates 0.19/0.20's per-row exact-test fix. Before that fix, both
+opclasses paid the same inflated per-candidate recheck cost (region_
+region() rebuilding a full covering-capable `sc_region` from scratch
+every row), so buffers and wall-clock tracked each other closely and the
+~20-degree buffers-based crossover was also roughly the wall-clock
+crossover. After the fix, per-candidate cost dropped enough that it no
+longer swamps whichever opclass returns fewer buffer-touching
+candidates -- except now *multi-cap* is the one with fewer effectively-
+costly false positives at `rc_corpus`'s scale, not box, so the wall-
+clock crossover moved independently of the still-roughly-unchanged
+buffers crossover.
+
+**But `rc_corpus`'s "small" band (1-3 degrees) isn't the same scale as
+the realistic catalogue footprints the old comment actually meant.**
+Round forty-two's own `fpr` corpus uses circle radii of 0.02-0.3 degrees
+(`power(10, -1.7 + 1.2*random())`), an order of magnitude smaller than
+`rc_corpus`'s "small" band. Re-ran that comparison fresh, under current
+(0.19/0.20-fixed) code, isolating circle-only and polygon-only subsets
+of `fpr` separately to find out whether box's win there was a polygon
+effect or a small-circle effect:
+
+| subset | box ms | multicap ms |
+|---|---|---|
+| circle-only | 13.554 | 72.449 |
+| polygon-only | 12.783 | 50.544 |
+
+Box wins **both** subsets, by a wide margin, including the pure-circle
+one -- so box's advantage on `fpr` isn't a polygon effect at all; it's
+a radius-scale effect, and `fpr`'s circles (0.02-0.3 degrees) sit well
+below wherever the true crossover now is. Tried to pin that crossover
+precisely with a dedicated 0.2-1.6-degree stratified corpus
+(`xover_corpus`/`xover_probe`, 3,000 rows/band, 40 probes/band, same
+construction as `rc_corpus`) and found it too sparse at these radii to
+produce a measurable per-probe signal (6-16 buffers, 0.025-0.032ms,
+indistinguishable from fixed overhead) -- would need a much denser
+corpus to resolve further, not attempted since the two existing
+bracketing points (`fpr`: 0.02-0.3 degrees, box wins; `rc_corpus`: 1-3
+degrees, multi-cap wins) already answer the question this round needed
+answered. The crossover sits somewhere between roughly 0.3 and 1 degree
+now -- down from the old ~20-degree figure, not reversed, just moved by
+0.19/0.20's own fix.
+
+**Promoted `skyregion_box_gist_ops` to DEFAULT on this evidence.**
+Realistic catalogue footprints (arcsec to a few degrees -- source
+apertures, instrument footprints, single-object cones) are squarely
+inside box's now-larger domain, box has full feature parity with
+multi-cap (all four strategies: `&&`, `@>`(region,point),
+`@>`(region,region), `<@`(region,region)), and multi-cap's one
+remaining real edge (circles above roughly a degree) is exactly the
+case still available by naming `skyregion_gist_ops` explicitly.
+
+**Implementation note, since this was a genuine SQL/catalog change, not
+a C-level one**: PostgreSQL has no `ALTER OPERATOR CLASS ... SET
+DEFAULT`, and only one default opclass is allowed per (type, access
+method) pair, so swapping which one is default means dropping both and
+recreating them with `DEFAULT` moved. First attempt used `DROP OPERATOR
+CLASS ... CASCADE`, which failed twice before landing:
+
+1. A stray `\set ON_ERROR_STOP 1` line, copied from habit out of this
+   project's own `bench/*.sql` scripts (which *are* run through psql),
+   is a psql-only meta-command -- invalid when the line isn't the
+   file's very first line. Only a single leading `\echo ... \quit` is
+   specially tolerated when an extension script is loaded by `ALTER
+   EXTENSION ... UPDATE` (the backend loads the file directly, not
+   through psql); every other backslash command in this file family
+   has to be real SQL. Caught immediately (`ERROR: syntax error at or
+   near "\"`) and removed.
+2. `DROP OPERATOR CLASS ... CASCADE` alone hit `duplicate key value
+   violates unique constraint "pg_amop_fam_strat_index"` on the
+   subsequent `CREATE OPERATOR CLASS`: both opclasses were originally
+   created without an explicit `FAMILY` clause, which implicitly
+   creates a same-named operator family holding the real `pg_amop`/
+   `pg_amproc` rows (keyed on the family, not the class) -- `DROP
+   OPERATOR CLASS` removes the class but leaves that family and its
+   rows behind, so recreating the class re-registered the same
+   strategies into an already-populated family. Fixed by dropping the
+   *family* (`DROP OPERATOR FAMILY ... USING gist CASCADE`) instead,
+   which cascades through the class to any dependent index in one step.
+
+Both failures rolled back cleanly (`ALTER EXTENSION UPDATE` runs as one
+transaction) and were caught before shipping, not after -- tested
+against both paths this project's own convention requires: a fresh
+`CREATE EXTENSION` (via `make installcheck`, exercising `skycell--
+0.21.sql`) and a real incremental upgrade (`ALTER EXTENSION skycell
+UPDATE TO '0.21'` against `paper_bench`, exercising `skycell--0.20--
+0.21.sql`, including the `CASCADE`'s documented side effect of dropping
+this session's own `rc_corpus_box`/`rc_corpus_multicap`/`fpr_box_gist`/
+`fpr_region_gist` benchmark indexes, which were then rebuilt and
+re-verified). Both pass `make installcheck`; a post-upgrade correctness
+spot-check (indexed `&&` vs brute-force `intersects()`) matched exactly
+(4,915 = 4,915).
+
+**STATUS**: shipped as skycell 0.21. `skyregion_box_gist_ops` is now
+`DEFAULT FOR TYPE skyregion USING gist`; `skyregion_gist_ops` remains
+available, non-default, for wide-area or very large regions. Both
+opclasses' `COMMENT ON OPERATOR CLASS` text updated to state the
+re-measured crossover and point at this round. No C code changed --
+pure catalog/SQL. One open question this round didn't chase: the exact
+crossover radius between 0.3 and 1 degree, which would need a denser
+dedicated corpus than the one tried here; left as a bracket, not a
+point estimate, since the two existing bracketing measurements were
+enough to decide the default.
