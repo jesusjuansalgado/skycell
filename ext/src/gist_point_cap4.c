@@ -35,9 +35,28 @@
  * Everything else -- compress()/picksplit()/same()/the query-side cache/
  * consistent()'s leaf-vs-internal branch -- is copied unmodified from
  * gist_point_cap.c; only cap_to_bytea()'s internal-tuple branch and
- * bytea_to_cap()'s matching decode differ. See GIST_REGION_DESIGN.md for
- * the measured result before relying on this for anything beyond
- * experimentation. Not wired into any versioned SQL file; register ad hoc.
+ * bytea_to_cap()'s matching decode differ.
+ *
+ * STATUS: correctness-verified (0 mismatches against both gist_point_cap.c
+ * and pgSphere's native spoint GiST, every radius tested). The result
+ * doesn't repeat "Round fifty-eight"'s box4 win, and the gap is not closed:
+ * reproduced on two independently reseeded 60-probes-per-radius runs
+ * (after finding and fixing three real benchmark-methodology bugs, not
+ * just the opclass itself -- see GIST_REGION_DESIGN.md's "Round sixty-
+ * two"), buffers came out statistically indistinguishable from
+ * gist_point_cap.c's own at every radius (unlike box4's clean, reproducible
+ * reduction for regions), wall-clock was genuinely noisy and unresolved,
+ * and pgSphere still won decisively (1.4-2.7x) at every radius from 1
+ * arcsecond through 30 arcmin in both runs, unchanged from "Round forty-
+ * three". Structural, not a tuning gap: box4 shrank every region key,
+ * leaf included, because region leaves were never exact in the first
+ * place; here leaf exactness is load-bearing, so only the minority
+ * internal-entry population could shrink -- far less surface area for the
+ * same lever to act on. Not wired into any versioned SQL file; currently
+ * registered ad hoc (CREATE FUNCTION ... AS '$libdir/skycell'; CREATE
+ * OPERATOR CLASS ...) against `paper_bench`, left in place (not cleaned
+ * up, unlike this round's own scratch tables) for anyone who wants to
+ * keep poking at it.
  */
 #include "postgres.h"
 
