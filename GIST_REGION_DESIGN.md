@@ -6100,3 +6100,73 @@ pathological plan choice, and a *single* comparison run against it
 confidently-wrong number -- exactly what happened here, and exactly
 the kind of thing this file's own "measured, not assumed" discipline
 exists to catch, just one round later than it should have.
+
+## Round fifty-seven: confirming, via `pageinspect`, that `scircle`'s
+## GiST key is the same lossy box as `spoint`'s -- not an exact cap
+
+Round fifty-six's write-up ends by saying pgSphere's win is currently
+unchallenged, but that whole comparison had been resting on an
+unverified assumption: that pgSphere's own `scircle` GiST stores
+something cap-shaped (centre + angular radius) at its leaves, the way
+skycell's multi-cap opclass does, and might therefore be both tighter
+*and* exact where skycell's box opclass is neither. Round forty-three
+already checked this for `spoint` specifically (`pageinspect` showed a
+24-byte, two-float4-triples degenerate box) but never followed up for
+`scircle` or `spoly`, which are the types this round's own `fpr`
+corpus and `20_region_xmatch.sql` actually exercise. Checked it
+directly rather than assuming it generalizes.
+
+**Method**: one-row disposable tables, each holding a single known
+`scircle` (centre `(100d, 20d)`, radius `5d`) or `spoly` (a 95-105 x
+15-25 degree box), each with a fresh `CREATE INDEX ... USING gist`,
+inspected with `pageinspect`'s `gist_page_items()` on the raw leaf
+page -- the same technique round forty-three used for `spoint`.
+
+**Result, `scircle`**: leaf `itemlen=32` (8-byte tuple header + 24
+bytes of payload), key printed as two 3-tuples of Cartesian
+coordinates -- `(-0.254183844,0.877404499,0.258819045),
+(-0.071547044,0.969907167,0.423919751)`. That's a min-corner/max-
+corner axis-aligned box in 3D Cartesian space, not a centre-plus-
+radius pair; the printed z-bounds (`0.258819`/`0.423919`) land right
+on `sin(dec-r)=sin(15d)=0.258819` and close to `sin(dec+r)=sin(25d)
+=0.422618` (the small gap consistent with pgSphere building the box
+from a discretized polygonal approximation of the circle's boundary,
+not the closed-form extremum). **Result, `spoly`**: same `itemlen=32`,
+same two-3-tuple box shape, for a plain rectangle-ish polygon --
+confirming this isn't something specific to `scircle`'s own code path.
+
+**Confirmed structurally, not just by byte-counting**: `pg_opclass`
+shows `scircle`, `spoly`, and the *default* `spoint` opclass all share
+one `opckeytype`, `spherekey` -- `pg_type` gives it `typlen=24,
+typbyval=f, typalign='i'`, i.e. a fixed 24-byte struct, int4-aligned,
+matching six `float4`s exactly (two Cartesian 3-tuples at single
+precision). There's a second, non-default point opclass (`spoint3`,
+keytype `pointkey`, `typlen=-1`, varlena) that stores something
+different, but it's not the one anything in this benchmark uses --
+`cat_sphere_idx` picks the default `spoint` opclass, confirmed via
+`pg_opclass.opcdefault`.
+
+**So the premise behind calling pgSphere's win "unchallenged" doesn't
+need qualifying, but the reason was wrong.** It isn't that pgSphere's
+box key is somehow both exact and tight for a circle/polygon the way
+an actual cap key would be -- it's exactly as lossy as skycell's own
+`skyregion_box_gist_ops` (same shape: axis-aligned 3D box, approximate
+for anything that isn't already box-shaped), just *smaller* (24 bytes
+at float4 vs skycell's box key, and skycell's own multi-cap key, both
+double-precision). pgSphere wins on raw key size and decades of
+C-level optimization in `consistent()`/`picksplit()`, not on having a
+structurally better representation. This matches round forty-three's
+`spoint` finding exactly and removes the one remaining gap in that
+finding's generality -- `scircle` and `spoly` use the identical
+mechanism, not something more sophisticated.
+
+**Does not change any shipped decision.** No opclass, comment, or
+default is touched by this round; it's a verification of an
+assumption flagged as open, not a new result about which opclass to
+pick. Probe tables (`cap_probe`, `poly_probe`) dropped after
+inspection; nothing persisted beyond this write-up.
+
+**STATUS**: closed. The box-key-vs-cap-key question about pgSphere is
+answered (box, confirmed for `spoint`, `scircle`, and `spoly` alike,
+all via the shared `spherekey` GiST keytype) and needs no further
+chasing.
