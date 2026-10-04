@@ -5570,3 +5570,100 @@ No SQL-visible change, same convention as 0.19. Between 0.19 and 0.20,
 every region-region and point-region exact-test call site in adql.c now
 goes through the same lite-build-plus-cache path; nothing in that family
 is known to still pay the full covering-table cost for a plain predicate.
+
+## Round fifty-two: why the planner never picks `skyregion_gist_ops` over
+the box opclass -- a real cost-estimate miscalibration, and a reverted fix
+
+Round fifty-one's own remaining 1.2-1.9x gap prompted a direct question:
+is the multi-cap (cap-GiST) opclass actually slower than the box opclass,
+since the planner never picks it naturally on `rc_corpus`? Measured
+directly rather than assumed from the planner's own choice: forced each
+opclass in turn (`UPDATE pg_index SET indisvalid = ...`), warm cache,
+repeated runs, all four bands. **The planner's choice is backwards from
+reality.** In every band, `skyregion_box_gist_ops`'s own *estimated* cost
+is lower (226 vs 307 at `small`, 316 vs 461 at `medium`, 477 vs 745 at
+`large`, 495 vs 778 at `huge`) -- which is the entire reason box always
+wins the comparison -- but the *measured* execution time is the reverse,
+multicap faster by 10-28% everywhere, and at `medium` multicap ties the
+planner's own natural Seq Scan choice rather than losing to it as an
+earlier same-session estimate (from a single, not-repeated run) had
+claimed.
+
+Chased the estimate itself rather than stopping at "the planner is
+wrong." PostgreSQL's GiST cost estimator (`genericcostestimate`, no
+per-opclass override -- the same limitation round forty-eight already
+hit) scales its page-visit estimate off `pg_class.relpages`, fed the
+*same* selectivity number for both opclasses (skycell's selectivity
+functions are operator-level, not opclass-level). The only thing left
+that can make multicap look pricier is index size, and it is: `rc_corpus_
+box` is 207 pages / 57.97 tuples-per-page, `rc_corpus_multicap` 531 pages
+/ 22.60 tuples-per-page -- a 2.56x size ratio matching the tuples-per-page
+ratio almost exactly, confirming it is pure per-entry size, not
+fragmentation. Confirmed in the source: `GistBox3D` is 6 doubles (48
+bytes); `GistMultiCap` is an overall cap plus `sub[MAX_SUBCAPS]` with
+`MAX_SUBCAPS = 4` (5 caps x 32 bytes = 160 bytes) -- ~3.3x bigger per
+entry, which is what inflates the page count the cost estimator penalizes.
+
+**Checked the project's own history before proposing a fix**, since
+shrinking this exact key had already been tried: Round nine built a
+variable-length encoding storing only as many sub-caps as a region
+actually has (a real, measured 35-47% smaller index, ~35% fewer cold
+buffer reads) and found query time got *worse* anyway at every scale
+and cache state (1.5-2.2x slower warm, 35-45% slower cold) -- the CPU
+cost of decoding a variable-length key on every `consistent()` call
+during index traversal outweighed the fanout it bought. Reverted, with
+the project's own conclusion on record: "the multi-cap GiST's gap to
+pgSphere is a structural tree-depth/fanout limit... not one
+`consistent()`-level tuning can close further." That round predates this
+session's 0.19/0.20 exact-test fixes, but it tests a different layer
+entirely (`consistent()`/`union()`/`picksplit()`'s own in-memory key
+handling during traversal, never touched by the exact-test caching
+fix), so its conclusion still applies unchanged.
+
+**Tried the one angle Round nine didn't: not a format change, just a
+smaller fixed constant.** `MAX_SUBCAPS` from 4 to 2 shrinks every entry
+to an overall cap plus 2 subs (96 bytes) with no decode branching at
+all -- still a fixed-size struct, same code, smaller arrays. Correctness
+held: `make installcheck` passed, and the project's own existing mixed-
+circle/polygon GiST benchmark (`bench/20_region_xmatch.sql` + `bench/
+22_region_gist.sql`, 50,000 footprints half circle/half polygon, the
+same scale "Picksplit, round two" used when it first found a single-cap
+key scaling badly) still matched brute force exactly (720 = 720) after
+`REINDEX`.
+
+Performance was the opposite story, and workload-dependent in exactly
+the way the file header already warned it would be. On `rc_corpus`
+(all-circle -- every leaf is already a single cap regardless of
+`MAX_SUBCAPS`, so only internal-node unions could be affected): index
+shrank 531 -> 339 pages, and real execution time was unchanged within
+noise (3.69-3.98ms repeated vs 3.26-3.92ms before -- no regression, but
+also, checked directly, not enough of a cost-estimate change to flip the
+planner's own natural Seq Scan choice at `medium` either). On `fpr`
+(half polygon, the same 50,000-row scale Round two's original single-cap
+key regression was measured at): index shrank 2118 -> 1394 pages (~34%,
+tracking the ~40% smaller fixed struct), but query time went from
+48.7-49.1ms to **816-926ms -- a 17-19x regression**, not a smaller one.
+Fewer sub-caps per node starves exactly the polygon decomposition this
+design exists for (`region_to_multicap`'s MOC-based split into up to
+`MAX_SUBCAPS` HEALPix cells), reproducing the "tree walked too much"
+failure mode Round two's own single-cap key first hit, now from the
+other direction (4 -> 2 instead of 1 -> 4).
+
+Reverted (`MAX_SUBCAPS` back to 4, `REINDEX` both indexes, `make
+installcheck` passes, `bench/22_region_gist.sql` back to 51.5-57.6ms,
+consistent with the pre-change baseline). Not kept as a documented-but-
+off option, same reasoning Round nine gave for its own revert: the diff
+is the record of what was tried.
+
+**STATUS**: the cost-estimate miscalibration is real and confirmed (box
+is not actually faster; the planner just thinks it is), but it is not
+fixable by shrinking the opclass's own key -- that trades a planner-
+visible number this extension cannot directly influence (GiST has no
+per-opclass cost hook) for a real, severe regression on exactly the
+workload (polygon regions) the multi-cap design exists to serve. This is
+the second independent confirmation of Round nine's structural
+conclusion, this time via a fixed-size constant rather than a format
+change, closing off that entire direction rather than narrowing it: the
+remaining gap to pgSphere on `rc_corpus` is not something the region
+GiST opclass's own key size can close, in either a variable-length or a
+smaller-fixed-size form.
