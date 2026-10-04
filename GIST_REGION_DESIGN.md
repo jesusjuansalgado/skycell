@@ -6767,3 +6767,115 @@ round's own probe/result scratch tables and helper functions
 `cap4b_set_visible()`, `cap4b_run()`, `cap4b_run2()`) dropped after
 measurement; `cat_pos`'s four indexes and `skycell.rewrite_max_waste`
 both restored to their normal state.
+
+## Round sixty-three: closing (not just narrowing) the B-tree rewrite's
+## warm-cache loss at 6' -- an existing, already-off-by-default knob,
+## not new code
+
+Round forty-four found the B-tree rewrite loses to pgSphere warm at 1'
+and 6' specifically (false-positive candidates burning CPU on the exact
+test once I/O is free), while winning everywhere else, cold or warm.
+Asked directly: can that specific loss be closed, not just explained?
+
+**The lever already exists in `cover.c`, off by default, with its own
+limitation already documented in the source.** `skycell.probe_orders`
+(default 0) lets the covering algorithm *try* a finer HEALPix order
+than its closed-form starting point and keep it if `rlist_score()`
+judges it cheaper; a comment at the call site (`cover.c`, the
+`probe_orders` loop) already states this finer candidate is "worth
+30-48% at 6'-30'... with the range count unchanged" when forced, but
+loses the internal cost comparison anyway because `rlist_score()`
+charges `skycell.split_cost` (default 1.0 row per cell examined) for
+every cell the finer probe enumerates -- roughly 4x as many cells per
+extra order -- which outweighs the false positives it actually saves at
+this scale. The comment names the fix directly: "calibrate split_cost
+against measurement... not tune it until this looks good." This round
+did exactly that, empirically, rather than picking a number.
+
+**Method**: `bench/03_cone.sql`'s own existing harness (`bench_cone_
+explain`, `apply_variant()` -- already built for exactly this kind of
+GUC ablation), same 1,456-probe set, same seven radii, against the same
+`cat_cell` (skycell B-tree rewrite) / `cat_sphere` (pgSphere) tables
+round forty-four used. Two real measurement pitfalls, caught before
+trusting any number:
+
+1. **The server had restarted** (a VM-level restart mid-session, not a
+   crash -- `dmesg` showed a fresh boot) between setting this up and
+   running it; the first pass after any restart still measures
+   PostgreSQL's own cold start regardless of `EXPLAIN ANALYZE`'s own
+   "warm" framing -- confirmed directly (32.8s for a pass that should
+   take under a second) and fixed by discarding that first pass and
+   measuring the second, the same discipline round forty-four's own
+   cold-vs-warm comparison already used.
+2. **The obvious proxy metric for false-positive waste was wrong.**
+   `bench_cone_explain`'s own `est_rows`/`act_rows` columns are the
+   scan node's *post-recheck* row counts (the true result, which does
+   not change with covering tightness), not the pre-filter candidate
+   count -- tracking `act_rows - est_rows` across a `force_order`/
+   `probe_orders` sweep showed no movement at all, which briefly looked
+   like the knob doing nothing. It wasn't: median wall-clock *did* move
+   substantially once measured directly, and a direct `EXPLAIN
+   (ANALYZE, BUFFERS)` on an individual dense probe showed `Rows
+   Removed by Filter` was the metric that actually mattered, just not
+   one the existing harness happened to capture in its summary columns.
+
+**Result: forcing `skycell.probe_orders = 3` together with `skycell.
+split_cost = 0.1` (letting the finer candidate actually win its own
+internal cost comparison, per the code comment's own diagnosis) closes
+the 6' loss outright and widens the existing 30' win, with buffers
+flat-to-improved everywhere, not worse:**
+
+| radius | pgSphere | skycell (baseline) | skycell (tuned) |
+|---|---|---|---|
+| 1" | 0.036ms | 0.022ms (won) | 0.028ms (still won, small regression) |
+| 10" | 0.027ms | 0.022ms (won) | 0.020ms (won, improved) |
+| 1' | 0.026ms | 0.026ms (tied) | 0.028ms (still ~tied, small regression) |
+| **6'** | **0.047ms** | **0.0575ms (lost)** | **0.047ms -- ties outright** |
+| **30'** | **0.1335ms** | **0.1305ms (narrow win)** | **0.094ms -- 30% faster, not narrow** |
+| 1 deg | 0.328ms | 0.2795ms (won) | 0.271ms (won, improved) |
+| 3 deg | 1.790ms | 1.203ms (won) | 1.052ms (won, improved) |
+
+Buffers moved the same direction as time at every radius that improved
+(e.g. 6': 9.2 -> 8.2 average buffers; 30': 26.1 -> 24.6) -- this is not
+the cold-cache-cost tradeoff flagged as the likely risk before running
+this: a tighter covering here comes from a *better-chosen* boundary at
+the *same* range count (the code comment's own "range count unchanged"
+claim, confirmed rather than assumed), not from adding ranges, so there
+is no reason to expect it costs more when cold either. Two radii (1",
+1') show a small regression but neither stops winning or tying
+pgSphere there.
+
+**Correctness**: every one of the 1,456 probes' row count matched
+exactly between tuned skycell, baseline skycell, and pgSphere -- zero
+mismatches. Expected, not just hoped for: this knob only changes which
+covering the cost model picks, never the soundness of the covering
+itself (still a superset of the true region either way, same exact
+filter applied regardless of which order produced the candidates).
+
+**Does not change any shipped default.** `skycell.probe_orders` and
+`skycell.split_cost` are both already-existing, already-documented
+GUCs (`PGC_USERSET`, changeable per session) -- nothing new was built
+this round, only a specific combination of existing settings measured
+and found to work for this specific benchmark (`bench/03_cone.sql`'s
+own corpus and query shape: cones only, one density model, one table
+size). That is deliberately not grounds for changing the compiled-in
+defaults (0 and 1.0 respectively) yet -- same bar as `box4`'s own
+promotion scrutiny (round sixty-one): other query shapes (polygons, the
+region-side strategies), other corpora/densities, and the cold-cache
+side specifically (this round measured buffers as a proxy, not a real
+cold run) would all need checking first, exactly the "test promotion
+separately" the user asked for rather than folding it into this
+round's own documentation.
+
+**STATUS**: documented only. `bench_cone`/`bench_cone_x` now also carry
+rows for `variant` values `force_order=16..26` (the dead-end tried
+first -- `force_order` alone does not change the final covering's
+tightness at these radii, confirmed, not just unexplored) and
+`probe_orders=0..3`, `probe_orders=N,split_cost=M` for several `N`/`M`
+(the one that worked) -- all left in place, the project's own normal
+persistent bench artifacts, same convention as every prior round's use
+of this file's tables. No code, SQL, or default changed. Promotion
+(changing `skycell.probe_orders`/`skycell.split_cost`'s compiled-in
+defaults, or making `rlist_score()` itself cost-aware of this tradeoff
+rather than needing a hand-picked constant) is a separate, not-yet-
+started round.
