@@ -1,4 +1,4 @@
 comment = 'skycell: HEALPix cell-id B-tree sky indexing with cost-based coverings (prototype)'
-default_version = '0.21'
+default_version = '0.22'
 module_pathname = '$libdir/skycell'
 relocatable = true

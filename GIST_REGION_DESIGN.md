@@ -5802,3 +5802,106 @@ crossover radius between 0.3 and 1 degree, which would need a denser
 dedicated corpus than the one tried here; left as a bracket, not a
 point estimate, since the two existing bracketing measurements were
 enough to decide the default.
+
+## Round fifty-four: pinning the crossover precisely -- it wasn't 0.3-1
+degree, and it isn't one number at all
+
+Asked directly to pin down round fifty-three's own bracket (0.3-1
+degree). Built a dense, isolated-scale corpus (`pin_corpus`/`pin_probe`,
+25,000 rows/band -- dense enough to avoid the earlier `xover_corpus`
+attempt's "too sparse to measure" failure) at 0.3, 0.4, 0.5, 0.6, 0.7,
+0.85, 1.0 degrees, each band's corpus and probes drawn at that one
+fixed radius, measured with the exact same per-probe `EXPLAIN (ANALYZE,
+BUFFERS)` methodology round fifty-one's own numbers used.
+
+**First measurement attempt used a batched nested-loop query (`rox_
+probe`-style, one query joining all 60 probes against the corpus) and
+got numbers flatly contradicting round fifty-three's own `rc_corpus`
+finding -- box winning at *every* radius tried, 0.3 through 2.5
+degrees, not just below ~1.** Didn't trust either result on its own;
+chased the discrepancy instead of picking a side. Root cause: a batched
+nested-loop's inner index scan is parameterized by the outer row
+(a Param, not a per-query Const), and the planner chose a plain,
+non-bitmap `Index Scan` for that shape -- re-visiting the same heap
+pages redundantly, exactly the pathology rounds forty-seven/forty-eight
+chased for a different reason. A single-probe query with the region as
+a literal gets a `Bitmap Heap Scan` instead and a very different,
+smaller buffer count. Confirmed directly: the exact single-literal
+query from round fifty-one's own methodology, re-run against the
+current `rc_corpus`, reproduced its original numbers precisely (293/413
+buffers, multicap winning) -- the batched form was measuring a
+different, non-representative execution shape, not a different
+reality. Redid the whole sweep with the validated per-probe/literal
+form.
+
+**With the corrected methodology, box won every band from 0.3 through
+1.0 degrees, and -- extending the sweep further -- through 2.5 degrees
+too**, directly contradicting round fifty-three's `rc_corpus`-based
+claim that multicap already wins by 1-3 degrees. Not a measurement
+artifact this time (reproduced, same methodology, same validated shape)
+-- a real, different result from testing an *isolated* single-scale
+corpus instead of `rc_corpus`'s own deliberately mixed one.
+
+**That's the actual resolution: `rc_corpus` mixes all four of its own
+radius bands (1-3, 20-40, 60-80, 85-89 degrees) into one shared GiST
+index, by design, to stress a wide scale range in one benchmark. Round
+fifty-three's own "small-band" measurement was never testing "a small
+probe against a small-only corpus" -- it was testing a small probe
+against a corpus that also contains near-hemisphere-sized circles
+sharing the exact same physical tree.** Confirmed this is the deciding
+variable, not probe radius, with a direct, controlled test: built a
+corpus half small (1-3 degree) rows and half huge (85-89 degree) rows,
+sharing one index (`pin5_corpus`), and ran the *same* small-radius
+probes against it two ways --
+
+| corpus | box ms | multicap ms |
+|---|---|---|
+| isolated small-only (`pin_corpus`, same probes) | ~0.07-0.10 | ~0.17-0.21 |
+| small+huge mixed, one index (`pin5_corpus`) | 8.601 | **5.796** |
+
+Identical probes, identical small radius -- box wins by ~1.5-3x in
+isolation, multicap wins by ~1.5x once a huge-radius population shares
+the index. An extreme outlier region distorts the box key's own
+bounding boxes for everything in its subtree; the multi-cap key's
+per-sub-cap structure tolerates that distortion better. This is a
+second, genuinely separate effect from the pure radius crossover, not
+an alternative explanation for the same one.
+
+**Having isolated that confound, re-ran the pure, single-scale radius
+sweep properly** -- `pin_corpus` (0.3-1.0 degrees) still box throughout;
+extended with `pin6_corpus` (10, 25, 45, 60 degrees, same isolated-
+single-scale design): multicap won every one of those, decisively (e.g.
+10.627ms vs 13.960ms at 10 degrees). So the true, isolated-scale
+crossover sits somewhere between 2.5 and 10 degrees -- narrowed further
+with `pin7_corpus` (3, 4, 5, 6, 7, 8 degrees, same design): box still
+clearly wins at 3-4 degrees, multicap clearly wins by 10, and 5-7
+degrees is a genuine, reproducibly close contest -- re-ran that specific
+range a second time and the ranking flipped band to band within normal
+run-to-run noise (buffers identical both runs, confirming the data and
+index didn't change, only wall-clock ordering at the margin). Reported
+as a bracket, honestly, rather than forcing a single number the data
+doesn't support: **the uniform-scale crossover is roughly 5-8 degrees**,
+not round fifty-three's 0.3-1.
+
+**Net effect on round fifty-three's decision**: the promotion of
+`skyregion_box_gist_ops` to DEFAULT stands, and is better supported now,
+not worse -- its real domain for a realistically uniform-scale catalogue
+column (sub-degree through several degrees) is wider than first
+measured. What was wrong was the stated number and its single-cause
+explanation; the actual picture needs two separate statements (a ~5-8
+degree uniform-scale crossover; a separate scale-mixing effect that can
+favour multicap at any radius if the column mixes very different region
+sizes in one index), not one. Both opclasses' `COMMENT ON OPERATOR
+CLASS` text and their preceding comment blocks corrected to say this,
+shipped as skycell 0.22 (`ext/sql/skycell--0.21--0.22.sql`) -- comment
+text only, no opclass/operator/function change, tested on both the
+fresh-install path (`make installcheck`) and a real incremental upgrade
+(`ALTER EXTENSION skycell UPDATE TO '0.22'` against `paper_bench`).
+
+**STATUS**: shipped. All `pin*`/`xover*` scratch tables dropped after
+measurement; none of this round's corpora are part of the committed
+`bench/` scripts. The 5-8 degree bracket is itself still a bracket, not
+a point estimate -- the close band (5-7 degrees) would need more probes
+or more repeats to resolve further, not attempted since the decision
+this round needed to inform (confirm the DEFAULT promotion, fix the
+wrong comment text) didn't need more precision than that.
