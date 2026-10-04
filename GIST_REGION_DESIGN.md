@@ -6291,3 +6291,120 @@ skycell UPDATE TO '0.25'` against `paper_bench`). All `b4_*` scratch
 tables and the ad hoc `b4_run_buffers()` helper dropped after
 measurement; nothing from this round's benchmark harness is part of the
 committed `bench/` scripts, same convention as `pin8`/`pin9` before it.
+
+## Round fifty-nine: round fifty-eight's win holds on a mixed circle/
+## polygon corpus, and surfaces two separate, real costs neither single-
+## type band could show
+
+Asked directly: round fifty-eight only tested isolated, circle-only
+bands -- does `skyregion_box4_gist_ops`'s win over pgSphere survive on
+the mixed circle/polygon corpus that's skycell's own `skyregion` type
+exists for (`20_region_xmatch.sql`'s own header: "pgSphere has no single
+region supertype ... needs two typed columns and a query that UNIONs
+one join per column")? Checked rather than assumed it generalizes.
+
+**Built five bands (same 0.05-1 degree radii as round fifty-eight,
+25,000 rows/band, 40 fresh probes/band), each row and each probe an
+independent 50/50 coin flip between a circle and an axis-aligned
+lon/lat-box polygon of the same nominal half-width** (same recipe `fpr`
+uses: `polygon('ICRS', ra-r, dec-r, ra+r, dec-r, ra+r, dec+r, ra-r,
+dec+r)`). skycell's `box8`/`box4` get one column, one index, one `&&`
+per probe, same as round fifty-eight. pgSphere gets two typed columns
+(`reg_circ scircle`, `reg_poly spoly`, one NULL per row depending on
+kind) and two GiST indexes, and a probe's query is the sum of two
+subqueries (one per column) -- `20_region_xmatch.sql`'s own
+`'pgsphere:mixed'` shape, now benchmarked instead of just described.
+Confirmed pgSphere's cross-type operators actually work and index
+correctly first (`spoly && scircle` and the reverse both evaluate true,
+and a literal `scircle` probe against an `spoly`-indexed column plans
+as a normal `Bitmap Index Scan`) before relying on them in the harness.
+
+**Correctness**: every method's count matched a brute-force `intersects()`
+oracle exactly, zero mismatches, across both an initial run and an
+independently-reseeded repeat.
+
+**Reproduced on two independent corpus/probe draws; both agree closely.**
+Median buffers and median wall-clock (`EXPLAIN (ANALYZE, BUFFERS)`, same
+methodology as round fifty-eight), run 1 / run 2:
+
+| radius | box8 buf | box4 buf | pgSphere buf | box8 ms | box4 ms | pgSphere ms |
+|---|---|---|---|---|---|---|
+| 0.05 deg | 6 / 6 | **4 / 4** | 16 / 16 | 0.364 / 0.341 | **0.093 / 0.100** | 0.294 / 0.300 |
+| 0.1 deg | 6 / 6 | **4 / 4** | 16 / 16 | 0.350 / 0.381 | **0.091 / 0.092** | 0.279 / 0.307 |
+| 0.3 deg | 8 / 10 | **6 / 6** | 19 / 19 | 0.343 / 0.378 | **0.100 / 0.094** | 0.316 / 0.304 |
+| 0.5 deg | 14 / 12 | **10 / 8** | 26 / 22 | 0.419 / 0.404 | **0.119 / 0.118** | 0.379 / 0.351 |
+| 1.0 deg | 31 / 30 | **29 / 26** | 48.5 / 49.5 | 0.388 / 0.436 | **0.145 / 0.138** | 0.390 / 0.432 |
+
+`skyregion_box4_gist_ops` wins decisively on *both* metrics in every
+band, on both runs -- by a wider margin than round fifty-eight's
+circle-only numbers, not a narrower one. That headline holds, but
+getting here surfaced two separate, genuinely different costs that a
+single-type corpus can't show at all, and conflating them would be
+wrong:
+
+**1. pgSphere pays a real, measurable architecture tax for being
+two-typed.** Its buffer count roughly *doubles to triples* going from
+round fifty-eight's circle-only bands (6-29.5) to this round's mixed
+ones (16-49.5) at the *same* radii -- not because the matching work
+grew, but because every single probe, circle or polygon, now pays for
+two separate index descents (`reg_circ`'s and `reg_poly`'s) instead of
+one, even on the half of probes whose true matches can only live in one
+of the two columns. `skyregion_box_gist_ops`/`box4_gist_ops`'s own
+buffer counts barely move between the two rounds (e.g. `box8` at 0.05
+deg: 6 circle-only, 6 mixed) -- one column, one index, same page-level
+cost regardless of what kind of region is stored in it. This is exactly
+the structural cost `20_region_xmatch.sql`'s own header predicted in
+words; this round is the first time it's actually been measured.
+
+**2. Recheck cost (CPU, not I/O) rose sharply for skycell's own box
+opclasses, independent of buffers.** `box8` at 0.05 deg: 6 buffers in
+*both* rounds, but 0.080ms (circle-only, round fifty-eight pass 2) vs
+0.34-0.36ms (mixed) -- a ~4.5x slowdown with an *unchanged* buffer
+count, so it isn't a paging/fanout effect at all. Both box opclasses
+always set `recheck = true` (sound but not tight, same as every region
+opclass in this project), so every candidate the box prunes to still
+needs a real `intersects()`-equivalent call against the exact region --
+and that call is pricier when either side is a polygon (point-in-
+polygon / edge-normal tests against a variable-length vertex array)
+than when both sides are a circle (one dot-product). In a 50/50 mixed
+corpus, even a *circle* probe's candidates are half polygons, so this
+cost rises for every probe, not just polygon ones -- confirmed by the
+per-probe-kind breakdown: `box8`'s `circ`-probe median rose from
+~0.047ms (round fifty-eight's all-circle corpus) to ~0.33-0.36ms here,
+despite an identical buffer count on identical-shaped queries. `box4`
+shows the same effect but much more mutedly (~0.055ms to ~0.09-0.10ms,
+under 2x) -- plausibly because its tighter per-entry box (round fifty-
+eight's own finding: fewer buffers touched for the same query) also
+means fewer candidates reach the expensive recheck call in the first
+place, so the *same* per-candidate CPU tax has less surface area to
+act on. This is a separate, real cost from the key-density story round
+fifty-eight told -- about `recheck()`'s own cost on mixed-kind regions,
+not about leaf fanout -- and it affects every region opclass this
+project ships, not something specific to this round's new one.
+
+**Net picture, not a single number**: on a realistic mixed circle/
+polygon corpus, `skyregion_box4_gist_ops` remains the clear winner on
+both I/O and wall-clock against both `skyregion_box_gist_ops` and
+pgSphere -- the round fifty-eight result generalizes, it doesn't
+narrow. But the *reasons* the three methods differ are now known to be
+two distinct effects stacked together (pgSphere's two-index tax on
+buffers; every region opclass's heavier recheck on polygon-involving
+candidates, on top of that) rather than one. Neither effect changes
+which opclass wins here, but either could matter on its own in a
+corpus shaped differently than this round's roughly-balanced 50/50 mix
+(e.g. a corpus that's 95% circles would dilute the recheck effect
+further; a corpus where pgSphere's two columns could each be indexed
+far more selectively than the combined skycell column might narrow or
+close its architecture tax) -- not tested here, flagged for whoever
+wants to chase it.
+
+**Does not change any shipped default.** Same status as round
+fifty-eight: `skyregion_box4_gist_ops` remains EXPERIMENTAL and
+non-default; this is further evidence for the mechanism, not a
+promotion decision.
+
+**STATUS**: shipped as a GIST_REGION_DESIGN.md entry only -- no opclass,
+operator, function, or SQL change this round (skycell stays at 0.25).
+All `bm_*` scratch tables and the ad hoc `bm_run()` helper dropped
+after measurement; not part of the committed `bench/` scripts, same
+convention as every disposable corpus before it.
