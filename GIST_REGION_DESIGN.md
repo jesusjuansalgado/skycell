@@ -6170,3 +6170,124 @@ inspection; nothing persisted beyond this write-up.
 answered (box, confirmed for `spoint`, `scircle`, and `spoly` alike,
 all via the shared `spherekey` GiST keytype) and needs no further
 chasing.
+
+## Round fifty-eight: cloning pgSphere's exact key layout (float4, fixed-
+## length, no varlena) not only closes the gap, it reverses it
+
+The user's own framing, directly: round fifty-seven confirmed pgSphere's
+box key is the same *shape* `skyregion_box_gist_ops` already uses
+(axis-aligned 3D Cartesian box), just physically smaller -- six `float4`s
+in a fixed 24-byte type versus this opclass's six `float8`s in a `bytea`
+(48 bytes of payload plus a varlena header). Asked directly: clone that
+physical layout exactly, holding the geometry and all other logic fixed,
+and see how much of round fifty-five's 1.3-7x pgSphere-wins-everywhere
+gap that one change alone recovers -- a controlled before/after, not
+another round of guessing from the outside at pgSphere's C code (which
+isn't available as source here, only `pg_sphere.so`'s compiled bitcode;
+round fifty-seven's reverse-engineering via `pageinspect`/`pg_opclass`
+was already the practical ceiling for inspecting it directly).
+
+**Built `skyregion_box4_gist_ops`** (`ext/src/gist_region_box4.c`,
+shipped as skycell 0.25, `ext/sql/skycell--0.24--0.25.sql`): byte-for-
+byte `skyregion_box_gist_ops`'s own `GistBox3D` struct and the identical
+`consistent()`/`picksplit()`/`union()`/penalty logic, with exactly two
+things changed -- `double` to `float`, and the `bytea`-wrapped varlena
+key to a genuine fixed-length 24-byte type (`skyregion_box4`,
+`INTERNALLENGTH = 24, ALIGNMENT = int4, STORAGE = plain`, the same
+shell-type pattern `skypos`/`skyregion` already use, with a real
+`OUT` function so `pageinspect` can still read it back -- the same
+property round fifty-seven relied on to read pgSphere's own key).
+Confirmed the clone is physically exact, not just byte-count-equal: a
+one-row probe table's leaf `itemlen` is 32 (8-byte tuple header + 24
+bytes of payload) -- identical to round fifty-seven's own measurement
+of pgSphere's `scircle` leaf.
+
+**Soundness was the one real risk this round had to get right**: casting
+a double-precision bound to `float` with ordinary nearest-rounding can
+round *inward*, silently shrinking the box below the true region and
+dropping real matches -- a correctness bug, not a performance detail.
+Every bound is rounded strictly outward instead (`round_down_f4`/
+`round_up_f4`: cast, then one `nextafterf()` step away from the box
+whenever the cast itself moved the value inward), on both the entry side
+and the cached query side, and every comparison against a point promotes
+the already-outward-rounded `float` bound back up to `double` rather
+than narrowing the point down. `recheck` stays `true` throughout, same
+as `skyregion_box_gist_ops`, so even a looser float4 box can never
+produce a wrong final answer -- only, in principle, extra candidates.
+
+**Correctness**: a direct per-probe cross-check (`box8` vs `box4` vs
+pgSphere's own `scircle &&`, three physically separate tables built from
+the exact same underlying point/radius draws so the three queries are
+asking the literal same geometric question) found zero mismatches across
+every band and probe tried.
+
+**Measured with the validated per-probe/literal methodology (rounds
+fifty-one/fifty-four/fifty-five -- a batched nested-loop gets a
+misleading plan shape, round fifty-four's own finding) on five isolated
+single-scale bands (0.05 deg through 1 deg, 25,000 rows/band, 20 fresh
+probes/band), each opclass in its own dedicated table to remove any
+"two indexes on one column, which does the planner pick" ambiguity.
+Reproduced on two fully independent corpus/probe draws (different
+seeds); both agree.** Median buffers (`EXPLAIN (ANALYZE, BUFFERS)`,
+every plan node's `Buffers:` line summed, not just the top one) and
+median wall-clock, run 1 / run 2:
+
+| radius | box8 buf | box4 buf | pgSphere buf | box8 ms | box4 ms | pgSphere ms |
+|---|---|---|---|---|---|---|
+| 0.05 deg | 6 / 6 | **4 / 4** | 6 / 6 | 0.080 / 0.078 | **0.055 / 0.054** | 0.065 / 0.062 |
+| 0.1 deg | 10 / 6 | **4 / 4** | 6 / 6 | 0.076 / 0.075 | **0.056 / 0.061** | 0.064 / 0.066 |
+| 0.3 deg | 8 / 8 | **6 / 6** | 8 / 8 | 0.085 / 0.080 | **0.063 / 0.061** | 0.073 / 0.076 |
+| 0.5 deg | 10 / 14 | **8 / 10** | 10 / 12.5 | 0.085 / 0.096 | **0.074 / 0.078** | 0.083 / 0.087 |
+| 1.0 deg | 27 / 26 | **23 / 23** | 29.5 / 33.5 | 0.136 / 0.107 | **0.112 / 0.100** | 0.124 / 0.105 |
+
+`box4` has the lowest median buffer count *and* the lowest median
+wall-clock time in all five bands, on both independent runs, beating
+not just `box8` (expected -- same opclass, smaller key) but pgSphere's
+own native GiST as well, by a modest but consistent margin (roughly
+10-25% fewer buffers, 10-20% less time). Spot-checked that this isn't
+an artifact of `box8`/`box4` naturally picking a plain Index Scan where
+pgSphere picks a Bitmap Heap Scan (a real difference in the plans the
+planner chose, visible in every `EXPLAIN` capture this round took):
+forcing `enable_indexscan = off` so `box4` and `box8` are also forced
+onto a Bitmap Heap Scan still shows `box4` touching fewer buffers than
+`box8` (2 vs 3 on a representative probe) -- the ordering holds under a
+matched plan shape too, not just in each opclass's own natural choice.
+
+**Answers the user's actual question directly**: yes, swapping only the
+key's physical representation -- nothing about what it represents,
+nothing about `consistent()`'s logic, nothing about which strategies are
+supported -- recovers all of round fifty-five's gap and then some, on
+this round's own isolated-single-scale methodology. That's strong
+evidence the pgSphere-vs-`skyregion_box_gist_ops` gap found in rounds
+fifty-one/fifty-four/fifty-five was substantially explained by key
+density (bytes per entry -> leaf fanout -> fewer pages touched per
+probe), not by pgSphere's `consistent()` embodying some geometrically
+sharper test -- both opclasses run the exact same box-overlap arithmetic
+shape, differing now only in which C type backs the six numbers. This
+doesn't rule out pgSphere also having a leaner, more optimized
+`consistent()`/`picksplit()` *on top* of that -- there's no source to
+read, so a true instruction-for-instruction comparison was never
+practical here (round fifty-seven's `pageinspect` reverse-engineering
+was already the ceiling for what's inspectable without it) -- but it
+does mean that hypothesis is no longer *needed* to explain the gap this
+session has measured: the controlled swap alone, with identical logic
+otherwise, already closes and reverses it.
+
+**Does not change any shipped default or recommendation.**
+`skyregion_box4_gist_ops` ships EXPERIMENTAL and non-default, exactly
+like `skyregion_box_gist_ops` was before its own promotion -- this
+round answers a mechanism question (why does the gap exist), it doesn't
+yet carry the breadth of correctness/scale testing (pole proximity,
+large radii, mixed-scale columns, polygon regions, 50,000+ row corpora)
+that earned `skyregion_box_gist_ops` its own DEFAULT status across
+rounds forty-two through fifty-four. That testing is the natural next
+step for whoever wants to actually promote this key format, not
+assumed here.
+
+**STATUS**: shipped as skycell 0.25 (`ext/sql/skycell--0.24--0.25.sql`,
+`ext/src/gist_region_box4.c`). Tested on both the fresh-install path
+(`make installcheck`) and a real incremental upgrade (`ALTER EXTENSION
+skycell UPDATE TO '0.25'` against `paper_bench`). All `b4_*` scratch
+tables and the ad hoc `b4_run_buffers()` helper dropped after
+measurement; nothing from this round's benchmark harness is part of the
+committed `bench/` scripts, same convention as `pin8`/`pin9` before it.
