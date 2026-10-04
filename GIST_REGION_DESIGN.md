@@ -6648,3 +6648,122 @@ finding or rebuilding something close to that round's own pin6_corpus
 and checking every radius's plan shape explicitly, the exact thing this
 round's own part 2 shows is easy to skip and easy to get a misleading
 number from if skipped.
+
+## Round sixty-two: does the box4 lesson transfer to *points* --
+## `skypos_cap4_gist_ops`, and three real methodology bugs found and
+## fixed in sequence before trusting any number
+
+Asked whether `box4`'s key-density lesson extends to the OTHER native-
+GiST-vs-pgSphere comparison this project has: `gist_point_cap.c`'s own
+`skypos_cap_gist_ops` vs pgSphere's native `spoint` GiST, where round
+forty-three found pgSphere winning below a ~10-30 arcmin crossover.
+That file's own history had already tried and reverted floating the
+*leaf* centre (3-5x slower -- it broke the exact, `recheck=false` leaf
+test points get and regions never had), so the one lever left
+untried, directly motivated by `box4`: shrink only the *internal*-node
+cap (28 bytes: double centre + packed float radius) to float4 (16
+bytes), leaving the leaf's double-precision exactness completely
+untouched.
+
+**Built `skypos_cap4_gist_ops`** (`ext/src/gist_point_cap4.c`,
+registered ad hoc, same non-shipped status as `gist_point_cap.c`
+itself): identical to that file except `cap_to_bytea()`'s internal
+branch and a new `shrink_cap_f4()` that rounds the cap's centre to
+float4 then inflates the radius by strictly more than the resulting
+centre drift (plus the radius's own rounding), rounded up via
+`nextafterf`, so the float4 cap always contains the exact double-
+precision cap it was built from -- `cap_overlaps()` is a necessary-
+condition pruning test, so this has to never shrink, only ever
+(slightly) grow. Correctness: 0 mismatches against both the existing
+cap-GiST and pgSphere, every radius tested.
+
+**Three real methodology bugs, found and fixed in sequence, each one
+capable of producing a confidently wrong number on its own:**
+
+1. **A third, always-visible index silently won.** `cat_pos` carries
+   `skypos_cap_gist_ops`, the new `skypos_cap4_gist_ops`, *and* the
+   already-shipped `skypos_spgist_ops` on the same column/operator --
+   toggling `pg_index.indisvalid` between the two cap variants did
+   nothing, because SP-GiST was never hidden and the planner preferred
+   it over both the whole time. Caught by capturing the actual index
+   name used per probe (a regex over the `EXPLAIN` text), not assumed
+   from the toggle -- the first full run's "cap vs cap4" gap was really
+   "SP-GiST run first vs SP-GiST run second," a warm-cache artifact
+   with nothing to do with either cap opclass.
+2. **Hiding the wrong thing broke the fallback.** Also hiding
+   `cat_pos_cellexpr` (skycell's own B-tree-rewrite index) to stop its
+   cost-based rewrite from competing didn't disable the rewrite -- it
+   still fired, found no B-tree to serve the resulting cell-range
+   filter, and fell back to a 10-million-row `Seq Scan` evaluating that
+   filter per row (187,000+ buffers at a 1-arcsecond radius). The fix
+   was the GUC the rewrite's own cost model is built around,
+   `skycell.rewrite_max_waste = 0`, which declines the rewrite outright
+   and falls back cleanly to whichever GiST index is visible --
+   `cat_pos_cellexpr` could stay valid throughout once this was set.
+3. **Interleaving three oversized structures thrashes the cache.**
+   `cat_pos_capgist` (870MB) + `cat_pos_cap4gist` (867MB) +
+   `cat_sphere_idx` (682MB) together are more than `shared_buffers`
+   (2GB); running all three methods interleaved per probe (deliberately,
+   to avoid batching-order bias) meant each one evicted the last one's
+   pages on every switch, inflating both buffer counts and wall-clock
+   for whichever structure a given probe happened to hit right after a
+   switch -- not a property of any opclass. Round forty-three's own
+   methodology note ("`EXPLAIN (ANALYZE, BUFFERS)`, *warmed*") already
+   named the fix: an untimed warm-up execution of each query
+   immediately before the timed one, inside `cap4b_run2()` itself, so
+   every timed measurement reflects steady state for its own structure.
+
+**With all three fixed, and reproduced on two independently reseeded,
+60-probes-per-radius runs (round forty-three's own 20-probe sweep had
+already flagged median instability on this same clustered corpus; even
+60 left real residual noise at sub-millisecond radii -- see below):**
+
+- **Buffers**: `cap4` and `cap` are statistically indistinguishable at
+  every radius from 1 arcsec through 1 degree (e.g. 1 arcsec: 22-24 vs
+  23-24 across the two runs; 1 degree: 263-331 vs 269-329) -- no real
+  win, unlike `box4`'s own clean, reproducible buffer reduction for
+  regions. At 3 degrees the two runs disagree on direction by a margin
+  smaller than their own run-to-run spread (448.5-465.5 vs 452.5-497).
+- **Wall-clock**: genuinely noisy at these small absolute times (sub-
+  millisecond to ~2ms) -- one run had `cap4` *slower* than `cap` at 5 of
+  7 radii, the other had it faster at 6 of 7, a direction flip neither
+  run's own buffer counts support. Not resolved by this round; reported
+  as unresolved rather than picking whichever run looked better.
+- **pgSphere wins decisively and consistently at every radius from 1
+  arcsec through 30 arcmin, in both runs, by a stable ~1.4-2.7x** --
+  unchanged from round forty-three's own finding, for `cap` and `cap4`
+  alike. At 1 degree and 3 degrees the three methods are within noise
+  of each other in both runs (sometimes `cap4` ahead, sometimes
+  pgSphere, consistent with round forty-three's own observation that
+  the cap family's relative standing improves at larger radii).
+
+**Why this doesn't reproduce `box4`'s result, and the explanation is
+structural, not a measurement gap**: `box4` shrank *every* key, leaf
+included, because region leaves were never exact in the first place
+(`recheck=true` regardless of key precision) -- the dominant leaf
+population got cheaper at every level of the tree. Here, leaf exactness
+is load-bearing (the project's own hard-won, already-reverted finding),
+so only the *minority* internal-entry population shrank. Since leaf
+entries vastly outnumber internal ones in any GiST tree, and most pages
+a small-radius probe touches are leaf pages regardless, shrinking only
+the internal layer has much less surface area to improve than shrinking
+everything did for regions. The lesson transfers in principle (key
+density still matters) but the two opclasses don't have the same amount
+of shrinkable surface to spend it on.
+
+**Does not change any shipped default or recommendation.**
+`skypos_cap4_gist_ops` is EXPERIMENTAL, unregistered in any versioned
+SQL file, same status as `gist_point_cap.c` itself -- a modest, safe
+(no measured regression anywhere, same leaf exactness, same
+correctness) variant worth keeping around, not a replacement.
+
+**STATUS**: shipped as a GIST_REGION_DESIGN.md entry and
+`ext/src/gist_point_cap4.c` only (no SQL/catalog change beyond the ad
+hoc registration this round made and then left in place on
+`paper_bench` for anyone who wants to keep poking at it -- unlike every
+other round's own scratch tables, which were dropped). All of this
+round's own probe/result scratch tables and helper functions
+(`cap4b_probe`, `cap4b_realsample`, `cap4b_results`, `cap4b_results2`,
+`cap4b_set_visible()`, `cap4b_run()`, `cap4b_run2()`) dropped after
+measurement; `cat_pos`'s four indexes and `skycell.rewrite_max_waste`
+both restored to their normal state.
