@@ -6513,3 +6513,138 @@ by the committed `20/22/23/24_region_*.sql` scripts, not this round) and
 were left as those scripts normally leave them; only this round's own
 additions (`fpr4` and its ad hoc `allops_results`/`allops_run()`
 harness) were dropped after measurement.
+
+## Round sixty-one: promoting `skyregion_box4_gist_ops` to DEFAULT --
+## the same scrutiny `box8` had before its own promotion, one real
+## discrepancy found and flagged rather than papered over, and one
+## confound reproduced
+
+Asked directly to promote `skyregion_box4_gist_ops` to DEFAULT. Flagged
+first that it hadn't had the breadth of scrutiny `skyregion_box_gist_
+ops` went through before its own promotion (rounds forty-two, fifty-
+three, fifty-four): pole proximity, large-radius behaviour, and a
+mixed-scale column. Asked to run that scrutiny before promoting, not
+instead of it.
+
+**Part 1 -- pole proximity.** Reran round forty-two's own declination-
+stratified design exactly (6,000 rows, 2,000 each at equator/<10,
+mid-lat 40-50, near-pole 85-89.9, `fpr`'s own 0.02-0.3 degree radius
+range, 300 stratified probes), box8/box4/multicap each in their own
+dedicated table. Correctness held exactly in all three bands --
+5/5/5/5, 8/8/8/8, 404/404/404/404 (brute/box8/box4/multicap) -- and
+box4's buffer advantage over box8 held near the pole too (630 vs 645 at
+the equator, 2196 vs 2271 near-pole), not eroding the way a float4-
+precision regression might have. No surprises, no regression.
+
+**Part 2 -- large-radius crossover.** Built isolated single-scale bands
+(uniform-on-sphere centres, one radius per dedicated table, box8/box4/
+multicap/pgSphere each with their own index) across 2.5 to 80 degrees.
+**Found a real methodology hazard before trusting any number**: at 60
+and 80 degrees the circle covers so much of a 15,000-row table that the
+planner's Index-Scan-vs-Bitmap-Heap-Scan cost estimate becomes a near
+coin flip, and it genuinely flips per opclass -- `box8` got a plain
+`Index Scan` at 60 degrees (13,703 buffers, the exact "many redundant
+false-positive rechecks" pathology rounds forty-seven/forty-eight/
+fifty-four/fifty-six have each independently hit) while `box4` on
+byte-identical data got a `Bitmap Heap Scan` (239 buffers) -- an
+18x-looking "difference" that's actually a planner tie-break artifact,
+not a geometry difference. Checked every radius's plan shape explicitly
+before trusting its numbers (not assumed from one spot check): clean
+and consistent (`Bitmap Heap Scan` for all four methods) from 2.5
+through 50 degrees; erratic (different scan types per method) at 55
+degrees and up, where the query is matching such a large fraction of
+the table that no plan is efficient and whichever one a given opclass's
+index happens to get is close to arbitrary. Restricted all conclusions
+to the verified-clean 2.5-50 degree range.
+
+**In that clean range, `box4` and `box8` both beat `skyregion_gist_ops`
+(multicap) decisively, at every radius tried, up to 50 degrees** --
+e.g. at 50 degrees, box8 778 buffers vs multicap 1612 (verified
+identical Bitmap Heap Scan plan shape for both, re-checked directly).
+Re-measured 10 degrees specifically at both this round's 15,000-row
+scale and round fifty-four's own reported 25,000-row scale, both with
+confirmed-clean plan shapes: box8 beat or tied multicap in both wall-
+clock and buffers at that radius too (296 vs 390.5 buffers at 15,000
+rows; 485 vs 643 at 25,000).
+
+**This directly contradicts round fifty-four's own claim** ("multicap
+won every one of [10, 25, 45, 60 degrees], decisively -- e.g. 10.627ms
+vs 13.960ms at 10 degrees"). Not explained by a batched-query artifact
+(this round's methodology is single-literal throughout, same validated
+form round fifty-four itself used) or by corpus size (reproduced at
+both 15,000 and 25,000 rows). **Could not fully root-cause the
+discrepancy within this round's scope** -- round fifty-four's own
+pin6_corpus no longer exists to re-inspect, and this round's own plan-
+shape hazard (part of this exact finding) is precisely the kind of
+thing that's easy to miss if only one spot-checked rather than every
+radius -- plausible, given round fifty-six already found a different,
+unrelated historical claim (round forty-two's own pgSphere comparison)
+was an artifact of an unverified plan choice in that same long-lived
+scratch database, that round fifty-four's own multicap-wins measurement
+had the same unverified gap. **Reporting this honestly as an open,
+unresolved discrepancy, not silently overriding five rounds of
+established history with one fresh result**: no specific large-radius
+crossover number is currently a safe claim for either box opclass.
+
+**Part 3 -- mixed-scale column.** Reproduced round fifty-four's other
+confound directly: one table, 15,000 rows, half 1-3 degree circles and
+half 85-89 degree circles, ONE shared index, small-radius-only probes
+(the regime isolation alone would favour the box opclasses in, per part
+2). Confirmed clean, identical plan shape (`Bitmap Heap Scan`) for
+box8/box4/multicap. Correctness exact (147,593 matches, all four
+methods agree). **This confound did reproduce, for box4 same as box8**:
+multicap touches far *more* buffers (823 vs box4's 338, box8's 525) but
+still comes out fastest on wall-clock (2.15ms vs
+box4's 2.20ms, essentially tied, vs box8's 2.71ms, clearly behind) --
+qualitatively the same effect round fifty-four found (buffer count and
+wall-clock disagree once an extreme-scale outlier shares the index),
+smaller in magnitude than that round's own 8.601/5.796ms numbers but
+the same direction and the same affected opclasses. `box4` narrows the
+gap to multicap here (near-tied rather than clearly behind) but doesn't
+reverse it.
+
+**Promotion decision**: `box4` was not worse than `box8` in any regime
+tested -- ties or wins on the mixed-scale confound (part 3), wins
+outright everywhere else (part 1, part 2's clean range, and every
+corpus in rounds fifty-eight through sixty). Swapping the DEFAULT from
+`box8` to `box4` therefore carries no regression versus the status quo
+in any tested regime, while being a strict improvement in the common
+case (small-to-few-degree, realistic catalogue footprints) and in the
+one strategy (`@>`(region,point)) where `box8` itself trailed pgSphere.
+The open large-radius discrepancy (part 2) doesn't block this decision
+either way: it doesn't newly justify demoting box4 (nothing found box4
+*losing* to multicap at any radius, clean-plan-shape or not), and it
+isn't resolved cleanly enough to assert a *wider* safe range than box8
+already claimed. The mixed-scale caveat box8's own comment always
+carried (`skyregion_gist_ops` wins for a column mixing very different
+region scales) is carried over to box4's comment unchanged, now
+confirmed directly for box4 rather than just inherited from box8's own
+geometry.
+
+**Shipped**: `skyregion_box4_gist_ops` promoted to `DEFAULT FOR TYPE
+skyregion USING gist`, demoting `skyregion_box_gist_ops` (same DROP-
+OPERATOR-FAMILY-and-recreate mechanism round twenty-one's own box8
+promotion used -- PostgreSQL has no `ALTER OPERATOR CLASS ... SET
+DEFAULT`). Shipped as skycell 0.26 (`ext/sql/skycell--0.25--0.26.sql`,
+folded into `ext/sql/skycell--0.26.sql`). No C code change -- box4's
+opclass functions and key type already existed from 0.25; only the
+`DEFAULT` keyword's placement and the three affected opclasses'
+`COMMENT ON` text changed. Tested on both the fresh-install path
+(`make installcheck`) and a real incremental upgrade (`ALTER EXTENSION
+skycell UPDATE TO '0.26'` against `paper_bench`), including a direct
+check that `pg_opclass.opcdefault` flipped correctly and that a plain,
+opclass-unqualified `CREATE INDEX ... USING gist (region)` now builds a
+`box4` index. `fpr_region_gist` (dropped by the `CASCADE`, same
+documented side effect round twenty-one's own promotion had) rebuilt
+afterward; `rc_corpus`'s two explicitly-named indexes were left for
+whoever next runs `26_region_crossover.sql` to recreate, same as that
+round's own precedent. All of this round's own scratch tables (`pole_*`,
+`lr_*`, `rc10*`, `ms_*`) and ad hoc helper functions dropped after
+measurement.
+
+**STATUS**: shipped. The large-radius discrepancy with round fifty-four
+(part 2) is open for whoever wants to chase it further -- ideally by
+finding or rebuilding something close to that round's own pin6_corpus
+and checking every radius's plan shape explicitly, the exact thing this
+round's own part 2 shows is easy to skip and easy to get a misleading
+number from if skipped.
