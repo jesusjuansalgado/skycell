@@ -5905,3 +5905,102 @@ a point estimate -- the close band (5-7 degrees) would need more probes
 or more repeats to resolve further, not attempted since the decision
 this round needed to inform (confirm the DEFAULT promotion, fix the
 wrong comment text) didn't need more precision than that.
+
+## Round fifty-five: the box opclass does not beat pgSphere -- "Round
+forty-two"'s own claim to the contrary does not reproduce, and could
+not be forensically explained
+
+Asked directly, after round fifty-four's own crossover work: does the
+box opclass still lose to pgSphere? Round fifty-one already measured a
+1.1-1.9x gap favouring pgSphere on `rc_corpus`, but `rc_corpus` mixes
+four radius bands into one index -- round fifty-four's own finding --
+so that number alone doesn't settle whether box loses to pgSphere
+everywhere, or only in the same mixed-scale regime where it also loses
+to multicap. Checked directly rather than assuming either answer.
+
+**Isolated single-scale corpora, box vs. pgSphere, same validated per-
+probe methodology as round fifty-four**: built `pin8` (25,000 rows, 1
+degree, matching a radius box already wins against multicap at) and
+`pin9` (five bands, 0.05-0.5 degrees, matching `fpr`'s own scale). pgSphere
+won every single band tried:
+
+| corpus | radius | box ms | pgsphere ms |
+|---|---|---|---|
+| pin8 | 1.0 deg | 0.042 | 0.027 |
+| pin9 | 0.05 deg | 0.047 | 0.023 |
+| pin9 | 0.1 deg | 0.032 | 0.019 |
+| pin9 | 0.2 deg | 0.042 | 0.022 |
+| pin9 | 0.3 deg | 0.038 | 0.0295 |
+| pin9 | 0.5 deg | 0.048 | 0.0385 |
+
+Reproduced with a repeat run at 1 degree (0.042/0.027 both times,
+stable). Box never wins here, at any radius tried -- not even in the
+exact regime (sub-degree, isolated scale) where round fifty-four found
+it winning decisively against multicap.
+
+**This directly contradicts "Round forty-two"'s own claim** ("box beats
+pgSphere 2.1-8.4x" on `fpr`, the project's own 50,000-row mixed circle/
+polygon corpus). Didn't take either number on faith; re-ran the actual
+`fpr` corpus, circle-only subset, two ways:
+
+| query form | box ms | pgsphere ms |
+|---|---|---|
+| per-probe, literal (round fifty-one/four's own validated form) | 0.1055 | 0.0150 |
+| batched nested-loop (round forty-two's own apparent query shape) | 7.658 | 4.779 |
+
+pgSphere wins **both** ways -- including the batched form, which is the
+*same* execution-shape artifact round fifty-four found inflating box's
+own numbers against multicap. Reproducing that exact shape here and
+still getting pgSphere ahead rules out "it's the same batched-query
+bug" as the explanation.
+
+**Checked every other explanation available, and ruled each one out**:
+- JIT: `SHOW jit` reports `off` in this environment, and every query in
+  this comparison costs far too little to reach `jit_above_cost` even
+  if it were on (confirmed irrelevant, not just disabled).
+- Cross-type query expressivity: pgSphere's own `scircle` GiST opclass
+  indexes `&&(scircle, spoly)` and the reverse natively (`pg_amop`
+  strategies 31-36), so a mixed circle/polygon corpus is not a
+  structural limitation forcing pgSphere into multiple unindexed
+  queries -- it can answer a mixed-type overlap test from one index,
+  same as skycell's own unified type.
+- Corpus staleness: `fpr` was rebuilt earlier this session (round
+  fifty-two's `MAX_SUBCAPS` test), but re-ran the comparison against
+  the corpus as it exists right now, not an assumed-stale one -- the
+  current numbers are what the current corpus actually produces.
+
+**Could not identify the actual cause.** "Round forty-two"'s own
+benchmark was explicitly ad hoc ("registered ad hoc against
+`splitcost_test`... this stays fully disposable pending a verdict"),
+never committed to this repository's own `bench/` scripts, so its exact
+query is not recoverable to re-run verbatim -- only a best-effort
+reconstruction, which still doesn't reproduce the claimed result even
+using that round's own apparent query shape. Reporting this honestly
+rather than guessing at a specific root cause: something about that
+original measurement does not describe current, repeatable reality,
+and no mechanism tried here explains the gap between the two.
+
+**Does not reopen round fifty-three's DEFAULT decision.** That decision
+rests on the box-vs-multicap comparison, independently re-verified
+multiple times this session (rounds fifty-one, fifty-three, fifty-
+four) with methodology artifacts controlled for each time; the
+pgSphere comparison was always a secondary claim layered on top, never
+the basis for promoting `skyregion_box_gist_ops`. Retracting it doesn't
+change which opclass should be default -- it changes what skycell can
+honestly claim about pgSphere, which is currently nothing in this
+opclass's favour.
+
+**STATUS**: shipped as skycell 0.23 (`ext/sql/skycell--0.22--0.23.sql`).
+Comment text only, both opclasses' `COMMENT ON OPERATOR CLASS` and
+`skyregion_box_gist_ops`'s preceding comment block, retracting the
+"closes the gap to pgSphere" claim and stating plainly that neither
+region opclass is currently known to beat pgSphere's native GiST.
+Tested on both the fresh-install path (`make installcheck`) and a real
+incremental upgrade (`ALTER EXTENSION skycell UPDATE TO '0.23'` against
+`paper_bench`). All `pin8`/`pin9` scratch tables and the ad hoc
+`fpr_reg_circ_gist`/`fpr_reg_poly_gist` indexes dropped after
+measurement. Open for whoever wants to chase it further: why does
+`skyregion_box_gist_ops`, whose key and `consistent()` logic were built
+to mirror pgSphere's own `Box3D` as closely as possible (round forty-
+two's own stated goal), still lose to it on every corpus and scale
+tried here.
