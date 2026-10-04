@@ -6408,3 +6408,108 @@ operator, function, or SQL change this round (skycell stays at 0.25).
 All `bm_*` scratch tables and the ad hoc `bm_run()` helper dropped
 after measurement; not part of the committed `bench/` scripts, same
 convention as every disposable corpus before it.
+
+## Round sixty: all four strategies, on the real 50,000-row `fpr`
+## corpus, not a synthetic isolated-scale band -- `box4` wins every one
+
+Rounds fifty-eight/fifty-nine used synthetic, isolated-single-scale
+bands (uniform radius per band, 50/50 circle/polygon, fresh independent
+draws) specifically to control confounds -- but that's not the corpus
+this project's own prior rounds (forty-two, fifty-five) used when they
+talked about "50,000 rows": `fpr` itself, built by the committed
+`20_region_xmatch.sql` (power-law radius 0.02-0.3 degree, sampled from
+real catalogue positions via `src`, not synthetic uniform-on-sphere).
+Asked directly to use the real thing, and to cover all four strategies
+`skyregion`'s GiST opclasses support (&&, `@>`/point, `@>`/region,
+`<@`/region), not just overlap.
+
+**Rebuilt `fpr` at the real scale** (`20_region_xmatch.sql -v
+nfp=50000`) and ran the project's own already-committed comparison
+scripts at that scale (`22/23/24_region_*.sql -v nprobe=500` --
+`fpr_region_gist`, the DEFAULT `box8` opclass, is what these scripts
+already measure against pgSphere and a brute-force oracle; this round
+didn't need to write that half). Added the one thing those scripts
+don't do: a `skyregion_box4_gist_ops`-indexed copy of the same 50,000
+rows (`fpr4`, built with `CREATE TABLE fpr4 AS SELECT * FROM fpr`, so
+every row and every probe comparison is against byte-identical
+geometry) run through the identical queries, plus the one pgSphere
+number `22_region_gist.sql` never computed (its own `&&`, which --
+unlike the other three strategies, where only one side of the
+comparison has a circle/polygon kind -- needed all four probe-kind x
+corpus-kind combinations summed, since both `fpr`'s rows and `rox_
+probe`'s own probes are a 50/50 circle/polygon mix).
+
+**Correctness**: every method's count matched the brute-force oracle
+(`intersects()`, `skycell_in_region()`, `skycell_region_covers()`,
+`skycell_region_covered_by()`) exactly, zero mismatches, across all
+four strategies.
+
+**Plan-shape sanity check, before trusting the numbers**: all three
+methods' queries plan as the identical shape here (a parameterized
+nested-loop `Index Scan`, `rox_probe` on the outer side) -- confirmed
+directly via `EXPLAIN`, not assumed -- so, unlike round fifty-eight's
+circle-only bands (where `box8`/`box4` naturally picked a plain Index
+Scan and pgSphere a Bitmap Heap Scan), this round's three-way ranking
+isn't comparing different plan shapes. Cross-checked the batched
+form's ranking against round fifty-four's own validated single-
+literal methodology too (one probe, same geometry, all three methods):
+`box4` 0.128ms/25 buffers, `box8` 0.248ms/27 buffers, pgSphere
+0.395ms/32 buffers for that one probe -- same ordering as the batched
+numbers below, so the batched form isn't producing a different
+ranking than the literal one would, this time.
+
+**Median-of-2 wall-clock, 500 probes/strategy, box8 (DEFAULT) / box4 /
+pgSphere**:
+
+| strategy | box8 ms | box4 ms | pgSphere ms |
+|---|---|---|---|
+| `&&` (overlap) | 17-21 | **8-11** | 66-67 |
+| `@>`(region,point) | 16.6-17 | **8.8-9.1** | 9.8-11.7 |
+| `@>`(region,region) "contains" | 14-16 | **6.5-8.0** | 11.5-11.8 |
+| `<@`(region,region) "covered_by" | 39-43 | **27-28** | 104-107 |
+
+`skyregion_box4_gist_ops` wins all four strategies outright, against
+both `skyregion_box_gist_ops` and pgSphere, on the real corpus -- not
+just the three isolated bands rounds fifty-eight/fifty-nine already
+covered, and not just `&&`. Two things worth separating from that
+headline:
+
+**`box8` (the shipped DEFAULT) does not uniformly beat pgSphere here --
+its standing is strategy-dependent, matching what `23_region_contains.
+sql`'s own comment already documented** (box8 loses to pgSphere on
+point-in-region containment, by ~1.5-1.7x at this scale, consistent
+with that script's own prior finding of the gap "widening to ~5.5x at
+50,000" in an earlier measurement) but *wins* on both region-region
+directions and (newly measured here) on `&&` too. `box4` is the only
+one of the three that wins everywhere, not by inheriting `box8`'s wins
+and losing where `box8` loses, but by beating pgSphere on the one
+strategy (`@>`/point) where `box8` itself could not.
+
+**pgSphere's `&&` number (66-67ms) is the single biggest number in the
+whole table, and it's almost certainly the two/four-typed-column tax
+round fifty-nine already found, now worse.** Round fifty-nine's mixed-
+corpus test only needed pgSphere to pay for two index descents per
+probe (one kind on each side of a single column pairing); `&&` on this
+corpus needs *four* subqueries (circle-circle, circle-polygon, polygon-
+circle, polygon-polygon), since both `rox_probe` and `fpr` are
+independently mixed -- paying for up to four index descents per probe
+where skycell's own opclasses still pay for exactly one. Consistent
+with, not a new mechanism beyond, what round fifty-nine already
+identified.
+
+**Does not change any shipped default.** Same status as rounds fifty-
+eight/fifty-nine: a further, now corpus-realistic confirmation of
+`skyregion_box4_gist_ops`'s mechanism, not a promotion decision --
+promoting it would still need the breadth of scrutiny (pole proximity,
+large-radius behaviour, mixed-scale columns) that earned `skyregion_
+box_gist_ops` its own DEFAULT status, none of which this round or the
+two before it attempted.
+
+**STATUS**: shipped as a GIST_REGION_DESIGN.md entry only -- no
+opclass/operator/function/SQL change (skycell stays at 0.25). `fpr`
+itself (rebuilt at 50,000 rows) and the `rox_probe*`/`bench_region_*`
+tables are the project's own normal, persistent bench artifacts (owned
+by the committed `20/22/23/24_region_*.sql` scripts, not this round) and
+were left as those scripts normally leave them; only this round's own
+additions (`fpr4` and its ad hoc `allops_results`/`allops_run()`
+harness) were dropped after measurement.
