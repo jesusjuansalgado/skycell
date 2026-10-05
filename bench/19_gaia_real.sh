@@ -1,5 +1,5 @@
 #!/bin/bash
-OUT=/tmp/gaia
+OUT=${GAIA_DIR:-/tmp/gaia}; mkdir -p "$OUT"
 # (1) all-sky sample of REAL positions: random_index is a precomputed random
 # permutation, so this is a uniform random thinning of the true point process --
 # every position is a real Gaia DR3 position and the density contrast is preserved
@@ -10,7 +10,7 @@ for i in $(seq 0 9); do
   curl -sS --max-time 600 -G 'https://gea.esac.esa.int/tap-server/tap/sync' \
     --data-urlencode 'REQUEST=doQuery' --data-urlencode 'LANG=ADQL' --data-urlencode 'FORMAT=csv' \
     --data-urlencode 'MAXREC=4000000' \
-    --data-urlencode "QUERY=SELECT source_id, ra, dec FROM gaiadr3.gaia_source WHERE random_index >= $lo AND random_index < $hi" \
+    --data-urlencode "QUERY=SELECT source_id, random_index, ra, dec FROM gaiadr3.gaia_source WHERE random_index >= $lo AND random_index < $hi" \
     -o "$f.tmp" 2>/dev/null
   if [ -s "$f.tmp" ] && head -1 "$f.tmp" | grep -q '^source_id'; then mv "$f.tmp" "$f"; echo "allsky $i: $(($(wc -l < "$f") - 1)) rows"; fi
 done
