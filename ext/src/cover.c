@@ -976,6 +976,7 @@ sc_cover_params_default(sc_cover_params *p)
 	p->max_ranges = 64;
 	p->range_cost = 30.0;
 	p->split_cost = 1.0;
+	p->probe_split_cost = 1.0;
 	p->max_steps = 4000;
 	p->max_area_ratio = 64.0;
 	p->use_seed = 1;
@@ -1230,14 +1231,17 @@ merge_gaps(rlist_t *l, const sc_density *d, const sc_cover_params *p, double are
  * Sort, merge adjacent, and score a candidate covering.
  *
  * score = ranges * range_cost + expected rows inside the covering
- *       + cells examined * split_cost
+ *       + cells examined * step_cost
  *
  * all three in rows.  The region's own rows are the same for every candidate,
- * so they cancel and are not subtracted.
+ * so they cancel and are not subtracted.  step_cost is passed in rather than
+ * read from p->split_cost because the only caller is the order-probe loop,
+ * which charges its own probe_split_cost for cells examined -- a different
+ * cost than the descent's split/keep decision charges for the same unit.
  */
 static double
 rlist_score(rlist_t *l, const sc_density *d, const sc_cover_params *p, int steps,
-			double region_area, double *rows_out)
+			double step_cost, double region_area, double *rows_out)
 {
 	double		rows = 0;
 	int			m = 0;
@@ -1262,7 +1266,7 @@ rlist_score(rlist_t *l, const sc_density *d, const sc_cover_params *p, int steps
 		rows += sc_density_rows(d, l->a[i].lo, l->a[i].hi);
 	if (rows_out)
 		*rows_out = rows;
-	return l->n * p->range_cost + rows + steps * p->split_cost;
+	return l->n * p->range_cost + rows + steps * step_cost;
 }
 
 void
@@ -1300,18 +1304,27 @@ sc_cover_compute(const sc_region *r, const sc_density *d,
 		 * is why the depth is small and why rlist_score() charges for the
 		 * cells examined as well as the ranges and the rows.
 		 *
-		 * This is OFF by default (skycell.probe_orders = 0) because it does
-		 * not yet deliver.  Forcing the order directly one to three steps finer
-		 * than the closed form is worth 30-48% at 6'-30' on the catalogue and
-		 * 32% on an ObsCore-shaped relation, with the range count unchanged --
-		 * the gain is real and measured.  Scored here, though, the finer
-		 * candidate usually loses, because rlist_score() charges split_cost
-		 * (1 row) for every cell examined and the enumeration at one order
-		 * finer examines roughly four times as many; at 6' that penalty
-		 * (~300 rows) outweighs the false positives saved (~180).  A cell
-		 * examined does not cost as much as a row fetched, so the honest fix
-		 * is to calibrate split_cost against measurement the way range_cost
-		 * now is, not to tune it until this looks good.
+		 * Forcing the order directly one to three steps finer than the closed
+		 * form is worth 30-48% at 6'-30' on the catalogue and 32% on an
+		 * ObsCore-shaped relation *in execution time alone* -- real and
+		 * measured, with the range count unchanged.  That is not the whole
+		 * bill, though: each extra probe is itself an enumeration, paid at
+		 * plan time, and it does not amortise unless the same (ra, dec,
+		 * radius) recurs often enough to hit sc_cover_compute()'s caller's
+		 * memoised cache.  Measured in total (plan + execution) time against
+		 * 1,456 distinct query centres -- i.e. the cache providing no
+		 * reuse, the realistic case for a service answering different
+		 * users' cones -- probe_orders = 3 is a net loss at several radii
+		 * (6', 30', 1 degree) relative to not probing at all, and even
+		 * probe_orders = 1 does not uniformly win once probe_split_cost
+		 * varies.  See GIST_REGION_DESIGN.md's probe-loop decoupling round.
+		 * probe_split_cost exists so that whoever tunes this for a workload
+		 * where it does amortise (a repeated query shape, or an offline
+		 * covering build) calibrates the probe loop's own enumeration cost
+		 * without also detuning the descent's unrelated split/keep decision
+		 * or its SC_PROBE_MIN guard below, which used to share split_cost
+		 * with it -- that coupling bug is fixed here regardless of whether
+		 * probing itself is worth enabling for any given workload.
 		 */
 		sc_cover_params pk = *p;
 		rlist_t		best = {0};
@@ -1336,7 +1349,7 @@ sc_cover_compute(const sc_region *r, const sc_density *d,
 				break;
 			}
 			steps += st;
-			cost = rlist_score(&cand, d, p, st, r->area, &cand_rows);
+			cost = rlist_score(&cand, d, p, st, p->probe_split_cost, r->area, &cand_rows);
 			if (cost < best_cost)
 			{
 				if (best.a)
@@ -1362,7 +1375,7 @@ sc_cover_compute(const sc_region *r, const sc_density *d,
 			 * rows: there is nothing there to win back, and the probe would be
 			 * pure plan-time loss.
 			 */
-			if (cand_rows < SC_PROBE_MIN * (st + 1) * fmax(p->split_cost, 1e-3))
+			if (cand_rows < SC_PROBE_MIN * (st + 1) * fmax(p->probe_split_cost, 1e-3))
 				break;
 		}
 

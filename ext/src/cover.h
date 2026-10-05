@@ -91,6 +91,15 @@ typedef struct sc_cover_params
 	int			max_steps;		/* cap on cell classifications */
 
 	/*
+	 * Cost charged per cell examined by the order-probe loop (skycell.
+	 * probe_orders), in rows.  Kept separate from split_cost: that field
+	 * tunes the unrelated descent's own split/keep decision, and sharing it
+	 * here meant calibrating one for the probe loop silently detuned the
+	 * other's SC_PROBE_MIN early-exit guard too.
+	 */
+	double		probe_split_cost;
+
+	/*
 	 * Robustness guard against density underestimates: a partially covered
 	 * cell may not be larger than max_area_ratio * area(region), and gaps are
 	 * only merged under the same bound.  0 disables (trust the density model).

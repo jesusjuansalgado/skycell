@@ -6983,3 +6983,111 @@ for whoever wants to keep testing density/shape sensitivity;
 `cold_trial`/`cold_results`/`cold_run()` (this round's own one-off
 cold-cache harness, not reusable infrastructure the way the density/
 shape ones are) dropped after measurement.
+
+## Round sixty-five: decoupling the probe loop's cost accounting from
+## `split_cost` -- done; promoting the result as a default -- not
+## supported once planning time is counted honestly
+
+Round sixty-four left two paths: promote `probe_orders=3, split_cost=
+0.1` outright, or decouple the probe loop's own cost accounting from
+`split_cost` first and promote `probe_orders` alone. Asked to do the
+second, then promote and re-validate.
+
+**The decoupling itself.** `cover.c`'s probe loop scored each candidate
+order through `rlist_score()`, which charged `p->split_cost` per cell
+examined, and separately gated its own early exit with `SC_PROBE_MIN *
+fmax(p->split_cost, 1e-3)`. Both uses now read a new field,
+`probe_split_cost` (`sc_cover_params`, wired through a new GUC
+`skycell.probe_split_cost`), leaving `split_cost` to do only the one
+job it was named for: the general descent's own split/keep decision at
+the `gain > p->split_cost` test, untouched by this round. `rlist_score()`
+itself now takes the step cost as an explicit argument rather than
+reading `p->split_cost` off the params struct, since the descent has no
+other caller for it. The three run-time range-slot caches (`slot_cache`,
+`poly_slot_cache`, `region_slot_cache` -- memoised per backend for
+non-constant cones/polygons/regions in joins) did not invalidate on
+`skycell.probe_orders` changing at all, a latent gap that mattered more
+once probing was a live default candidate; fixed by adding both new
+fields to all three caches' keys. `make installcheck` passes; zero
+correctness mismatches across every `probe_orders`/`probe_split_cost`/
+`force_order` combination tried in this round's own sweep (`bench_cone_
+x`'s `act_rows` -- the true, post-recheck result -- is identical for
+every variant stored against a given `qid`), confirming what decoupling
+a cost knob should always confirm: it changes which covering is chosen,
+never whether the chosen one is sound.
+
+**Promotion, attempted and then reverted.** `probe_orders = 3`,
+`probe_split_cost = 0.1` (the direct analogue of round sixty-three's
+coupled fix, now properly isolated) was set as the compiled-in default
+and run back through `bench/03_cone.sql`'s own 1,456-probe sweep. The
+regression suite passed and buffers looked the same as round sixty-
+three's own measurement -- flat to improved at every radius. But this
+round checked **total** time (`EXPLAIN`'s `Planning Time` + `Execution
+Time`), not execution time alone, because every one of the 1,456 probe
+centres is a distinct `(ra, dec, radius)`, which is also the realistic
+shape of a TAP service answering different users' cones: the per-
+backend covering cache (`cover_cache`) cannot amortise a covering that
+is never asked for twice. Round sixty-three's own published table was
+execution time only; its "Planning Time" column existed in the harness
+but was never summed into the headline numbers. Doing that sum changes
+the conclusion:
+
+| radius | buffers (off \| default) | **total** ms, median (off \| default) |
+|---|---|---|
+| 1" | 4.1 \| 4.1 | 0.051 \| 0.055 (tied) |
+| 10" | 4.5 \| 4.5 | 0.055 \| 0.066 (worse) |
+| 1' | 5.7 \| 5.3 | 0.068 \| 0.084 (worse) |
+| 6' | 9.2 \| 8.2 | 0.097 \| 0.203 (much worse) |
+| 30' | 26.1 \| 24.6 | 0.212 \| 0.588 (much worse) |
+| 1 deg | 50.8 \| 49.5 | 0.743 \| 0.792 (worse) |
+| 3 deg | 330.9 \| 328.2 | 6.925 \| 7.263 (worse) |
+
+Buffers move the direction round sixty-three measured -- probing
+genuinely does pick a tighter covering, at the same range count, exactly
+as claimed. But the probe loop's own enumeration is not free: trying one
+order finer costs roughly four times the cell classifications of the
+order just tried, paid at plan time, on every single query that does not
+repeat. At 6' and 30' -- the two radii round sixty-three highlighted as
+the clearest wins -- that planning cost outweighs the rows saved on the
+exact-test filter by 2-6x. The execution-time-only view was not wrong
+about what it measured; it was incomplete about what a user pays.
+
+**`probe_orders = 1` is better, but still not a clean, corpus-
+independent win.** Swept `probe_orders` over 0-3 (same total-time
+accounting): one probe, not three, recovered most of the execution-time
+gain at a quarter of the enumeration cost, and a repeat pass found it
+at-or-ahead of `probe_orders = 0` at every radius tried (3 deg: 1.67ms
+vs 1.83ms median, a real win; 30': tied within noise). That is a better
+operating point than this round's attempted default, but: (a) its own
+sensitivity to `probe_split_cost` was not monotonic in one quick check
+(`probe_split_cost = 1.0`, i.e. uncalibrated, scored as well or better
+than `0.1` at several radii in a single pass -- not yet run to the
+confidence level the rest of this round holds itself to), and (b) it has
+only been checked against this round's own clustered-catalogue cone
+corpus, not polygons, a different density, or cold cache the way round
+sixty-four checked the coupled fix. Recommending it as a default from
+one afternoon's sweep would repeat exactly the mistake this round just
+found and corrected in round sixty-three's own number.
+
+**Decision: ship the decoupling, not a new default.** `skycell.
+probe_orders` stays at 0 (off) and `skycell.probe_split_cost` stays at
+1.0 (matching `split_cost`'s own default, inert while probing is off).
+The fix that was promoted is architectural, not numerical: the probe
+loop's own cost accounting no longer shares a knob with -- and silently
+detunes -- the descent's unrelated split/keep decision and its `SC_
+PROBE_MIN` guard, so whoever *does* calibrate `probe_orders` for a
+workload where it amortises (a repeated query shape, or an offline
+covering build done once and reused) gets a clean knob to do it with,
+isolated from everything else `split_cost` controls. Both GUCs remain
+`PGC_USERSET` and fully documented; this is not a dead end, only a
+promotion this round could not honestly support on its own evidence.
+
+**STATUS**: shipped -- `cover.c`, `cover.h`, `skycell.c` changed
+(decoupling only; no default changed), `make installcheck` passes. The
+`probe_orders = 1` lead is left as a documented, not-yet-promoted
+candidate for whoever next studies this with the breadth round sixty-
+four gave the coupled fix (polygons, density, cold cache, `probe_split_
+cost` sensitivity at proper statistical power) -- not folded into this
+round's own promotion, for the same reason round sixty-one and sixty-
+four both declined to fold measurement into promotion without that
+breadth first.

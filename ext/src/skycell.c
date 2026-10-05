@@ -91,6 +91,7 @@ static bool skycell_cache_coverings = true;
 static bool skycell_exact_cells = true;
 static int	skycell_force_order = -1;
 static int	skycell_probe_orders = 0;
+static double skycell_probe_split_cost = 1.0;
 
 void		_PG_init(void);
 
@@ -175,10 +176,28 @@ _PG_init(void)
 	DefineCustomIntVariable("skycell.probe_orders",
 							"Orders past the closed-form choice to score on the covering "
 							"they actually produce (0, the default, disables: see the "
-							"comment in cover.c -- the gain the forced-order measurements "
-							"show is not yet captured by this).",
+							"comment in cover.c -- this helps execution time but its own "
+							"enumeration cost is paid at plan time on every distinct query, "
+							"which GIST_REGION_DESIGN.md's probe-loop decoupling round found "
+							"erases or reverses the gain, radius-dependently, once total "
+							"plan+exec time is measured honestly rather than execution time "
+							"alone).",
 							NULL, &skycell_probe_orders, 0, 0, 8,
 							PGC_USERSET, 0, NULL, NULL, NULL);
+	DefineCustomRealVariable("skycell.probe_split_cost",
+							 "Cost charged per cell examined by the order-probe loop "
+							 "(skycell.probe_orders), in rows. Separate from "
+							 "skycell.split_cost, which prices the unrelated descent's own "
+							 "split/keep decision: sharing one field between them meant "
+							 "calibrating it for the probe loop also detuned the descent's "
+							 "SC_PROBE_MIN early-exit guard (see GIST_REGION_DESIGN.md's "
+							 "probe-loop decoupling round). Default 1.0, matching "
+							 "skycell.split_cost's own default -- inert while "
+							 "skycell.probe_orders = 0, and not yet separately calibrated "
+							 "for when it isn't: the decoupling is this GUC's point, not a "
+							 "measured tuning recommendation.",
+							 NULL, &skycell_probe_split_cost, 1.0, 0.0, 1e9,
+							 PGC_USERSET, 0, NULL, NULL, NULL);
 	DefineCustomIntVariable("skycell.force_order",
 							"Diagnostics only: cover cones at this HEALPix order instead of "
 							"the one the cost model chooses (-1 = let the model choose).",
@@ -304,6 +323,7 @@ current_params(sc_cover_params *p, int max_ranges, const sc_density *d)
 	p->range_cost = (skycell_range_cost < 0)
 		? auto_range_cost(d) : skycell_range_cost;
 	p->split_cost = skycell_split_cost;
+	p->probe_split_cost = skycell_probe_split_cost;
 	p->max_area_ratio = skycell_max_area_ratio;
 	p->max_ranges = max_ranges;
 	p->max_steps = skycell_max_steps;
@@ -370,6 +390,7 @@ typedef struct cover_key
 				radius,
 				range_cost,
 				split_cost,
+				probe_split_cost,
 				area_ratio;
 	Oid			statrel;		/* whose density map this used */
 	int32		max_ranges;
@@ -519,6 +540,7 @@ cover_cached(const sc_region *reg, const sc_density *d, const sc_cover_params *p
 	key.radius = radius;
 	key.range_cost = p->range_cost;
 	key.split_cost = p->split_cost;
+	key.probe_split_cost = p->probe_split_cost;
 	key.area_ratio = p->max_area_ratio;
 	key.statrel = statrel;
 	key.max_ranges = p->max_ranges;
@@ -1902,9 +1924,11 @@ static struct
 				ntotal,
 				range_cost,
 				split_cost,
+				probe_split_cost,
 				area_ratio;
 	uint32		hhash;
 	int			nslots;
+	int32		probe_orders;
 	int64		lo[MAX_SLOTS],
 				hi[MAX_SLOTS];
 }			slot_cache;
@@ -1946,6 +1970,8 @@ skycell_cone_bound(PG_FUNCTION_ARGS)
 		slot_cache.hhash != hc->hash || slot_cache.nslots != nslots ||
 		slot_cache.range_cost != skycell_range_cost ||
 		slot_cache.split_cost != skycell_split_cost ||
+		slot_cache.probe_split_cost != skycell_probe_split_cost ||
+		slot_cache.probe_orders != skycell_probe_orders ||
 		slot_cache.area_ratio != skycell_max_area_ratio)
 	{
 		sc_region	reg;
@@ -1977,6 +2003,8 @@ skycell_cone_bound(PG_FUNCTION_ARGS)
 		slot_cache.nslots = nslots;
 		slot_cache.range_cost = skycell_range_cost;
 		slot_cache.split_cost = skycell_split_cost;
+		slot_cache.probe_split_cost = skycell_probe_split_cost;
+		slot_cache.probe_orders = skycell_probe_orders;
 		slot_cache.area_ratio = skycell_max_area_ratio;
 		slot_cache.valid = true;
 	}
@@ -1996,8 +2024,10 @@ static struct
 	double		ntotal,
 				range_cost,
 				split_cost,
+				probe_split_cost,
 				area_ratio;
 	int			nslots;
+	int32		probe_orders;
 	int64		lo[MAX_SLOTS],
 				hi[MAX_SLOTS];
 }			poly_slot_cache;
@@ -2040,6 +2070,8 @@ skycell_poly_bound(PG_FUNCTION_ARGS)
 		poly_slot_cache.hhash != hc->hash || poly_slot_cache.nslots != nslots ||
 		poly_slot_cache.range_cost != skycell_range_cost ||
 		poly_slot_cache.split_cost != skycell_split_cost ||
+		poly_slot_cache.probe_split_cost != skycell_probe_split_cost ||
+		poly_slot_cache.probe_orders != skycell_probe_orders ||
 		poly_slot_cache.area_ratio != skycell_max_area_ratio)
 	{
 		sc_region	reg;
@@ -2070,6 +2102,8 @@ skycell_poly_bound(PG_FUNCTION_ARGS)
 		poly_slot_cache.nslots = nslots;
 		poly_slot_cache.range_cost = skycell_range_cost;
 		poly_slot_cache.split_cost = skycell_split_cost;
+		poly_slot_cache.probe_split_cost = skycell_probe_split_cost;
+		poly_slot_cache.probe_orders = skycell_probe_orders;
 		poly_slot_cache.area_ratio = skycell_max_area_ratio;
 		poly_slot_cache.valid = true;
 	}
@@ -2092,8 +2126,10 @@ static struct
 	double		ntotal,
 				range_cost,
 				split_cost,
+				probe_split_cost,
 				area_ratio;
 	int			nslots;
+	int32		probe_orders;
 	int64		lo[MAX_SLOTS],
 				hi[MAX_SLOTS];
 }			region_slot_cache;
@@ -2136,6 +2172,8 @@ skycell_region_bound(PG_FUNCTION_ARGS)
 		region_slot_cache.hhash != hc->hash || region_slot_cache.nslots != nslots ||
 		region_slot_cache.range_cost != skycell_range_cost ||
 		region_slot_cache.split_cost != skycell_split_cost ||
+		region_slot_cache.probe_split_cost != skycell_probe_split_cost ||
+		region_slot_cache.probe_orders != skycell_probe_orders ||
 		region_slot_cache.area_ratio != skycell_max_area_ratio)
 	{
 		sc_region	reg;
@@ -2166,6 +2204,8 @@ skycell_region_bound(PG_FUNCTION_ARGS)
 		region_slot_cache.nslots = nslots;
 		region_slot_cache.range_cost = skycell_range_cost;
 		region_slot_cache.split_cost = skycell_split_cost;
+		region_slot_cache.probe_split_cost = skycell_probe_split_cost;
+		region_slot_cache.probe_orders = skycell_probe_orders;
 		region_slot_cache.area_ratio = skycell_max_area_ratio;
 		region_slot_cache.valid = true;
 	}
