@@ -797,15 +797,18 @@ explanation predicts a crossover at larger relations, checked by building the sa
 ObsCore-shaped relation (observations in groups of 128 sharing a field centre, clustered
 by collection and field) at three sizes (Table~\ref{tab:crossover}): for the cone with
 catalogue cuts (Q07) and the degree-scale cone (Q06), \texttt{skycell} pulls further
-ahead as the relation grows; the empty cone (Q12) is level; the small-cone class (Q05) we
-cannot pin down to better than a factor of two across repeats, but the deficit is at
-least localised to execution rather than planning.
+ahead as the relation grows; the empty cone (Q12) is level. The small-cone class (Q05) we
+cannot pin down -- 2.16 times slower immediately after the build (the table), level
+(0.94) once thoroughly warm, not reproducible on this host to better than that factor of
+two -- but the deficit is at least localised to execution (0.324\,ms against 0.161)
+rather than planning.
 
 \begin{table}
-  \caption{Crossover on an ObsCore-shaped relation: total query time as the ratio
-    skycell/pgSphere, with buffer pages at $10^7$ rows. Q05: 0.15\degr\ cone; Q06:
-    2\degr; Q07: 0.5\degr\ with calibration/time cuts; Q12: an empty 0.7\arcsec\ cone
-    (Q05 is regime-dependent, text).}
+  \caption{Crossover on an ObsCore-shaped relation, randomized paired trials (30
+    centres, 3 repetitions, each method warmed on its own query first): total query
+    time as the ratio skycell/pgSphere, with buffer pages at $10^7$ rows. Q05:
+    0.15\degr\ cone; Q06: 2\degr; Q07: 0.5\degr\ with calibration/time cuts; Q12: an
+    empty 0.7\arcsec\ cone (Q05 is regime-dependent, text).}
   \label{tab:crossover}
   \centering
   \footnotesize
