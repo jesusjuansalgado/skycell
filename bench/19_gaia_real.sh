@@ -17,7 +17,7 @@ done
 # (2) complete, full-density real fields for crowding: cluster cores, bulge, Magellanic.
 #     name:ra:dec:radius_deg
 for fld in "omega_cen:201.697:-47.4795:0.25" "47tuc:6.0236:-72.0814:0.25" "m4:245.8967:-26.5256:0.25" \
-           "baade:18.17:-29.95:0.25" "gal_centre:266.4168:-29.0078:0.25" "lmc:80.8942:-69.7561:0.5" \
+           "baade:270.904:-30.035:0.25" "gal_centre:266.4168:-29.0078:0.25" "lmc:80.8942:-69.7561:0.5" \
            "m13:250.4235:36.4613:0.25" "ngc104_off:8.0:-72.0:0.25"; do
   n=${fld%%:*}; r=${fld##*:}; rest=${fld#*:}; ra=${rest%%:*}; rest=${rest#*:}; dec=${rest%%:*}
   f="$OUT/field_$n.csv"; [ -s "$f" ] && continue
