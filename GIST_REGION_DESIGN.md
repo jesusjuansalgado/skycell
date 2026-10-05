@@ -7196,5 +7196,8 @@ statistics target 1000, three independent `ANALYZE` samples.
   1.6M row count, this says the published corpus used the correct
   position and only the script had drifted.
 
-No change to the paper is needed. The table remains unreproducible from
-the repo until its measurement is scripted.
+No change to the paper is needed. The measurement is now scripted as
+`bench/29_estimator.sql`, which repeats it over several `ANALYZE` samples:
+those move the estimate more than the three above suggested (47 Tuc
+0.02-0.11, LMC 0.51-0.80 in one run), so the table's single-sample
+figures should be read with that spread.

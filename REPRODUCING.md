@@ -93,6 +93,7 @@ psql -f bench/14_shapes.sql
 psql -f bench/16_sensitivity.sql     # cost parameters, density estimator
 psql -f bench/17_ablation.sql        # clustering / covering / index representation
 psql -f bench/18_xmatch_sweep.sql    # outer size × radius × target distribution
+psql -f bench/29_estimator.sql       # density estimate vs truth per field (tab:estimator)
 python3 bench/ab_report.py           # paired ratios, bootstrap intervals
 ```
 
