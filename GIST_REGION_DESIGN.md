@@ -7091,3 +7091,101 @@ cost` sensitivity at proper statistical power) -- not folded into this
 round's own promotion, for the same reason round sixty-one and sixty-
 four both declined to fold measurement into promotion without that
 breadth first.
+
+## Round sixty-six: re-verifying the paper's own numbers against the
+## current build, after the decoupling and the box4 writeup -- both
+## hold, with two real measurement bugs found and fixed along the way
+
+Asked directly, after folding box4/cap4 and the probe-loop finding into
+the paper (round sixty-five and after): do the paper's existing cone-
+search tables still describe the shipped extension, and does the new
+region-opclass table's own numbers hold up under an independent re-
+measurement rather than a transcription from rounds fifty-eight through
+sixty? Checked both rather than assumed either.
+
+**Cone search (`tab:cones`/`tab:scale`): re-ran `bench_cone_explain`
+against the current 0.26 build (`skycell.probe_orders`/`split_cost`
+confirmed at their shipped defaults, 0 and 1) on `paper_bench`'s
+existing `cat_cell`/`cat_sphere` (10M rows).** First pass looked alarming
+-- wall-clock ratios 1.1-2.0x worse than the paper's published 0.9-1.0,
+skycell apparently losing everywhere. The buffer counts told a different
+story: 50.8 against pgSphere's 153.7 at 1 degree, against the paper's
+own 55/154 -- almost exact agreement. Root cause, confirmed by isolating
+each method's own warm-up (several dedicated passes per method before
+switching, not interleaved): `cat_cell`+`cat_sphere`'s combined size
+(866MB + 1413MB = 2.28GB) exceeds this container's 2GB `shared_buffers`,
+so alternating between them evicts each other's pages -- the same
+cache-thrashing mechanism round forty-four and round sixty-two both
+already found and fixed for their own comparisons, now hit again on a
+different container than either the paper's own rig or this session's
+earlier work. Wall-clock on this specific machine does not reproduce the
+paper's ratios even isolated-warm (skycell's planning time alone runs
+2-5x pgSphere's here, against a much gentler growth in the paper's own
+numbers) -- consistent with, not contradicting, the paper's own "every
+number here comes from one machine... only the comparisons travel"
+caveat (Sect. 5.2): this container is simply not that machine. The
+buffer counts, which depend only on the covering chosen and not on this
+host's own timing characteristics, are the right signal here, and they
+confirm the algorithm is unchanged: the decoupling touched nothing that
+runs when `probe_orders = 0`.
+
+**Region GiST (`tab:gistregion`, new this revision): re-measured box4 vs
+box8 vs pgSphere on the real `fpr`/`rox_probe*` corpus (50,000 rows, 500
+probes) directly, rather than trusting the transcription from rounds
+fifty-eight through sixty.** Built a compact harness (`region_recheck_*`,
+dropped after use) covering all four strategies, toggling `pg_index.
+indisvalid` between `fpr_region_gist` (box4, the shipped default) and a
+freshly-built `fpr_region_box8` to force each in turn, verified by
+`EXPLAIN` every time rather than assumed. Two real bugs found and fixed
+before trusting any number, both the kind that silently produces a
+confidently wrong one:
+
+1. **The harness's own `contains`/`covered_by` pgSphere queries were
+   wrong**, checking only the circle side (`NOT f.is_poly`) and omitting
+   the polygon side pgSphere answers through a different operator
+   (`~` for containment, `<@` for covered-by, against `reg_poly`) --
+   undercounting pgSphere's own true matches by very close to half (274
+   vs 561 for `contains`, 6095 vs 12193 for `covered_by`) on this 50/50
+   mixed corpus. Caught by comparing row counts across all three methods
+   before trusting any timing, the same discipline this project's own
+   committed `24_region_contains_region.sql` already uses and that this
+   round's own harness should have copied exactly rather than
+   reconstructing from memory. Fixed by summing both sides, matching
+   that script's own query; all three methods then agree exactly on
+   every strategy.
+2. **The mean was the wrong statistic for pgSphere's own `&&` query**:
+   a first pass averaged 90.7ms with the measurements ranging 51.5-326.8
+   (one 4-subquery plan apparently far more exposed to this container's
+   own noise than the single-subquery strategies), against the paper's
+   published 66-67ms -- not a regression, a statistic that doesn't
+   belong on numbers this noisy. The median, the statistic round sixty's
+   own text already named ("Median-of-2 wall-clock"), gives 67.7ms --
+   agreement with the published number to within rounding, on the first
+   larger sample this round took.
+
+**With both fixed, every ratio in `tab:gistregion` reproduces on a fresh
+run**, median wall-clock, box4/pgSphere: `&&` 0.109 (published
+0.12-0.17), point containment 0.864 (published 0.75-0.93), region-
+contains 0.540 (published 0.55-0.70, at the edge), region-covered-by
+0.260 (published 0.26-0.27). Every strategy's row count matched exactly
+across box4, box8 and pgSphere throughout.
+
+**Does not change any shipped default, opclass, or paper claim.** Both
+findings are measurement-harness bugs in this round's own ad hoc
+checking code, not in the extension or in the numbers already
+published; nothing in `paper/body.tex` needed correcting as a result of
+this round. The value was in not trusting either the alarming first
+cone-search pass or the alarming first region pass without finding the
+actual mechanism behind each -- a result that only looks wrong because
+of where it's run, or because of which statistic is read off a noisy
+sample, is not the same finding as a real regression, and conflating the
+two would have been exactly the kind of error this project's own
+measurement discipline (rounds forty-four, fifty-one, fifty-four,
+sixty-two) exists to catch.
+
+**STATUS**: verification only -- no code, SQL, GUC, or paper change.
+`region_recheck_x`/`region_recheck_sql()`/`region_recheck_run()` and the
+ad hoc `fpr_region_box8` index dropped after measurement; `fpr`'s
+indexes and `pg_index.indisvalid` restored to their normal state;
+`bench_cone_x`'s `variant = ''` rows left as this round's own addition
+to that table's existing convention.
