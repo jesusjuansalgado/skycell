@@ -301,16 +301,47 @@ point (planning cost) removed.
 \emph{A GiST opclass for stored regions.} A \texttt{skyregion} column can carry its own
 GiST index instead, serving \texttt{\&\&} and both containment operators without the
 B-tree rewrite, keyed either by a small number of spherical caps (exact for a circle at
-any radius, but larger) or a plain axis-aligned 3D box. Shrinking the box key from
-\texttt{float8} (48 bytes) to outward-rounded \texttt{float4} (24 bytes, pgSphere's own
-GiST representation) beat both the wider box and the cap key, and pgSphere's native
-GiST, on every corpus tried -- isolated single-scale bands, a mixed circle/polygon
-corpus, all four region operators on a real 50\,000-row catalogue -- and is now the
-default region opclass; the cap key remains better for a column mixing very different
-region scales. The same shrink did \emph{not} transfer to a GiST key over
-\emph{points}: a point's leaf stores its position exactly, so shrinking only the
-internal-node key pruned less than it cost, losing to pgSphere's native point GiST on
-wall-clock despite winning on buffer counts above 30\arcmin.
+any radius, but larger) or a plain axis-aligned 3D box. On isolated single-scale bands
+(0.05\degr--1\degr), shrinking the box key from \texttt{float8} (48 bytes) to
+outward-rounded \texttt{float4} (24 bytes, pgSphere's own GiST representation) beats
+pgSphere's native GiST by 10--25\% fewer buffers and 10--20\% less time; on a mixed
+circle/polygon corpus the margin widens (pgSphere pays for two index descents per probe
+there, one per region kind), and on the real 50\,000-row \texttt{fpr} catalogue, across
+all four region strategies (Table~\ref{tab:gistregion}), the \texttt{float4} box wins
+every one -- including point containment, the one strategy its own \texttt{float8}
+predecessor still loses to pgSphere on. It is now the default region opclass; the
+multi-cap key remains better for a column mixing very different region scales, where
+box's looseness around a large circle costs more than its smaller key saves.
+
+\begin{table}
+  \caption{Region-opclass wall-clock, real 50\,000-row \texttt{fpr} catalogue, 500
+    probes/strategy: ratio of the \texttt{float4} box (\texttt{skyregion\_box4\_gist\_ops},
+    now default) to pgSphere's native GiST. Below 1: skycell faster.}
+  \label{tab:gistregion}
+  \centering
+  \footnotesize
+  \begin{tabular}{l r}
+    \hline\hline
+    strategy & box4 / pgSphere \\
+    \hline
+    \texttt{\&\&} (overlap) & \textbf{0.12--0.17} \\
+    \texttt{@>}(region,point) & \textbf{0.75--0.93} \\
+    \texttt{@>}(region,region) & \textbf{0.55--0.70} \\
+    \texttt{<@}(region,region) & \textbf{0.26--0.27} \\
+    \hline
+  \end{tabular}
+\end{table}
+
+The same shrink did \emph{not} transfer to a GiST key over \emph{points}
+(\texttt{skypos\_cap4\_gist\_ops}, shrinking only the internal-node cap, since a point's
+leaf stores its position exactly and leaf exactness is load-bearing there): buffers are
+statistically indistinguishable from the unshrunk cap key at every radius from
+1\arcsec\ to 3\degr\ -- no win, unlike the region case, because leaf entries dominate a
+GiST tree's page count and the leaf layer here has nothing to shrink. pgSphere's native
+point GiST still wins by a stable 1.4--2.7$\times$ from 1\arcsec\ through 30\arcmin,
+converging within noise by 1\degr\ -- unchanged by the shrink, since the structural
+reason region leaves could shrink safely (recheck is already \texttt{true} regardless of
+key precision) does not hold for points.
 
 \emph{Tuning the covering's own search.} Trying one or more orders finer than
 Eq.~(\ref{eq:sstar})'s closed form and keeping whichever scores lowest
