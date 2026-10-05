@@ -7121,20 +7121,28 @@ range against the queried table. PostgreSQL 16, default GUCs
 
 | | radius | visits | distinct cells | orders | visits on empty cells | inside-verdict visits empty | final kept cells empty |
 |---|---|---|---|---|---|---|---|
-| A | 30' | 5,032 | 3,182 | 6-9 | 0.00% | 0.00% | 0.00% |
-| A | 1 deg | 11,857 | 8,745 | 6-9 | 0.00% | 0.00% | 0.00% |
-| A | 3 deg | 28,515 | 20,090 | 6-8 | 0.00% | 0.00% | 0.00% |
-| B | 30' | 1,647 | 963 | 6-9 | 0.00% | 0.00% | 0.00% |
-| B | 1 deg | 4,434 | 2,896 | 6-9 | 0.00% | 0.00% | 0.00% |
-| B | 3 deg | 15,803 | 10,639 | 6-8 | 0.05% | 0.06% | 0.04% |
+| A | 30' | 5,586 | 3,552 | 6-9 | 0.00% | 0.00% | 0.00% |
+| A | 1 deg | 12,621 | 9,463 | 6-9 | 0.00% | 0.00% | 0.00% |
+| A | 3 deg | 28,883 | 20,338 | 6-8 | 0.00% | 0.00% | 0.00% |
+| B | 30' | 1,911 | 1,148 | 6-9 | 0.00% | 0.00% | 0.00% |
+| B | 1 deg | 4,134 | 2,695 | 6-9 | 0.00% | 0.00% | 0.00% |
+| B | 3 deg | 15,043 | 10,136 | 5-8 | 0.03% | 0.03% | 0.00% |
 | C | 30' | 22,925 | 3,557 | 9-10 | 57.5% | 49.1% | 48.7% |
 | C | 1 deg | 22,950 | 2,859 | 7-9 | 83.8% | 79.2% | 79.7% |
 | C | 3 deg | 32,777 | 3,321 | 6-8 | 97.2% | 96.7% | 95.6% |
 
+(Measured with statistics target 1000 on the cell index, as
+REPRODUCING.md section 4 specifies. A first pass ran on 100-bucket
+histograms -- the loader's `ANALYZE` inside a `DO` block ignored the
+target set on the index in the same block, fixed in
+`bench/19_gaia_load.sh` -- and gave the same picture: A 0.00%, B 0.04%,
+C identical to the last digit, since the fields' estimates moved by under
+12% and the walk there is held by its cell budget, not by density.)
+
 **On all-sky real data round thirteen replicates.** Zero empty cells in
-45,404 visits with data-drawn centres, and 0.04% with uniform centres --
-the latter all order-8 cells at 3 deg in the sparsest sky, where the
-visited order-8 cells average 60 rows and the thinned (0.55%) sample
+47,090 visits with data-drawn centres, and 0.02% with uniform centres --
+the latter all at 3 deg in the sparsest sky, where the visited
+order-8 cells average about 60 rows and the thinned (0.55%) sample
 occasionally leaves one at zero. That is sampling, not footprint. So the
 0% was not an artefact of the synthetic corpus's uniform background:
 `choose_order()` stops at cells that real all-sky density keeps populated.
@@ -7163,3 +7171,30 @@ catalogue; this round only removes "0% empty" as the reason not to try.
 
 **STATUS**: measurement only; no code changed (instrumentation reverted,
 `git status` clean on `ext/src/cover.c`). Handoff open item 9 updated.
+
+**Addendum: the paper's Baade's Window row.** `bench/19_gaia_real.sh`
+queried Baade's Window at RA 18.17 deg (its RA in hours), a high-latitude
+cone of 578 sources, until this branch moved it to 270.904, -30.035
+(225,522). The paper's estimator table (`tab:estimator`) is not produced by
+any script in the repo, so it was reconstructed: rho-hat from
+`skycell_cover_info()` against the counted density, radii 0.01-1 deg,
+statistics target 1000, three independent `ANALYZE` samples.
+
+- On `gaia_realc` the reconstruction reproduces the paper's other rows
+  (omega Cen 0.06-0.08 vs 0.08; LMC 0.74-0.84 vs 0.76; Galactic centre
+  3.71-3.81 vs 3.74), so that is the table it was measured on. Baade
+  gives median 0.90-0.94 (range 0.44-1.16) at the corrected position and
+  0.71-0.74 (0.55-1.03) at the old one; the paper's 0.80 (0.68-1.01) sits
+  between and does not identify either. Both are ordinary-sky values, so
+  the row's role in the paper -- an accurate field, not a failure case --
+  holds at either position.
+- On the full-density fields the old position cannot produce the second
+  referee response's figures: its 578 sources are invisible to the
+  histogram (rho-hat/rho = 0.00 at every radius), whereas the corrected
+  field gives 0.96 at 0.05 deg and 0.23 at 0.2 deg, matching the response's
+  "0.97-1.05 at <= 0.05 deg ... collapses to 0.15-0.23 at 0.2 deg". With the
+  1.6M row count, this says the published corpus used the correct
+  position and only the script had drifted.
+
+No change to the paper is needed. The table remains unreproducible from
+the repo until its measurement is scripted.

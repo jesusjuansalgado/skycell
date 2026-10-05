@@ -556,7 +556,7 @@ not in priority order — pick what matches the actual goal:
    combination already wins.
 9. ~~**Real survey-footprint sparsity**~~ — measured on real Gaia DR3
    (round sixty-six): on the all-sky 10M sample round thirteen's 0%
-   replicates (0.00% of 45,404 visits, 0.04% with uniform centres); on the
+   replicates (0.00% of 47,090 visits, 0.02% with uniform centres); on the
    8-field `gaia_fields` corpus 57-97% of visits land on empty sky, because
    the histogram-based density cannot see gaps. The premise holds wherever
    a catalogue has a footprint; whether skipping empty cells pays is still

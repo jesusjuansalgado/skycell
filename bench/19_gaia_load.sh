@@ -59,9 +59,16 @@ BEGIN
     EXECUTE format('ALTER INDEX %1$s_cell ALTER COLUMN 1 SET STATISTICS 1000', t);
     EXECUTE format('CREATE INDEX %1$s_q3c ON %1$s (q3c_ang2ipix(ra, dec))', t);
     EXECUTE format('CREATE INDEX %1$s_gist ON %1$s USING gist (pos)', t);
-    EXECUTE format('ANALYZE %s', t);
   END LOOP;
 END $$;
+
+-- Not inside the DO block: there, ANALYZE ignored the statistics target just
+-- set on the index and built a 100-bucket histogram instead of 1000.
+ANALYZE gaia_realu;
+ANALYZE gaia_realc;
+ANALYZE gaia_fields;
+SELECT tablename, array_length(histogram_bounds::text::text[], 1) - 1 AS buckets
+FROM pg_stats WHERE tablename ~ '^gaia_(realu|realc|fields)_cell$' ORDER BY 1;
 
 DROP TABLE gaia_raw, gaia_raw_fields;
 
