@@ -7196,8 +7196,14 @@ statistics target 1000, three independent `ANALYZE` samples.
   1.6M row count, this says the published corpus used the correct
   position and only the script had drifted.
 
-No change to the paper is needed. The measurement is now scripted as
-`bench/29_estimator.sql`, which repeats it over several `ANALYZE` samples:
-those move the estimate more than the three above suggested (47 Tuc
-0.02-0.11, LMC 0.51-0.80 in one run), so the table's single-sample
-figures should be read with that spread.
+The measurement is now scripted as `bench/29_estimator.sql`, and the
+paper's table and text were updated from it (ten `ANALYZE` samples).
+Sampling moves the estimate more than the three samples above suggested
+-- 47 Tuc's median ranges over 0.01-0.08 -- and the cluster-core
+underestimate is 10-100x, not the 8-12x the paper had. Re-measuring what
+that costs (part (b) of the script): the chosen covering in a cluster
+core is within 0.96-1.55 of the best fixed order (1.76 in one sample
+with 47 Tuc at 0.01) against 0.96-1.25 where the estimate is accurate,
+so the paper's "no worse than where the estimate is accurate" was
+withdrawn; "does not cost a wrong covering" (vs 243-830x for a bad fixed
+order) stands.

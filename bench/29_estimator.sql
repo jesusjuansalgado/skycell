@@ -8,24 +8,24 @@
 --
 -- ANALYZE draws a random sample that cannot be seeded, so the estimate moves
 -- between runs.  The measurement is repeated over :reps fresh samples and each
--- is reported; the paper's figures are one such sample.  Measured on
--- 2026-10-05 (PG16, statistics target 1000, gaia_realc), three samples:
+-- is reported.  The paper's tab:estimator is this script on gaia_realc with
+-- -v reps=10 (2026-10-05, PG16, statistics target 1000):
 --
---   field        median per sample    range           paper
---   omega_cen    0.08 0.09 0.06       0.05-0.55       0.08  (0.05-0.51)
---   47tuc        0.02 0.03 0.11       0.01-0.94       0.12  (0.06-0.93)
---   lmc          0.80 0.57 0.51       0.22-1.09       0.76  (0.25-0.93)
---   baade        0.96 0.92 0.92       0.45-1.01       0.80  (0.68-1.01)
---   ngp          1.29 1.30 1.35       0.52-1.54       0.90  (0.53-1.28)
---   gal_centre   3.63 3.75 3.70       2.41-4.85       3.74  (2.53-3.95)
+--   field        median of medians   spread across samples   range
+--   omega_cen    0.07                0.06-0.08               0.05-0.56
+--   47tuc        0.03                0.01-0.08               0.00-0.94
+--   lmc          0.69                0.42-0.85               0.22-1.16
+--   baade        0.96                0.92-0.99               0.47-1.14
+--   ngp          1.31                1.18-1.58               0.49-1.80
+--   gal_centre   3.69                3.48-3.83               1.99-5.47
 --
--- The sample-to-sample spread is large in compact fields (47 Tuc 0.02-0.11,
--- the LMC 0.51-0.80).  The paper's omega Cen, LMC and Galactic-centre values
--- fall inside it and its 47 Tuc value just outside.  Two rows do not match:
--- the north Galactic pole, where the 10M sample holds 0 rows inside 0.1 deg
--- and 4/9/41 at 0.2/0.5/1 deg, so its ratio rests on three small counts; and
--- Baade, above the paper's 0.80 (see GIST_REGION_DESIGN.md round sixty-six,
--- addendum).
+-- The north Galactic pole holds 0 rows inside 0.1 deg and 4/9/41 at
+-- 0.2/0.5/1 deg in the 10M sample, so its ratio rests on three small counts.
+--
+-- Part (b), -v decision=1, gives the paper's "within 0.96-1.55 of the best
+-- fixed order" (three samples, 9 timed repetitions each; cluster cores at
+-- 0.05 deg are the worst case, 1.37-1.55, and 1.76 in a sample that put
+-- 47 Tuc at 0.01), against 0.96-1.25 at Baade's Window and the LMC.
 
 -- Baade's Window is at RA 270.904, Dec -30.035.  19_gaia_real.sh used to put
 -- it at RA 18.17 (its RA in hours), a high-latitude cone.
@@ -105,3 +105,75 @@ FROM est_runs r JOIN est_truth t USING (tbl, field, r)
 WHERE r.tbl = :'tbl' AND t.n > 0
 GROUP BY r.field, r.rep
 ORDER BY array_position(ARRAY['omega_cen','47tuc','lmc','baade','ngp','gal_centre'], r.field), r.rep;
+
+-- ------------------------------------------------------------------
+-- (b) does the error matter?  The cost-chosen covering against every fixed
+-- order, at each field, under the statistics of the last sample above.  As
+-- 17_ablation.sql's factor 2: one timed, warmed EXPLAIN per (order, query),
+-- orders shuffled within each trial, plan + execution time.
+-- Usage: add -v decision=1, and -v dreps=N for N timed repetitions (default 9;
+-- about 2 minutes on gaia_realc).
+-- ------------------------------------------------------------------
+\if :{?decision}
+\if :{?dreps}
+\else
+  \set dreps 9
+\endif
+CREATE TABLE IF NOT EXISTS est_decision (tbl text, field text, r float8, rep int,
+  setting text, ms float8, n bigint);
+
+CREATE OR REPLACE FUNCTION est_one(tbl text, field text, rep int, setting text,
+                                   ra float8, dc float8, r float8)
+RETURNS void LANGUAGE plpgsql AS $$
+DECLARE q text; j json; nn bigint;
+BEGIN
+  q := format('SELECT count(*) FROM %I WHERE skycell_cone(skycell_ang2cell(ra,dec), ra, dec, %s, %s, %s)',
+              tbl, ra, dc, r);
+  EXECUTE q INTO nn;                                   -- warm this order on this query
+  EXECUTE 'EXPLAIN (ANALYZE, TIMING OFF, SUMMARY ON, FORMAT JSON) ' || q INTO j;
+  INSERT INTO est_decision VALUES (tbl, field, r, rep, setting,
+    (j->0->>'Planning Time')::float8 + (j->0->>'Execution Time')::float8, nn);
+END $$;
+
+CREATE OR REPLACE FUNCTION est_decision_run(tbl text, reps int DEFAULT 3)
+RETURNS void LANGUAGE plpgsql AS $$
+DECLARE f record; rep int; r float8; s text;
+BEGIN
+  DELETE FROM est_decision d WHERE d.tbl = est_decision_run.tbl;
+  PERFORM setseed(0.29);
+  FOR rep IN 1 .. reps LOOP
+    FOR f IN SELECT * FROM est_fields ORDER BY random() LOOP
+      FOREACH r IN ARRAY ARRAY[0.0028, 0.05, 0.5] LOOP
+        FOR s IN SELECT x FROM unnest(ARRAY['chosen','4','5','6','7','8','9','10','11','12','13']) x
+                 ORDER BY random() LOOP
+          PERFORM set_config('skycell.force_order', CASE s WHEN 'chosen' THEN '-1' ELSE s END, true);
+          PERFORM est_one(tbl, f.field, rep, s, f.ra, f.dec, r);
+        END LOOP;
+        PERFORM set_config('skycell.force_order', '-1', true);
+      END LOOP;
+    END LOOP;
+  END LOOP;
+END $$;
+
+SELECT est_decision_run(:'tbl', :dreps);
+
+-- the estimate the decision was made with (last sample), and the chosen
+-- covering's median time over the best fixed order's
+WITH med AS (
+  SELECT field, r, setting, percentile_cont(0.5) WITHIN GROUP (ORDER BY ms) AS ms, max(n) AS n
+  FROM est_decision WHERE tbl = :'tbl' GROUP BY 1, 2, 3),
+best AS (
+  SELECT DISTINCT ON (field, r) field, r, setting AS best_order, ms AS best_ms
+  FROM med WHERE setting <> 'chosen' ORDER BY field, r, ms),
+est AS (
+  SELECT r.field, round((percentile_cont(0.5) WITHIN GROUP (ORDER BY r.rho_est / t.rho_true))::numeric, 2) AS est_ratio
+  FROM est_runs r JOIN est_truth t USING (tbl, field, r)
+  WHERE r.tbl = :'tbl' AND t.n > 0
+    AND r.rep = (SELECT max(rep) FROM est_runs WHERE tbl = :'tbl')
+  GROUP BY r.field)
+SELECT m.field, e.est_ratio, m.r, m.n, b.best_order,
+       round((m.ms / b.best_ms)::numeric, 2) AS chosen_over_best
+FROM med m JOIN best b USING (field, r) JOIN est e USING (field)
+WHERE m.setting = 'chosen'
+ORDER BY array_position(ARRAY['omega_cen','47tuc','lmc','baade','ngp','gal_centre'], m.field), m.r;
+\endif
