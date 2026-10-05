@@ -20,6 +20,21 @@
   \set nfp 5000
 \endif
 
+-- ORDER BY f: without it, CREATE TABLE AS materialises rows in whatever
+-- order the join's own execution plan happens to produce them (join
+-- strategy, parallel workers, src's own physical layout -- none of which
+-- setseed() pins down), so two runs of this script can build a `fpr` with
+-- the exact same set of (ra0, dec0, r) values but a different physical
+-- row order. That matters because GiST's index build is order-sensitive
+-- (one tuple at a time, no sort-based bulk load for this opclass), so a
+-- supposedly reproducible corpus could silently get a differently-packed
+-- index from one run to the next -- confirmed as the root cause of a
+-- benchmark discrepancy that took several rounds to track down (GIST_
+-- REGION_DESIGN.md's "Round fifty-six"). Pinning the row order here is
+-- the fix for that class of problem specifically, not for the one that
+-- round actually turned out to be (a stale index in a database that was
+-- never REINDEXed) -- but it removes a second, real source of run-to-run
+-- irreproducibility this script had regardless.
 SELECT setseed(0.77);
 DROP TABLE IF EXISTS fpr;
 CREATE TABLE fpr AS
@@ -27,7 +42,8 @@ SELECT f AS fid, s.ra AS ra0, greatest(-85, least(85, s.dec)) AS dec0,
        power(10, -1.7 + 1.2 * random()) AS r,
        (f % 2 = 0) AS is_poly
 FROM generate_series(1, :nfp) f
-JOIN src s ON s.id = 1 + (f * 97) % (SELECT count(*) FROM src);
+JOIN src s ON s.id = 1 + (f * 97) % (SELECT count(*) FROM src)
+ORDER BY f;
 
 ALTER TABLE fpr ADD COLUMN s_region skyregion;
 ALTER TABLE fpr ADD COLUMN reg_circ scircle;

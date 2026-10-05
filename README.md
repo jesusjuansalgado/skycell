@@ -299,6 +299,31 @@ footprint column (an ObsCore `s_region`, say) should carry. For a per-row region
 cross-matched against a plain point catalogue with no `skyregion` column of its
 own, use `skycell_cone()` or `skycell_cone_ranges()` instead.
 
+**Two alternative index types for a `skypos` column itself**, instead of the
+B-tree cell rewrite above, exist as opt-in opclasses — competitors to pgSphere's
+native `spoint` GiST, not to the rewrite path, which stays the default:
+
+```sql
+CREATE INDEX ON t USING spgist (pos);                       -- skypos_spgist_ops, DEFAULT for spgist
+CREATE INDEX ON t USING gist (pos skypos_cap_gist_ops);      -- opt-in
+```
+
+`skypos_spgist_ops` (`ext/src/spgist_region.c`) is a real SP-GiST descent of
+the HEALPix NESTED pixel hierarchy, exact (recheck always false). `skypos_
+cap_gist_ops` (`ext/src/gist_point_cap.c`) is a GiST opclass with a single
+spherical-cap key per entry — leaves store the point exactly (recheck false
+there too), internal nodes a bounding cap. Measured against pgSphere's native
+GiST and against each other: `skypos_cap_gist_ops` beats `skypos_spgist_ops`
+at every radius tested, and beats pgSphere on buffer counts from roughly 30
+arcminutes on, but loses to pgSphere on median wall-clock at every radius
+(the buffer-count win doesn't survive contact with pgSphere's cheaper native
+per-candidate test below ~1 degree). Both are **EXPERIMENTAL**: correctness-
+verified (brute-force comparisons in `ext/test/`), far less scrutiny than the
+rewrite path's own years of hardening, and neither is a drop-in win over it —
+see `GIST_REGION_DESIGN.md`'s "Round thirty-eight" onward and "Round
+forty-three" for the numbers before relying on either for anything beyond
+experimentation.
+
 The `skyregion` GiST opclass is new and not yet stress-tested under concurrent
 writes. Region-region `@>`/`<@` reuse `&&`'s own pruning test rather than a
 tighter one purpose-built for containment (see `ext/src/gist_region.c`'s "round
@@ -310,6 +335,99 @@ selective as `&&` itself is for its own predicate. In exchange, unlike `@>`
 region-region `@>` predates `<@` by several versions and had no commutator of
 its own until `<@` was added — both directions are indexed now, and either
 spelling reaches the index regardless of which one you write.
+
+**`CREATE INDEX ON t USING gist (region)` with no opclass named picks
+`skyregion_box4_gist_ops`** (`ext/src/gist_region_box4.c`, DEFAULT as of
+`skycell` 0.26) — a plain axis-aligned 3D box key, no spherical caps,
+keyed exactly like pgSphere's own `spherekey` (six `float4`s, a fixed
+24-byte type, bounds rounded strictly outward on the `float4` cast for
+soundness). It beat every other opclass tried — the multi-cap opclass
+below, its own `float8` predecessor (`skyregion_box_gist_ops`), and
+pgSphere's native GiST — on every corpus measured: isolated single-scale
+bands, a mixed circle/polygon corpus, and all four strategies (`&&`,
+`@>(region,point)`, `@>(region,region)`, `<@(region,region)`) on the real
+50,000-row `fpr` corpus, including `@>(region,point)`, the one strategy
+its `float8` predecessor itself loses to pgSphere on. See `GIST_REGION_
+DESIGN.md`'s "Round fifty-seven" through "Round sixty-one" (promotion
+scrutiny) for the numbers.
+
+**For a `skyregion` column mixing very different region scales in one
+index** (a survey-tile table alongside catalogue-scale footprints, say),
+a second, opt-in opclass is worth pointing at instead:
+
+```sql
+CREATE INDEX ON t USING gist (region skyregion_gist_ops);
+```
+
+`skyregion_gist_ops` (`ext/src/gist_region.c`) keys each entry with a
+small number of spherical caps rather than a box — a circle's own
+multi-cap key is the circle itself, exact at any radius, so it doesn't
+share the box opclasses' large-radius looseness (see below) and wins
+specifically when a single index must serve both ends of a wide scale
+range. That key is larger and costs more per candidate than the box
+opclasses' fixed 24/48 bytes, which is why it loses on every single-
+scale corpus measured — the box opclass above is the better default
+precisely because most columns don't mix scales.
+
+**A third opclass, `skyregion_box_gist_ops`** (`ext/src/gist_region_box.c`)
+is the same axis-aligned-box geometry as the default, but `float8` in a
+`bytea` (48 bytes) instead of `float4` in a fixed-length type (24 bytes).
+It is EXPERIMENTAL and non-default as of 0.26 (it was DEFAULT from 0.21
+through 0.25) — superseded by `skyregion_box4_gist_ops`, which beat it on
+every corpus measured with no regression found in any regime (round
+sixty-one's own promotion scrutiny). Kept available for comparison and as
+a fallback; select it explicitly if needed:
+
+```sql
+CREATE INDEX ON t USING gist (region skyregion_box_gist_ops);
+```
+
+A box opclass's looseness around a circle grows through the medium-to-
+large radius range and doesn't recover until close to a hemisphere; past
+roughly 20° radius `skyregion_gist_ops` (multi-cap) wins back regardless
+of which box opclass it's compared against — see `GIST_REGION_DESIGN.md`'s
+"Round forty-two" (and its two addenda, on pole proximity and on large
+radii) for the numbers behind that tradeoff, measured originally against
+`skyregion_box_gist_ops` and not yet confirmed to reproduce at the exact
+same crossover radius for `skyregion_box4_gist_ops` (round fifty-seven
+onward found the known round-fifty-four crossover didn't reproduce
+through 50° for either box opclass in a fresh, plan-verified
+re-measurement — an open discrepancy, not yet resolved, so treat any
+specific large-radius crossover claim for either box opclass as unsettled
+rather than relying on the round forty-two number).
+
+All three opclasses can also coexist on the same column — `CREATE INDEX`
+each — and PostgreSQL's ordinary cost-based planner will pick between
+them per query, the same way it already does for `skypos_spgist_ops` and
+`skypos_cap_gist_ops` on a point column. That needs the region-region
+`&&`/`@>`/`<@` operators' selectivity estimates to actually reflect the
+query's own region size, which they didn't until `skycell` 0.16 (they used
+PostgreSQL's generic, radius-blind `areasel`/`contsel` defaults until then
+— see `GIST_REGION_DESIGN.md`'s "Round forty-six"). **Measured directly**
+(`GIST_REGION_DESIGN.md`'s "Round forty-seven"), and 0.16's estimate turned
+out to have a real gap of its own: it assumed the *other* side of the
+clause was point-like, zero-area, which badly underestimated selectivity
+— and led to a severe planner regression — whenever the indexed column's
+own stored regions have real area (not the small-catalogue-footprint case
+0.16 was scoped for). A `CREATE INDEX ... (area(region_col))` expression
+index, when present, lets the planner use a real, data-driven estimate of
+the column's typical region size instead of assuming zero — first with a
+single representative value (0.17, `GIST_REGION_DESIGN.md`'s "Round
+forty-eight"), then, once that left a smaller residual on mixed-scale
+columns, averaged properly over the index's whole size distribution
+instead of collapsed to one number (0.18, "Round forty-nine"). **As of
+0.18**, measured directly on the same corpus that found the original
+regression: all four radius bands land on the cheapest available plan
+with zero exceptions across 240 probes — no residual left. The one thing
+0.18 does not change: the planner's own plain-Index-Scan-vs-Bitmap-Heap-
+Scan cost model is still a generic PostgreSQL limitation this extension
+cannot override, so a sufficiently adversarial corpus could in principle
+still land close enough to that boundary to trip it; `SET enable_indexscan
+= off` remains available for anyone who wants a guarantee independent of
+estimate quality. Picking one opclass explicitly per column, per the
+guidance above, is still the simplest default — but running both
+together, with a `CREATE INDEX ... (area(region_col))` alongside them, is
+now a genuinely solid option, not just a measured-safe-enough one.
 
 For "which of my regions contain this point" specifically, a plain
 `CREATE INDEX ON t USING gin (skycell_region_moc(region))` — an ordinary
@@ -435,6 +553,10 @@ WHERE point('ICRS', ra, dec) <@ circle('ICRS', 269.45, 4.69, 0.05 + 0.006)
 | `skycell.exact_cells` | on | tight cell geometry; off falls back to the `max_pixrad` cap |
 | `skycell.force_order` | -1 | diagnostics: cover cones at this order (-1 = let the model choose) |
 | `skycell.split_cost`, `skycell.max_steps` | 1, 4000 | refinement guards for polygons and very large cones |
+| `skycell.probe_orders` | 0 (off) | try this many orders past the closed-form choice, keep whichever scores lowest; off by default — real but inconsistent gain once planning time is counted honestly for queries that don't repeat, see `GIST_REGION_DESIGN.md`'s "Round sixty-five" |
+| `skycell.probe_split_cost` | 1.0 (inert while probing is off) | cost per cell the order-probe loop charges itself; kept separate from `skycell.split_cost` precisely so tuning this doesn't also detune `split_cost`'s own, unrelated guard — see "Round sixty-five" |
+| `skycell.rewrite_max_waste` | 100 | decline the B-tree range rewrite for a constant region when the covering's own cost model expects more than this many false-positive rows, scaled by how cache-resident the relation is; set very high to force the always-rewrite behaviour every version before 0.2x had |
+| `skycell.rewrite_waste_scale_cap` | 10 | upper bound, as a multiple of `rewrite_max_waste`, on how far that scaling may go for a relation far bigger than `shared_buffers` |
 
 ---
 
@@ -783,7 +905,13 @@ sequence, so each finer one ran on a warmer cache. Interleaving removes both.
 `skycell.probe_orders` scores candidate orders on the covering they actually
 produce instead of on the closed form. It now works — the probe does pick
 finer coverings (area ratio 11.5 → 8.9 at 6′) — and query time does not move,
-which is what 3% headroom predicts. **Off by default.**
+which is what 3% headroom predicts. **Off by default.** A later round found
+this does move execution time at some radii once the probe loop's own cost
+accounting is separately calibrated (`skycell.probe_split_cost`), but that
+gain doesn't survive counting the probe's own planning-time cost for queries
+that don't repeat — see `GIST_REGION_DESIGN.md`'s "Round sixty-three" through
+"Round sixty-five" for the fuller, more mixed picture than this section's
+own single-order measurement shows.
 
 `skycell_density_build()` builds a multi-order count map (leaf cells split
 until each holds ≤ N rows) which the covering reads in preference to the

@@ -17,6 +17,8 @@
 #ifndef SKYCELL_COVER_H
 #define SKYCELL_COVER_H
 
+#include <stdbool.h>
+
 #include "healpix.h"
 
 typedef enum
@@ -89,6 +91,15 @@ typedef struct sc_cover_params
 	int			max_steps;		/* cap on cell classifications */
 
 	/*
+	 * Cost charged per cell examined by the order-probe loop (skycell.
+	 * probe_orders), in rows.  Kept separate from split_cost: that field
+	 * tunes the unrelated descent's own split/keep decision, and sharing it
+	 * here meant calibrating one for the probe loop silently detuned the
+	 * other's SC_PROBE_MIN early-exit guard too.
+	 */
+	double		probe_split_cost;
+
+	/*
 	 * Robustness guard against density underestimates: a partially covered
 	 * cell may not be larger than max_area_ratio * area(region), and gaps are
 	 * only merged under the same bound.  0 disables (trust the density model).
@@ -125,9 +136,24 @@ typedef struct sc_cover
 	int			order;			/* order the cost model asked for (-1: n/a) */
 } sc_cover;
 
-/* region constructors; return NULL on success or a static error message */
-const char *sc_region_cone(sc_region *r, double ra_deg, double dec_deg, double radius_deg);
-const char *sc_region_poly(sc_region *r, int nv, const double *ra_deg, const double *dec_deg);
+/*
+ * region constructors; return NULL on success or a static error message.
+ *
+ * need_covering controls whether out_c2[]/in_c2[]/sin_rho[] (one entry per
+ * HEALPix order, up to 4 sin()/pow() calls each -- the dominant cost of
+ * either constructor, ~90% of it) get filled in. Those tables are read by
+ * sc_region_classify_cap() alone, for the pixel-by-pixel descent a GiST/
+ * SP-GiST index walk or a planner covering performs; sc_region_contains(),
+ * sc_region_contains_region() and sc_region_overlaps() -- the exact test a
+ * row-at-a-time predicate like skycell_region_overlap()/_covers()/
+ * _covered_by() runs -- never touch them. Pass false from a call site that
+ * only ever reaches those three functions; every index/covering call site
+ * must still pass true.
+ */
+const char *sc_region_cone(sc_region *r, double ra_deg, double dec_deg, double radius_deg,
+							bool need_covering);
+const char *sc_region_poly(sc_region *r, int nv, const double *ra_deg, const double *dec_deg,
+							bool need_covering);
 void		sc_region_free(sc_region *r);
 
 /* exact point-in-region test */

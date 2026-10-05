@@ -1,0 +1,39 @@
+\echo Use "ALTER EXTENSION skycell UPDATE TO '0.18'" to load this file. \quit
+
+-- No new SQL objects: this version tracks a C-level fix to the
+-- region-region selectivity functions 0.17 shipped
+-- (skycell_region_overlap_sel/_covers_sel/_covered_by_sel,
+-- ext/src/adql.c), same names and signatures, corrected implementation.
+--
+-- GIST_REGION_DESIGN.md's "Round forty-eight" fixed a 2.2x selectivity
+-- underestimate by looking up a CREATE INDEX ... (area(region_col))
+-- expression index's ANALYZE histogram and using its *median* bound as
+-- a "typical" stored region size, instead of assuming the other operand
+-- was point-like. That closed a severe regression at large/huge radii,
+-- but round forty-eight's own STATUS flagged a residual: a single
+-- number collapsed from the histogram still represents a genuinely
+-- mixed-scale column poorly, and 13/60 medium-radius probes in its own
+-- test corpus still hit the same class of planner knife-edge (a plain
+-- Index Scan narrowly, wrongly, beating a Bitmap Heap Scan) as a result.
+--
+-- "Round forty-nine" removes the single-number step entirely:
+-- region_area_histogram() (skycell.c, replacing typical_region_area())
+-- now returns the whole histogram, and the selectivity formula is
+-- averaged over the full cross product of both operands' angle sets
+-- (node_angles()/combine_angles_avg(), adql.c) instead of being
+-- evaluated once on two single numbers. Exact under an equal-frequency
+-- histogram's own implicit model (each bound represents an equal share
+-- of the rows), a strict generalisation of 0.17's formula (identical
+-- output whenever a constant operand meets a column with no matching
+-- area() index), not a different approximation.
+--
+-- Measured directly on round forty-seven/forty-eight's own test corpus:
+-- the residual 13/60 medium-band outliers drop to 0/60, with the
+-- already-fixed small/large/huge bands unchanged (0 outliers before and
+-- after). All four radius bands now land on the cheapest available
+-- plan with zero exceptions across 240 probes.
+--
+-- Process-wide C code, independent of which extension version is
+-- CREATEd or ALTERed; there is nothing to CREATE or ALTER here. The
+-- version bump exists to give this fix a place in this file's own
+-- changelog, the same as any other shipped change.

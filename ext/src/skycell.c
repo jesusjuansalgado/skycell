@@ -84,11 +84,14 @@ static double skycell_max_area_ratio = 64.0;
 static int	skycell_max_ranges = 64;
 static int	skycell_max_steps = 4000;
 int			skycell_join_slots = 4;	/* adql.c's non-constant skyregion branch shares this */
+double		skycell_rewrite_max_waste = 100.0;	/* adql.c's region_support_simplify shares this */
+static double skycell_rewrite_waste_scale_cap = 10.0;
 static bool skycell_use_stats = true;
 static bool skycell_cache_coverings = true;
 static bool skycell_exact_cells = true;
 static int	skycell_force_order = -1;
 static int	skycell_probe_orders = 0;
+static double skycell_probe_split_cost = 1.0;
 
 void		_PG_init(void);
 
@@ -121,6 +124,42 @@ _PG_init(void)
 							"Number of range slots emitted for non-constant regions (joins).",
 							NULL, &skycell_join_slots, 4, 1, MAX_SLOTS,
 							PGC_USERSET, 0, NULL, NULL, NULL);
+	DefineCustomRealVariable("skycell.rewrite_max_waste",
+							 "Decline the B-tree range rewrite for a constant region when the "
+							 "covering's own cost model expects more than this many rows to be "
+							 "fetched and then rejected by the exact test (cov.exp_rows * "
+							 "(1 - sel)), scaled by how much of the relation is expected to be "
+							 "cache-resident (see rewrite_waste_threshold(): this value applies "
+							 "as-is when the whole relation fits in the shared buffer pool "
+							 "(NBuffers), and scales up as it doesn't, since that same wasted "
+							 "CPU work is cheap once I/O, not CPU, is the bottleneck -- measured "
+							 "directly in GIST_REGION_DESIGN.md's 'Round forty-four', not "
+							 "assumed). A covering's overshoot is cheap in absolute rows at small "
+							 "radii and expensive at large ones when cache-resident; past this "
+							 "many wasted rows, leaving the original <@/@> clause unrewritten lets "
+							 "the planner cost a GiST-family index (skypos_spgist_ops, or an "
+							 "experimental opclass) against it instead, if one exists -- see "
+							 "GIST_REGION_DESIGN.md's 'Round forty-three' for the warm-cache "
+							 "crossover this value was tuned from. Set this very high to recover "
+							 "the always-rewrite behaviour every version before this one had.",
+							 NULL, &skycell_rewrite_max_waste, 100.0, 0.0, 1e12,
+							 PGC_USERSET, 0, NULL, NULL, NULL);
+	DefineCustomRealVariable("skycell.rewrite_waste_scale_cap",
+							 "Upper bound, as a multiple of skycell.rewrite_max_waste, on how far "
+							 "rewrite_waste_threshold() may scale the gate up for a relation far "
+							 "bigger than the shared buffer pool. The scaling itself only prices "
+							 "in the exact-test's wasted CPU rows getting cheaper as I/O comes to "
+							 "dominate -- it has no term for the rewrite's own page count, which "
+							 "GIST_REGION_DESIGN.md's 'Round forty-five' measured growing faster "
+							 "than a GiST-family alternative's at the largest radii on a table "
+							 "whose rows are not physically ordered by cell, even cold. Left "
+							 "unbounded, a deployment with a small enough buffer pool relative to "
+							 "the table could scale past that radius's own waste estimate and force "
+							 "the rewrite exactly where this was measured to lose. This caps the "
+							 "scaling before that point without touching small-to-mid radii, where "
+							 "scaling up was measured correct even cold.",
+							 NULL, &skycell_rewrite_waste_scale_cap, 10.0, 1.0, 1e12,
+							 PGC_USERSET, 0, NULL, NULL, NULL);
 	DefineCustomBoolVariable("skycell.use_stats",
 							 "Use the ANALYZE histogram of the cell column as a density map.",
 							 NULL, &skycell_use_stats, true,
@@ -137,10 +176,28 @@ _PG_init(void)
 	DefineCustomIntVariable("skycell.probe_orders",
 							"Orders past the closed-form choice to score on the covering "
 							"they actually produce (0, the default, disables: see the "
-							"comment in cover.c -- the gain the forced-order measurements "
-							"show is not yet captured by this).",
+							"comment in cover.c -- this helps execution time but its own "
+							"enumeration cost is paid at plan time on every distinct query, "
+							"which GIST_REGION_DESIGN.md's probe-loop decoupling round found "
+							"erases or reverses the gain, radius-dependently, once total "
+							"plan+exec time is measured honestly rather than execution time "
+							"alone).",
 							NULL, &skycell_probe_orders, 0, 0, 8,
 							PGC_USERSET, 0, NULL, NULL, NULL);
+	DefineCustomRealVariable("skycell.probe_split_cost",
+							 "Cost charged per cell examined by the order-probe loop "
+							 "(skycell.probe_orders), in rows. Separate from "
+							 "skycell.split_cost, which prices the unrelated descent's own "
+							 "split/keep decision: sharing one field between them meant "
+							 "calibrating it for the probe loop also detuned the descent's "
+							 "SC_PROBE_MIN early-exit guard (see GIST_REGION_DESIGN.md's "
+							 "probe-loop decoupling round). Default 1.0, matching "
+							 "skycell.split_cost's own default -- inert while "
+							 "skycell.probe_orders = 0, and not yet separately calibrated "
+							 "for when it isn't: the decoupling is this GUC's point, not a "
+							 "measured tuning recommendation.",
+							 NULL, &skycell_probe_split_cost, 1.0, 0.0, 1e9,
+							 PGC_USERSET, 0, NULL, NULL, NULL);
 	DefineCustomIntVariable("skycell.force_order",
 							"Diagnostics only: cover cones at this HEALPix order instead of "
 							"the one the cost model chooses (-1 = let the model choose).",
@@ -192,6 +249,73 @@ auto_range_cost(const sc_density *d)
 	return fmin(1e6, fmax(1.0, descent / per_row));
 }
 
+/*
+ * skycell.rewrite_max_waste scaled by how much of the relation PostgreSQL's
+ * own planner already expects to find in cache -- GIST_REGION_DESIGN.md's
+ * "Round forty-four" measured directly (fresh, restart-isolated probes,
+ * not guessed) that the rewrite's exact-test waste this GUC bounds is
+ * expensive only when it costs CPU with nothing to show for it, i.e. when
+ * the pages it touches are already cache-resident; the exact same waste is
+ * cheap -- cheaper than the alternative GiST-family descent it would
+ * otherwise fall back to -- when the pages are not resident, because CPU is
+ * negligible next to a real disk fetch. skycell's own GUC was tuned from
+ * warm-cache measurements alone (a fully cache-resident table), so it is
+ * scaled up here in proportion to how far the relation's own size exceeds
+ * the server's actual cache capacity.
+ *
+ * That capacity is read from NBuffers -- the real, already-allocated size of
+ * the shared buffer pool (shared_buffers converted to pages) -- rather than
+ * from effective_cache_size. effective_cache_size is not a measurement of
+ * anything: it is a standalone GUC the admin may set to any value (commonly
+ * left at its build-in default, or sized for a machine the server no longer
+ * runs on), with nothing tying it to the memory PostgreSQL actually holds.
+ * NBuffers is that memory. The tradeoff is that NBuffers, unlike
+ * effective_cache_size, counts only shared_buffers and not the OS page
+ * cache behind it, so this reads as more conservative (a relation is
+ * treated as exceeding cache sooner) whenever the OS cache is doing real
+ * work the shared buffer pool alone would not reflect -- the same direction
+ * Round forty-four already measured as the safer one to err towards: it
+ * found skycell's rewrite winning most broadly exactly where cache pressure
+ * is underestimated (cold, I/O-bound reads), and losing only in the fully
+ * warm case this scaling leaves untouched (cache_frac = 1).
+ *
+ * This is deliberately the same level of approximation as auto_range_cost()
+ * above (a simple ratio, not a reproduction of PostgreSQL's own, considerably
+ * more elaborate formula): cache_frac = 1 when the whole relation is
+ * expected to fit in the shared buffer pool (no change from the tuned
+ * default), falling toward 0 as the relation grows far past it (the
+ * threshold scaling up as a relation's reads become reliably I/O-bound) --
+ * not a precise cost-model derivation, an explicit choice to stay as
+ * legible as this file's other heuristics.
+ *
+ * The scaling is capped, not unbounded, at skycell.rewrite_waste_scale_cap
+ * times the base threshold (cache_frac floored at 1/cap rather than at a
+ * value close to zero). The scaling's whole justification is that the
+ * waste it bounds -- wasted CPU rows from the exact test -- gets cheaper
+ * as I/O comes to dominate; it says nothing about the rewrite's *own*
+ * expected page count, which GIST_REGION_DESIGN.md's "Round forty-five"
+ * measured growing faster than a GiST-family alternative's at the largest
+ * radii specifically, on a relation whose rows are not physically ordered
+ * by cell (an ordinary, unclustered table -- not a special case). Past
+ * some point a low cache_frac stops meaning "the waste is cheap" and
+ * starts meaning "the whole rewrite, waste included, is expensive, for a
+ * reason this ratio was never modelling" -- the cap keeps the scaling in
+ * the regime "Round forty-four" and "Round forty-five" both measured it
+ * correct in (small-to-mid radii, even cold) without reaching into the
+ * regime "Round forty-five" measured it wrong in (the largest radii, an
+ * unclustered table, even cold).
+ */
+double
+rewrite_waste_threshold(const sc_density *d)
+{
+	double		relpages = (d && d->relpages > 0) ? d->relpages : 0;
+	double		cache_frac = (relpages > 0)
+		? fmin(1.0, (double) NBuffers / relpages) : 1.0;
+	double		min_frac = 1.0 / fmax(skycell_rewrite_waste_scale_cap, 1.0);
+
+	return skycell_rewrite_max_waste / fmax(cache_frac, min_frac);
+}
+
 void
 current_params(sc_cover_params *p, int max_ranges, const sc_density *d)
 {
@@ -199,6 +323,7 @@ current_params(sc_cover_params *p, int max_ranges, const sc_density *d)
 	p->range_cost = (skycell_range_cost < 0)
 		? auto_range_cost(d) : skycell_range_cost;
 	p->split_cost = skycell_split_cost;
+	p->probe_split_cost = skycell_probe_split_cost;
 	p->max_area_ratio = skycell_max_area_ratio;
 	p->max_ranges = max_ranges;
 	p->max_steps = skycell_max_steps;
@@ -243,7 +368,7 @@ poly_from_array(ArrayType *arr, sc_region *r)
 		ra[i] = DatumGetFloat8(elems[2 * i]);
 		dec[i] = DatumGetFloat8(elems[2 * i + 1]);
 	}
-	check_err(sc_region_poly(r, n / 2, ra, dec));
+	check_err(sc_region_poly(r, n / 2, ra, dec, true));
 }
 
 /* ------------------------------------------------------------------ */
@@ -265,6 +390,7 @@ typedef struct cover_key
 				radius,
 				range_cost,
 				split_cost,
+				probe_split_cost,
 				area_ratio;
 	Oid			statrel;		/* whose density map this used */
 	int32		max_ranges;
@@ -414,6 +540,7 @@ cover_cached(const sc_region *reg, const sc_density *d, const sc_cover_params *p
 	key.radius = radius;
 	key.range_cost = p->range_cost;
 	key.split_cost = p->split_cost;
+	key.probe_split_cost = p->probe_split_cost;
 	key.area_ratio = p->max_area_ratio;
 	key.statrel = statrel;
 	key.max_ranges = p->max_ranges;
@@ -799,6 +926,139 @@ density_for_expr(PlannerInfo *root, Node *arg, sc_density *d, Oid *statrel,
 }
 
 /*
+ * The region-area analogue of density_for_expr(), for the region-region
+ * operator selectivity fix (adql.c's region_angle_est(), "Round forty-
+ * eight"/"Round forty-nine"): given a region expression (in practice
+ * almost always a bare column), looks for a plain btree expression index
+ * on area(<that same expression>) and, if ANALYZE has run on it, returns
+ * its histogram -- in whatever unit the SQL area() function itself
+ * returns (square degrees: skycell_area() multiplies sc_region.area, in
+ * steradians, by RAD2DEG twice), not the steradians every other caller
+ * of sc_region.area in this file works in. This function's contract is
+ * "whatever area() would return for this expression," matching the index
+ * a user would actually write (CREATE INDEX ... (area(region_col))), not
+ * an internal-only unit nothing else here uses; converting back to
+ * steradians is the caller's job (region_angle_est() does it), not this
+ * function's.
+ *
+ * Deliberately a separate, simpler function rather than a generalisation
+ * of density_for_expr(): that function's statistics are a *point*-density
+ * model (a histogram of cell-id boundaries, optionally refined by
+ * skycell_density_build()'s own multi-order count map) -- meaningless for
+ * a plain distribution of float8 area values, which is all ANALYZE ever
+ * needs to have built for an ordinary expression index, no custom
+ * density map involved. No caching across calls within a plan either
+ * (density_for_expr()'s idx_cache is specific to its own cell-expression
+ * lookups) -- this runs only for region-region clauses, not the
+ * potentially-hot point-rewrite path, so the lookup cost was not worth
+ * the extra bookkeeping to avoid.
+ *
+ * Returns the *whole* histogram, not a single "typical" value collapsed
+ * out of it ("Round forty-nine" -- a single value, however chosen, is a
+ * poor stand-in for the real distribution once a column mixes genuinely
+ * different scales, e.g. both small source footprints and a few huge
+ * survey tiles: whichever single number is picked, most rows are not
+ * that size). region_angle_est()'s own callers average their selectivity
+ * formula over every bound instead, which is exact for an equal-
+ * frequency histogram's own implicit model of the distribution (each
+ * bound represents an equal share of the rows) rather than a guess at
+ * which single bound best represents all of them. Still only as good as
+ * ANALYZE's histogram itself is -- a sample, not the true population,
+ * and silent about most-common-values entirely -- but that is a
+ * precision limit of the statistics available, not an approximation
+ * this function adds on top of them.
+ */
+bool
+region_area_histogram(Oid selfid, PlannerInfo *root, Node *region_expr,
+					   double **areas, int *n)
+{
+	List	   *vars = pull_var_clause(region_expr, 0);
+	ListCell   *lc;
+	Index		varno = 0;
+	RangeTblEntry *rte;
+	Relation	rel;
+	List	   *indexes;
+	Node	   *probe;
+	Oid			regiontype;
+	Oid			one[1];
+	bool		found = false;
+
+	foreach(lc, vars)
+	{
+		Var		   *v = (Var *) lfirst(lc);
+
+		if (!IsA(v, Var) || v->varlevelsup != 0 || (varno != 0 && v->varno != varno))
+			return false;
+		varno = v->varno;
+	}
+	if (varno == 0 || varno > list_length(root->parse->rtable))
+		return false;
+	rte = rt_fetch(varno, root->parse->rtable);
+	if (rte->rtekind != RTE_RELATION)
+		return false;
+
+	regiontype = exprType(region_expr);
+	one[0] = regiontype;
+	probe = (Node *) makeFuncExpr(lookup_sibling_func(selfid, "area", 1, one),
+								  FLOAT8OID, list_make1(copyObject(region_expr)),
+								  InvalidOid, InvalidOid, COERCE_EXPLICIT_CALL);
+	/* index expressions are stored with varno 1 */
+	ChangeVarNodes(probe, varno, 1, 0);
+
+	rel = table_open(rte->relid, NoLock);	/* locked by the parser */
+	indexes = RelationGetIndexList(rel);
+	foreach(lc, indexes)
+	{
+		Oid			indexoid = lfirst_oid(lc);
+		Relation	irel = index_open(indexoid, AccessShareLock);
+
+		if (irel->rd_rel->relam == BTREE_AM_OID &&
+			irel->rd_index->indnatts >= 1 && irel->rd_index->indkey.values[0] == 0)
+		{
+			List	   *exprs = RelationGetIndexExpressions(irel);
+
+			if (exprs != NIL && equal(linitial(exprs), probe))
+			{
+				for (int inh = 0; inh <= 1 && !found; inh++)
+				{
+					HeapTuple	tp = SearchSysCache3(STATRELATTINH,
+													 ObjectIdGetDatum(indexoid),
+													 Int16GetDatum(1), BoolGetDatum(inh));
+
+					if (HeapTupleIsValid(tp))
+					{
+						AttStatsSlot sslot;
+
+						if (get_attstatsslot(&sslot, tp, STATISTIC_KIND_HISTOGRAM,
+											 InvalidOid, ATTSTATSSLOT_VALUES))
+						{
+							if (sslot.nvalues >= 2 && sslot.valuetype == FLOAT8OID)
+							{
+								double	   *vals = palloc(sizeof(double) * sslot.nvalues);
+
+								for (int i = 0; i < sslot.nvalues; i++)
+									vals[i] = DatumGetFloat8(sslot.values[i]);
+								*areas = vals;
+								*n = sslot.nvalues;
+								found = true;
+							}
+							free_attstatsslot(&sslot);
+						}
+						ReleaseSysCache(tp);
+					}
+				}
+			}
+		}
+		index_close(irel, AccessShareLock);
+		if (found)
+			break;
+	}
+	list_free(indexes);
+	table_close(rel, NoLock);
+	return found;
+}
+
+/*
  * "Which of my regions contain this point" is the opposite direction from
  * density_for_expr's own case (a point-catalog index answering many
  * points against one region): here it's the *region* column that needs an
@@ -1107,7 +1367,8 @@ simplify_cone(PlannerInfo *root, FuncExpr *fexpr)
 		check_err(sc_region_cone(&reg,
 								 DatumGetFloat8(((Const *) list_nth(args, 3))->constvalue),
 								 DatumGetFloat8(((Const *) list_nth(args, 4))->constvalue),
-								 DatumGetFloat8(((Const *) list_nth(args, 5))->constvalue)));
+								 DatumGetFloat8(((Const *) list_nth(args, 5))->constvalue),
+								 true));
 		current_params(&p, skycell_max_ranges, &dens);
 		cover_cached(&reg, &dens, &p, dens_statrel,
 					 DatumGetFloat8(((Const *) list_nth(args, 3))->constvalue),
@@ -1663,9 +1924,11 @@ static struct
 				ntotal,
 				range_cost,
 				split_cost,
+				probe_split_cost,
 				area_ratio;
 	uint32		hhash;
 	int			nslots;
+	int32		probe_orders;
 	int64		lo[MAX_SLOTS],
 				hi[MAX_SLOTS];
 }			slot_cache;
@@ -1707,6 +1970,8 @@ skycell_cone_bound(PG_FUNCTION_ARGS)
 		slot_cache.hhash != hc->hash || slot_cache.nslots != nslots ||
 		slot_cache.range_cost != skycell_range_cost ||
 		slot_cache.split_cost != skycell_split_cost ||
+		slot_cache.probe_split_cost != skycell_probe_split_cost ||
+		slot_cache.probe_orders != skycell_probe_orders ||
 		slot_cache.area_ratio != skycell_max_area_ratio)
 	{
 		sc_region	reg;
@@ -1716,7 +1981,7 @@ skycell_cone_bound(PG_FUNCTION_ARGS)
 		int			s;
 
 		slot_cache.valid = false;
-		check_err(sc_region_cone(&reg, ra0, dec0, radius));
+		check_err(sc_region_cone(&reg, ra0, dec0, radius, true));
 		current_params(&p, nslots, &d);
 		sc_cover_compute(&reg, &d, &p, &cov);
 		for (s = 0; s < cov.n && s < nslots; s++)
@@ -1738,6 +2003,8 @@ skycell_cone_bound(PG_FUNCTION_ARGS)
 		slot_cache.nslots = nslots;
 		slot_cache.range_cost = skycell_range_cost;
 		slot_cache.split_cost = skycell_split_cost;
+		slot_cache.probe_split_cost = skycell_probe_split_cost;
+		slot_cache.probe_orders = skycell_probe_orders;
 		slot_cache.area_ratio = skycell_max_area_ratio;
 		slot_cache.valid = true;
 	}
@@ -1757,8 +2024,10 @@ static struct
 	double		ntotal,
 				range_cost,
 				split_cost,
+				probe_split_cost,
 				area_ratio;
 	int			nslots;
+	int32		probe_orders;
 	int64		lo[MAX_SLOTS],
 				hi[MAX_SLOTS];
 }			poly_slot_cache;
@@ -1801,6 +2070,8 @@ skycell_poly_bound(PG_FUNCTION_ARGS)
 		poly_slot_cache.hhash != hc->hash || poly_slot_cache.nslots != nslots ||
 		poly_slot_cache.range_cost != skycell_range_cost ||
 		poly_slot_cache.split_cost != skycell_split_cost ||
+		poly_slot_cache.probe_split_cost != skycell_probe_split_cost ||
+		poly_slot_cache.probe_orders != skycell_probe_orders ||
 		poly_slot_cache.area_ratio != skycell_max_area_ratio)
 	{
 		sc_region	reg;
@@ -1831,6 +2102,8 @@ skycell_poly_bound(PG_FUNCTION_ARGS)
 		poly_slot_cache.nslots = nslots;
 		poly_slot_cache.range_cost = skycell_range_cost;
 		poly_slot_cache.split_cost = skycell_split_cost;
+		poly_slot_cache.probe_split_cost = skycell_probe_split_cost;
+		poly_slot_cache.probe_orders = skycell_probe_orders;
 		poly_slot_cache.area_ratio = skycell_max_area_ratio;
 		poly_slot_cache.valid = true;
 	}
@@ -1853,8 +2126,10 @@ static struct
 	double		ntotal,
 				range_cost,
 				split_cost,
+				probe_split_cost,
 				area_ratio;
 	int			nslots;
+	int32		probe_orders;
 	int64		lo[MAX_SLOTS],
 				hi[MAX_SLOTS];
 }			region_slot_cache;
@@ -1897,6 +2172,8 @@ skycell_region_bound(PG_FUNCTION_ARGS)
 		region_slot_cache.hhash != hc->hash || region_slot_cache.nslots != nslots ||
 		region_slot_cache.range_cost != skycell_range_cost ||
 		region_slot_cache.split_cost != skycell_split_cost ||
+		region_slot_cache.probe_split_cost != skycell_probe_split_cost ||
+		region_slot_cache.probe_orders != skycell_probe_orders ||
 		region_slot_cache.area_ratio != skycell_max_area_ratio)
 	{
 		sc_region	reg;
@@ -1927,6 +2204,8 @@ skycell_region_bound(PG_FUNCTION_ARGS)
 		region_slot_cache.nslots = nslots;
 		region_slot_cache.range_cost = skycell_range_cost;
 		region_slot_cache.split_cost = skycell_split_cost;
+		region_slot_cache.probe_split_cost = skycell_probe_split_cost;
+		region_slot_cache.probe_orders = skycell_probe_orders;
 		region_slot_cache.area_ratio = skycell_max_area_ratio;
 		region_slot_cache.valid = true;
 	}
@@ -2004,7 +2283,7 @@ skycell_cone_ranges(PG_FUNCTION_ARGS)
 		InitMaterializedSRF(fcinfo, MAT_SRF_USE_EXPECTED_DESC);
 		return (Datum) 0;
 	}
-	check_err(sc_region_cone(&reg, PG_GETARG_FLOAT8(0), PG_GETARG_FLOAT8(1), PG_GETARG_FLOAT8(2)));
+	check_err(sc_region_cone(&reg, PG_GETARG_FLOAT8(0), PG_GETARG_FLOAT8(1), PG_GETARG_FLOAT8(2), true));
 	dens = density_from_args(fcinfo, 3);
 	current_params(&p, skycell_max_ranges, dens);
 	sc_cover_compute(&reg, dens, &p, &cov);
@@ -2054,7 +2333,7 @@ skycell_cover_info(PG_FUNCTION_ARGS)
 
 	if (PG_ARGISNULL(0) || PG_ARGISNULL(1) || PG_ARGISNULL(2))
 		PG_RETURN_NULL();
-	check_err(sc_region_cone(&reg, PG_GETARG_FLOAT8(0), PG_GETARG_FLOAT8(1), PG_GETARG_FLOAT8(2)));
+	check_err(sc_region_cone(&reg, PG_GETARG_FLOAT8(0), PG_GETARG_FLOAT8(1), PG_GETARG_FLOAT8(2), true));
 	dens = density_from_args(fcinfo, 3);
 	current_params(&p, skycell_max_ranges, dens);
 	sc_cover_compute(&reg, dens, &p, &cov);
@@ -2292,7 +2571,7 @@ skycell_cone_moc(PG_FUNCTION_ARGS)
 {
 	sc_region	reg;
 
-	check_err(sc_region_cone(&reg, PG_GETARG_FLOAT8(0), PG_GETARG_FLOAT8(1), PG_GETARG_FLOAT8(2)));
+	check_err(sc_region_cone(&reg, PG_GETARG_FLOAT8(0), PG_GETARG_FLOAT8(1), PG_GETARG_FLOAT8(2), true));
 	PG_RETURN_ARRAYTYPE_P(moc_for_region(&reg, Max(PG_GETARG_INT32(3), 4),
 										 Min(Max(PG_GETARG_INT32(4), 0), SC_MAX_ORDER)));
 }

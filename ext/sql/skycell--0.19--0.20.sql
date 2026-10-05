@@ -1,0 +1,46 @@
+\echo Use "ALTER EXTENSION skycell UPDATE TO '0.20'" to load this file. \quit
+
+-- No new SQL objects: this version tracks a C-level performance fix to
+-- pos_in_region() (adql.c), the point-in-region exact test behind
+-- skycell_contains/skycell_pos_in_region/skycell_region_has_pos/
+-- skycell_pos_in_region_sel/skycell_intersects_pos -- the ADQL CONTAINS
+-- point form, <@/@> on (skypos, skyregion), and INTERSECTS(point,
+-- region) -- skycell's own headline cone-search workload, not just the
+-- region-region crossover 0.19 fixed.
+--
+-- Flagged while shipping 0.19 as the identical bug, same shape, not yet
+-- fixed: pos_in_region() rebuilt its region argument from scratch via
+-- skycell_region_from_datum() on every point tested, including the
+-- 30-level out_c2[]/in_c2[]/sin_rho[] table 0.19's own write-up showed
+-- only a GiST/SP-GiST descent ever reads -- pure waste for a point-in-
+-- cap/polygon test, and typically rebuilding the *same* region on every
+-- row of a scan (one constant circle tested against many points).
+--
+-- Fixed the same way as 0.19: pos_in_region() now takes the calling
+-- FunctionCallInfo and fetches its region argument through
+-- cached_region_arg() (adql.c) -- the same fn_extra cache, keyed on the
+-- argument's bytes, 0.19 built for region_region(); the five wrapper
+-- functions above now pass fcinfo through. (cached_region_arg() and its
+-- backing structs moved earlier in adql.c, above pos_in_region(), so
+-- both call sites can share one implementation; no behaviour change
+-- from the move itself.)
+--
+-- Measured standalone (the same cover.c/healpix.c build outside
+-- Postgres 0.19 used): the construct-once-reuse shape this fix enables,
+-- 500,000 points against one constant region, 413.9 ns/point before
+-- (full build every row) vs 30.8 ns/point after (lite build once,
+-- reused) -- a ~13.4x reduction in the raw region-construction-and-test
+-- cost; the end-to-end per-row win inside a real query is smaller once
+-- normal executor/function-call overhead is added back in, but the
+-- mechanism is the same one 0.19 already measured end-to-end on the
+-- region-region crossover.
+--
+-- Correctness re-checked after the fix, not assumed preserved: a fresh
+-- brute-force angular-distance check against contains()/<@/@>/
+-- intersects() on points never used for this before, exact match; make
+-- installcheck (skycell and adql regression suites) passes.
+--
+-- Process-wide C code, independent of which extension version is
+-- CREATEd or ALTERed; there is nothing to CREATE or ALTER here. The
+-- version bump exists to give this fix a place in this file's own
+-- changelog, the same as any other shipped change.

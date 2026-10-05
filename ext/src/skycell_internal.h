@@ -16,6 +16,8 @@ extern void current_params(sc_cover_params *p, int max_ranges, const sc_density 
 extern ArrayType *moc_for_region(const sc_region *r, int max_cells, int max_order);
 
 extern int	skycell_join_slots;
+extern double skycell_rewrite_max_waste;
+extern double rewrite_waste_threshold(const sc_density *d);
 
 extern Const *int8_const(int64 v);
 extern Const *float8_const(double v);
@@ -32,6 +34,8 @@ extern void cover_cached(const sc_region *reg, const sc_density *d,
 						 double ra0, double dec0, double radius, sc_cover *out);
 extern bool density_for_expr(PlannerInfo *root, Node *arg, sc_density *d, Oid *statrel,
 							  bool *uses_cell_ops);
+extern bool region_area_histogram(Oid selfid, PlannerInfo *root, Node *region_expr,
+								   double **areas, int *n);
 extern void density_for_var(PlannerInfo *root, Node *arg, sc_density *d, Oid *statrel,
 							 bool *uses_cell_ops);
 extern bool gin_moc_index_for_region(PlannerInfo *root, Node *rg, Node **moc_expr,
@@ -41,5 +45,6 @@ extern Expr *array_overlap_expr(Node *left, Expr *right);
 /* adql.c: a skypos/skyregion datum, as cover.c understands it */
 extern sc_vec3 skycell_pos_from_datum(Datum d);
 extern void skycell_region_from_datum(Datum d, sc_region *r);
+extern void skycell_region_from_datum_lite(Datum d, sc_region *r);
 
 #endif

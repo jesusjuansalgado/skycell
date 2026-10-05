@@ -1,0 +1,58 @@
+\echo Use "ALTER EXTENSION skycell UPDATE TO '0.19'" to load this file. \quit
+
+-- No new SQL objects: this version tracks a C-level performance fix to
+-- the region-region exact-test functions (skycell_region_overlap/
+-- _covers/_covered_by, skycell_contains_region/skycell_intersects --
+-- the && / @> / <@ / contains() / intersects() implementations,
+-- ext/src/adql.c's region_region()/skycell_region_covers()).
+--
+-- Found while chasing a 3-5x wall-clock gap against pgSphere's scircle
+-- on the same region-region crossover corpus and operators (GIST_
+-- REGION_DESIGN.md's follow-up to "Round fifty"): every row of that
+-- gap traced to sc_region_cone()/sc_region_poly() (cover.c), which fill
+-- a 30-entry out_c2[]/in_c2[]/sin_rho[] table (one per HEALPix order,
+-- up to 4 sin()/pow() calls each) on every construction -- ~90% of the
+-- constructor's own cost, measured standalone at ~375-411ns/call vs
+-- ~31-32ns/call with that table skipped. Those tables are read by
+-- sc_region_classify_cap() alone, for a GiST/SP-GiST index descent or a
+-- planner covering; sc_region_contains()/sc_region_contains_region()/
+-- sc_region_overlaps() -- the exact test a row-at-a-time predicate
+-- actually runs -- never touch them (confirmed by reading cover.c
+-- before changing anything). Worse, the exact-test call sites rebuilt
+-- *both* arguments from scratch on every single row, including
+-- whichever argument is the same value across the whole scan (a
+-- literal probe region in a WHERE clause, or one side of a cross join).
+--
+-- Two independent fixes, both measured before and after rather than
+-- assumed:
+--
+-- 1. sc_region_cone()/sc_region_poly() (cover.h/cover.c) take a new
+--    need_covering argument; every index/covering call site keeps
+--    passing true (unchanged behaviour, unchanged cost), and a new
+--    skycell_region_from_datum_lite() (adql.c/skycell_internal.h)
+--    passes false for the exact-test-only path.
+--
+-- 2. region_region() and skycell_region_covers() (adql.c) now cache
+--    each argument's built sc_region in fn_extra, one slot per argument
+--    position, keyed on the argument datum's *bytes* -- the same
+--    cache-key discipline spg_cached_region (spgist_region.c, an
+--    earlier round of this exact fix for the SP-GiST support functions)
+--    already established, and for the same reason: a short-lived
+--    per-tuple memory context is reused across calls, so pointer
+--    identity alone cannot tell two different rows' regions apart.
+--    Whichever argument position turns out constant across a run of
+--    calls stops paying to rebuild; if neither does, the cost is one
+--    extra memcmp per call.
+--
+-- Measured on the region-crossover corpus's own && / @> / <@ queries,
+-- all four radius bands, after reconfirming correctness unchanged
+-- (exact match against the brute-force contains()/intersects() oracle,
+-- both the long-queried warm probe set and a probe set fresh this
+-- round): 2.3x-3.9x faster, closing most (not all) of the gap to
+-- pgSphere's scircle on the identical corpus and queries. See GIST_
+-- REGION_DESIGN.md's write-up for the full before/after/pgSphere table.
+--
+-- Process-wide C code, independent of which extension version is
+-- CREATEd or ALTERed; there is nothing to CREATE or ALTER here. The
+-- version bump exists to give this fix a place in this file's own
+-- changelog, the same as any other shipped change.

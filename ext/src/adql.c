@@ -125,7 +125,7 @@ region_poly(int nv, const double *coords)
 			ra[i] = coords[2 * i];
 			dec[i] = coords[2 * i + 1];
 		}
-		check_err(sc_region_poly(&probe, nv, ra, dec));
+		check_err(sc_region_poly(&probe, nv, ra, dec, true));
 		sc_region_free(&probe);
 		pfree(ra);
 		pfree(dec);
@@ -143,13 +143,13 @@ skycell_pos_from_datum(Datum d)
 }
 
 /* a skyregion datum as the covering code understands it */
-void
-skycell_region_from_datum(Datum d, sc_region *out)
+static void
+region_from_datum_ex(Datum d, sc_region *out, bool need_covering)
 {
 	SkyRegion  *r = DatumGetSkyRegion(d);
 
 	if (r->kind == SKY_CONE)
-		check_err(sc_region_cone(out, r->v[0], r->v[1], r->v[2]));
+		check_err(sc_region_cone(out, r->v[0], r->v[1], r->v[2], need_covering));
 	else
 	{
 		int			nv = SKYREGION_NVERT(r);
@@ -161,8 +161,28 @@ skycell_region_from_datum(Datum d, sc_region *out)
 			ra[i] = r->v[2 * i];
 			dec[i] = r->v[2 * i + 1];
 		}
-		check_err(sc_region_poly(out, nv, ra, dec));
+		check_err(sc_region_poly(out, nv, ra, dec, need_covering));
 	}
+}
+
+void
+skycell_region_from_datum(Datum d, sc_region *out)
+{
+	region_from_datum_ex(d, out, true);
+}
+
+/*
+ * Same, but skips out_c2[]/in_c2[]/sin_rho[] -- the ~90%-of-the-cost tables
+ * that only an index/covering descent via sc_region_classify_cap() reads
+ * (see cover.h). For a call site that only ever reaches sc_region_contains(),
+ * sc_region_contains_region() or sc_region_overlaps() -- the exact test
+ * region_region() below runs -- building those tables is pure waste, repeated
+ * on every row.
+ */
+void
+skycell_region_from_datum_lite(Datum d, sc_region *out)
+{
+	region_from_datum_ex(d, out, false);
 }
 
 /* ------------------------------------------------------------------ */
@@ -487,30 +507,99 @@ pos_vec(SkyPos *p)
 	return sc_radec2vec(p->ra, p->dec);
 }
 
-static bool
-pos_in_region(SkyPos *p, Datum region)
+/*
+ * A shared per-region-argument cache, one slot per argument position, used
+ * by every plain two-argument region predicate below (point-in-region and
+ * region-region alike): keyed on byte content, not pointer identity, for
+ * exactly the reason spg_cached_region (spgist_region.c, the same fix for
+ * the SP-GiST support functions) already documented there -- a short-lived
+ * per-tuple memory context is reset and reused across calls, so two
+ * genuinely different rows' region datums can legitimately land at the
+ * same address. fn_extra lives in fn_mcxt for the query's duration, so the
+ * cached sc_region (and any poly v[]/n[] it owns) has to live there too,
+ * not in the per-tuple context the argument datum itself arrived in.
+ *
+ * Built with two slots, not one keyed on a fixed "query" side, because
+ * unlike a GiST/SP-GiST support function, a plain predicate has no fixed
+ * constant argument position -- either argument, or both, can be the same
+ * value across a run of calls (a cross join's outer row, a literal region
+ * in a WHERE clause), and whichever one does is the one that stops paying
+ * to rebuild. A point-in-region caller below only ever uses slot 0 (there
+ * is only one region argument to cache); region_region() below uses both.
+ * The lite build (skycell_region_from_datum_lite(), skipping the 30-level
+ * out_c2[]/in_c2[]/sin_rho[] table sc_region_classify_cap() alone reads)
+ * is always safe here: nothing cached through this function ever reaches
+ * an index descent or covering, only sc_region_contains()/
+ * sc_region_contains_region()/sc_region_overlaps().
+ */
+typedef struct
 {
+	bytea	   *last_datum;		/* palloc'd copy in fn_mcxt, or NULL */
+	Size		last_size;
 	sc_region	reg;
-	bool		res;
+} region_arg_cache;
 
-	skycell_region_from_datum(region, &reg);
-	res = sc_region_contains(&reg, pos_vec(p)) != 0;
-	sc_region_free(&reg);
-	return res;
+typedef struct
+{
+	region_arg_cache arg[2];
+} region_pair_cache;
+
+static sc_region *
+cached_region_arg(FunctionCallInfo fcinfo, int argno, Datum arg_datum)
+{
+	region_pair_cache *c = (region_pair_cache *) fcinfo->flinfo->fn_extra;
+	region_arg_cache *slot;
+	bytea	   *b = DatumGetByteaP(arg_datum);
+	Size		sz = VARSIZE(b);
+
+	if (c == NULL)
+	{
+		c = MemoryContextAllocZero(fcinfo->flinfo->fn_mcxt, sizeof(region_pair_cache));
+		fcinfo->flinfo->fn_extra = c;
+	}
+	slot = &c->arg[argno];
+	if (slot->last_datum == NULL || slot->last_size != sz ||
+		memcmp(slot->last_datum, b, sz) != 0)
+	{
+		MemoryContext oldcxt = MemoryContextSwitchTo(fcinfo->flinfo->fn_mcxt);
+
+		if (slot->last_datum != NULL)
+			sc_region_free(&slot->reg);	/* frees the old poly v[]/n[], if any */
+		skycell_region_from_datum_lite(arg_datum, &slot->reg);
+		MemoryContextSwitchTo(oldcxt);
+
+		if (slot->last_datum == NULL || slot->last_size < sz)
+		{
+			if (slot->last_datum != NULL)
+				pfree(slot->last_datum);
+			slot->last_datum = MemoryContextAlloc(fcinfo->flinfo->fn_mcxt, sz);
+		}
+		memcpy(slot->last_datum, b, sz);
+		slot->last_size = sz;
+	}
+	return &slot->reg;
+}
+
+static bool
+pos_in_region(FunctionCallInfo fcinfo, SkyPos *p, Datum region)
+{
+	sc_region *reg = cached_region_arg(fcinfo, 0, region);
+
+	return sc_region_contains(reg, pos_vec(p)) != 0;
 }
 
 PG_FUNCTION_INFO_V1(skycell_pos_in_region);
 Datum
 skycell_pos_in_region(PG_FUNCTION_ARGS)
 {
-	PG_RETURN_BOOL(pos_in_region(PG_GETARG_SKYPOS(0), PG_GETARG_DATUM(1)));
+	PG_RETURN_BOOL(pos_in_region(fcinfo, PG_GETARG_SKYPOS(0), PG_GETARG_DATUM(1)));
 }
 
 PG_FUNCTION_INFO_V1(skycell_region_has_pos);
 Datum
 skycell_region_has_pos(PG_FUNCTION_ARGS)
 {
-	PG_RETURN_BOOL(pos_in_region(PG_GETARG_SKYPOS(1), PG_GETARG_DATUM(0)));
+	PG_RETURN_BOOL(pos_in_region(fcinfo, PG_GETARG_SKYPOS(1), PG_GETARG_DATUM(0)));
 }
 
 /* the exact test the rewrite appends; the last argument is a selectivity hint */
@@ -518,28 +607,23 @@ PG_FUNCTION_INFO_V1(skycell_pos_in_region_sel);
 Datum
 skycell_pos_in_region_sel(PG_FUNCTION_ARGS)
 {
-	PG_RETURN_BOOL(pos_in_region(PG_GETARG_SKYPOS(0), PG_GETARG_DATUM(1)));
+	PG_RETURN_BOOL(pos_in_region(fcinfo, PG_GETARG_SKYPOS(0), PG_GETARG_DATUM(1)));
 }
 
 PG_FUNCTION_INFO_V1(skycell_contains);
 Datum
 skycell_contains(PG_FUNCTION_ARGS)
 {
-	PG_RETURN_INT32(pos_in_region(PG_GETARG_SKYPOS(0), PG_GETARG_DATUM(1)) ? 1 : 0);
+	PG_RETURN_INT32(pos_in_region(fcinfo, PG_GETARG_SKYPOS(0), PG_GETARG_DATUM(1)) ? 1 : 0);
 }
 
 static int
 region_region(PG_FUNCTION_ARGS, bool contains)
 {
-	sc_region	a,
-				b;
-	int			res;
+	sc_region  *a = cached_region_arg(fcinfo, 0, PG_GETARG_DATUM(0));
+	sc_region  *b = cached_region_arg(fcinfo, 1, PG_GETARG_DATUM(1));
+	int			res = contains ? sc_region_contains_region(a, b) : sc_region_overlaps(a, b);
 
-	skycell_region_from_datum(PG_GETARG_DATUM(0), &a);
-	skycell_region_from_datum(PG_GETARG_DATUM(1), &b);
-	res = contains ? sc_region_contains_region(&a, &b) : sc_region_overlaps(&a, &b);
-	sc_region_free(&a);
-	sc_region_free(&b);
 	return res ? 1 : 0;
 }
 
@@ -562,7 +646,7 @@ Datum
 skycell_intersects_pos(PG_FUNCTION_ARGS)
 {
 	/* a point has no area: intersecting one is being contained in it */
-	PG_RETURN_INT32(pos_in_region(PG_GETARG_SKYPOS(0), PG_GETARG_DATUM(1)) ? 1 : 0);
+	PG_RETURN_INT32(pos_in_region(fcinfo, PG_GETARG_SKYPOS(0), PG_GETARG_DATUM(1)) ? 1 : 0);
 }
 
 PG_FUNCTION_INFO_V1(skycell_region_overlap);
@@ -589,15 +673,10 @@ skycell_region_covers(PG_FUNCTION_ARGS)
 	 * reuses; the only regression test for this function,
 	 * skycell_region_covers(p, p), is symmetric and could never catch a
 	 * reversed argument order. */
-	sc_region	a,
-				b;
-	int			res;
+	sc_region  *a = cached_region_arg(fcinfo, 0, PG_GETARG_DATUM(0));
+	sc_region  *b = cached_region_arg(fcinfo, 1, PG_GETARG_DATUM(1));
+	int			res = sc_region_contains_region(b, a);
 
-	skycell_region_from_datum(PG_GETARG_DATUM(0), &a);
-	skycell_region_from_datum(PG_GETARG_DATUM(1), &b);
-	res = sc_region_contains_region(&b, &a);
-	sc_region_free(&a);
-	sc_region_free(&b);
 	PG_RETURN_BOOL(res != 0);
 }
 
@@ -875,6 +954,40 @@ region_support_simplify(SupportRequestSimplify *req, Oid funcid, Node *pt, Node 
 			sc_cover_compute(&reg, &dens, &p, &cov);
 		sel = (cov.area > 0) ? fmin(1.0, reg.area / cov.area) : 0.0;
 
+		/*
+		 * Decline the rewrite when the covering's own cost model expects
+		 * too many rows to be fetched from the heap only to be rejected by
+		 * the exact test below (skycell.rewrite_max_waste's own comment has
+		 * the full story). Measured directly, not guessed: at small radii
+		 * this waste is a handful of rows regardless of how poor the
+		 * covering's *ratio* looks (sel near 0 but cov.exp_rows tiny), and
+		 * the rewrite wins outright; past roughly a hundred wasted rows
+		 * (when the table is expected to be cache-resident -- see
+		 * rewrite_waste_threshold()'s own comment for why that qualifier
+		 * matters and how the threshold scales when it isn't) it starts
+		 * costing more in exact-test CPU than the ranges save in heap I/O,
+		 * and a GiST-family index (when one exists) wins instead.
+		 * Returning NULL here leaves the original <@/@> clause in place for
+		 * the planner's normal cost-based index selection to consider --
+		 * skycell_pos_region_sel/skycell_region_pos_sel give it a real,
+		 * non-default selectivity estimate for that clause either way.
+		 *
+		 * cov is NOT freed here (unlike reg): for a cone, cover_cached()
+		 * hands back entry->r, a pointer straight into its own long-lived
+		 * cache entry (skycell_cache_cxt), not a caller-owned copy -- the
+		 * existing success path below never frees cov either, for exactly
+		 * that reason. sc_cover_free() on it would pfree the cache's own
+		 * backing array out from under every future cache hit for this key,
+		 * corrupting that memory context (found the hard way: a segfault
+		 * several unrelated queries later, in whatever next allocation hit
+		 * the corrupted free list -- see GIST_REGION_DESIGN.md).
+		 */
+		if (cov.exp_rows * (1.0 - sel) > rewrite_waste_threshold(&dens))
+		{
+			sc_region_free(&reg);
+			return NULL;
+		}
+
 		exact = makeFuncExpr(lookup_sibling_func(funcid, "skycell_in_region", 3, exact_types),
 							 BOOLOID,
 							 list_make3(copyObject(pt), copyObject(rg), float8_const(sel)),
@@ -1013,4 +1126,348 @@ skycell_region_sel_support(PG_FUNCTION_ARGS)
 		PG_RETURN_POINTER(req);
 	}
 	PG_RETURN_POINTER(NULL);
+}
+
+/*
+ * Restriction selectivity for the raw, un-rewritten <@(skypos,skyregion) and
+ * @>(skyregion,skypos) operators -- the ones a GiST or SP-GiST index on
+ * skypos indexes directly (skypos_spgist_ops, gist_point_cap.c's
+ * experimental skypos_cap_gist_ops), with no B-tree rewrite in the picture
+ * to hand off to skycell_in_region/skycell_region_sel_support above.
+ *
+ * Both operators are declared with `RESTRICT = contsel` (see their CREATE
+ * OPERATOR), PostgreSQL's generic containment-operator fallback, which
+ * returns a flat default (effectively ~0.001 of the table) regardless of
+ * the actual query radius. A SupportRequestSelectivity handler on the
+ * backing function cannot fix this -- per PostgreSQL's own documented rule
+ * (nodes/supportnodes.h), a function's support function is never consulted
+ * for selectivity when that function is invoked as an operator's
+ * implementation, only the operator's own RESTRICT/JOIN estimator is. The
+ * fix has to be a plain oprrest-shaped C function assigned via RESTRICT=,
+ * the same mechanism contsel itself uses.
+ *
+ * This was found, not assumed: it explained a real, measured planner
+ * misbehaviour -- cat_pos_capgist (58 actual matching rows at a given
+ * probe) was costed at a flat 10000-row estimate, which pushed the planner
+ * onto a Bitmap Index Scan + Bitmap Heap Scan (built for an estimated-large,
+ * low-selectivity result) where pgSphere's own spoint<@scircle, selectivity-
+ * aware, got a cheap plain Index Scan instead for the same 58-row result,
+ * at a fraction of the wall-clock cost despite touching more buffer pages.
+ * See GIST_REGION_DESIGN.md for the numbers.
+ *
+ * ROUND TWO -- DENSITY-AWARE: a first version of this fix used only
+ * area(region)/4pi, a uniform-sky estimate. Measured against a real,
+ * 60%-clustered corpus, it was a clear win for ordinary (sparse-sky)
+ * queries but a real regression for queries landing in or near a genuine
+ * density cluster: a uniform-sky estimate understates their true row count,
+ * which flipped some medium-radius probes from a (correct, needed) Bitmap
+ * Scan to a (wrong, slower) plain Index Scan. The fix for that is exactly
+ * the machinery region_support_simplify() above already uses for the B-tree
+ * rewrite's own cost model: cell_expr_for_point() builds the skycell_cell
+ * (pos) expression a point column would be indexed by, density_for_expr()
+ * finds that expression index's real ANALYZE histogram (or skycell's own
+ * finer multi-order count map, when skycell_density_build() has made one)
+ * if the table has one, and sc_cover_compute()/cover_cached() turn that
+ * into cov.exp_rows -- an estimate that already reflects genuine clustering,
+ * not an assumption of uniformity. reg.area/cov.area narrows that from
+ * "rows in the covering" to "rows truly inside the region", the same ratio
+ * the rewrite's own exact-test selectivity hint already uses. Falls back to
+ * the round-one uniform-sky estimate when no such index exists on the
+ * table (this opclass needs no such index itself to function -- only this
+ * selectivity estimate benefits from one being present) or the region
+ * isn't a compile-time constant.
+ */
+static double
+region_pos_density_sel(Oid selfid, PlannerInfo *root, Node *pt, Node *rg)
+{
+	sc_region	reg;
+	double		fallback;
+	double		result;
+
+	if (!IsA(rg, Const) || ((Const *) rg)->constisnull)
+		return 1e-4;		/* non-constant or null region: no better guess */
+
+	skycell_region_from_datum(((Const *) rg)->constvalue, &reg);
+	fallback = fmin(1.0, fmax(reg.area / (4.0 * M_PI), 1e-12));
+	result = fallback;
+
+	if (root != NULL)
+	{
+		Node	   *cell = cell_expr_for_point(selfid, pt);
+
+		if (cell != NULL)
+		{
+			sc_density	dens;
+			Oid			statrel = InvalidOid;
+			bool		uses_cell_ops;
+
+			if (density_for_expr(root, cell, &dens, &statrel, &uses_cell_ops) &&
+				dens.ntotal > 0)
+			{
+				sc_cover_params p;
+				sc_cover	cov;
+				double		est;
+
+				current_params(&p, 64, &dens);
+				if (reg.kind == SC_REGION_CONE)
+				{
+					double		ra0 = atan2(reg.center.y, reg.center.x) * RAD2DEG;
+					double		dec0 = asin(fmax(-1.0, fmin(1.0, reg.center.z))) * RAD2DEG;
+					double		radius = reg.radius * RAD2DEG;
+
+					cover_cached(&reg, &dens, &p, statrel, ra0, dec0, radius, &cov);
+				}
+				else
+					sc_cover_compute(&reg, &dens, &p, &cov);
+
+				est = cov.exp_rows * ((cov.area > 0) ? fmin(1.0, reg.area / cov.area) : 0.0);
+				result = fmin(1.0, fmax(est / dens.ntotal, 1e-12));
+				/* cov not freed: see region_support_simplify's identical
+				 * comment above -- cover_cached()'s cone branch aliases its
+				 * own long-lived cache entry, not a caller-owned copy. */
+			}
+		}
+	}
+	sc_region_free(&reg);
+	return result;
+}
+
+/* backs <@(skypos,skyregion): point is the left operand, region the right */
+PG_FUNCTION_INFO_V1(skycell_pos_region_sel);
+Datum
+skycell_pos_region_sel(PG_FUNCTION_ARGS)
+{
+	PlannerInfo *root = (PlannerInfo *) PG_GETARG_POINTER(0);
+	List	   *args = (List *) PG_GETARG_POINTER(2);
+
+	if (list_length(args) != 2)
+		PG_RETURN_FLOAT8(1e-4);
+	PG_RETURN_FLOAT8(region_pos_density_sel(fcinfo->flinfo->fn_oid, root,
+											 (Node *) linitial(args), (Node *) lsecond(args)));
+}
+
+/* backs @>(skyregion,skypos): region is the left operand, point the right */
+PG_FUNCTION_INFO_V1(skycell_region_pos_sel);
+Datum
+skycell_region_pos_sel(PG_FUNCTION_ARGS)
+{
+	PlannerInfo *root = (PlannerInfo *) PG_GETARG_POINTER(0);
+	List	   *args = (List *) PG_GETARG_POINTER(2);
+
+	if (list_length(args) != 2)
+		PG_RETURN_FLOAT8(1e-4);
+	PG_RETURN_FLOAT8(region_pos_density_sel(fcinfo->flinfo->fn_oid, root,
+											 (Node *) lsecond(args), (Node *) linitial(args)));
+}
+
+/*
+ * Selectivity for the region-region operators (&&, @>, <@ between two
+ * skyregion values) -- the same bug as skycell_pos_region_sel/
+ * skycell_region_pos_sel above, on a different set of operators:
+ * skycell_region_overlap/_covers/_covered_by are declared with
+ * RESTRICT = areasel/contsel, PostgreSQL's generic, radius-blind
+ * defaults, which cost a query region's own size out of the estimate
+ * entirely. The fix is the same shape -- an oprrest-shaped RESTRICT
+ * function, since none of these three backing functions has (or could
+ * usefully have) a SUPPORT clause consulted for selectivity, same rule
+ * as before.
+ *
+ * ROUND TWO -- region_angle_est() below replaces the original "Tier 1"
+ * area(const)/4pi estimate (GIST_REGION_DESIGN.md's "Round forty-six")
+ * with one that no longer assumes the *other* operand is point-like.
+ * "Round forty-seven" measured directly why that assumption matters: on
+ * a corpus whose own stored regions have large areas (round forty-two's
+ * own large/huge radius bands, not the small-catalogue-footprint case
+ * Tier 1 was scoped for), area(const)/4pi underestimated a 67-degree
+ * probe's true overlap fraction by 2.2x (estimated 3685 rows, actual
+ * 8085), which in turn led the planner into a severe, confirmed-by-
+ * disabling-plain-index-scans regression (9,293 buffers via a plain
+ * Index Scan against 319 via Bitmap Heap Scan on the *same* index for
+ * the *same* query) -- not an inherent, unrelated PostgreSQL cost-model
+ * blind spot as that round's own first-pass diagnosis said, but a direct
+ * consequence of this selectivity estimate being wrong by over 2x.
+ * Confirmed directly: feeding the planner a selectivity close to the
+ * true value (by hand, for that diagnosis only) made it choose the
+ * correct plan on its own.
+ *
+ * The fix, "Round forty-eight": typical_region_area() (skycell.c)
+ * answered "what's a typical stored region's own area" with a single
+ * number pulled from a `CREATE INDEX ... (area(region_col))` expression
+ * index's ANALYZE histogram when one exists, converted to an angular
+ * radius (area = 2*pi*(1-cos(theta)), inverted) and combined with the
+ * other operand's own angle (summed for &&, subtracted for @>/<@). That
+ * closed the regression it was built for, but round forty-eight's own
+ * STATUS flagged a residual: a single summary number, however chosen,
+ * represents a genuinely mixed-scale column poorly, and the pathology
+ * it was fixing (a plain Index Scan narrowly, wrongly, beating a Bitmap
+ * Heap Scan on the planner's own cost estimate) can still trigger
+ * whenever that one number is off by enough -- which it will be for
+ * *some* rows whenever the real distribution is wide.
+ *
+ * "Round forty-nine" removes the single-number step: region_area_
+ * histogram() (skycell.c) now returns the *whole* histogram, and
+ * node_angles() below converts every one of its bounds to an angle
+ * instead of picking one. combine_angles_avg() then averages the
+ * selectivity formula itself over the cross product of both operands'
+ * angle sets -- exact under an equal-frequency histogram's own implicit
+ * model (each bound stands for an equal share of the rows), not a
+ * best-guess single point standing in for a population that may have no
+ * single typical member at all. A constant operand's "distribution" is
+ * just its own one exact angle, so this reduces to round forty-eight's
+ * own formula whenever the non-constant side has no matching index
+ * (folded in as a single angle of 0, point-like, exactly Tier 1's
+ * original assumption) -- another strict generalisation, not a
+ * replacement: identical output in every case round forty-eight already
+ * got right, closer to the true distribution in the cases it didn't.
+ *
+ * && sums each pair of angles across both operands' sets (two circles
+ * overlap roughly whenever their centres are within the sum of their
+ * radii) and averages area(cap of that sum)/4pi over every pair.
+ * @>/<@ need the *container* side to offer at least one angle (a
+ * constant, or a column with an area() index) to compute anything --
+ * falling back to the flat default otherwise, same rule as round forty-
+ * eight. Once it does, the *contained* side's own angle set (if any)
+ * shrinks the effective containing cap pair by pair, clamped at 0, and
+ * averaged the same way -- including, as round forty-eight's own bonus
+ * still holds, the "wrong direction" case (contained side constant,
+ * container column has an area() index) now answering a real question
+ * instead of shrugging at it.
+ */
+static bool
+node_angles(Oid selfid, PlannerInfo *root, Node *n, double **angles, int *count)
+{
+	if (IsA(n, Const))
+	{
+		sc_region	reg;
+		double	   *a;
+
+		if (((Const *) n)->constisnull)
+			return false;
+		skycell_region_from_datum(((Const *) n)->constvalue, &reg);
+		a = palloc(sizeof(double));
+		a[0] = acos(fmax(-1.0, fmin(1.0, 1.0 - reg.area / (2.0 * M_PI))));
+		sc_region_free(&reg);
+		*angles = a;
+		*count = 1;
+		return true;
+	}
+	else
+	{
+		double	   *areas;		/* square degrees, region_area_histogram()'s
+								 * own unit -- see that function's header
+								 * comment for why not steradians */
+		int			n_areas;
+
+		if (!region_area_histogram(selfid, root, n, &areas, &n_areas))
+			return false;
+		for (int i = 0; i < n_areas; i++)
+		{
+			double		area_sr = areas[i] / (RAD2DEG * RAD2DEG);
+
+			areas[i] = acos(fmax(-1.0, fmin(1.0, 1.0 - area_sr / (2.0 * M_PI))));
+		}
+		*angles = areas;		/* same buffer, now holding angles */
+		*count = n_areas;
+		return true;
+	}
+}
+
+/* area(cap of this angular radius)/4pi, clamped to a sane selectivity range */
+static double
+cap_frac(double angle)
+{
+	angle = fmin(M_PI, fmax(0.0, angle));
+	return fmin(1.0, fmax((1.0 - cos(angle)) / 2.0, 1e-12));
+}
+
+/*
+ * cap_frac(a[i] +/- b[j]), averaged over every pair -- a's or b's own
+ * angle set standing in for "unknown" (no constant, no area() index) is
+ * a single 0 (point-like), not zero pairs, so an entirely-unknown
+ * operand degrades to exactly the other operand's own area(.)/4pi
+ * rather than to no estimate at all.
+ */
+static double
+combine_angles_avg(double *a, int na, double *b, int nb, bool subtract)
+{
+	double		zero = 0.0;
+	double		sum = 0;
+
+	if (na == 0)
+	{
+		a = &zero;
+		na = 1;
+	}
+	if (nb == 0)
+	{
+		b = &zero;
+		nb = 1;
+	}
+	for (int i = 0; i < na; i++)
+		for (int j = 0; j < nb; j++)
+			sum += cap_frac(subtract ? (a[i] - b[j]) : (a[i] + b[j]));
+	return sum / ((double) na * (double) nb);
+}
+
+/* backs &&(skyregion,skyregion): symmetric, average over both sides' angle sets */
+PG_FUNCTION_INFO_V1(skycell_region_overlap_sel);
+Datum
+skycell_region_overlap_sel(PG_FUNCTION_ARGS)
+{
+	PlannerInfo *root = (PlannerInfo *) PG_GETARG_POINTER(0);
+	List	   *args = (List *) PG_GETARG_POINTER(2);
+	double	   *a = NULL,
+			   *b = NULL;
+	int			na = 0,
+				nb = 0;
+	bool		have_a,
+				have_b;
+
+	if (list_length(args) != 2)
+		PG_RETURN_FLOAT8(1e-4);
+	have_a = node_angles(fcinfo->flinfo->fn_oid, root, (Node *) linitial(args), &a, &na);
+	have_b = node_angles(fcinfo->flinfo->fn_oid, root, (Node *) lsecond(args), &b, &nb);
+	if (!have_a && !have_b)
+		PG_RETURN_FLOAT8(1e-4);
+	PG_RETURN_FLOAT8(combine_angles_avg(a, na, b, nb, false));
+}
+
+/* backs @>(skyregion,skyregion): LEFTARG is the container, RIGHTARG the contained */
+PG_FUNCTION_INFO_V1(skycell_region_covers_sel);
+Datum
+skycell_region_covers_sel(PG_FUNCTION_ARGS)
+{
+	PlannerInfo *root = (PlannerInfo *) PG_GETARG_POINTER(0);
+	List	   *args = (List *) PG_GETARG_POINTER(2);
+	double	   *container = NULL,
+			   *contained = NULL;
+	int			ncontainer = 0,
+				ncontained = 0;
+
+	if (list_length(args) != 2)
+		PG_RETURN_FLOAT8(1e-4);
+	if (!node_angles(fcinfo->flinfo->fn_oid, root, (Node *) linitial(args), &container, &ncontainer))
+		PG_RETURN_FLOAT8(1e-4);
+	(void) node_angles(fcinfo->flinfo->fn_oid, root, (Node *) lsecond(args), &contained, &ncontained);
+	PG_RETURN_FLOAT8(combine_angles_avg(container, ncontainer, contained, ncontained, true));
+}
+
+/* backs <@(skyregion,skyregion): RIGHTARG is the container, LEFTARG the contained */
+PG_FUNCTION_INFO_V1(skycell_region_covered_by_sel);
+Datum
+skycell_region_covered_by_sel(PG_FUNCTION_ARGS)
+{
+	PlannerInfo *root = (PlannerInfo *) PG_GETARG_POINTER(0);
+	List	   *args = (List *) PG_GETARG_POINTER(2);
+	double	   *container = NULL,
+			   *contained = NULL;
+	int			ncontainer = 0,
+				ncontained = 0;
+
+	if (list_length(args) != 2)
+		PG_RETURN_FLOAT8(1e-4);
+	if (!node_angles(fcinfo->flinfo->fn_oid, root, (Node *) lsecond(args), &container, &ncontainer))
+		PG_RETURN_FLOAT8(1e-4);
+	(void) node_angles(fcinfo->flinfo->fn_oid, root, (Node *) linitial(args), &contained, &ncontained);
+	PG_RETURN_FLOAT8(combine_angles_avg(container, ncontainer, contained, ncontained, true));
 }

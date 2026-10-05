@@ -101,6 +101,92 @@ SELECT (SELECT count(*) FROM cat WHERE skycell_radial_query(ra, dec, 10, 20, 0.5
  t                   | t                    | t
 (1 row)
 
+-- skycell_poly_join: the polygon analogue of skycell_join/skycell_radial_query,
+-- for a cross-match whose polygon comes from another table's row rather than a
+-- compile-time constant. Dec is clamped away from the poles: a tiny quad
+-- straddling one is a separate (already-tested) edge case, not what this
+-- exercises.
+CREATE TABLE tile AS SELECT ra, least(greatest(dec, -85), 85) AS dec FROM probe;
+SELECT plan_uses_index(
+  'SELECT count(*) FROM tile t, cat c WHERE skycell_poly_join(c.ra, c.dec, ' ||
+  'ARRAY[t.ra-0.05,t.dec-0.05, t.ra+0.05,t.dec-0.05, t.ra+0.05,t.dec+0.05, t.ra-0.05,t.dec+0.05]::float8[])'
+) AS poly_join_indexed;
+ poly_join_indexed 
+-------------------
+ t
+(1 row)
+
+SELECT (SELECT count(*) FROM tile t, cat c
+          WHERE skycell_poly_join(c.ra, c.dec,
+            ARRAY[t.ra-0.05,t.dec-0.05, t.ra+0.05,t.dec-0.05, t.ra+0.05,t.dec+0.05, t.ra-0.05,t.dec+0.05]::float8[]))
+      = (SELECT count(*) FROM tile t, cat c
+          WHERE skycell_in_poly(c.ra, c.dec,
+            ARRAY[t.ra-0.05,t.dec-0.05, t.ra+0.05,t.dec-0.05, t.ra+0.05,t.dec+0.05, t.ra-0.05,t.dec+0.05]::float8[]))
+      AS poly_join_matches_exact;
+ poly_join_matches_exact 
+-------------------------
+ t
+(1 row)
+
+DROP TABLE tile;
+-- skycell_region_bound / <@ against a non-constant skyregion column: the
+-- generic-region analogue of skycell_poly_join, dispatching on each row's own
+-- kind tag the same way skycell_region_from_datum already does for a
+-- constant region. Covers a cross-match against another table's per-row
+-- footprint column (e.g. an archive's s_region), whichever kind it holds.
+CREATE TABLE footprint AS
+  SELECT ra, least(greatest(dec, -85), 85) AS dec,
+         CASE WHEN row_number() OVER () % 2 = 0
+              THEN circle('ICRS', ra, least(greatest(dec, -85), 85), 0.05)
+              ELSE polygon('ICRS', ra-0.05, least(greatest(dec, -85), 85)-0.05,
+                                   ra+0.05, least(greatest(dec, -85), 85)-0.05,
+                                   ra+0.05, least(greatest(dec, -85), 85)+0.05,
+                                   ra-0.05, least(greatest(dec, -85), 85)+0.05)
+         END AS s_region
+  FROM probe;
+SELECT plan_uses_index(
+  $q$SELECT count(*) FROM footprint f, cat c
+     WHERE point('ICRS', c.ra, c.dec) <@ f.s_region$q$
+) AS region_join_indexed;
+ region_join_indexed 
+---------------------
+ t
+(1 row)
+
+SELECT (SELECT count(*) FROM footprint f, cat c
+          WHERE point('ICRS', c.ra, c.dec) <@ f.s_region)
+      = (SELECT count(*) FROM footprint f, cat c
+          WHERE skycell_in_region(point('ICRS', c.ra, c.dec), f.s_region))
+      AS region_join_matches_exact;
+ region_join_matches_exact 
+---------------------------
+ t
+(1 row)
+
+DROP TABLE footprint;
+-- BOX cross-match: box(...) is a plain skyregion (a four-corner polygon
+-- under the hood, built by box_region()'s cos(dec) corner compression), so
+-- no dedicated join function is needed -- <@'s non-constant branch already
+-- covers it, whatever kind of region it happens to be built from.
+SELECT plan_uses_index(
+  $q$SELECT count(*) FROM probe p, cat c
+     WHERE point('ICRS', c.ra, c.dec) <@ box('ICRS', p.ra, least(greatest(p.dec, -85), 85), 0.1, 0.1)$q$
+) AS box_join_indexed;
+ box_join_indexed 
+------------------
+ t
+(1 row)
+
+SELECT (SELECT count(*) FROM probe p, cat c
+          WHERE point('ICRS', c.ra, c.dec) <@ box('ICRS', p.ra, least(greatest(p.dec, -85), 85), 0.1, 0.1))
+      = (SELECT count(*) FROM probe p, cat c
+          WHERE skycell_in_region(point('ICRS', c.ra, c.dec), box('ICRS', p.ra, least(greatest(p.dec, -85), 85), 0.1, 0.1)))
+      AS box_join_matches_exact;
+ box_join_matches_exact 
+------------------------
+ t
+(1 row)
+
 DROP TABLE probe;
 DROP INDEX cat_a2c;
 -- The cell-range operator class: same answers as the stock operators, and the
@@ -194,6 +280,53 @@ SELECT poly_mismatches() AS poly_mismatches;
 
 SELECT skycell_poly(1, 0, 0, ARRAY[0,0, 10,0, 1,1, 0,10]::float8[]);  -- non-convex: error
 ERROR:  skycell: polygon must be convex and smaller than a hemisphere
+-- sc_region_contains's polygon branch used a strict "< 0" test on a vertex's
+-- dot product against each edge's plane, so a vertex sitting exactly ON that
+-- plane (up to independent floating-point rounding, not identically 0) could
+-- read as outside -- every vertex of a polygon is exactly on its own two
+-- adjacent edges, so this made a polygon fail to contain, or overlap, an
+-- identical or boundary-touching copy of itself.  A -1e-12 tolerance (already
+-- used for the same kind of dot product in poly_setup's convexity check)
+-- fixes it; the circle branch was already boundary-inclusive (<=).
+SELECT skycell_region_covers(p, p) AS self_covers,
+       skycell_region_overlap(p, p) AS self_overlaps,
+       intersects(p, p) = 1 AS self_intersects,
+       (p && p) AS self_op
+FROM (SELECT polygon('ICRS', 229.54244884307008-0.05, -48.37916509457751-0.05,
+                              229.54244884307008+0.05, -48.37916509457751-0.05,
+                              229.54244884307008+0.05, -48.37916509457751+0.05,
+                              229.54244884307008-0.05, -48.37916509457751+0.05) AS p) s;
+ self_covers | self_overlaps | self_intersects | self_op 
+-------------+---------------+-----------------+---------
+ t           | t             | t               | t
+(1 row)
+
+-- two neighbouring polygons sharing an edge (no gap, no overlap in area) must
+-- still be reported as touching/overlapping (a shared boundary is not empty).
+SELECT skycell_region_overlap(polygon('ICRS', 0,0, 1,0, 1,1, 0,1),
+                               polygon('ICRS', 1,0, 2,0, 2,1, 1,1)) AS shared_edge_ok;
+ shared_edge_ok 
+----------------
+ t
+(1 row)
+
+-- skycell_region_covers(a, b), backing @>, had its argument order backwards
+-- since the extension's first commit: it called the same underlying
+-- primitive CONTAINS(a, b) uses ("is every point of a also in b"), so
+-- `a @> b` computed "a is inside b" instead of "a contains b". Undetected
+-- because the only prior test here, self_covers above, compares a region
+-- to itself, where direction cannot matter. These use a genuinely
+-- asymmetric pair, so a reversed argument order fails them.
+SELECT skycell_region_covers(circle('ICRS', 10, 20, 5.0), circle('ICRS', 10, 20, 1.0)) AS big_contains_small,
+       skycell_region_covers(circle('ICRS', 10, 20, 1.0), circle('ICRS', 10, 20, 5.0)) AS small_does_not_contain_big,
+       (circle('ICRS', 10, 20, 5.0) @> circle('ICRS', 10, 20, 1.0)) AS op_form_agrees,
+       contains(circle('ICRS', 10, 20, 1.0), circle('ICRS', 10, 20, 5.0)) = 1 AS
+         adql_contains_still_right_way_round;
+ big_contains_small | small_does_not_contain_big | op_form_agrees | adql_contains_still_right_way_round 
+--------------------+----------------------------+----------------+-------------------------------------
+ t                  | f                          | t              | t
+(1 row)
+
 -- joins: run-time slots and LATERAL vs brute force -------------------------
 CREATE TABLE probe AS
 SELECT id, ra + 0.0003 * (random() - 0.5) AS ra, greatest(-90, least(90, dec + 0.0003 * (random() - 0.5))) AS dec
@@ -241,6 +374,285 @@ SELECT max(cardinality(skycell_cone_moc(ra0, dec0, r, 12))) <= 12 AS moc_size_ok
  t
 (1 row)
 
+-- skycell_region_moc_ranges: the region-region recipe's own convenience
+-- wrapper (skycell_region_moc() unnested and reduced to nuniq_lo/hi ranges
+-- in one call) must return exactly as many rows as skycell_region_moc()
+-- itself, capped the same way.
+SELECT count(*) <= 8 AS ranges_capped,
+       count(*) = cardinality(skycell_region_moc(circle('ICRS', 10, 20, 1), 8)) AS ranges_match_moc
+FROM skycell_region_moc_ranges(circle('ICRS', 10, 20, 1), 8);
+ ranges_capped | ranges_match_moc 
+---------------+------------------
+ t             | t
+(1 row)
+
+-- region-region INTERSECTS via MOC ranges: neither side of the join is a
+-- point, so none of the per-row coverings above apply and skyregion has no
+-- GiST opclass of its own -- but the same MOC decomposition, applied to
+-- *both* sides and reduced to skycell_nuniq_lo/hi's native [lo,hi] cell-id
+-- ranges, turns "do these two regions overlap" into a plain interval overlap
+-- test that PostgreSQL's built-in int8range GiST opclass already indexes.
+CREATE TABLE rr_a AS
+  SELECT fid AS aid, CASE WHEN fid % 2 = 0 THEN circle('ICRS', ra0, dec0, r)
+                          ELSE polygon('ICRS', ra0-r, dec0-r, ra0+r, dec0-r, ra0+r, dec0+r, ra0-r, dec0+r)
+                     END AS region
+  FROM fp WHERE abs(dec0) < 85;
+CREATE TABLE rr_b AS
+  SELECT fid AS bid, CASE WHEN fid % 2 = 1 THEN circle('ICRS', ra0 + r, dec0, r * 1.5)
+                          ELSE polygon('ICRS', ra0-r*1.5, dec0-r, ra0+r*1.5, dec0-r, ra0+r*1.5, dec0+r, ra0-r*1.5, dec0+r)
+                     END AS region
+  FROM fp WHERE abs(dec0) < 85;
+CREATE TABLE rr_b_moc AS
+  SELECT bid, rng FROM rr_b, skycell_region_moc_ranges(region, 8);
+CREATE INDEX ON rr_b_moc USING gist (rng);
+ANALYZE rr_b_moc;
+SELECT plan_uses_index(
+  $q$SELECT DISTINCT a.aid FROM rr_a a
+     JOIN LATERAL skycell_region_moc_ranges(a.region, 8) am ON true
+     JOIN rr_b_moc b ON b.rng && am.rng$q$
+) AS region_overlap_indexed;
+ region_overlap_indexed 
+------------------------
+ t
+(1 row)
+
+WITH cand AS (
+  SELECT DISTINCT a.aid, b.bid FROM rr_a a
+  JOIN LATERAL skycell_region_moc_ranges(a.region, 8) am ON true
+  JOIN rr_b_moc b ON b.rng && am.rng
+),
+moc AS (SELECT count(*) AS n FROM cand c
+        JOIN rr_a a ON a.aid = c.aid JOIN rr_b b ON b.bid = c.bid
+        WHERE intersects(a.region, b.region) = 1),
+brute AS (SELECT count(*) AS n FROM rr_a a, rr_b b WHERE intersects(a.region, b.region) = 1)
+SELECT brute.n > 50 AS many, moc.n = brute.n AS region_overlap_matches_exact FROM moc, brute;
+ many | region_overlap_matches_exact 
+------+------------------------------
+ t    | t
+(1 row)
+
+DROP TABLE rr_a, rr_b, rr_b_moc;
+-- skyregion GiST opclass (EXPERIMENTAL, ext/src/gist_region.c): the same
+-- region-region INTERSECTS as above, but indexed directly (bounding-cap key)
+-- with a plain CREATE INDEX ... USING gist (region) and no side table at
+-- all. Both self-join (many-to-many) and literal-vs-column forms must plan
+-- through the index and agree with the unindexed exact predicate.
+CREATE TABLE rg_gist AS
+  SELECT fid, ra0, dec0, r,
+         CASE WHEN fid % 2 = 0 THEN circle('ICRS', ra0, dec0, r)
+              ELSE polygon('ICRS', ra0-r, dec0-r, ra0+r, dec0-r, ra0+r, dec0+r, ra0-r, dec0+r)
+         END AS region
+  FROM fp WHERE abs(dec0) < 85;
+CREATE INDEX ON rg_gist USING gist (region);
+ANALYZE rg_gist;
+SELECT plan_uses_index(
+  $q$SELECT a.fid FROM rg_gist a, rg_gist b WHERE a.region && b.region AND a.fid < b.fid$q$
+) AS gist_region_join_indexed;
+ gist_region_join_indexed 
+--------------------------
+ t
+(1 row)
+
+SELECT (SELECT count(*) FROM rg_gist a, rg_gist b WHERE a.region && b.region AND a.fid < b.fid)
+     = (SELECT count(*) FROM rg_gist a, rg_gist b WHERE intersects(a.region, b.region) = 1 AND a.fid < b.fid)
+     AS gist_region_join_matches_exact;
+ gist_region_join_matches_exact 
+--------------------------------
+ t
+(1 row)
+
+-- (not asserting plan_uses_index for this single-table filter form: on a
+-- fixture this small, a plain Seq Scan legitimately costs less than the
+-- index regardless of operator, the same as any other tiny-table case in
+-- this file -- the self-join above, where an index pays off even at this
+-- size, is the one that must plan through it.)
+SELECT (SELECT count(*) FROM rg_gist WHERE region && circle('ICRS', 0, 0, 20))
+     = (SELECT count(*) FROM rg_gist WHERE intersects(region, circle('ICRS', 0, 0, 20)) = 1)
+     AS gist_region_literal_matches_exact;
+ gist_region_literal_matches_exact 
+-----------------------------------
+ t
+(1 row)
+
+-- second strategy on the same opclass: @>(skyregion,skypos) / its commutator
+-- <@(skypos,skyregion) ("which regions contain this point") -- the direction
+-- the point-in-footprint recipe elsewhere in this file cannot serve at all
+-- (it needs the point side to be the large, cell-indexed table). Probe
+-- points are offset from each row's own centre, so most land inside their
+-- source region (and sometimes a neighbour's, from overlap) rather than
+-- every probe trivially matching only its own row.
+CREATE TABLE rg_gist_pts AS
+  SELECT fid AS pid, point('ICRS', ra0 + 0.3*r, dec0) AS pos FROM rg_gist;
+SELECT plan_uses_index(
+  $q$SELECT p.pid FROM rg_gist_pts p, rg_gist f WHERE p.pos <@ f.region$q$
+) AS gist_region_contains_indexed;
+ gist_region_contains_indexed 
+------------------------------
+ t
+(1 row)
+
+SELECT (SELECT count(*) FROM rg_gist_pts p, rg_gist f WHERE p.pos <@ f.region)
+     = (SELECT count(*) FROM rg_gist_pts p, rg_gist f WHERE skycell_in_region(p.pos, f.region))
+     AS gist_region_contains_matches_exact;
+ gist_region_contains_matches_exact 
+------------------------------------
+ t
+(1 row)
+
+-- an automatic alternative to the GiST strategy just above: a planner
+-- support function (region_support_simplify, ext/src/adql.c) recognises a
+-- GIN index on skycell_region_moc(region) and rewrites region_col @> pos /
+-- pos <@ region_col into the array-overlap test the manual MOC-in-a-B-tree
+-- recipe (skycell--0.11.sql's own comment block) computes by hand with a
+-- side table -- same predicate, no side table, no hand-written join. The
+-- rewrite replaces the @>/<@ clause outright whenever this index exists,
+-- regardless of whether the planner then goes on to actually use that
+-- index or a plain sequential scan of the rewritten form -- on a fixture
+-- this small (a few hundred rows), GIN's own per-probe overhead legitimately
+-- loses to a sequential scan, the same "not asserting plan_uses_index for
+-- this small a table" caveat as the literal-vs-column && test above; the
+-- rewrite firing at all, and computing the right answer, is what these
+-- checks confirm. See GIST_REGION_DESIGN.md's "Round eight" for the numbers
+-- (measured on a much larger fixture) showing this rewrite beats the GiST
+-- strategy once a table is actually large enough for either index to pay
+-- for itself.
+CREATE FUNCTION plan_mentions(q text, needle text) RETURNS bool LANGUAGE plpgsql AS $$
+DECLARE l text; found bool := false;
+BEGIN
+  FOR l IN EXECUTE 'EXPLAIN (COSTS OFF) ' || q LOOP
+    IF l ~ needle THEN found := true; END IF;
+  END LOOP;
+  RETURN found;
+END $$;
+CREATE INDEX rg_gist_moc_gin ON rg_gist USING gin (skycell_region_moc(region));
+ANALYZE rg_gist;
+SELECT plan_mentions(
+  $q$SELECT p.pid FROM rg_gist_pts p, rg_gist f WHERE p.pos <@ f.region$q$, 'skycell_region_moc'
+) AS gin_region_contains_rewrite_fires;
+ gin_region_contains_rewrite_fires 
+-----------------------------------
+ t
+(1 row)
+
+SELECT (SELECT count(*) FROM rg_gist_pts p, rg_gist f WHERE p.pos <@ f.region)
+     = (SELECT count(*) FROM rg_gist_pts p, rg_gist f WHERE skycell_in_region(p.pos, f.region))
+     AS gin_region_contains_matches_exact;
+ gin_region_contains_matches_exact 
+-----------------------------------
+ t
+(1 row)
+
+-- the commutator spelling must rewrite and match identically
+SELECT plan_mentions(
+  $q$SELECT p.pid FROM rg_gist_pts p, rg_gist f WHERE f.region @> p.pos$q$, 'skycell_region_moc'
+) AS gin_region_contains_commutator_rewrite_fires;
+ gin_region_contains_commutator_rewrite_fires 
+----------------------------------------------
+ t
+(1 row)
+
+SELECT (SELECT count(*) FROM rg_gist_pts p, rg_gist f WHERE f.region @> p.pos)
+     = (SELECT count(*) FROM rg_gist_pts p, rg_gist f WHERE p.pos <@ f.region)
+     AS gin_region_contains_commutator_agrees;
+ gin_region_contains_commutator_agrees 
+---------------------------------------
+ t
+(1 row)
+
+-- a smaller, user-chosen max_order at index-creation time is read back and
+-- used as the ancestor lookup's own upper bound (an exact, safe narrowing,
+-- not a guess -- see gin_moc_index_for_region()'s own comment in
+-- skycell.c); still must match exactly, not just rewrite.
+DROP INDEX rg_gist_moc_gin;
+CREATE INDEX rg_gist_moc_gin ON rg_gist USING gin (skycell_region_moc(region, 8, 16));
+ANALYZE rg_gist;
+SELECT plan_mentions(
+  $q$SELECT p.pid FROM rg_gist_pts p, rg_gist f WHERE p.pos <@ f.region$q$, 'skycell_ancestors.*0, 16'
+) AS gin_region_contains_narrowed_order;
+ gin_region_contains_narrowed_order 
+------------------------------------
+ t
+(1 row)
+
+SELECT (SELECT count(*) FROM rg_gist_pts p, rg_gist f WHERE p.pos <@ f.region)
+     = (SELECT count(*) FROM rg_gist_pts p, rg_gist f WHERE skycell_in_region(p.pos, f.region))
+     AS gin_region_contains_narrowed_matches_exact;
+ gin_region_contains_narrowed_matches_exact 
+--------------------------------------------
+ t
+(1 row)
+
+DROP TABLE rg_gist_pts;
+-- third strategy: @>(skyregion,skyregion) ("which rows wholly contain that
+-- other region") -- reuses OVERLAP's own pruning test rather than a tighter
+-- one (see ext/src/gist_region.c's "round six" for why a tighter test would
+-- risk a false negative), so recheck (skycell_region_covers) does the real
+-- work; this checks the index-accelerated answer still matches it exactly.
+-- rg_gist's own row sizes span three orders of magnitude (fid <= 2 down to
+-- sub-arcsecond, Table cones), so the self-join finds genuine containment,
+-- not just the trivial a=b case skycell_region_covers(p, p) above covers.
+SELECT plan_uses_index(
+  $q$SELECT a.fid FROM rg_gist a, rg_gist b WHERE a.region @> b.region AND a.fid <> b.fid$q$
+) AS gist_region_covers_join_indexed;
+ gist_region_covers_join_indexed 
+---------------------------------
+ t
+(1 row)
+
+SELECT (SELECT count(*) FROM rg_gist a, rg_gist b WHERE a.region @> b.region AND a.fid <> b.fid)
+     = (SELECT count(*) FROM rg_gist a, rg_gist b WHERE skycell_region_covers(a.region, b.region) AND a.fid <> b.fid)
+     AS gist_region_covers_join_matches_exact;
+ gist_region_covers_join_matches_exact 
+---------------------------------------
+ t
+(1 row)
+
+SELECT (SELECT count(*) FROM rg_gist a, rg_gist b WHERE a.region @> b.region AND a.fid <> b.fid) > 0
+     AS gist_region_covers_join_has_positives;
+ gist_region_covers_join_has_positives 
+---------------------------------------
+ t
+(1 row)
+
+-- fourth strategy: <@(skyregion,skyregion), the third strategy's mirror --
+-- "which rows are wholly contained within that other region". Round six's
+-- @> had no COMMUTATOR, so only "indexed_col @> probe" could use the index;
+-- round seven adds <@ (and backfills @>'s COMMUTATOR), so "indexed_col <@
+-- probe" and the commutator spelling "probe @> indexed_col" both should.
+SELECT plan_uses_index(
+  $q$SELECT a.fid FROM rg_gist a, rg_gist b WHERE a.region <@ b.region AND a.fid <> b.fid$q$
+) AS gist_region_covered_by_join_indexed;
+ gist_region_covered_by_join_indexed 
+-------------------------------------
+ t
+(1 row)
+
+SELECT (SELECT count(*) FROM rg_gist a, rg_gist b WHERE a.region <@ b.region AND a.fid <> b.fid)
+     = (SELECT count(*) FROM rg_gist a, rg_gist b WHERE skycell_region_covered_by(a.region, b.region) AND a.fid <> b.fid)
+     AS gist_region_covered_by_join_matches_exact;
+ gist_region_covered_by_join_matches_exact 
+-------------------------------------------
+ t
+(1 row)
+
+SELECT (SELECT count(*) FROM rg_gist a, rg_gist b WHERE a.region <@ b.region AND a.fid <> b.fid) > 0
+     AS gist_region_covered_by_join_has_positives;
+ gist_region_covered_by_join_has_positives 
+-------------------------------------------
+ t
+(1 row)
+
+-- the commutator spelling of the same predicate must agree exactly (both
+-- plan through a's index, per the direction note above)
+SELECT (SELECT count(*) FROM rg_gist a, rg_gist b WHERE a.region <@ b.region AND a.fid <> b.fid)
+     = (SELECT count(*) FROM rg_gist a, rg_gist b WHERE b.region @> a.region AND a.fid <> b.fid)
+     AS gist_region_covered_by_commutator_agrees;
+ gist_region_covered_by_commutator_agrees 
+------------------------------------------
+ t
+(1 row)
+
+DROP TABLE rg_gist;
 -- expression index instead of a cell column (how egernia's ivoa.obscore is
 -- indexed): the rewrite must use it and read its statistics
 CREATE TABLE cat_expr AS SELECT id, ra, dec FROM cat;

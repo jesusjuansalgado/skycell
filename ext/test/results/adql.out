@@ -17,10 +17,16 @@ SELECT '(10.5, -30.25)'::skypos AS parsed, point('ICRS', 10.5, -30.25) AS built,
  (10.5,-30.25) | (10.5,-30.25) | t
 (1 row)
 
-SELECT 'CIRCLE(10, 20, 0.5)'::skyregion AS circ, 'POLYGON(10,10, 12,10, 11,12)'::skyregion AS poly;
-       circ        |            poly            
--------------------+----------------------------
- CIRCLE(10,20,0.5) | POLYGON(10,10,12,10,11,12)
+SELECT 'CIRCLE ICRS 10 20 0.5'::skyregion AS circ, 'POLYGON ICRS 10 10 12 10 11 12'::skyregion AS poly;
+         circ          |              poly              
+-----------------------+--------------------------------
+ CIRCLE ICRS 10 20 0.5 | POLYGON ICRS 10 10 12 10 11 12
+(1 row)
+
+SELECT ('CIRCLE ICRS 10 20 0.5'::skyregion)::text = 'CIRCLE ICRS 10 20 0.5' AS stcs_roundtrip;
+ stcs_roundtrip 
+----------------
+ t
 (1 row)
 
 SELECT '(370, 10)'::skypos AS ra_wrapped;
@@ -33,10 +39,15 @@ SELECT '(0, 91)'::skypos;                                  -- error
 ERROR:  declination 91 out of range [-90, 90]
 LINE 1: SELECT '(0, 91)'::skypos;
                ^
-SELECT 'POLYGON(0,0, 10,0, 1,1, 0,10)'::skyregion;         -- error: not convex
+SELECT 'POLYGON ICRS 0 0 10 0 1 1 0 10'::skyregion;         -- error: not convex
 ERROR:  skycell: polygon must be convex and smaller than a hemisphere
-LINE 1: SELECT 'POLYGON(0,0, 10,0, 1,1, 0,10)'::skyregion;
+LINE 1: SELECT 'POLYGON ICRS 0 0 10 0 1 1 0 10'::skyregion;
                ^
+SELECT 'CIRCLE GALACTIC 10 20 0.5'::skyregion;              -- error: frame
+ERROR:  invalid input syntax for type skyregion: "CIRCLE GALACTIC 10 20 0.5"
+LINE 1: SELECT 'CIRCLE GALACTIC 10 20 0.5'::skyregion;
+               ^
+HINT:  The coordinate frame must be ICRS; convert with gal2icrs() or ecl2icrs() first.
 SELECT box('ICRS', 10, 89.9, 1, 1);                        -- error: reaches the pole
 ERROR:  BOX reaches a pole; use a POLYGON or a CIRCLE instead
 SELECT point('FK5', 10, 20);                               -- error: frame
@@ -93,6 +104,28 @@ SELECT adql_plan_uses_index('SELECT * FROM acat WHERE pos <@ circle(''ICRS'', 10
  stored_pos | from_columns | poly | bx | not_constant 
 ------------+--------------+------+----+--------------
  t          | t            | t    | t  | f
+(1 row)
+
+-- @>'s commutator spelling (region @> pos) must be rewritten exactly like
+-- <@ (pos <@ region): skycell_region_has_pos, the function backing @>, used
+-- to carry no SUPPORT function of its own and silently fell back to a
+-- sequential scan even though it and skycell_pos_in_region (backing <@)
+-- compute the identical predicate with the arguments swapped.
+SELECT adql_plan_uses_index('SELECT * FROM acat WHERE circle(''ICRS'', 10, 20, 0.5) @> pos') AS reversed_stored_pos,
+       adql_plan_uses_index('SELECT * FROM acat WHERE circle(''ICRS'', 10, 20, 0.5) @> skycell_point(ra, dec)') AS reversed_from_columns,
+       adql_plan_uses_index('SELECT * FROM acat WHERE polygon(''ICRS'', 10,10, 12,10, 12,12, 10,12) @> pos') AS reversed_poly,
+       adql_plan_uses_index('SELECT * FROM acat WHERE box(''ICRS'', 10, 20, 2, 1) @> pos') AS reversed_bx;
+ reversed_stored_pos | reversed_from_columns | reversed_poly | reversed_bx 
+---------------------+-----------------------+---------------+-------------
+ t                   | t                     | t             | t
+(1 row)
+
+SELECT (SELECT count(*) FROM acat WHERE pos <@ circle('ICRS', 10, 20, 0.5))
+     = (SELECT count(*) FROM acat WHERE circle('ICRS', 10, 20, 0.5) @> pos)
+     AS reversed_matches_forward;
+ reversed_matches_forward 
+--------------------------
+ t
 (1 row)
 
 -- indexed and sequential answers must be identical
