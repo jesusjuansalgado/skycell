@@ -6879,3 +6879,107 @@ of this file's tables. No code, SQL, or default changed. Promotion
 defaults, or making `rlist_score()` itself cost-aware of this tradeoff
 rather than needing a hand-picked constant) is a separate, not-yet-
 started round.
+
+## Round sixty-four: promotion scrutiny for `probe_orders=3, split_
+## cost=0.1` -- generalizes cleanly on two axes, confirmed on a real
+## cold run, and one real side effect identified, not hand-waved past
+
+Round sixty-three found that combination closes the B-tree rewrite's
+one known warm-cache loss (6') and widens its 30' win, but flagged
+three open questions before trusting it beyond that one benchmark:
+other query shapes, other corpora/densities, and a real cold-cache
+run (that round only had buffers as a cold-cache proxy). All three
+checked this round.
+
+**Part 1 -- polygons.** `bench/05_poly.sql`'s own 120-polygon corpus
+(0.05-2 degrees across), extended with buffer capture
+(`bench_poly_explain`, mirroring `bench_cone_explain`'s own pattern).
+Unlike cones, polygons never had a warm-cache loss to begin with --
+skycell's B-tree rewrite already beats pgSphere's `spoly` by 2x-10x at
+every size bucket tried, un-tuned. The tuning still helps, modestly
+and in the same direction as cones (8-25% faster, buffers flat to
+improved), with zero correctness mismatches across all 120 polygons.
+No regression found; nothing to close, since there was no loss here.
+
+**Part 2 -- a different density.** Every round before this one measured
+against `src`/`cat_cell`/`cat_sphere`'s own 60%-clustered corpus. Built
+a fresh, fully uniform-on-sphere corpus (`cat_cell_u`/`cat_sphere_u`,
+2 million rows -- a scoped density check, not a second 10-million-row
+rebuild) and reran the same radius sweep. skycell already wins by large
+margins at every radius here too (no dense clusters means no exact-
+filter waste to begin with, the opposite extreme from the clustered
+corpus's 6' problem), so again there was no loss for the tuning to
+close. The tuning's own effect was genuinely mixed here -- faster at
+6'/30'/3deg, flat at 1"/10", and one real regression at 1 degree
+(0.137ms -> 0.1675ms, buffers improving slightly despite the slower
+time) -- but never close to threatening skycell's own large lead over
+pgSphere at any radius on this corpus. Zero correctness mismatches.
+
+**Part 3 -- a real cold-cache run, not the buffer-count proxy.** Round
+sixty-three's "buffers flat to improved, so probably fine cold too" was
+a reasonable inference, not a measurement -- checked directly this
+round, reusing round forty-four's own fix for the `drop_caches`-is-a-
+no-op problem in this environment (fresh, never-before-touched probe
+coordinates per trial, a full `pg_ctlcluster restart` immediately
+before each). Four trials (baseline/tuned x 6'/30', 20 fresh probes
+each, genuinely cold -- confirmed by per-probe times in the tens-to-
+low-hundreds of milliseconds, matching round forty-four's own cold
+ballpark, not warm-range numbers):
+
+| trial | mean buffers | median buffers | mean ms | median ms |
+|---|---|---|---|---|
+| 6', baseline | 8.4 | 6.0 | 74.20 | 69.30 |
+| 6', tuned | **5.7** | **5.0** | **62.08** | **30.89** |
+| 30', baseline | 18.0 | 15.0 | 95.83 | 69.54 |
+| 30', tuned | 18.0 | **13.0** | **50.84** | **24.54** |
+
+Not a tradeoff -- tuned is equal-or-fewer buffers *and* faster, cold,
+at both radii. This directly confirms the "range count unchanged, no
+cold-cache cost" claim from round sixty-three's own source-comment
+citation, now against a real restart-and-measure run rather than a
+buffer-count inference.
+
+**One real side effect, found by checking the mechanism, not just the
+outcome, for the two small regressions parts 1-2 both showed at the
+smallest radii.** `cover.c`'s own probe-order loop guards against
+probing a tiny, nothing-to-win-back query one order deeper with
+`cand_rows < SC_PROBE_MIN * (st + 1) * fmax(p->split_cost, 1e-3)` (`SC_
+PROBE_MIN` = 8.0) -- lowering `split_cost` to 0.1 lowers this guard's
+own threshold by the same 10x, letting the loop probe deeper than
+intended for exactly the tiny-radius case the guard exists to skip.
+This is the mechanism behind the 1"/1' regressions round sixty-three
+already saw and this round's own 1-degree regression on the uniform
+corpus -- `split_cost` is a single GUC doing two jobs (the probe loop's
+own cost accounting, and this unrelated early-exit guard), and tuning
+it for one job detunes the other. Not fatal -- every regression found,
+on both corpora, stayed small and never flipped a win into a loss --
+but a real, now-identified cost of promoting `split_cost=0.1` as a
+*global* default rather than something narrower.
+
+**Promotion recommendation, not a unilateral change**: the measured
+case for promoting `probe_orders=3` outright is strong (closes the one
+known loss, generalizes to polygons and a different density with no
+new loss anywhere, confirmed cold not just warm, zero correctness
+issues across three benchmarks). The case for `split_cost=0.1`
+specifically is good but not clean -- it works by coupling into an
+unrelated guard, which is why the small regressions exist at all. Two
+honest paths forward, not decided here:
+1. Promote both as the new compiled-in defaults now -- net clearly
+   positive, every regression found is small and non-reversing.
+2. Decouple the probe loop's own cost accounting from `skycell.split_
+   cost` first (the fix `cover.c`'s own comment already named --
+   "calibrate split_cost against measurement... not tune it until this
+   looks good" -- taken one step further: give the probe loop its own
+   calibrated constant instead of overloading the general one), then
+   promote `probe_orders` alone without needing to touch `split_cost`'s
+   default or risk its other guard at all.
+
+**STATUS**: measured, not shipped. No code, SQL, GUC default, or
+opclass changed this round. `cat_cell_u`/`cat_sphere_u`/`src_u`/
+`bench_centers_u`/`bench_u_x`/`bench_u_explain()` and `bench_poly_x`/
+`bench_poly_explain()` left in place as reusable bench infrastructure
+(same convention as `bench_cone_x`/`bench_cone_explain()` before them)
+for whoever wants to keep testing density/shape sensitivity;
+`cold_trial`/`cold_results`/`cold_run()` (this round's own one-off
+cold-cache harness, not reusable infrastructure the way the density/
+shape ones are) dropped after measurement.
