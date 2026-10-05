@@ -336,37 +336,69 @@ region-region `@>` predates `<@` by several versions and had no commutator of
 its own until `<@` was added — both directions are indexed now, and either
 spelling reaches the index regardless of which one you write.
 
-**For a `skyregion` column you know holds small, catalogue-scale footprints**
-(arcseconds to a few degrees — the common case for a source's own
-footprint, as opposed to a survey tile or an all-sky query region), a
-second, opt-in opclass is worth pointing at instead:
+**`CREATE INDEX ON t USING gist (region)` with no opclass named picks
+`skyregion_box4_gist_ops`** (`ext/src/gist_region_box4.c`, DEFAULT as of
+`skycell` 0.26) — a plain axis-aligned 3D box key, no spherical caps,
+keyed exactly like pgSphere's own `spherekey` (six `float4`s, a fixed
+24-byte type, bounds rounded strictly outward on the `float4` cast for
+soundness). It beat every other opclass tried — the multi-cap opclass
+below, its own `float8` predecessor (`skyregion_box_gist_ops`), and
+pgSphere's native GiST — on every corpus measured: isolated single-scale
+bands, a mixed circle/polygon corpus, and all four strategies (`&&`,
+`@>(region,point)`, `@>(region,region)`, `<@(region,region)`) on the real
+50,000-row `fpr` corpus, including `@>(region,point)`, the one strategy
+its `float8` predecessor itself loses to pgSphere on. See `GIST_REGION_
+DESIGN.md`'s "Round fifty-seven" through "Round sixty-one" (promotion
+scrutiny) for the numbers.
+
+**For a `skyregion` column mixing very different region scales in one
+index** (a survey-tile table alongside catalogue-scale footprints, say),
+a second, opt-in opclass is worth pointing at instead:
+
+```sql
+CREATE INDEX ON t USING gist (region skyregion_gist_ops);
+```
+
+`skyregion_gist_ops` (`ext/src/gist_region.c`) keys each entry with a
+small number of spherical caps rather than a box — a circle's own
+multi-cap key is the circle itself, exact at any radius, so it doesn't
+share the box opclasses' large-radius looseness (see below) and wins
+specifically when a single index must serve both ends of a wide scale
+range. That key is larger and costs more per candidate than the box
+opclasses' fixed 24/48 bytes, which is why it loses on every single-
+scale corpus measured — the box opclass above is the better default
+precisely because most columns don't mix scales.
+
+**A third opclass, `skyregion_box_gist_ops`** (`ext/src/gist_region_box.c`)
+is the same axis-aligned-box geometry as the default, but `float8` in a
+`bytea` (48 bytes) instead of `float4` in a fixed-length type (24 bytes).
+It is EXPERIMENTAL and non-default as of 0.26 (it was DEFAULT from 0.21
+through 0.25) — superseded by `skyregion_box4_gist_ops`, which beat it on
+every corpus measured with no regression found in any regime (round
+sixty-one's own promotion scrutiny). Kept available for comparison and as
+a fallback; select it explicitly if needed:
 
 ```sql
 CREATE INDEX ON t USING gist (region skyregion_box_gist_ops);
 ```
 
-`skyregion_box_gist_ops` (`ext/src/gist_region_box.c`) is a plain
-axis-aligned 3D box key, no spherical caps — smaller and faster than the
-default multi-cap opclass above at that scale (roughly a third of the
-index size, and a clear win on `&&` and both containment strategies,
-closing a gap to pgSphere the default opclass doesn't close), because a
-box is cheaper to test per candidate than a multi-cap key is. That
-advantage is real but not universal: it reverses once regions get large
-— a circle's *multi-cap* key is the circle itself, exact at any radius,
-while a box's looseness around a circle grows through the medium-to-large
-radius range and doesn't recover until close to a hemisphere. Past
-roughly 20° radius the default opclass wins back. So this is a deliberate
-choice to make per column based on what it actually stores, not a
-drop-in replacement — see `GIST_REGION_DESIGN.md`'s "Round forty-two"
-(and its two addenda, on pole proximity and on large radii) for the
-numbers behind both directions of that tradeoff. Same EXPERIMENTAL
-caveat as the default opclass above applies, with less scrutiny behind
-it (this opclass is new; the default one has had forty-plus rounds of
-hardening).
+A box opclass's looseness around a circle grows through the medium-to-
+large radius range and doesn't recover until close to a hemisphere; past
+roughly 20° radius `skyregion_gist_ops` (multi-cap) wins back regardless
+of which box opclass it's compared against — see `GIST_REGION_DESIGN.md`'s
+"Round forty-two" (and its two addenda, on pole proximity and on large
+radii) for the numbers behind that tradeoff, measured originally against
+`skyregion_box_gist_ops` and not yet confirmed to reproduce at the exact
+same crossover radius for `skyregion_box4_gist_ops` (round fifty-seven
+onward found the known round-fifty-four crossover didn't reproduce
+through 50° for either box opclass in a fresh, plan-verified
+re-measurement — an open discrepancy, not yet resolved, so treat any
+specific large-radius crossover claim for either box opclass as unsettled
+rather than relying on the round forty-two number).
 
-Both opclasses can also coexist on the same column — `CREATE INDEX` both —
-and PostgreSQL's ordinary cost-based planner will pick between them per
-query, the same way it already does for `skypos_spgist_ops` and
+All three opclasses can also coexist on the same column — `CREATE INDEX`
+each — and PostgreSQL's ordinary cost-based planner will pick between
+them per query, the same way it already does for `skypos_spgist_ops` and
 `skypos_cap_gist_ops` on a point column. That needs the region-region
 `&&`/`@>`/`<@` operators' selectivity estimates to actually reflect the
 query's own region size, which they didn't until `skycell` 0.16 (they used
@@ -521,6 +553,10 @@ WHERE point('ICRS', ra, dec) <@ circle('ICRS', 269.45, 4.69, 0.05 + 0.006)
 | `skycell.exact_cells` | on | tight cell geometry; off falls back to the `max_pixrad` cap |
 | `skycell.force_order` | -1 | diagnostics: cover cones at this order (-1 = let the model choose) |
 | `skycell.split_cost`, `skycell.max_steps` | 1, 4000 | refinement guards for polygons and very large cones |
+| `skycell.probe_orders` | 0 (off) | try this many orders past the closed-form choice, keep whichever scores lowest; off by default — real but inconsistent gain once planning time is counted honestly for queries that don't repeat, see `GIST_REGION_DESIGN.md`'s "Round sixty-five" |
+| `skycell.probe_split_cost` | 1.0 (inert while probing is off) | cost per cell the order-probe loop charges itself; kept separate from `skycell.split_cost` precisely so tuning this doesn't also detune `split_cost`'s own, unrelated guard — see "Round sixty-five" |
+| `skycell.rewrite_max_waste` | 100 | decline the B-tree range rewrite for a constant region when the covering's own cost model expects more than this many false-positive rows, scaled by how cache-resident the relation is; set very high to force the always-rewrite behaviour every version before 0.2x had |
+| `skycell.rewrite_waste_scale_cap` | 10 | upper bound, as a multiple of `rewrite_max_waste`, on how far that scaling may go for a relation far bigger than `shared_buffers` |
 
 ---
 
@@ -869,7 +905,13 @@ sequence, so each finer one ran on a warmer cache. Interleaving removes both.
 `skycell.probe_orders` scores candidate orders on the covering they actually
 produce instead of on the closed form. It now works — the probe does pick
 finer coverings (area ratio 11.5 → 8.9 at 6′) — and query time does not move,
-which is what 3% headroom predicts. **Off by default.**
+which is what 3% headroom predicts. **Off by default.** A later round found
+this does move execution time at some radii once the probe loop's own cost
+accounting is separately calibrated (`skycell.probe_split_cost`), but that
+gain doesn't survive counting the probe's own planning-time cost for queries
+that don't repeat — see `GIST_REGION_DESIGN.md`'s "Round sixty-three" through
+"Round sixty-five" for the fuller, more mixed picture than this section's
+own single-order measurement shows.
 
 `skycell_density_build()` builds a multi-order count map (leaf cells split
 until each holds ≤ N rows) which the covering reads in preference to the
