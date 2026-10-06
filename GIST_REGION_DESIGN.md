@@ -7859,3 +7859,112 @@ ceiling, not proof.
 function reverted in full (`git diff` against the fixed commit is empty
 after this round); `make installcheck` re-confirmed green on the
 restored build.
+
+## Round seventy-three: a genuinely controlled A/B, same session --
+## supersedes round seventy-one's cross-session comparison; the 10"
+## "regression" does not reproduce
+
+Round seventy-two argued the 10" result was more likely a cross-session
+artefact than a property of the fix, but could not prove it without a
+cleaner test. Built one: rather than rebuild and reinstall the extension
+between "before" and "after" (two separate backend sessions, two separate
+warm-up runs, the source of the session-to-session noise rounds
+seventy-one/seventy-two kept running into), load the pre-fix source as a
+*second* shared library in the *same* session, alongside the already-
+installed fixed one, and compare both against identical queries, back to
+back, randomized order, one warm-up, no rebuild in between.
+
+**How.** Pre-fix `cover.c`/`cover.h`/`adql.c`/`spgist_region.c` (commit
+`365b4f4`) copied into a scratch build directory, compiled to a
+separately-named `skycell_old.so` -- `_PG_init` renamed to a dead symbol
+(so PostgreSQL never calls it: this process already has every
+`skycell.*` GUC registered by the production library, and a second
+`DefineCustomRealVariable` call for the same name errors) and
+`skycell_cache_coverings`'s compiled-in default flipped to `false` (the
+production library's own copy is controlled by `SET
+skycell.cache_coverings`, but a GUC is one process-global name bound to
+whichever library registered it first -- the old library's same-named
+static is a separate, unreachable variable, so this is the only way to
+stop *its* covering cache from hiding repeat measurements of the same
+query the way round seventy-one's warm-up accidentally did). Declared
+ad hoc (no extension, no commit) against the running database:
+`skycell_support_old`/`skycell_cone_old`, pointing at `skycell_old.so`'s
+`skycell_support`/`skycell_cone` symbols, `skycell_cone_old` given
+`SUPPORT skycell_support_old`. `lookup_sibling_func()` resolves
+`skycell_in_cone` by name in the schema regardless of which library
+calls it, so both versions' rewritten quals share the exact same
+production exact-test function -- confirmed identical plans, identical
+filter conditions, identical buffers (12 vs 12) on a sample query before
+trusting anything further.
+
+**Protocol.** One combined warm-up pass (both versions, same queries,
+same table). Then 30 repetitions over all 1,456 `bench_centers`, and
+*within each repetition, for each query*, a coin flip on which version
+runs first -- the paired, randomized-order-per-trial discipline
+`tab:cones`' own protocol uses, now actually possible because both
+versions live in the same backend and touch the same warm pages.
+`skycell.cache_coverings` off throughout (controls the new side; the old
+side's own cache is permanently off by the build above). 87,360 EXPLAIN
+calls, 23 seconds.
+
+**Buffers matched exactly** -- 507,480 for both versions, every
+repetition -- the correctness check this round could run for free.
+
+**Per query, median of 30, bootstrapped (4000 resamples) 95% CI on the
+planning-time ratio (new/old):**
+
+| radius | n | plan ratio | 95% CI | total-time ratio | 95% CI |
+|---|---|---|---|---|---|
+| 1" | 400 | 0.997 | [0.989, 1.006] | 0.998 | [0.990, 1.006] |
+| 10" | 400 | 0.989 | [0.980, 0.998] | 0.992 | [0.985, 1.000] |
+| 1' | 300 | 0.997 | [0.987, 1.007] | 0.995 | [0.987, 1.004] |
+| 6' | 200 | 0.999 | [0.985, 1.014] | 0.999 | [0.988, 1.010] |
+| 30' | 100 | 1.005 | [0.983, 1.025] | 0.995 | [0.985, 1.006] |
+| 1 deg | 40 | 0.972 | [0.947, 0.998] | 0.997 | [0.983, 1.012] |
+| 3 deg | 16 | 0.964 | [0.928, 0.996] | 0.994 | [0.978, 1.009] |
+| **all pooled** | 1456 | **0.991** | **[0.985, 0.998]** | 0.995 | [0.990, 1.001] |
+
+**The 10" result reverses.** Round seventy-one's cross-session
+comparison found a resolved 5.7% *loss* there; this same-session,
+randomized A/B finds a resolved 1.1% *win* instead -- the opposite sign,
+from the same real queries on the same table, differing only in whether
+the comparison crossed a session boundary. That is exactly what round
+seventy-two's instrumentation predicted (the mechanism is identical at
+1" and 10"; whatever drove round seventy-one's divergence had to be
+something else) and now has direct confirmation: it was something else.
+
+**The honest result: a small, real, mostly-resolved win in planning
+time; a smaller and mostly-unresolved one in total time.** Pooled across
+every radius, planning time is 0.9% faster, resolved (CI excludes 1).
+Individually, 10", 1 deg and 3 deg resolve; 1", 1', 6', 30' do not (CI
+straddles 1) -- consistent with a real effect of a percent or two that
+this container's remaining noise, even controlled this well, does not
+fully resolve at every radius individually. No radius, pooled or
+individual, shows a resolved loss. Total time (plan+exec, what actually
+answers a query) is directionally the same but smaller and not resolved
+anywhere except at the pooled level it's close (0.995 [0.990, 1.001]) --
+expected, since execution time (unaffected by this fix, roughly 2x
+planning time here) dilutes a planning-only saving once summed in.
+
+This is a real answer to the question round seventy opened with a 7-22%
+number from a standalone harness with no backend, no syscache, no
+`Expr`-tree construction around it: embedded in an actual backend, on
+this corpus, on this container, the fix is worth roughly 1% of planning
+time and under 1% of total query time -- smaller than the isolated
+measurement suggested, exactly the direction the caveat in round
+seventy's own writeup predicted, and, now that the comparison is
+controlled properly, a real win rather than a mixed bag.
+
+**What this does not settle.** One container, one corpus (designed,
+10M rows, the only one loaded), one host that round sixty-six already
+found does not reproduce `tab:cones`' own published ratios for unrelated
+reasons (`shared_buffers` thrashing). A ~1% win is real here; whether it
+is 1% on the paper's own host, where the planning/execution balance
+round sixty-six found to differ, is not something this container can
+answer.
+
+**STATUS**: measurement only. `skycell_old.so`, the scratch build
+directory, and every ad hoc function/table this round created were
+removed after measurement; confirmed via a sample query that the
+production `skycell_cone` still answers correctly post-cleanup. No
+code, GUC, or paper change.
