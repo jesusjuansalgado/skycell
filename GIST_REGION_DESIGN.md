@@ -7189,3 +7189,119 @@ ad hoc `fpr_region_box8` index dropped after measurement; `fpr`'s
 indexes and `pg_index.indisvalid` restored to their normal state;
 `bench_cone_x`'s `variant = ''` rows left as this round's own addition
 to that table's existing convention.
+
+## Round sixty-seven: round thirteen's "0% empty cells" re-run on real
+## Gaia DR3 -- replicates on all-sky data, does not hold where there
+## are real gaps
+
+Round thirteen ruled out a data-aware covering because 0.0% of the cells
+`cover_cone_direct()` visited were empty, with the caveat that its
+synthetic corpus has a 35% uniform background and so no true gaps
+(handoff open item 9). The real-Gaia corpora are now rebuildable
+(`bench/19_gaia_real.sh`, `bench/19_gaia_load.sh`), so the measurement was
+repeated on them.
+
+**Method, as round thirteen**: a temporary `fprintf` (not committed) at
+all three `classify` call sites in `cover_cone_direct()` -- seed, child,
+final -- logging `(query, order, pix, verdict)`; `EXPLAIN` only, so the
+covering is computed at plan time and nothing executes; 40 distinct
+centres x {30', 1 deg, 3 deg}, so the covering memo never hits; every
+distinct visited cell then checked with a real `EXISTS` on its order-29
+range against the queried table. PostgreSQL 16, default GUCs
+(`probe_orders` as shipped). Three workloads:
+
+- **A** `gaia_realc` (10M real DR3 positions, all-sky), centres drawn from
+  its rows -- the benchmarks' own protocol;
+- **B** `gaia_realc`, centres uniform on the sphere;
+- **C** `gaia_fields` (1.59M, complete DR3 in 8 fields of 0.25-0.5 deg
+  radius), centres drawn from its rows -- cones larger than the fields,
+  so they cross genuinely unobserved sky.
+
+| | radius | visits | distinct cells | orders | visits on empty cells | inside-verdict visits empty | final kept cells empty |
+|---|---|---|---|---|---|---|---|
+| A | 30' | 5,586 | 3,552 | 6-9 | 0.00% | 0.00% | 0.00% |
+| A | 1 deg | 12,621 | 9,463 | 6-9 | 0.00% | 0.00% | 0.00% |
+| A | 3 deg | 28,883 | 20,338 | 6-8 | 0.00% | 0.00% | 0.00% |
+| B | 30' | 1,911 | 1,148 | 6-9 | 0.00% | 0.00% | 0.00% |
+| B | 1 deg | 4,134 | 2,695 | 6-9 | 0.00% | 0.00% | 0.00% |
+| B | 3 deg | 15,043 | 10,136 | 5-8 | 0.03% | 0.03% | 0.00% |
+| C | 30' | 22,925 | 3,557 | 9-10 | 57.5% | 49.1% | 48.7% |
+| C | 1 deg | 22,950 | 2,859 | 7-9 | 83.8% | 79.2% | 79.7% |
+| C | 3 deg | 32,777 | 3,321 | 6-8 | 97.2% | 96.7% | 95.6% |
+
+(Measured with statistics target 1000 on the cell index, as
+REPRODUCING.md section 4 specifies. A first pass ran on 100-bucket
+histograms -- the loader's `ANALYZE` inside a `DO` block ignored the
+target set on the index in the same block, fixed in
+`bench/19_gaia_load.sh` -- and gave the same picture: A 0.00%, B 0.04%,
+C identical to the last digit, since the fields' estimates moved by under
+12% and the walk there is held by its cell budget, not by density.)
+
+**On all-sky real data round thirteen replicates.** Zero empty cells in
+47,090 visits with data-drawn centres, and 0.02% with uniform centres --
+the latter all at 3 deg in the sparsest sky, where the visited
+order-8 cells average about 60 rows and the thinned (0.55%) sample
+occasionally leaves one at zero. That is sampling, not footprint. So the
+0% was not an artefact of the synthetic corpus's uniform background:
+`choose_order()` stops at cells that real all-sky density keeps populated.
+
+**Where real gaps exist, the walk does not see them.** On `gaia_fields`
+half to almost all of the visits, and of the final cells kept, are empty
+sky. The cost model reads density from the ANALYZE histogram, which
+round thirteen already found prorates a bucket over every sub-cell
+inside it and so can never report emptiness -- near a field it reads
+crowded-field density and refines further (orders 9-10 at 30', against
+6-9 on `gaia_realc`), spending the extra resolution on empty sky. The
+premise of round thirteen's data-aware covering -- that the walk wastes
+work on unoccupied cells -- is therefore true for a catalogue with a
+footprint, and false only for an all-sky one.
+
+**What this does not establish.** `gaia_fields` is an extreme footprint
+(eight small disks queried with cones up to 12x their radius); a real
+survey footprint (stripes, tiles, pointed fields with partial overlap)
+sits somewhere between B and C, and Gaia, being all-sky, cannot supply
+one. Nor was cost measured: an empty cell visited costs one `classify`
+step at plan time (microseconds, round thirteen's profile), and an empty
+cell kept costs a B-tree descent that finds nothing at execution, before
+`merge_gaps()` may absorb it into a neighbouring range. Whether skipping
+them would pay is a separate measurement against a footprint-limited
+catalogue; this round only removes "0% empty" as the reason not to try.
+
+**STATUS**: measurement only; no code changed (instrumentation reverted,
+`git status` clean on `ext/src/cover.c`). Handoff open item 9 updated.
+
+**Addendum: the paper's Baade's Window row.** `bench/19_gaia_real.sh`
+queried Baade's Window at RA 18.17 deg (its RA in hours), a high-latitude
+cone of 578 sources, until this branch moved it to 270.904, -30.035
+(225,522). The paper's estimator table (`tab:estimator`) is not produced by
+any script in the repo, so it was reconstructed: rho-hat from
+`skycell_cover_info()` against the counted density, radii 0.01-1 deg,
+statistics target 1000, three independent `ANALYZE` samples.
+
+- On `gaia_realc` the reconstruction reproduces the paper's other rows
+  (omega Cen 0.06-0.08 vs 0.08; LMC 0.74-0.84 vs 0.76; Galactic centre
+  3.71-3.81 vs 3.74), so that is the table it was measured on. Baade
+  gives median 0.90-0.94 (range 0.44-1.16) at the corrected position and
+  0.71-0.74 (0.55-1.03) at the old one; the paper's 0.80 (0.68-1.01) sits
+  between and does not identify either. Both are ordinary-sky values, so
+  the row's role in the paper -- an accurate field, not a failure case --
+  holds at either position.
+- On the full-density fields the old position cannot produce the second
+  referee response's figures: its 578 sources are invisible to the
+  histogram (rho-hat/rho = 0.00 at every radius), whereas the corrected
+  field gives 0.96 at 0.05 deg and 0.23 at 0.2 deg, matching the response's
+  "0.97-1.05 at <= 0.05 deg ... collapses to 0.15-0.23 at 0.2 deg". With the
+  1.6M row count, this says the published corpus used the correct
+  position and only the script had drifted.
+
+The measurement is now scripted as `bench/29_estimator.sql`, and the
+paper's table and text were updated from it (ten `ANALYZE` samples).
+Sampling moves the estimate more than the three samples above suggested
+-- 47 Tuc's median ranges over 0.01-0.08 -- and the cluster-core
+underestimate is 10-100x, not the 8-12x the paper had. Re-measuring what
+that costs (part (b) of the script): the chosen covering in a cluster
+core is within 0.96-1.55 of the best fixed order (1.76 in one sample
+with 47 Tuc at 0.01) against 0.96-1.25 where the estimate is accurate,
+so the paper's "no worse than where the estimate is accurate" was
+withdrawn; "does not cost a wrong covering" (vs 243-830x for a bad fixed
+order) stands.

@@ -58,7 +58,10 @@ The memory-pressure experiment (§6.4 of the paper) overrides these with
 order, i.e. random on the sky (**unclustered**). They hold the same rows, so
 heap layout is an isolated variable.
 
-Fetching the real positions: `bench/19_gaia_real.sh` (ESA TAP, ~600 MB).
+Fetching the real positions: `bench/19_gaia_real.sh` (ESA TAP, ~700 MB, into
+`$GAIA_DIR`, default `/tmp/gaia`); loading them into `gaia_realu`, `gaia_realc` and
+`gaia_fields` with the §4 indexes: `bench/19_gaia_load.sh` (~5 min). A rebuild
+should give exactly 10,000,000 / 10,000,000 / 1,593,958 rows (DR3 is frozen).
 Generation of the synthetic corpora: `bench/01_data.sql`, seeds fixed with
 `setseed()` and recorded in each script.
 
@@ -90,6 +93,7 @@ psql -f bench/14_shapes.sql
 psql -f bench/16_sensitivity.sql     # cost parameters, density estimator
 psql -f bench/17_ablation.sql        # clustering / covering / index representation
 psql -f bench/18_xmatch_sweep.sql    # outer size × radius × target distribution
+psql -f bench/29_estimator.sql       # density estimate vs truth per field (tab:estimator)
 python3 bench/ab_report.py           # paired ratios, bootstrap intervals
 ```
 

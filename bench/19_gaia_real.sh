@@ -1,5 +1,5 @@
 #!/bin/bash
-OUT=/tmp/gaia
+OUT=${GAIA_DIR:-/tmp/gaia}; mkdir -p "$OUT"
 # (1) all-sky sample of REAL positions: random_index is a precomputed random
 # permutation, so this is a uniform random thinning of the true point process --
 # every position is a real Gaia DR3 position and the density contrast is preserved
@@ -10,14 +10,14 @@ for i in $(seq 0 9); do
   curl -sS --max-time 600 -G 'https://gea.esac.esa.int/tap-server/tap/sync' \
     --data-urlencode 'REQUEST=doQuery' --data-urlencode 'LANG=ADQL' --data-urlencode 'FORMAT=csv' \
     --data-urlencode 'MAXREC=4000000' \
-    --data-urlencode "QUERY=SELECT source_id, ra, dec FROM gaiadr3.gaia_source WHERE random_index >= $lo AND random_index < $hi" \
+    --data-urlencode "QUERY=SELECT source_id, random_index, ra, dec FROM gaiadr3.gaia_source WHERE random_index >= $lo AND random_index < $hi" \
     -o "$f.tmp" 2>/dev/null
   if [ -s "$f.tmp" ] && head -1 "$f.tmp" | grep -q '^source_id'; then mv "$f.tmp" "$f"; echo "allsky $i: $(($(wc -l < "$f") - 1)) rows"; fi
 done
 # (2) complete, full-density real fields for crowding: cluster cores, bulge, Magellanic.
 #     name:ra:dec:radius_deg
 for fld in "omega_cen:201.697:-47.4795:0.25" "47tuc:6.0236:-72.0814:0.25" "m4:245.8967:-26.5256:0.25" \
-           "baade:18.17:-29.95:0.25" "gal_centre:266.4168:-29.0078:0.25" "lmc:80.8942:-69.7561:0.5" \
+           "baade:270.904:-30.035:0.25" "gal_centre:266.4168:-29.0078:0.25" "lmc:80.8942:-69.7561:0.5" \
            "m13:250.4235:36.4613:0.25" "ngc104_off:8.0:-72.0:0.25"; do
   n=${fld%%:*}; r=${fld##*:}; rest=${fld#*:}; ra=${rest%%:*}; rest=${rest#*:}; dec=${rest%%:*}
   f="$OUT/field_$n.csv"; [ -s "$f" ] && continue

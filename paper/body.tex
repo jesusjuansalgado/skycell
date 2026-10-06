@@ -45,8 +45,8 @@ polygons 2.7--4.4 times faster, matches \texttt{q3c\_join} on cross-matching whi
 times faster than pgSphere at it, and its row estimates are wrong by a factor 1.2 rather
 than 2.5--3.0. Its one free cost parameter is derived from the relation's own statistics,
 its chosen cell order costs about 3\% against the best available one, and its density
-estimate is accurate to about 25\% on ordinary sky (low by up to 12$\times$ in a globular
-cluster core, with no measurable effect on the covering chosen). Raising the catalogue to
+estimate is good to within a factor 1.6 on ordinary sky (low by 10--100$\times$ in a
+globular cluster core, which costs the covering chosen at most a factor 1.8). Raising the catalogue to
 50 million rows widens the advantage for regions of 30\arcmin\ and larger while cones of
 an arcminute and below do not move. A \texttt{float4} GiST box key matched to pgSphere's
 own representation beats every region-opclass alternative tried, including pgSphere's
@@ -739,32 +739,43 @@ finer at 6\arcmin) for the same reason.
 The model's input, $\hat\rho$ from Eq.~(\ref{eq:rho}), was called unbiased in an earlier
 version of this work -- true of positions resampled from a density map with no structure
 below $0.11\degr$, but not of real Gaia DR3 positions. Table~\ref{tab:estimator} compares
-$\hat\rho$ with $\rho$ counted from the same relation: good to about $\pm25\%$ on
-ordinary sky, \emph{low by a factor 8--12} in a globular cluster core, \emph{high by a
-factor 3.7} at the Galactic centre, as the histogram resolves a cluster while a query
-sits inside it and averages it away once the query is larger (the failure
-Sect.~\ref{sec:density} predicts, now measured on real positions). The consequence is
-smaller than the error suggests: since $s^*\propto\sqrt\rho$, an order of magnitude in
-$\rho$ is a factor three in cell size, and the cost curve is flat across that -- the
-covering chosen in a cluster core, wrong by an order of magnitude, is within 1.09--1.43
-of the best fixed order, no worse than where the estimate is accurate. The estimator
-should be judged by the decision it produces, not the number it reports.
+$\hat\rho$ with $\rho$ counted from the same relation: within 10\% at Baade's Window
+and a factor 1.6 at the Galactic pole (where the sample holds a few dozen rows),
+\emph{low by a factor 10--100} in a globular cluster core, \emph{high by a factor 3.7}
+at the Galactic centre, as the histogram resolves a cluster while a query sits inside
+it and averages it away once the query is larger (the failure Sect.~\ref{sec:density}
+predicts, now measured on real positions). The estimate also moves between
+\texttt{ANALYZE} runs, which sample the relation afresh: at 47~Tuc the median ranges
+over 0.01--0.08 across ten. The consequence is smaller than the error: since
+$s^*\propto\sqrt\rho$, an order of magnitude in $\rho$ is a factor three in cell size,
+and the cost curve is flat across much of that -- the covering chosen in a cluster
+core is within 0.96--1.55 of the best fixed order (1.76 in a sample that put 47~Tuc a
+hundredfold low), against 0.96--1.25 where the estimate is accurate, and against
+243--830 for a fixed order chosen badly. The error costs something in cluster cores at
+intermediate radii; it does not cost a wrong covering. The estimator should be judged
+by the decision it produces, not the number it reports.
 
 \begin{table}
   \caption{The density estimate against the truth, real Gaia DR3 positions: $\hat\rho$
     is what the cost model reads, $\rho$ counted from the same relation, both in
-    rows\,sr$^{-1}$, over four decades of surface density, radii $0.01\degr$--$1\degr$.}
+    rows\,sr$^{-1}$, over four decades of surface density, radii $0.01\degr$--$1\degr$.
+    $\hat\rho/\rho$: median over radii, then median over ten \texttt{ANALYZE} samples;
+    \emph{samples}: spread of that median across them; \emph{range}: over all radii and
+    samples. \texttt{bench/29\_estimator.sql},
+    PostgreSQL 16.}
   \label{tab:estimator}
   \centering
   \footnotesize
-  \begin{tabular}{l rr}
+  \begin{tabular}{l rrr}
     \hline\hline
-    field & median $\hat\rho/\rho$ & range \\
+    field & $\hat\rho/\rho$ & samples & range \\
     \hline
-    $\omega$~Cen           & \textbf{0.08} & 0.05--0.51 \\
-    47~Tuc                 & \textbf{0.12} & 0.06--0.93 \\
-    Baade's Window         & 0.80 & 0.68--1.01 \\
-    Galactic centre        & \textbf{3.74} & 2.53--3.95 \\
+    $\omega$~Cen           & \textbf{0.07} & 0.06--0.08 & 0.05--0.56 \\
+    47~Tuc                 & \textbf{0.03} & 0.01--0.08 & 0.00--0.94 \\
+    LMC                    & 0.69 & 0.42--0.85 & 0.22--1.16 \\
+    Baade's Window         & 0.96 & 0.92--0.99 & 0.47--1.14 \\
+    Galactic pole          & 1.31 & 1.18--1.58 & 0.49--1.80 \\
+    Galactic centre        & \textbf{3.69} & 3.48--3.83 & 1.99--5.47 \\
     \hline
   \end{tabular}
 \end{table}
