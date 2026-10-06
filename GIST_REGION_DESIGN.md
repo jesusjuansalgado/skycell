@@ -7719,3 +7719,69 @@ settle, the next step is either many more repetitions here (cost:
 `shared_buffers`-thrashing noise may not average out fast) or the actual
 `tab:cones` re-run on a host that matches the paper's own (not available
 from this container).
+
+**Follow-up, same round: asked to push repetitions until the signal
+clears the noise. It does -- and it is not the clean, uniform win the
+standalone harness showed.** The container had restarted between this
+request and the one above (fresh boot, load average ~0, nothing else
+running -- about as quiet as this host gets); `cat_cell`/`cat_sphere`/
+`bench_centers`/the installed extension all survived on the persistent
+data directory, confirmed before reusing them. 30 repetitions per build
+(not 3), `skycell.cache_coverings` still off, one warm-up before all 30
+measured passes rather than one per pass. A `pgSphere` control run
+immediately after each skycell capture (same session, same chronological
+position) measures this container's own session-to-session drift
+independent of anything round seventy touched -- `pgSphere`'s own
+total-time ratio between the two sessions ran 1.02-1.06 across every
+radius, confirming real ambient drift of that size exists here even with
+nothing in pgSphere's code or data changing, so any skycell comparison
+has to be read net of it, not at face value.
+
+Per query, median of 30, bootstrapped (4000 resamples over queries) 95%
+CI on skycell's own after/before ratio *divided by* pgSphere's same-session
+drift ratio (the net effect, drift cancelled):
+
+| radius | skycell ratio | pgSphere drift | net (skycell / drift) | 95% CI |
+|---|---|---|---|---|
+| 1" | 1.006 | 1.065 | 0.945 | [0.932, 0.958] |
+| 10" | 1.080 | 1.021 | 1.057 | [1.042, 1.074] |
+| 1' | 1.078 | 1.065 | 1.012 | [0.998, 1.027] |
+| 6' | 1.025 | 1.017 | 1.009 | [0.987, 1.028] |
+| 30' | 1.001 | 1.021 | 0.981 | [0.967, 0.996] |
+| 1 deg | 1.005 | 1.017 | 0.988 | [0.974, 1.001] |
+| 3 deg | 0.942 | 1.036 | 0.909 | [0.878, 0.961] |
+
+Four of seven intervals exclude 1 -- the signal does clear this
+container's noise floor at 30 repetitions, which it could not at 3. But
+it is not one signal: **a real, resolved win at 1" (5.5%), 30' (1.9%) and
+3 deg (9%); a real, resolved** ***loss*** **at 10" (5.7%); not resolved
+either way at 1', 6', 1 deg** (interval straddles 1). Buffers were
+already confirmed identical before/after at every radius (round seventy
+and the first pass above), so the covering chosen cannot be the cause --
+whatever is responsible lives in how the lazy-fill change interacts with
+the rest of a real backend (syscache lookups, memory context switching,
+code layout/inlining effects elsewhere in the binary once this function's
+boundary moved) that the standalone harness, by construction, has none
+of. That harness measured a real, reproducible property of
+`sc_region_cone()`+`sc_cover_compute()` in isolation (round seventy's
+7-22% figure stands, unchanged, for what it measured) -- it is just not
+a reliable predictor of the fix's net effect once embedded in a live
+backend, at least on this container, at least on this corpus.
+
+**What this means for round seventy.** Not a clean win to report, and
+not a regression to revert on reflex either: three of seven radii
+improve, one gets reliably worse, three are a wash, and the two that
+matter most to the motivating problem (the real-corpus warm deficit,
+rounds sixty-eight/sixty-nine, worst at 1"-30') include both a win (1",
+30') and the one loss (10"). Whether that net is worth the added
+`filled`-bitmask complexity is a judgement call this round does not
+make unilaterally -- it surfaces the honest, now-resolved number instead
+of the earlier "probably smaller than noise" hedge, which turned out to
+be wrong in an interesting way: the effect is bigger than 3-repetition
+noise, just not uniform.
+
+**STATUS (follow-up)**: measurement only, still no code or GUC change.
+Tighter repetitions confirm the fix is correctness-neutral (identical
+buffers, `make installcheck` re-passed after restoring the fixed build)
+and reveal a real but mixed timing effect this round does not resolve
+into a keep/revert decision.
