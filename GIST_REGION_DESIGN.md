@@ -7409,3 +7409,126 @@ measurement, as were round sixty-seven's ad hoc `est`, `est2`, `est3`,
 `walk`, `walk_cells` and `gaia_fields_old`; `bench/29_estimator.sql`'s own
 result tables (`est_fields`, `est_truth`, `est_runs`, `est_decision`)
 kept, as that script's output.
+
+## Round sixty-nine: the cone-search comparison on real Gaia DR3
+## positions, cold -- skycell wins from 30' up, mixed below, and the
+## planning constant no longer decides it
+
+Round sixty-eight measured `tab:cones`' comparison on `gaia_realc` warm and
+could not measure it cold: both methods read the same heap, so a centre
+probed by one warmed the other's pages. Asked to fix that and add a cold
+column to `tab:cones`, using round forty-four's protocol.
+
+**Setup.** Two per-method tables built from the same 10M CSV rows
+(`bench/19_gaia_real.sh`), mirroring `02_build.sql`'s `cat_cell` /
+`cat_sphere` split, by a new committed loader,
+`bench/19_gaia_load_split.sh`: `gaia_real_cell` (stored `cell int8`,
+plain B-tree, statistics target 1000; heap 652MB, index 214MB) and
+`gaia_real_sphere` (`spoint` + pgSphere GiST; heap 731MB, index 684MB),
+both heaps in cell order, `VACUUM (FREEZE)` and `ANALYZE` as `02_build.sql`
+does. PostgreSQL 16, `shared_buffers` 2GB, JIT and parallelism off,
+`track_io_timing` on, every `skycell.*` GUC at its boot value. Queries are
+`03_cone.sql`'s `cone_sql()` shapes on the two tables (`skycell_cone(cell,
+...)`, `pos <@ scircle(...)`), with `sum(random_index)` standing in for
+`sum(mag)`.
+
+**Centres: never touched, and kept apart.** 1,456 new centres at
+`tab:cones`' radii and counts (400/400/300/200/100/40/16), half drawn from
+`gaia_realc` rows (a different table, so drawing reads none of the two
+tables' pages), half uniform, `setseed(0.69)`. Placed greedily, largest
+radii first, so that no two cones come within 2 deg of each other
+(centre distance at least r1 + r2 + 2 deg) and none comes near the four
+1-deg regions this round's own latency tests touched. A heap page in
+sparse sky spans up to about half a degree and an index leaf more, so
+without the gap one centre's first touch could warm the next one's
+pages; round forty-four's centres, drawn with `03_cone.sql`'s pool
+formula, did not have this guarantee. Only the inner index pages are
+shared between centres, and those are read once per pass by its first
+query.
+
+**Protocol.** For each of the seven radius labels in turn, both methods
+in an order drawn per label (seeded): stop the server, `sync`, `echo 3 >
+/proc/sys/vm/drop_caches`, start the server, then run that method's
+centres for that label once each with `EXPLAIN (ANALYZE, BUFFERS, TIMING
+OFF, SUMMARY ON)` -- fourteen restarts. Reported per centre: planning
+and execution time, buffer hits and reads, I/O read time, and the scan's
+row count. Paired skycell/pgSphere ratio of total (planning + execution)
+time per centre; median per label with a 4,000-resample percentile
+bootstrap over centres. Plans checked first: a bitmap OR of cell ranges,
+and a GiST index scan. Row counts: 0 mismatches in 1,456 pairs (662,651
+rows). The first query of each pass also pays catalog loading and the
+index's top levels after the restart (3-10 ms for skycell, 9-26 ms for
+pgSphere, against medians of 0.27-45 ms); it is kept, as it is part of
+a first touch, and the median absorbs it.
+
+**How cold "cold" is here -- measured, not assumed.** After a restart
+and `drop_caches`, a first-touch read costs about 0.08 ms per page
+(`track_io_timing`: 15 reads in 2.1 ms, 61 in 4.3 ms, 27 in 2.1 ms on
+three 1-deg probes), against round forty-four's tens of milliseconds for
+a handful of reads on genuinely cold storage. Streaming 4.6GB of other
+relations through the cache first (127 s) did not change that. The
+container's page cache is dropped, but the host's cache below the
+virtual disk evidently holds these freshly written tables and cannot be
+reached from here. So this is cold for PostgreSQL and for the virtual
+machine -- every page is a real read, counted exactly -- but not for the
+disk.
+
+| radius | n | total time, skycell/pgSphere | execution only | planning, skycell - pgSphere | I/O ms, skycell / pgSphere | reads, skycell / pgSphere | buffers, skycell / pgSphere |
+|---|---|---|---|---|---|---|---|
+| 1" | 400 | 1.06 [1.01, 1.11] | 0.93 [0.90, 0.98] | +0.027 ms | 0.19 / 0.20 | 1.7 / 2.5 | 4.1 / 5.6 |
+| 10" | 400 | 0.91 [0.87, 0.95] | 0.78 [0.74, 0.82] | +0.024 ms | 0.19 / 0.24 | 1.8 / 2.6 | 4.4 / 5.6 |
+| 1' | 300 | 1.21 [1.11, 1.27] | 1.05 [0.99, 1.15] | +0.036 ms | 0.25 / 0.25 | 2.6 / 2.9 | 5.0 / 5.8 |
+| 6' | 200 | 0.95 [0.91, 1.04] | 0.89 [0.85, 0.98] | +0.027 ms | 0.37 / 0.42 | 4.8 / 5.6 | 7.7 / 9.5 |
+| 30' | 100 | 0.89 [0.81, 0.98] | 0.83 [0.77, 0.90] | +0.090 ms | 0.66 / 0.97 | 17.6 / 25.6 | 25.0 / 54.8 |
+| 1 deg | 40 | 0.65 [0.58, 0.70] | 0.59 [0.52, 0.64] | +0.129 ms | 0.95 / 2.42 | 57.1 / 97.5 | 69.9 / 246.6 |
+| 3 deg | 16 | 0.62 [0.49, 0.82] | 0.56 [0.48, 0.77] | +0.332 ms | 5.98 / 17.32 | 470.0 / 887.8 | 500.1 / 890.1 |
+
+Times and ratios are medians; reads and buffers are means.
+
+**From 30' up, cold favours skycell clearly**: 0.89 at 30', 0.65 at
+1 deg, 0.62 at 3 deg, against warm 1.29, 1.00 and 0.73 (round
+sixty-eight). skycell reads 0.53-0.69 of pgSphere's pages there, and with
+every one a real read, I/O decides: at 1 deg skycell spends 0.95 ms on
+reads to pgSphere's 2.42. The planning difference (0.09-0.33 ms) is
+real but small beside that.
+
+**Below 30', the warm finding does not explain cold, and cold does not
+give a clean verdict either.** Warm, the whole small-cone deficit was
+skycell's 0.017-0.03 ms of extra planning, set against pgSphere answering
+in about 0.05 ms. Cold, each query spends 0.2-0.4 ms on first-touch reads
+alone, so the same planning constant is a tenth of the total and stops
+deciding the result. The verdict is mixed instead: 1.06 at 1", 0.91 at
+10", 1.21 at 1', level at 6'. skycell reads fewer pages at every one of
+these radii (0.68-0.90 of pgSphere's), but at about 0.08 ms a read the
+saving is one or two tenths of a millisecond, and its I/O time is not
+consistently lower: level at 1" and 1' despite the fewer reads, as reads
+from different files and offsets do not cost the same here. So the
+cold small-cone result is set by a few page reads either way, not by
+planning -- the question the request posed, answered "a different
+story", though not a uniform one.
+
+**What this predicts on real storage, and what it does not prove.** With
+true disk latency each read would cost tens of times more, which should
+push every ratio towards skycell's page ratio (0.68-0.90 below 30',
+0.53-0.69 above) and make planning negligible -- round forty-four's
+result on the synthetic corpus, where skycell won at every radius cold.
+That is an expectation from the read counts, not a measurement: this
+container cannot produce disk-cold reads, so the small-radius cold
+numbers here are the conservative case for skycell.
+
+**Against the paper.** The resampled corpus's cold column (0.78, 0.80,
+0.95, 0.90, 0.57, 0.53, 0.40) is uniformly in skycell's favour; the real
+corpus, measured here with cheap reads, agrees from 30' up in direction
+though less strongly, and disagrees at 1" and 1'. `tab:cones` now
+carries this as a "real corpus, cold" column beside round sixty-eight's
+warm one, with the caption stating what kind of cold it is, and
+`sec:realcones` gains a paragraph with the result above. The rest of
+that section is unchanged: the warm interpretation stands.
+
+**STATUS**: measurement plus a paper update and a new loader
+(`bench/19_gaia_load_split.sh`); no extension code or GUC changed. The
+per-method tables `gaia_real_cell` and `gaia_real_sphere` are kept as a
+corpus, like `gaia_realc`, rebuilt by that script. Scratch objects
+`r69_centers`, `r69_x`, `r69_cand`, `r69_sql()` and `r69_pass()` dropped
+after measurement; `track_io_timing` was a server start option for this
+round only, and the server was restarted without it.

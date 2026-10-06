@@ -535,6 +535,20 @@ at larger radii. This is a genuine limitation, not an artefact of the resampled
 corpus's own structure: real sub-cell clustering does not cost skycell extra rows
 fetched, it costs the time spent deciding how to cut the cone before any row is
 touched, and that cost does not scale down with the query.
+Cold, the picture divides by radius (Table~\ref{tab:cones}, last column). Here the
+two methods read separate copies of the same rows, so neither warms the other's pages;
+every centre is new and kept apart from every other; and the server is restarted before
+each method's pass at each radius. From 30\arcmin\ up \texttt{skycell} is faster, 0.89
+at 30\arcmin\ and 0.62--0.65 at 1\degr\ and 3\degr, because it reads 0.5--0.7 of
+pgSphere's pages and those reads now dominate. Below that the verdict is mixed (1.06 at
+1\arcsec, 0.91 at 10\arcsec, 1.21 at 1\arcmin, level at 6\arcmin): a first-touch query
+there spends 0.2--0.4\,ms reading 2--6 pages, which swamps the 0.03\,ms planning
+difference that decides the warm result, and \texttt{skycell}'s one fewer page read is
+not reliably worth more than that difference. These reads cost about 0.08\,ms each: the
+container's page cache was dropped, but a cache on the host beneath it could not be, so
+this is cold for PostgreSQL and the virtual machine, not for the disk. With true disk
+latency each page saved would count for more, and the small-radius ratios should move
+towards \texttt{skycell}'s page ratio (0.7--0.9 there) -- expected, not measured here.
 \label{sec:realcones}
 
 \label{sec:scope}
@@ -558,24 +572,28 @@ than biasing the ratios.
     (the skycell/Q3C ratio, 0.02--0.75 depending on radius and cache regime, is given
     in the text, Sect.~\ref{sec:scope}). \emph{Real}: 10 million real Gaia DR3
     positions (\texttt{random\_index} $<10^7$), its own centre draw at the same radii
-    and counts; warm only, total time -- Sect.~\ref{sec:realcones} explains why this
-    column alone moves against the other two.}
+    and counts, total time. Warm: one shared heap, per-method warm-up. Cold: one table
+    per method, fresh centres, server restarted before each method's pass at each
+    radius, first touch only; cold for PostgreSQL and the virtual machine but not for the
+    host's own cache. Sect.~\ref{sec:realcones} explains why these columns move against
+    the other two.}
   \label{tab:cones}
   \centering
   \footnotesize
-  \begin{tabular}{l r cc cc c}
+  \setlength{\tabcolsep}{4pt}
+  \begin{tabular}{l r cc cc cc}
     \hline\hline
-    & & \multicolumn{2}{c}{designed corpus} & \multicolumn{2}{c}{Gaia corpus (resampled)} & real corpus \\
-    \cline{3-4}\cline{5-6}\cline{7-7}
-    radius & $n$ & warm & cold & warm & cold & warm \\
+    & & \multicolumn{2}{c}{designed corpus} & \multicolumn{2}{c}{Gaia corpus (resampled)} & \multicolumn{2}{c}{real corpus} \\
+    \cline{3-4}\cline{5-6}\cline{7-8}
+    radius & $n$ & warm & cold & warm & cold & warm & cold \\
     \hline
-    1\arcsec  & 400 & \textbf{0.90} [0.88, 0.93] & \textbf{0.72} [0.68, 0.76] & \textbf{0.89} [0.87, 0.92] & \textbf{0.78} [0.72, 0.85] & \emph{1.12} [1.10, 1.16] \\
-    10\arcsec & 400 & \textbf{0.93} [0.91, 0.96] & \textbf{0.88} [0.84, 0.92] & \textbf{0.90} [0.88, 0.91] & \textbf{0.80} [0.75, 0.86] & \emph{1.16} [1.14, 1.19] \\
-    1\arcmin  & 300 & \textbf{0.94} [0.93, 0.97] & \textbf{0.95} [0.87, 1.00] & \textbf{0.93} [0.90, 0.96] & 0.95 [0.90, 1.01] & \emph{1.23} [1.19, 1.26] \\
-    6\arcmin  & 200 & 1.00 [0.98, 1.06] & \textbf{0.85} [0.77, 0.94] & \emph{1.03} [1.00, 1.08] & \textbf{0.90} [0.83, 0.96] & \emph{1.45} [1.38, 1.49] \\
-    30\arcmin & 100 & 0.98 [0.91, 1.06] & \textbf{0.68} [0.59, 0.79] & \textbf{0.92} [0.85, 0.98] & \textbf{0.57} [0.50, 0.65] & \emph{1.29} [1.12, 1.47] \\
-    1\degr    &  40 & 0.92 [0.83, 1.00] & \textbf{0.57} [0.47, 0.62] & \textbf{0.85} [0.72, 0.96] & \textbf{0.53} [0.41, 0.59] & 1.00 [0.89, 1.26] \\
-    3\degr    &  16 & \textbf{0.63} [0.56, 0.76] & \textbf{0.39} [0.26, 0.62] & \textbf{0.69} [0.53, 0.86] & \textbf{0.40} [0.22, 0.58] & \textbf{0.73} [0.62, 0.85] \\
+    1\arcsec  & 400 & \textbf{0.90} [0.88, 0.93] & \textbf{0.72} [0.68, 0.76] & \textbf{0.89} [0.87, 0.92] & \textbf{0.78} [0.72, 0.85] & \emph{1.12} [1.10, 1.16] & \emph{1.06} [1.01, 1.11] \\
+    10\arcsec & 400 & \textbf{0.93} [0.91, 0.96] & \textbf{0.88} [0.84, 0.92] & \textbf{0.90} [0.88, 0.91] & \textbf{0.80} [0.75, 0.86] & \emph{1.16} [1.14, 1.19] & \textbf{0.91} [0.87, 0.95] \\
+    1\arcmin  & 300 & \textbf{0.94} [0.93, 0.97] & \textbf{0.95} [0.87, 1.00] & \textbf{0.93} [0.90, 0.96] & 0.95 [0.90, 1.01] & \emph{1.23} [1.19, 1.26] & \emph{1.21} [1.11, 1.27] \\
+    6\arcmin  & 200 & 1.00 [0.98, 1.06] & \textbf{0.85} [0.77, 0.94] & \emph{1.03} [1.00, 1.08] & \textbf{0.90} [0.83, 0.96] & \emph{1.45} [1.38, 1.49] & 0.95 [0.91, 1.04] \\
+    30\arcmin & 100 & 0.98 [0.91, 1.06] & \textbf{0.68} [0.59, 0.79] & \textbf{0.92} [0.85, 0.98] & \textbf{0.57} [0.50, 0.65] & \emph{1.29} [1.12, 1.47] & \textbf{0.89} [0.81, 0.98] \\
+    1\degr    &  40 & 0.92 [0.83, 1.00] & \textbf{0.57} [0.47, 0.62] & \textbf{0.85} [0.72, 0.96] & \textbf{0.53} [0.41, 0.59] & 1.00 [0.89, 1.26] & \textbf{0.65} [0.58, 0.70] \\
+    3\degr    &  16 & \textbf{0.63} [0.56, 0.76] & \textbf{0.39} [0.26, 0.62] & \textbf{0.69} [0.53, 0.86] & \textbf{0.40} [0.22, 0.58] & \textbf{0.73} [0.62, 0.85] & \textbf{0.62} [0.49, 0.82] \\
     \hline
   \end{tabular}
 \end{table*}
