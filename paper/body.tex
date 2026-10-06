@@ -898,7 +898,10 @@ pgSphere between 6\arcmin\ and 1\degr\ (Sect.~\ref{sec:cones}); it is slower on 
 class -- a row we do not claim. Better row estimates did not, on the join shapes we
 wrote, produce better plans. Every number comes from one machine and one storage device,
 with a density field standing in for real positions except where
-Sects.~\ref{sec:xmatch} and~\ref{sec:estimator} say otherwise.
+Sects.~\ref{sec:xmatch},~\ref{sec:estimator} and the real-position paragraphs
+of~\ref{sec:cones} say otherwise; on those real positions the small-cone
+advantage is a clean loss warm and a mixed result cold, not the win the other
+two corpora show.
 
 What remains expensive is planning: a covering costs 0.015--0.12\,ms even cached against
 0.006--0.008\,ms for a GiST predicate needing no such step, the whole of
@@ -924,8 +927,11 @@ yet showing it helps.
 \texttt{skycell} keeps Q3C's compact integer key and B-tree while answering the region
 queries pgSphere was built for, treating a covering's depth as a cost question from
 local source density and the price of an index range. Against pgSphere it is faster for
-cone searches at most radii warm and at every radius cold (up to 2.5$\times$), and
-answers convex polygons 2.7--4.4$\times$ faster; against Q3C, at the cross-match Q3C is
+cone searches at most radii warm and at every radius cold (up to 2.5$\times$) on the
+designed and resampled-Gaia corpora; on real, unresampled Gaia DR3 positions this
+reverses below 1\degr\ warm and is unsettled below 30\arcmin\ cold, a genuine limit of
+the cost-based planning step rather than of the index (Sect.~\ref{sec:realcones}). It
+also answers convex polygons 2.7--4.4$\times$ faster; against Q3C, at the cross-match Q3C is
 built for, it is Q3C's equal and 2.5--3.3$\times$ faster than pgSphere at the same
 operation, with an index a third the size (38 against 160\,GiB at Gaia DR3 scale for
 the pgSphere-plus-Q3C pair), built thirty times faster, from a cost model whose one
