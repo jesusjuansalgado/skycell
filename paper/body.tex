@@ -503,19 +503,39 @@ ratios with intervals, on both corpora, warm and cold.
 \end{figure*}
 
 Warm, \texttt{skycell} is faster than pgSphere by 6--11\% for radii from 1\arcsec\ to
-1\arcmin\ and by 31--37\% at 3\degr, on both corpora. Between 6\arcmin\ and 1\degr\ the
-two are, on the designed corpus, indistinguishable; on the Gaia corpus skycell is 3\%
-\emph{slower} at 6\arcmin\ and 8--15\% faster at 30\arcmin\ and 1\degr.
+1\arcmin\ and by 31--37\% at 3\degr, on the two synthetic corpora. Between 6\arcmin\ and
+1\degr\ the two are, on the designed corpus, indistinguishable; on the resampled Gaia
+corpus skycell is 3\% \emph{slower} at 6\arcmin\ and 8--15\% faster at 30\arcmin\ and
+1\degr.
 \label{sec:phase}
 This matters more than it sounds: measuring one method's whole grid then the next
 instead gives ratios of 0.69--0.87 below 30\arcmin\ where the paired protocol finds
 0.89--1.03, since the phase-ordered arrangement flatters whichever method runs later --
 here, \texttt{skycell}. The paired number is the one we stand behind.
 
-Cold, skycell is faster at every radius on both corpora, by 5\% at 1\arcmin\ and by a
-factor 2--2.5 at 30\arcmin\ and beyond, because it touches a third of pgSphere's buffer
-pages at 1\degr\ (55 against 154) -- a few microseconds of memory traffic when those
-pages are warm, the whole cost of the query when they are not.
+Cold, skycell is faster at every radius on both synthetic corpora, by 5\% at 1\arcmin\
+and by a factor 2--2.5 at 30\arcmin\ and beyond, because it touches a third of
+pgSphere's buffer pages at 1\degr\ (55 against 154) -- a few microseconds of memory
+traffic when those pages are warm, the whole cost of the query when they are not.
+
+\paragraph{On real Gaia DR3 positions, warm, the small-cone advantage reverses.} The
+resampled corpus places positions uniformly within each 0.11\degr\ map cell; the real
+one keeps every scale of clustering the map cannot see. On 10 million real DR3
+positions (Table~\ref{tab:cones}'s rightmost column), skycell is 12--45\% \emph{slower}
+than pgSphere from 1\arcsec\ to 30\arcmin, ties at 1\degr, and is 27\% faster at
+3\degr\ -- the one radius where the resampled corpus's number still holds. Buffers
+rule out the data itself as the cause: skycell touches \emph{fewer} pages than
+pgSphere at every radius (0.74 of pgSphere's at 1\arcsec, 0.27 at 1\degr, tighter than
+the resampled corpus's own 0.36 at 1\degr), and execution time alone is faster or
+level everywhere (0.59--0.99). The whole deficit is skycell's own planning -- the
+covering computation and rewrite, 0.017\,ms per query at 1\arcsec\ rising to 0.25\,ms
+at 3\degr\ -- measured against pgSphere answering a small cone in about 0.05\,ms total,
+so a few hundredths of a millisecond of planning is not lost in the noise the way it is
+at larger radii. This is a genuine limitation, not an artefact of the resampled
+corpus's own structure: real sub-cell clustering does not cost skycell extra rows
+fetched, it costs the time spent deciding how to cut the cone before any row is
+touched, and that cost does not scale down with the query.
+\label{sec:realcones}
 
 \label{sec:scope}
 Against Q3C, \texttt{skycell} is faster by a factor 4--50, a comparison of
@@ -536,22 +556,26 @@ than biasing the ratios.
     not distinguishable. $n$: distinct queries at that radius, each answered five
     times per method (warm) or once (cold), all three methods randomized per trial
     (the skycell/Q3C ratio, 0.02--0.75 depending on radius and cache regime, is given
-    in the text, Sect.~\ref{sec:scope}).}
+    in the text, Sect.~\ref{sec:scope}). \emph{Real}: 10 million real Gaia DR3
+    positions (\texttt{random\_index} $<10^7$), its own centre draw at the same radii
+    and counts; warm only, total time -- Sect.~\ref{sec:realcones} explains why this
+    column alone moves against the other two.}
   \label{tab:cones}
   \centering
-  \begin{tabular}{l r cc cc}
+  \footnotesize
+  \begin{tabular}{l r cc cc c}
     \hline\hline
-    & & \multicolumn{2}{c}{designed corpus} & \multicolumn{2}{c}{Gaia corpus} \\
-    \cline{3-4}\cline{5-6}
-    radius & $n$ & warm & cold & warm & cold \\
+    & & \multicolumn{2}{c}{designed corpus} & \multicolumn{2}{c}{Gaia corpus (resampled)} & real corpus \\
+    \cline{3-4}\cline{5-6}\cline{7-7}
+    radius & $n$ & warm & cold & warm & cold & warm \\
     \hline
-    1\arcsec  & 400 & \textbf{0.90} [0.88, 0.93] & \textbf{0.72} [0.68, 0.76] & \textbf{0.89} [0.87, 0.92] & \textbf{0.78} [0.72, 0.85] \\
-    10\arcsec & 400 & \textbf{0.93} [0.91, 0.96] & \textbf{0.88} [0.84, 0.92] & \textbf{0.90} [0.88, 0.91] & \textbf{0.80} [0.75, 0.86] \\
-    1\arcmin  & 300 & \textbf{0.94} [0.93, 0.97] & \textbf{0.95} [0.87, 1.00] & \textbf{0.93} [0.90, 0.96] & 0.95 [0.90, 1.01] \\
-    6\arcmin  & 200 & 1.00 [0.98, 1.06] & \textbf{0.85} [0.77, 0.94] & \emph{1.03} [1.00, 1.08] & \textbf{0.90} [0.83, 0.96] \\
-    30\arcmin & 100 & 0.98 [0.91, 1.06] & \textbf{0.68} [0.59, 0.79] & \textbf{0.92} [0.85, 0.98] & \textbf{0.57} [0.50, 0.65] \\
-    1\degr    &  40 & 0.92 [0.83, 1.00] & \textbf{0.57} [0.47, 0.62] & \textbf{0.85} [0.72, 0.96] & \textbf{0.53} [0.41, 0.59] \\
-    3\degr    &  16 & \textbf{0.63} [0.56, 0.76] & \textbf{0.39} [0.26, 0.62] & \textbf{0.69} [0.53, 0.86] & \textbf{0.40} [0.22, 0.58] \\
+    1\arcsec  & 400 & \textbf{0.90} [0.88, 0.93] & \textbf{0.72} [0.68, 0.76] & \textbf{0.89} [0.87, 0.92] & \textbf{0.78} [0.72, 0.85] & \emph{1.12} [1.10, 1.16] \\
+    10\arcsec & 400 & \textbf{0.93} [0.91, 0.96] & \textbf{0.88} [0.84, 0.92] & \textbf{0.90} [0.88, 0.91] & \textbf{0.80} [0.75, 0.86] & \emph{1.16} [1.14, 1.19] \\
+    1\arcmin  & 300 & \textbf{0.94} [0.93, 0.97] & \textbf{0.95} [0.87, 1.00] & \textbf{0.93} [0.90, 0.96] & 0.95 [0.90, 1.01] & \emph{1.23} [1.19, 1.26] \\
+    6\arcmin  & 200 & 1.00 [0.98, 1.06] & \textbf{0.85} [0.77, 0.94] & \emph{1.03} [1.00, 1.08] & \textbf{0.90} [0.83, 0.96] & \emph{1.45} [1.38, 1.49] \\
+    30\arcmin & 100 & 0.98 [0.91, 1.06] & \textbf{0.68} [0.59, 0.79] & \textbf{0.92} [0.85, 0.98] & \textbf{0.57} [0.50, 0.65] & \emph{1.29} [1.12, 1.47] \\
+    1\degr    &  40 & 0.92 [0.83, 1.00] & \textbf{0.57} [0.47, 0.62] & \textbf{0.85} [0.72, 0.96] & \textbf{0.53} [0.41, 0.59] & 1.00 [0.89, 1.26] \\
+    3\degr    &  16 & \textbf{0.63} [0.56, 0.76] & \textbf{0.39} [0.26, 0.62] & \textbf{0.69} [0.53, 0.86] & \textbf{0.40} [0.22, 0.58] & \textbf{0.73} [0.62, 0.85] \\
     \hline
   \end{tabular}
 \end{table*}
