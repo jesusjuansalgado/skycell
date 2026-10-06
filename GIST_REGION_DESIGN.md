@@ -7305,3 +7305,107 @@ with 47 Tuc at 0.01) against 0.96-1.25 where the estimate is accurate,
 so the paper's "no worse than where the estimate is accurate" was
 withdrawn; "does not cost a wrong covering" (vs 243-830x for a bad fixed
 order) stands.
+
+## Round sixty-eight: the cone-search comparison on real Gaia DR3
+## positions -- buffer counts reproduce the paper's direction, wall-clock
+## does not below 1 deg, and the whole gap is planning time
+
+Asked to run `tab:cones`'s comparison (skycell's B-tree rewrite against
+pgSphere's native GiST, shipped defaults) on `gaia_realc` -- 10M real DR3
+positions, heap in skycell cell order -- with round sixty-six's method:
+isolated per-method warm-up, several repetitions, buffer counts and median
+wall-clock.
+
+**One caveat before any number**: `tab:cones`' "Gaia corpus" column and
+`tab:scale` were measured on the `gaia_map`-*resampled* corpus (positions
+placed at random within each order-9 cell, REPRODUCING.md section 3), not
+on `gaia_realc`. This round therefore compares against a related but
+different corpus; the paper's own Discussion says so ("a density field
+standing in for real positions").
+
+**Setup.** PostgreSQL 16, `shared_buffers` 2GB, JIT and parallelism off,
+skycell 0.26 with every `skycell.*` GUC at its boot value
+(`probe_orders` 0, `split_cost` 1). `gaia_realc` heap 731MB, cell B-tree
+214MB, pgSphere GiST 683MB: the two methods' working sets (945MB and
+1,414MB) together exceed `shared_buffers`, round sixty-six's thrashing
+condition. Queries mirror `03_cone.sql`'s `cone_sql()` -- `skycell_cone()`
+on the expression index, `pos <@ scircle(...)` -- with `sum(random_index)`
+standing in for `sum(mag)` to force the heap visit. 1,456 centres at the
+paper's radii and counts (400/400/300/200/100/40/16), half drawn from
+`gaia_realc`, half uniform, `setseed(0.68)`. Per method: three unlogged
+warm-up passes over all centres, then five measured `EXPLAIN (ANALYZE,
+BUFFERS, TIMING OFF, SUMMARY ON)` passes, then the other method; the whole
+thing twice, skycell first and pgSphere first. Per query, the median of
+its ten measurements; per radius, the median paired skycell/pgSphere
+ratio with a 4,000-resample percentile bootstrap over queries. Plans
+checked: bitmap OR of cell ranges for skycell, GiST index scan for
+pgSphere. Row counts compared on every centre: 0 mismatches in 1,456
+(720,710 rows).
+
+| radius | n | total time, skycell/pgSphere | paper, Gaia warm | execution only | planning, skycell - pgSphere | buffers, skycell / pgSphere |
+|---|---|---|---|---|---|---|
+| 1" | 400 | 1.12 [1.10, 1.16] | 0.89 | 0.59 [0.56, 0.61] | +0.017 ms | 4.3 / 5.8 |
+| 10" | 400 | 1.16 [1.14, 1.19] | 0.90 | 0.62 [0.60, 0.64] | +0.017 ms | 4.7 / 5.9 |
+| 1' | 300 | 1.23 [1.19, 1.26] | 0.93 | 0.73 [0.69, 0.75] | +0.019 ms | 5.1 / 6.4 |
+| 6' | 200 | 1.45 [1.38, 1.49] | 1.03 | 0.99 [0.93, 1.08] | +0.029 ms | 9.6 / 12.6 |
+| 30' | 100 | 1.29 [1.12, 1.47] | 0.92 | 0.99 [0.89, 1.12] | +0.058 ms | 35.4 / 95.2 |
+| 1 deg | 40 | 1.00 [0.89, 1.26] | 0.85 | 0.84 [0.75, 1.01] | +0.089 ms | 82.6 / 309.1 |
+| 3 deg | 16 | 0.73 [0.62, 0.85] | 0.69 | 0.67 [0.60, 0.74] | +0.254 ms | 537.8 / 961.4 |
+
+Buffer counts were identical in both block orders, as they must be: they
+depend only on the covering chosen, not on timing or on what is cached.
+
+**Buffers reproduce the paper's direction, and more strongly.** skycell
+touches fewer pages than pgSphere at every radius: 0.74 of pgSphere's at
+1", 0.37 at 30', 0.27 at 1 deg, against the paper's 55/154 = 0.36 at
+1 deg on the resampled corpus (and 152/514 = 0.30 at 50M rows). Absolute
+counts are higher than the paper's (82.6/309.1 against 55/154 at 1 deg)
+on this different corpus; the ratio is what carries across.
+
+**Wall-clock does not reproduce below 1 deg, and the reason is
+planning, not the index.** In total time skycell is 12-45% *slower* from
+1" to 30', level at 1 deg (interval spans 1), and 27% faster at 3 deg
+(the paper's 0.69 reproduces there). Execution alone, skycell is faster
+or level at every radius (0.59-0.99). The whole deficit is skycell's
+extra planning -- covering computation and the rewrite, 0.017 ms per
+query at small radii rising to 0.25 ms at 3 deg -- which on this host is a
+large share of queries pgSphere answers in about 0.05 ms in total. This
+is round sixty-six's finding again on a different corpus ("skycell's
+planning time alone runs 2-5x pgSphere's here") and the paper's own
+Discussion ("what remains expensive is planning: a covering costs
+0.015-0.12 ms even cached"). Whether the paper's host gave execution a
+larger share, which would explain its sub-1 ratios, cannot be checked
+from this container; the published numbers are not contradicted by
+anything measured here, only not reproduced, and "only the comparisons
+travel" (Reproducibility subsection) does not quite cover it, since here the comparison
+itself moves with the host's balance of planning against execution.
+
+**A discrepancy with the second referee response.** That response
+reports, on real positions, skycell "1.0-1.8x slower at 10" and 0.1 deg"
+-- consistent with the totals above -- and attributes it to the data:
+"sub-cell clustering increases the number of rows a coarse covering
+admits". On this host that mechanism is not visible: skycell reads fewer
+pages and executes faster at those radii, and the deficit is planning
+alone. The response also says Sect. 6.2 "now reports the real-position
+numbers as the primary result"; the current `tab:cones` carries only the
+designed and resampled corpora. Neither is changed here -- both are the
+author's call -- but the response's diagnosis should not be repeated
+without re-measuring execution and planning separately on the paper's
+own host.
+
+**Not measured.** *Cold cache*: both methods read the same `gaia_realc`
+heap, so a centre probed by one warms it for the other, and dropping the
+VM page cache here does not reach the host's cache below it (the GiST
+file read in 3,100 ms first ever, 113 ms warm, 432 ms after
+`drop_caches`) -- round forty-four's limitation, unsolved, so no cold
+column is reported rather than a misleadingly warm one. *`tab:scale`'s
+50M column*: there is no 50M real-position corpus here (it would need a
+5x larger fetch); its 10M column is `tab:cones`' Gaia column, compared
+above.
+
+**STATUS**: measurement only -- no code, GUC, or paper change. Scratch
+objects `r68_centers`, `r68_x`, `r68_sql()`, `r68_block()` dropped after
+measurement, as were round sixty-seven's ad hoc `est`, `est2`, `est3`,
+`walk`, `walk_cells` and `gaia_fields_old`; `bench/29_estimator.sql`'s own
+result tables (`est_fields`, `est_truth`, `est_runs`, `est_decision`)
+kept, as that script's output.
