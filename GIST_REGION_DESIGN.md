@@ -7785,3 +7785,77 @@ Tighter repetitions confirm the fix is correctness-neutral (identical
 buffers, `make installcheck` re-passed after restoring the fixed build)
 and reveal a real but mixed timing effect this round does not resolve
 into a keep/revert decision.
+
+## Round seventy-two: why 10" specifically regresses -- it doesn't,
+## mechanically; the fix behaves identically at 1" and 10", so whatever
+## diverges between them isn't in the code round seventy changed
+
+Asked to dig into the one resolved loss (10", net 1.057). Instrumented
+the installed extension directly (temporary global counters in
+`ensure_cone_bounds()`/`sc_region_classify_cap()`'s cone branch, a
+throwaway SQL-callable accessor reading and resetting them, declared ad
+hoc against the built `.so` rather than touching any committed `.sql` --
+all reverted after this round, nothing here is kept) to count, per
+query, how many times `sc_region_classify_cap()` is called
+(`classify_calls`) and how many of those are a genuine first-touch fill
+rather than an already-filled bitmask hit (`fill_calls`) -- run against
+the real `bench_centers` rows, the exact queries round seventy-one
+measured, `skycell.cache_coverings` off as before.
+
+**The fix's own code path is essentially identical at 1" and 10".**
+`fill_calls` is exactly 1 for *every single query* at both radii, no
+exceptions (400/400 at each). `classify_calls` -- how many times that one
+order gets hit, filled once then read from the bitmask the rest of the
+way -- averages 1.47 at 1" and 1.60 at 10", with near-identical
+distributions (1", 2 or 4 total calls, both radii, similar proportions).
+At these radii the entire covering is one HEALPix order, found
+immediately by `seed_cone_at()` with no splitting -- the direct-cone
+fast path at its simplest, and the two radii exercise it the same way.
+
+**This is the wrong place to look for a mechanism, because there isn't
+one here to find.** Eager fill always paid for 30 orders regardless;
+lazy fill pays for 1, at both radii, by an equal margin (saving the same
+~29 unneeded `sin()`/`pow()` pairs either way). A branch-check difference
+of 0.13 calls (1.60 - 1.47) is sub-nanosecond-scale against the
+microsecond totals involved -- nowhere close to accounting for a 5-point
+swing in opposite directions between the two radii. Whatever produces
+round seventy-one's resolved divergence, it is not `sc_region_cone()`/
+`sc_cover_compute()`/`sc_region_classify_cap()` behaving differently at
+1" versus 10": they don't.
+
+**What this implies about round seventy-one's own method.** The
+drift-correction there (dividing by a same-session pgSphere ratio)
+removes whatever noise is common to both tables -- global scheduler or
+thermal effects, mainly -- but pgSphere and skycell touch different
+physical heap and index pages, so table-specific buffer-placement noise
+between two separately-launched sessions (same warm-up protocol, not
+necessarily the same physical page-cache state) is not something a
+cross-table ratio can cancel, and pgSphere's own drift ratio already
+varied by radius in that round (1.065 at 1"/1', 1.02 at 10"/1deg/30') for
+reasons having nothing to do with skycell's code -- confirming such
+radius-correlated, table-specific noise is real and already visible in
+the one series that is supposed to be a clean reference. A bootstrap
+interval excluding 1 means the observed difference is unlikely under
+*that* null (pure sampling noise around a stable mean), not that the
+cause is necessarily the code change being tested -- and here, with the
+mechanism directly instrumented and shown not to differ, the more likely
+account is exactly that kind of session-level, radius-correlated
+confound, not round seventy's fix.
+
+**Revised picture for round seventy.** Nothing found here argues for
+reverting it: `make installcheck` and `make selftest` are unaffected,
+buffers are identical at every radius in every round that checked, and
+the call-count instrumentation confirms the change is exactly what it
+was written to be -- fewer trig calls per covering, pure constant-factor
+cheaper, radius-independent in its own behaviour. The mixed per-radius
+timing picture in round seventy-one is better explained by this
+container's own session-to-session noise than by anything the fix does
+differently by radius, which removes most of the pressure to treat
+10"'s regression as a real cost of the change -- though without a
+cleaner host to confirm that on, "better explained by" is the honest
+ceiling, not proof.
+
+**STATUS**: measurement only. Temporary debug counters and accessor
+function reverted in full (`git diff` against the fixed commit is empty
+after this round); `make installcheck` re-confirmed green on the
+restored build.
