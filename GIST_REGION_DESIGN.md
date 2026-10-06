@@ -7532,3 +7532,107 @@ corpus, like `gaia_realc`, rebuilt by that script. Scratch objects
 `r69_centers`, `r69_x`, `r69_cand`, `r69_sql()` and `r69_pass()` dropped
 after measurement; `track_io_timing` was a server start option for this
 round only, and the server was restarted without it.
+
+## Round seventy: lazy per-order fill for a cone's out_c2[]/in_c2[] --
+## a real but modest cut to the covering-computation cost rounds
+## sixty-eight/sixty-nine pinned the whole warm small-radius deficit on
+
+Asked whether warm cone-search performance can be improved, since rounds
+sixty-eight and sixty-nine (and the paper's own Discussion) already
+localised the small-radius deficit to planning time, not the index or
+execution: "a covering costs 0.015-0.12 ms even cached" against pgSphere's
+0.006-0.008 ms GiST predicate needing no such step.
+
+**What `sc_region_cone()` was doing.** With `need_covering=true` it filled
+`out_c2[k]`/`in_c2[k]` for every HEALPix order `k` from 0 to `SC_MAX_ORDER`
+(30 entries, up to 4 `sin()`/`pow()` calls each -- spgist_region.c's own
+comment already called this "on the order of 120+ transcendental calls")
+unconditionally, every time a cone region is constructed. But
+`sc_region_classify_cap()`, the only reader of either table, is only ever
+called with the small band of orders a single covering actually visits:
+with the shipped defaults (`skycell.probe_orders = 0`, `skycell.direct =
+1`), `sc_cover_compute()` calls `choose_order()` once (reads only
+`r->radius`/`r->area`/density, no table) and `cover_cone_direct()` once,
+which finds a seed order by descending from the chosen order with
+`seed_cone_at()` (pure spherical geometry, no table either) and then
+splits from there up to the chosen order -- a handful of orders out of
+30, confirmed by instrumentation during this round. Filling all 30 was
+work thrown away on every single query, repeating-query caching
+(`cover_cached()`) aside -- and 1,456 distinct centres against no cache
+hits is exactly the realistic case rounds sixty-eight/sixty-nine already
+measured warm cone search under.
+
+**The fix.** `out_c2[]`/`in_c2[]` are now filled lazily, one order at a
+time, by `ensure_cone_bounds()` (new, `cover.c`), called from
+`sc_region_classify_cap()`'s cone branch immediately before either value
+is read. A `filled` bitmask (new field on `sc_region`, 30 of 32 bits used)
+tracks which orders are already computed. `sc_region_cone()` no longer
+fills anything; `memset()`'s zeroing of the struct is already the lazy
+starting state. `ensure_cone_bounds()` takes a `const sc_region *` and
+casts the const away internally to mutate the cache -- safe because every
+`sc_region` in this codebase is backend-local and constructed fresh per
+call, never shared across backends or reused concurrently (confirmed by
+grep: only `cover.c`, `skycell.c`'s MOC walk, and `spgist_region.c`'s
+descent ever read these fields, and each constructs or caches its own
+region value, never shares one by pointer across calls that could race).
+`need_covering` is kept as the call site's declaration of intent (cover.h)
+even though the cone branch no longer does anything eager either way; the
+flag still matters for a polygon, whose `sin_rho[]` -- one `sin()` per
+order, a sixth of the cone table's cost -- is still filled eagerly and
+was not worth the same treatment.
+
+**Measurement, and a trap in the obvious way to make one.**
+`cover_selftest`'s own radius sweep calls `sc_region_cone()` once
+*outside* its timing loop and reuses that one region for 5 repeated
+`sc_cover_compute()` calls -- which hid this change almost entirely,
+since in the old code the eager fill already happened before the clock
+started, and in the new code only the first of the 5 reps pays the lazy
+fill, diluted 5x by the average. (First attempt at measuring this round
+used exactly that harness and found no difference -- the harness, not
+the fix, as confirmed by moving construction inside the timed loop.) A
+standalone harness instead builds a fresh `sc_region` and calls
+`sc_cover_compute()` once per distinct query -- what a real backend does
+for 1,456 non-repeating centres -- at `tab:cones`' radii, a clustered
+density histogram, 3,000 queries per radius, 5 trials per build, medians
+compared:
+
+| radius | old (us/query, median of 5) | new | ratio |
+|---|---|---|---|
+| 1" | 2.985 | 2.569 | 0.86 |
+| 10" | 3.614 | 2.815 | 0.78 |
+| 1' | 3.123 | 2.652 | 0.85 |
+| 6' | 3.516 | 2.953 | 0.84 |
+| 30' | 7.029 | 6.526 | 0.93 |
+| 1 deg | 9.446 | 8.201 | 0.87 |
+| 3 deg | 32.413 | 29.051 | 0.90 |
+
+A real, consistent 7-22% cut at every radius tested, no regression
+anywhere -- the first attempt's apparent 3 deg regression (one run each,
+not medians) did not reproduce over 5 trials either way; both builds
+simply have high single-run variance at that radius (step counts there
+run into the thousands). `ensure_cone_bounds()` is marked
+`always_inline`; without it the numbers were noisier but not
+systematically worse, so this is a minor hygiene choice, not load-bearing.
+
+**What this is not.** It is the cost of `sc_region_cone()` +
+`sc_cover_compute()` alone, in a standalone C harness -- not the
+PostgreSQL-side planning cost rounds sixty-eight/sixty-nine measured
+(0.017-0.03 ms per query at small radii), which also includes
+`density_for_var()`'s cache lookups, `lookup_sibling_func()`'s syscache
+hits, and building the rewritten `Expr` tree. This round only touches one
+component of that total, so a 7-22% cut here is not a 7-22% cut to the
+paper's warm planning-time numbers; it should move them by some smaller
+fraction. Re-running the actual `tab:cones` comparison inside PostgreSQL
+to measure that fraction was not done this round -- worth doing before
+claiming any specific number for the paper.
+
+**Correctness.** `make selftest` (pure C, both `healpix_selftest` and
+`cover_selftest`): "ALL OK", 0 failures, 0 false negatives, identical
+range/step/order/fp_frac columns to before the change (only timing
+differs). `make installcheck` (`skycell`, `adql` regression suites):
+2/2 pass, unchanged expected output.
+
+**STATUS**: `ext/src/cover.c`, `cover.h` (new `filled` field),
+`spgist_region.c` and `adql.c` (comments only, updated for accuracy).
+No SQL, GUC, or catalog change, so no version bump. Not yet re-run against
+the paper's own `tab:cones` benchmark or folded into any paper claim.

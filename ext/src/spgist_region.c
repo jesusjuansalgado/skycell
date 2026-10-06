@@ -594,10 +594,13 @@ spg_healpix_picksplit(PG_FUNCTION_ARGS)
  * via skycell_region_from_datum(), the same wasted-work shape gist_region.c's
  * consistent() found and fixed for the region GiST opclass (round one of
  * that opclass; see GIST_REGION_DESIGN.md). Here it's worse than a parse:
- * sc_region_cone() alone fills out_c2[]/in_c2[] for every order 0..SC_MAX_
- * ORDER (30 entries, up to 4 sin()/pow() calls each) plus the initial
- * sc_radec2vec()/sc_ang2pix() -- on the order of 120+ transcendental calls,
- * repeated at every one of a query's node visits rather than once per scan.
+ * sc_region_cone()/sc_region_poly() redo sc_radec2vec()/sc_ang2pix() (a
+ * cone) or the full vertex/area/sin_rho[] setup (a polygon) from scratch,
+ * at every one of a query's node visits rather than once per scan -- a
+ * cone's out_c2[]/in_c2[] are filled lazily, order by order, so a fresh,
+ * uncached reconstruction also throws away whatever this descent's earlier
+ * node visits had already filled, paying for the same order's two sin()/pow()
+ * calls again at the next visit instead of once for the whole scan.
  * Cached here in fn_extra, the same value-based cache-key discipline
  * gist_region.c's own fix established: keyed on the query Datum's *bytes*,
  * not pointer identity, because a join's per-tuple memory context is reset

@@ -45,6 +45,9 @@ typedef struct sc_region
 	int64_t		center_pix;		/* the centre's order-29 cell (containment test) */
 	double		out_c2[SC_MAX_ORDER + 1];	/* chord^2 beyond which a cell is OUT */
 	double		in_c2[SC_MAX_ORDER + 1];	/* chord^2 below which a cell is IN */
+	uint32_t	filled;			/* bit k set once out_c2[k]/in_c2[k] are computed
+								 * (sc_region_classify_cap() fills them lazily, on
+								 * first use at that order -- see cover.c) */
 
 	/* convex polygon: vertices CCW, unit edge normals, interior n.p >= 0 */
 	int			nv;
@@ -139,16 +142,29 @@ typedef struct sc_cover
 /*
  * region constructors; return NULL on success or a static error message.
  *
- * need_covering controls whether out_c2[]/in_c2[]/sin_rho[] (one entry per
- * HEALPix order, up to 4 sin()/pow() calls each -- the dominant cost of
- * either constructor, ~90% of it) get filled in. Those tables are read by
+ * need_covering controls whether out_c2[]/in_c2[]/sin_rho[] -- read by
  * sc_region_classify_cap() alone, for the pixel-by-pixel descent a GiST/
- * SP-GiST index walk or a planner covering performs; sc_region_contains(),
- * sc_region_contains_region() and sc_region_overlaps() -- the exact test a
- * row-at-a-time predicate like skycell_region_overlap()/_covers()/
- * _covered_by() runs -- never touch them. Pass false from a call site that
- * only ever reaches those three functions; every index/covering call site
- * must still pass true.
+ * SP-GiST index walk or a planner covering performs -- are ever filled in.
+ * sc_region_contains(), sc_region_contains_region() and sc_region_overlaps()
+ * -- the exact test a row-at-a-time predicate like
+ * skycell_region_overlap()/_covers()/_covered_by() runs -- never touch
+ * them. Pass false from a call site that only ever reaches those three
+ * functions; every index/covering call site must still pass true.
+ *
+ * For a cone, out_c2[]/in_c2[] are filled lazily by sc_region_classify_cap()
+ * itself, one order at a time, the first time that order is actually
+ * classified (tracked in sc_region.filled) -- not here, and not for every
+ * order 0..SC_MAX_ORDER as an earlier version did. A single covering only
+ * ever classifies a narrow band of orders (the seed order up to the order
+ * the cost model chose, typically a handful out of 30), so filling the rest
+ * was wasted work on every call, up to 4 sin()/pow() calls apiece. need_covering
+ * stays as the call site's declaration of intent -- true if
+ * sc_region_classify_cap() may be called on this region at all -- even
+ * though for a cone the fill itself no longer happens here.
+ *
+ * sin_rho[] (the polygon analogue) is a single sin() per order, a sixth of
+ * the cone table's cost, and is still filled eagerly: not worth the same
+ * treatment.
  */
 const char *sc_region_cone(sc_region *r, double ra_deg, double dec_deg, double radius_deg,
 							bool need_covering);
