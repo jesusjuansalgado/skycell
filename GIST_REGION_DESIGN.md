@@ -7636,3 +7636,86 @@ differs). `make installcheck` (`skycell`, `adql` regression suites):
 `spgist_region.c` and `adql.c` (comments only, updated for accuracy).
 No SQL, GUC, or catalog change, so no version bump. Not yet re-run against
 the paper's own `tab:cones` benchmark or folded into any paper claim.
+
+## Round seventy-one: re-running round seventy's fix against `tab:cones`
+## itself -- a real methodological trap found and fixed, and a real
+## noise floor that then hides whatever the fix is worth here
+
+Asked to re-run the actual `tab:cones` comparison (not the standalone
+harness) with round seventy's fix, on whichever corpus is available in
+this container. Only the designed corpus (`cat_cell`/`cat_sphere`/
+`cat_q3c`, 10M rows) is loaded; the Gaia-resampled 10M corpus needs
+`gaia_map`, built from a per-order-9-cell count fetched from the same ESA
+TAP host round sixty-nine's instructions needed and this container's
+egress policy denies (confirmed again this round) -- so only the designed
+corpus could be re-measured, and round sixty-six already found this
+specific container does not reproduce `tab:cones`' own wall-clock ratios
+on it anyway (`cat_cell`+`cat_sphere` together exceed `shared_buffers`,
+and "this container is simply not that [paper's] machine").
+
+**A real trap, caught before trusting any number.** First attempt: build
+before (pre-fix) and after (post-fix), each with three isolated per-method
+warm-up passes over all 1,456 `bench_centers` before the timed
+`bench_cone_explain()` pass, matching round sixty-six's own fix for
+cache-thrashing. Buffers matched exactly (16916 total, both builds, every
+radius) -- expected, since the fix changes nothing about which cells are
+chosen. But `plan_ms` showed no consistent direction at all (some radii
+up, some down, overall ratio 1.065 -- *slower* after the fix) and,
+suspiciously, `exec_ms` moved by similar amounts in both directions too,
+which round seventy's fix cannot touch at all (it runs during planning,
+not execution). That inconsistency was the tell: `cover_cached()`
+memoises a covering per backend, keyed on `(ra0, dec0, radius, ...)`, and
+the warm-up passes -- run to settle the *heap/index* page cache -- also
+populate that *covering* cache for every one of the 1,456 centres before
+the timed pass ever runs. The timed `EXPLAIN` was measuring a cache hit
+(a hash lookup plus the unrelated `Expr`-tree rebuild) on both builds,
+never reaching `sc_region_cone()`/`sc_cover_compute()` at all -- the exact
+code this round's fix changed. `SET skycell.cache_coverings = off` (a
+GUC already there for this purpose) forces every query through a genuine
+recomputation, matching the "1,456 distinct centres, no reuse" framing
+rounds sixty-eight/sixty-nine and the paper's own Sect. 6.2 already use
+for the realistic case.
+
+**With caching off, three repetitions each, paired per query, median of
+3 compared:** `plan_ms` ratio (after/before) by radius: 1" 1.048, 10"
+0.781, 1' 0.878, 6' 0.798, 30' 0.774, 1 deg 1.013, 3 deg 1.147 -- faster
+at four of seven radii, slower at three, no pattern by radius size that
+matches round seventy's own clean, monotonic-ish 7-22% win in the
+standalone harness.
+
+**Why, measured rather than assumed: the noise floor here is as large as
+the effect.** Comparing the three *before* repetitions against each
+other (same binary, same everything) gives `exec_ms` -- which this fix
+cannot affect at all -- swinging 11-45% across radii from run to run
+alone (`plan_ms`'s own same-code spread: 6-45%). A 7-22% signal cannot be
+read off a comparison whose noise floor, on this specific container,
+already spans that range or wider. More repetitions would narrow it (the
+standalone harness needed none of `cover_cached()`, `shared_buffers`
+contention, or a live backend's own allocation noise, which is why it
+could see the effect cleanly with the same 3-5 repetitions), but how many
+is itself unknown without running them, and this round's return on that
+effort looked low given everything else already pointing the same way:
+round seventy's own caveat already said a cut to one minority component
+of total planning time "should move [the paper's numbers] by some
+smaller fraction", and round sixty-six already established this
+container cannot reproduce `tab:cones`' wall-clock ratios at all,
+independent of this fix.
+
+**Conclusion.** Buffers (the one thing this round could check cleanly)
+confirm the fix changes nothing about correctness or the covering chosen,
+on top of round seventy's own `make installcheck`. Whether round
+seventy's real, measured 7-22% cut to `sc_region_cone()`+
+`sc_cover_compute()` moves `tab:cones`' own published ratios by a
+noticeable amount is not established either way by this round -- not
+confirmed, and not ruled out, only shown to be smaller than what three
+repetitions can resolve against this container's own noise. No paper
+change from this round: nothing here is a number worth publishing,
+honestly.
+
+**STATUS**: measurement only, no code or GUC change (the fix stands as
+round seventy left it; `skycell.cache_coverings` already existed).
+`r70_snap` (scratch) dropped after measurement. If this matters enough to
+settle, the next step is either many more repetitions here (cost:
+`shared_buffers`-thrashing noise may not average out fast) or the actual
+`tab:cones` re-run on a host that matches the paper's own (not available
+from this container).
