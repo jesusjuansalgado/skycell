@@ -141,7 +141,8 @@ for stage in $STAGES; do
     step "  ObsCore-shaped crossover (10): tab:crossover"
     q -f 10_crossover.sql >/dev/null
     for r in $(echo "$CROSS_ROWS" | tr -d '{}' | tr , ' '); do
-      step "    $r M rows"; q -c "SELECT bench_cross_run($r, $NQ_CROSS)" >/dev/null
+      step "    $r M rows"
+      q -c "CALL build_obscore(($r * 1e6)::bigint)" -c "SELECT bench_cross_run($r, $NQ_CROSS)" >/dev/null
     done
     export_tables bench_ab bench_ab_x cm_sweep cm_rho cm_curve bench_join bench_cross
     ;;
