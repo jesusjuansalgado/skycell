@@ -97,8 +97,9 @@ the price of an extra index range -- and is computed rather than configured.
 
 The measurements are built to survive scrutiny rather than flatter the method: every
 query is answered by all three methods back to back in randomized order, analysed
-paired; everything is measured warm and cold; and the density structure of one corpus
-comes from the real Gaia DR3 sky rather than from the authors. Section~\ref{sec:method}
+paired; everything is measured warm and cold; and one corpus is density-matched to the real Gaia DR3 sky while another is real,
+unresampled Gaia DR3 positions, not a density field standing in for them.
+Section~\ref{sec:method}
 develops the method, Sect.~\ref{sec:impl} its planner integration and GiST
 alternatives, Sect.~\ref{sec:validation} what is proven versus tested,
 Sects.~\ref{sec:bench}--\ref{sec:results} the benchmark and results, and
