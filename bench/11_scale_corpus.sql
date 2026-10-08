@@ -24,3 +24,6 @@ FROM (SELECT ivo_healpix_center(29, g.hpx9 * 1099511627776::bigint
       FROM gaia_map g, tot,
            LATERAL generate_series(1, floor(:n * g.n / tot.s + random())::int) k) q;
 SELECT count(*) AS src50_rows FROM src;
+-- 04_xmatch.sql sizes its sample from pg_class.reltuples, which is -1 until
+-- the table has been analysed.
+ANALYZE src;
