@@ -6,6 +6,9 @@
 # (source_id / 2^35), so the order-9 cell is source_id / 2^35 / 4^3 =
 # source_id / 2^41.  The query aggregates all 1.8e9 rows, too long for the
 # synchronous endpoint 19_gaia_real.sh uses, so it runs as an async TAP job.
+# ESA's GAIA_HEALPIX_INDEX(9, source_id) computes the same thing (checked
+# against the arithmetic); ADQL only allows a column in GROUP BY, so it groups
+# by the alias.
 #
 # Output: $GAIA_DIR/gaia_map_hpx9.csv (hpx9,n), at most 3,145,728 rows,
 # summing to the DR3 total 1,811,709,771.  Load with:
@@ -21,7 +24,7 @@ F="$OUT/gaia_map_hpx9.csv"
 JOB=$(curl -sS -o /dev/null -w '%{redirect_url}' -X POST "$TAP/async" \
   --data-urlencode 'REQUEST=doQuery' --data-urlencode 'LANG=ADQL' \
   --data-urlencode 'FORMAT=csv' --data-urlencode 'PHASE=RUN' \
-  --data-urlencode 'QUERY=SELECT source_id / 2199023255552 AS hpx9, COUNT(*) AS n FROM gaiadr3.gaia_source GROUP BY source_id / 2199023255552')
+  --data-urlencode 'QUERY=SELECT GAIA_HEALPIX_INDEX(9, source_id) AS hpx9, COUNT(*) AS n FROM gaiadr3.gaia_source GROUP BY hpx9')
 [ -n "$JOB" ] || { echo "job submission failed" >&2; exit 1; }
 echo "job: $JOB"
 while :; do
