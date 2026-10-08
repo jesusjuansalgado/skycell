@@ -293,8 +293,10 @@ arc_dist(sc_vec3 p, sc_vec3 a, sc_vec3 b, sc_vec3 n)
  * inflating them by 4x the edge's departure from its chord at the midpoint.
  * That is not a bound: where an edge crosses its chord plane near the midpoint
  * the estimate collapses, and healpix_selftest measures the true departure at
- * up to 64x the midpoint value (order 18).  The absolute error was ~1e-8 rad,
- * below the 0.4 mas leaf cell, but small is not zero, so the test is gone.
+ * up to 159x the midpoint value (order 18, deterministic -- fixed seed).  The
+ * absolute error was ~1e-8 rad, below the 0.4 mas leaf cell, but small is not
+ * zero, so the test is gone.  healpix_selftest prints this ratio itself each
+ * run; if it changes, this comment (and the paper's Sect. 2.4) are stale.
  */
 static sc_class
 classify_cone_exact(const sc_region *r, int order, int64_t pix, double *f_out)
