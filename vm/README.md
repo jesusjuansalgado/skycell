@@ -128,6 +128,13 @@ should be read as round sixty-nine describes.
   see `bench/tap-ab/`.
 - **`14_shapes.sql`**. It needs the 20M-row ObsCore relation `oc20`, which no
   committed script builds.
+- **`20_region_xmatch.sql`'s own cross-match runs.** The stage uses `20` only
+  to build `fpr`. Against `cat_cell`'s stored `cell` column, its
+  `point(ra, dec) <@ s_region` join has no index path, so it runs as a full
+  nested loop: at paper scale, 50,000 footprints × 10M rows, that is
+  5×10¹¹ evaluations. No paper table comes from it. (Running it also
+  exposed a memory leak in the operator's region cache, fixed in commit
+  `a76609b`.)
 
 ## 7. Caveats for anyone comparing numbers
 

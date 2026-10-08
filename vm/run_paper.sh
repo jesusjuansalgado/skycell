@@ -114,14 +114,16 @@ for stage in $STAGES; do
     q -f 06_footprints.sql >/dev/null
     for m in pgsphere skycell; do q -c "SELECT bench_fp_run('$m', 1)" -c "SELECT bench_fp_run('$m', 2)" >/dev/null; done
     step "  region opclasses on fpr, $NFP footprints (20-24): tab:gistregion"
+    # 20 builds fpr.  Its own cross-match functions are not run: against
+    # cat_cell's stored cell column the point(ra, dec) <@ s_region join has no
+    # index path, so it is a full nested loop (5e11 evaluations at paper scale)
+    # and no paper table comes from it.
     q -v nfp="$NFP" -f 20_region_xmatch.sql >/dev/null
-    for m in skycell pgsphere q3c; do for s in circle poly mixed; do
-      q -c "SELECT bench_region_xmatch_run('$m', '$s', 1)" -c "SELECT bench_region_xmatch_run('$m', '$s', 2)" >/dev/null; done; done
     for f in 21_region_overlap 22_region_gist 23_region_contains 24_region_contains_region; do
       step "    $f"; q -v nprobe="$NPROBE_RG" -f "$f.sql" > "$OUT/$f.out"
     done
     export_tables bench_ab bench_ab_x cm_sweep cm_rho cm_curve bench_join bench_poly bench_xmatch bench_fp \
-      bench_region_xmatch bench_region_overlap bench_region_gist bench_region_contains bench_region_contains_region
+      bench_region_overlap bench_region_gist bench_region_contains bench_region_contains_region
     ;;
 
   gaia)
