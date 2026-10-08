@@ -44,15 +44,26 @@ sudo -E vm/provision.sh                     # ~5 min; ends with PROVISION_DONE
 ```
 
 This installs PostgreSQL 18 (set `PG_MAJOR=17` to use another version) and
-whatever Q3C and pgSphere versions PGDG currently ships for it. The paper used
-Q3C 2.0.5 and pgSphere 1.5.2; the script prints the installed versions, so
-record them. It also writes `/etc/postgresql/18/main/conf.d/skycell-bench.conf`
+whatever Q3C and pgSphere versions PGDG currently ships for it. Checked on
+2026-10-08 for Ubuntu 24.04: PGDG offers PostgreSQL 18.6, Q3C 2.0.5 and
+pgSphere 1.5.2, exactly the paper's versions, and skycell compiles cleanly
+against PostgreSQL 18. The script prints the installed versions; record them
+with your results. It also writes `/etc/postgresql/18/main/conf.d/skycell-bench.conf`
 with REPRODUCING.md section 2's settings (`shared_buffers = 2GB`,
 `effective_cache_size = 5GB`, `random_page_cost = 1.1`, `work_mem = 64MB`,
 `maintenance_work_mem = 1GB`, parallelism and JIT off), and creates a
 PostgreSQL superuser named after your login, so `psql` works without a password.
 
 ## 3. Smoke test first
+
+`run_paper.sh` has been run end to end with `SMOKE=1` (all five stages, on
+PostgreSQL 16, in a container). That run caught and fixed six bugs before
+this runbook was published, among them a memory leak in skycell's `<@`
+region cache and two benchmark scripts whose statistics-target changes never
+took effect (see the git log). `provision.sh` itself has not been run, since
+the container has no systemd; it is the step most likely to need adjusting on
+a new distribution.
+
 
 ```bash
 SMOKE=1 PGDATABASE=smoke vm/run_paper.sh designed gaia gaia50 report
