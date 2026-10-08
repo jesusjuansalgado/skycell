@@ -33,6 +33,7 @@
 #include "utils/array.h"
 #include "utils/builtins.h"
 #include "utils/lsyscache.h"
+#include "utils/memutils.h"
 
 #include "cover.h"
 #include "skycell_internal.h"
@@ -532,10 +533,18 @@ pos_vec(SkyPos *p)
  * nothing cached through this function ever reaches an index descent or
  * covering, only sc_region_contains()/sc_region_contains_region()/
  * sc_region_overlaps().
+ *
+ * Each slot owns a small memory context, reset on every rebuild: building
+ * the region allocates more than the sc_region keeps (a detoasted copy of
+ * the datum, a polygon's ra[]/dec[] scratch arrays), and allocating those
+ * straight into fn_mcxt leaked them for the rest of the query -- one per
+ * call when the region changes on every row, as in a nested-loop join
+ * against a stored footprint column, where it ran a backend out of memory.
  */
 typedef struct
 {
-	bytea	   *last_datum;		/* palloc'd copy in fn_mcxt, or NULL */
+	MemoryContext cxt;			/* owns last_datum and reg's arrays, or NULL */
+	bytea	   *last_datum;		/* copy of the datum the region was built from */
 	Size		last_size;
 	sc_region	reg;
 } region_arg_cache;
@@ -562,21 +571,23 @@ cached_region_arg(FunctionCallInfo fcinfo, int argno, Datum arg_datum)
 	if (slot->last_datum == NULL || slot->last_size != sz ||
 		memcmp(slot->last_datum, b, sz) != 0)
 	{
-		MemoryContext oldcxt = MemoryContextSwitchTo(fcinfo->flinfo->fn_mcxt);
+		MemoryContext oldcxt;
 
-		if (slot->last_datum != NULL)
-			sc_region_free(&slot->reg);	/* frees the old poly v[]/n[], if any */
+		/* drop the previous region and everything building it allocated */
+		if (slot->cxt == NULL)
+			slot->cxt = AllocSetContextCreate(fcinfo->flinfo->fn_mcxt,
+											  "skycell region argument",
+											  ALLOCSET_SMALL_SIZES);
+		else
+			MemoryContextReset(slot->cxt);
+		slot->last_datum = NULL;
+
+		oldcxt = MemoryContextSwitchTo(slot->cxt);
 		skycell_region_from_datum_lite(arg_datum, &slot->reg);
-		MemoryContextSwitchTo(oldcxt);
-
-		if (slot->last_datum == NULL || slot->last_size < sz)
-		{
-			if (slot->last_datum != NULL)
-				pfree(slot->last_datum);
-			slot->last_datum = MemoryContextAlloc(fcinfo->flinfo->fn_mcxt, sz);
-		}
+		slot->last_datum = palloc(sz);
 		memcpy(slot->last_datum, b, sz);
 		slot->last_size = sz;
+		MemoryContextSwitchTo(oldcxt);
 	}
 	return &slot->reg;
 }
