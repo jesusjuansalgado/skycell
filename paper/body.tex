@@ -247,7 +247,8 @@ The extension exposes ADQL's own vocabulary: types \texttt{skypos} and
 emits the standard's spelling rather than a dialect, where pgSphere needs
 \texttt{spoint}/\texttt{scircle}/\texttt{spoly} and Q3C a separate fast path per shape
 with no region type at all; the operator form \texttt{pos <@ circle(\ldots)} is the one
-a planner can answer from an index.
+a planner can answer from an index. Table~\ref{tab:ops} sets \texttt{skycell} against
+the pgSphere-plus-Q3C pair for the constructs where they differ most.
 
 \texttt{skyregion}'s text representation is IVOA STC-S \citep{stc} (\texttt{CIRCLE ICRS
 $\alpha$ $\delta$ $r$} / \texttt{POLYGON ICRS $\ldots$}), the same syntax an ObsCore
@@ -264,6 +265,35 @@ proper-motion-aware cone search is an indexable cone widened by the largest moti
 interest, intersected with an exact test on the propagated position -- exercised by
 round-trip tests (Barnard's star to sub-microarcsecond over 16 years) rather than
 benchmarked.
+
+\begin{table}
+  \caption{What a translator emits, for the ADQL constructs where the pgSphere-plus-Q3C
+    pair and \texttt{skycell} differ most (the remaining surface -- \texttt{BOX},
+    \texttt{DISTANCE}, \texttt{AREA}/\texttt{CENTROID}, epoch propagation -- translates
+    the same way and is omitted for space). \texttt{skycell} uses ADQL's own spellings
+    throughout; pgSphere needs region types and Q3C a separate fast path per shape.}
+  \label{tab:ops}
+  \centering
+  \footnotesize
+  \begin{tabular}{@{}p{0.2\columnwidth} p{0.38\columnwidth} p{0.24\columnwidth}@{}}
+    \hline\hline
+    ADQL & pgSphere $+$ Q3C & skycell \\
+    \hline
+    \texttt{POINT}\allowbreak/\allowbreak\texttt{CIRCLE}\allowbreak/\allowbreak\texttt{POLYGON} &
+      \texttt{spoint}\allowbreak/\allowbreak\texttt{scircle}\allowbreak/\allowbreak\texttt{spoly} &
+      \texttt{point}\allowbreak/\allowbreak\texttt{circle}\allowbreak/\allowbreak\texttt{polygon} \\[2pt]
+    \texttt{CONTAINS(}\allowbreak\texttt{POINT,}\allowbreak\ \texttt{CIRCLE)} &
+      \texttt{q3c\_radial\_query} \emph{or}\allowbreak\ \texttt{pos <@ scircle} &
+      \texttt{point <@ circle} \\[2pt]
+    \texttt{INTERSECTS(}\allowbreak\texttt{r$_1$,}\allowbreak\texttt{r$_2$)} &
+      \texttt{r$_1$ \&\& r$_2$} (no Q3C region type) &
+      \texttt{r$_1$ \&\& r$_2$} \\[2pt]
+    cross-match &
+      \texttt{q3c\_join}; pgSphere 2.5--3.3$\times$ slower (Sect.~\ref{sec:xmatch}) &
+      \texttt{skycell\_cone}, or \texttt{\_ranges()} in a \texttt{LATERAL} \\[2pt]
+    \hline
+  \end{tabular}
+\end{table}
 
 \section{Implementation}
 \label{sec:impl}
@@ -905,15 +935,28 @@ two corpora show.
 
 What remains expensive is planning: a covering costs 0.015--0.12\,ms even cached against
 0.006--0.008\,ms for a GiST predicate needing no such step, the whole of
-\texttt{skycell}'s disadvantage at 6\arcmin. Two attempts to remove this did not pay
-off. An SP-GiST class over the cell hierarchy, tried to remove it architecturally, costs
-correctness margin elsewhere (the duplicate-position tolerance shrinks by roughly an
-order of magnitude), so it stays exploratory. Letting the covering search try finer
-orders (Sect.~\ref{sec:gist-family}) picks a tighter covering and looks like a win in
-execution time alone, but the extra enumeration's own planning cost, paid on every
-non-repeating query, erases or reverses it at exactly the radii it looked largest -- a
-caution about measuring a cost-based index's own overhead, not only what it saves. An
-index descent avoiding planning cost altogether remains open.
+\texttt{skycell}'s disadvantage at 6\arcmin. Three attempts to cut this were tried;
+two did not pay off. An SP-GiST class over the cell hierarchy, tried to remove it
+architecturally, costs correctness margin elsewhere (the duplicate-position tolerance
+shrinks by roughly an order of magnitude), so it stays exploratory. Letting the
+covering search try finer orders (Sect.~\ref{sec:gist-family}) picks a tighter covering
+and looks like a win in execution time alone, but the extra enumeration's own planning
+cost, paid on every non-repeating query, erases or reverses it at exactly the radii it
+looked largest -- a caution about measuring a cost-based index's own overhead, not only
+what it saves.
+
+The third, narrower, did pay off. The per-order chord bounds a covering's classify
+step reads were computed for all thirty HEALPix orders on every call, regardless of how
+many a given covering actually visits -- typically one or a handful. Filling them
+lazily, only for orders actually visited, changes no covering and no buffer count at
+any radius tested. Measured on a different host from the rest of this paper, via a
+same-session randomized A/B against the unmodified build sharing one warm cache and one
+exact-test function (so only the covering computation itself differs), it cuts planning
+time by about 1\% pooled across \texttt{tab:cones}' own radii (95\% bootstrap CI
+excluding 1; no radius resolves a loss) -- real, but an order of magnitude smaller than
+measuring the covering computation alone in isolation suggested (7--22\%), since
+planning time also spends cycles on statistics-cache and syscache lookups this change
+does not touch. An index descent avoiding planning cost altogether remains open.
 
 The density synopsis is the other limit: an equi-depth histogram cannot see a cluster
 smaller than one of its buckets, and raising the statistics target does not help, since
