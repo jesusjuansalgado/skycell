@@ -17,8 +17,12 @@
 # takes seconds.  Parts are kept, so a rerun resumes; each is retried up to 3
 # times.
 #
-# Output: $GAIA_DIR/gaia_map_hpx9.csv (hpx9,n), at most 3,145,728 rows,
-# summing to the DR3 total 1,811,709,771.  Load with:
+# Output: $GAIA_DIR/gaia_map_hpx9.csv (hpx9,n), summing to the DR3 total
+# 1,811,709,771.  Fetched 2026-10-08: 3,145,727 rows -- every order-9 cell but
+# one, 2750834 (RA 246.7, Dec -24.5, the rho Ophiuchi dark cloud core), which
+# holds no DR3 source at all (checked directly) and so is absent from the
+# GROUP BY; treat it as n = 0.  A copy is committed as
+# bench/data/gaia_map_hpx9.csv.gz.  Load with:
 #   CREATE TABLE gaia_map (hpx9 bigint PRIMARY KEY, n bigint);
 #   \copy gaia_map FROM 'gaia_map_hpx9.csv' CSV HEADER
 # then bench/11_scale_corpus.sql resamples positions from it.

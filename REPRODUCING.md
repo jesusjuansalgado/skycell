@@ -62,6 +62,11 @@ Fetching the real positions: `bench/19_gaia_real.sh` (ESA TAP, ~700 MB, into
 `$GAIA_DIR`, default `/tmp/gaia`); loading them into `gaia_realu`, `gaia_realc` and
 `gaia_fields` with the §4 indexes: `bench/19_gaia_load.sh` (~5 min). A rebuild
 should give exactly 10,000,000 / 10,000,000 / 1,593,958 rows (DR3 is frozen).
+The `gaia_map` density map the resampled corpora are drawn from (source counts per
+order-9 cell) is committed as `bench/data/gaia_map_hpx9.csv.gz` (3,145,727 non-empty
+cells summing to 1,811,709,771; the one empty cell is the rho Ophiuchi dark cloud core)
+and re-fetched by `bench/19_gaia_map.sh`. Load it as `gaia_map (hpx9 bigint, n bigint)`
+before `bench/11_scale_corpus.sql`.
 For a cold-cache comparison, `bench/19_gaia_load_split.sh` loads the same all-sky
 rows into one table per method instead (`gaia_real_cell`, `gaia_real_sphere`, as
 `02_build.sql` does for the synthetic corpora), so neither method warms the other's
