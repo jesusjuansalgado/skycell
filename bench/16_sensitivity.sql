@@ -57,7 +57,7 @@ END $$;
 -- recorded, so a result shows whether the target took effect.  rho_true is in
 -- rows per steradian, the unit skycell_cover_info().rho uses (it was per square
 -- degree, which put every ratio 3,283 times too high).
-DROP FUNCTION IF EXISTS sens_dens_run(text, regclass, regclass, name, name);
+DROP ROUTINE IF EXISTS sens_dens_run(text, regclass, regclass, name, name);
 ALTER TABLE sens_dens ADD COLUMN IF NOT EXISTS buckets int;
 CREATE OR REPLACE PROCEDURE sens_dens_run(corpus text, tbl regclass, idx regclass,
                                           col name, statcol name)
