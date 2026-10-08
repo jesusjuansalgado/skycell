@@ -7091,3 +7091,880 @@ cost` sensitivity at proper statistical power) -- not folded into this
 round's own promotion, for the same reason round sixty-one and sixty-
 four both declined to fold measurement into promotion without that
 breadth first.
+
+## Round sixty-six: re-verifying the paper's own numbers against the
+## current build, after the decoupling and the box4 writeup -- both
+## hold, with two real measurement bugs found and fixed along the way
+
+Asked directly, after folding box4/cap4 and the probe-loop finding into
+the paper (round sixty-five and after): do the paper's existing cone-
+search tables still describe the shipped extension, and does the new
+region-opclass table's own numbers hold up under an independent re-
+measurement rather than a transcription from rounds fifty-eight through
+sixty? Checked both rather than assumed either.
+
+**Cone search (`tab:cones`/`tab:scale`): re-ran `bench_cone_explain`
+against the current 0.26 build (`skycell.probe_orders`/`split_cost`
+confirmed at their shipped defaults, 0 and 1) on `paper_bench`'s
+existing `cat_cell`/`cat_sphere` (10M rows).** First pass looked alarming
+-- wall-clock ratios 1.1-2.0x worse than the paper's published 0.9-1.0,
+skycell apparently losing everywhere. The buffer counts told a different
+story: 50.8 against pgSphere's 153.7 at 1 degree, against the paper's
+own 55/154 -- almost exact agreement. Root cause, confirmed by isolating
+each method's own warm-up (several dedicated passes per method before
+switching, not interleaved): `cat_cell`+`cat_sphere`'s combined size
+(866MB + 1413MB = 2.28GB) exceeds this container's 2GB `shared_buffers`,
+so alternating between them evicts each other's pages -- the same
+cache-thrashing mechanism round forty-four and round sixty-two both
+already found and fixed for their own comparisons, now hit again on a
+different container than either the paper's own rig or this session's
+earlier work. Wall-clock on this specific machine does not reproduce the
+paper's ratios even isolated-warm (skycell's planning time alone runs
+2-5x pgSphere's here, against a much gentler growth in the paper's own
+numbers) -- consistent with, not contradicting, the paper's own "every
+number here comes from one machine... only the comparisons travel"
+caveat (Sect. 5.2): this container is simply not that machine. The
+buffer counts, which depend only on the covering chosen and not on this
+host's own timing characteristics, are the right signal here, and they
+confirm the algorithm is unchanged: the decoupling touched nothing that
+runs when `probe_orders = 0`.
+
+**Region GiST (`tab:gistregion`, new this revision): re-measured box4 vs
+box8 vs pgSphere on the real `fpr`/`rox_probe*` corpus (50,000 rows, 500
+probes) directly, rather than trusting the transcription from rounds
+fifty-eight through sixty.** Built a compact harness (`region_recheck_*`,
+dropped after use) covering all four strategies, toggling `pg_index.
+indisvalid` between `fpr_region_gist` (box4, the shipped default) and a
+freshly-built `fpr_region_box8` to force each in turn, verified by
+`EXPLAIN` every time rather than assumed. Two real bugs found and fixed
+before trusting any number, both the kind that silently produces a
+confidently wrong one:
+
+1. **The harness's own `contains`/`covered_by` pgSphere queries were
+   wrong**, checking only the circle side (`NOT f.is_poly`) and omitting
+   the polygon side pgSphere answers through a different operator
+   (`~` for containment, `<@` for covered-by, against `reg_poly`) --
+   undercounting pgSphere's own true matches by very close to half (274
+   vs 561 for `contains`, 6095 vs 12193 for `covered_by`) on this 50/50
+   mixed corpus. Caught by comparing row counts across all three methods
+   before trusting any timing, the same discipline this project's own
+   committed `24_region_contains_region.sql` already uses and that this
+   round's own harness should have copied exactly rather than
+   reconstructing from memory. Fixed by summing both sides, matching
+   that script's own query; all three methods then agree exactly on
+   every strategy.
+2. **The mean was the wrong statistic for pgSphere's own `&&` query**:
+   a first pass averaged 90.7ms with the measurements ranging 51.5-326.8
+   (one 4-subquery plan apparently far more exposed to this container's
+   own noise than the single-subquery strategies), against the paper's
+   published 66-67ms -- not a regression, a statistic that doesn't
+   belong on numbers this noisy. The median, the statistic round sixty's
+   own text already named ("Median-of-2 wall-clock"), gives 67.7ms --
+   agreement with the published number to within rounding, on the first
+   larger sample this round took.
+
+**With both fixed, every ratio in `tab:gistregion` reproduces on a fresh
+run**, median wall-clock, box4/pgSphere: `&&` 0.109 (published
+0.12-0.17), point containment 0.864 (published 0.75-0.93), region-
+contains 0.540 (published 0.55-0.70, at the edge), region-covered-by
+0.260 (published 0.26-0.27). Every strategy's row count matched exactly
+across box4, box8 and pgSphere throughout.
+
+**Does not change any shipped default, opclass, or paper claim.** Both
+findings are measurement-harness bugs in this round's own ad hoc
+checking code, not in the extension or in the numbers already
+published; nothing in `paper/body.tex` needed correcting as a result of
+this round. The value was in not trusting either the alarming first
+cone-search pass or the alarming first region pass without finding the
+actual mechanism behind each -- a result that only looks wrong because
+of where it's run, or because of which statistic is read off a noisy
+sample, is not the same finding as a real regression, and conflating the
+two would have been exactly the kind of error this project's own
+measurement discipline (rounds forty-four, fifty-one, fifty-four,
+sixty-two) exists to catch.
+
+**STATUS**: verification only -- no code, SQL, GUC, or paper change.
+`region_recheck_x`/`region_recheck_sql()`/`region_recheck_run()` and the
+ad hoc `fpr_region_box8` index dropped after measurement; `fpr`'s
+indexes and `pg_index.indisvalid` restored to their normal state;
+`bench_cone_x`'s `variant = ''` rows left as this round's own addition
+to that table's existing convention.
+
+## Round sixty-seven: round thirteen's "0% empty cells" re-run on real
+## Gaia DR3 -- replicates on all-sky data, does not hold where there
+## are real gaps
+
+Round thirteen ruled out a data-aware covering because 0.0% of the cells
+`cover_cone_direct()` visited were empty, with the caveat that its
+synthetic corpus has a 35% uniform background and so no true gaps
+(handoff open item 9). The real-Gaia corpora are now rebuildable
+(`bench/19_gaia_real.sh`, `bench/19_gaia_load.sh`), so the measurement was
+repeated on them.
+
+**Method, as round thirteen**: a temporary `fprintf` (not committed) at
+all three `classify` call sites in `cover_cone_direct()` -- seed, child,
+final -- logging `(query, order, pix, verdict)`; `EXPLAIN` only, so the
+covering is computed at plan time and nothing executes; 40 distinct
+centres x {30', 1 deg, 3 deg}, so the covering memo never hits; every
+distinct visited cell then checked with a real `EXISTS` on its order-29
+range against the queried table. PostgreSQL 16, default GUCs
+(`probe_orders` as shipped). Three workloads:
+
+- **A** `gaia_realc` (10M real DR3 positions, all-sky), centres drawn from
+  its rows -- the benchmarks' own protocol;
+- **B** `gaia_realc`, centres uniform on the sphere;
+- **C** `gaia_fields` (1.59M, complete DR3 in 8 fields of 0.25-0.5 deg
+  radius), centres drawn from its rows -- cones larger than the fields,
+  so they cross genuinely unobserved sky.
+
+| | radius | visits | distinct cells | orders | visits on empty cells | inside-verdict visits empty | final kept cells empty |
+|---|---|---|---|---|---|---|---|
+| A | 30' | 5,586 | 3,552 | 6-9 | 0.00% | 0.00% | 0.00% |
+| A | 1 deg | 12,621 | 9,463 | 6-9 | 0.00% | 0.00% | 0.00% |
+| A | 3 deg | 28,883 | 20,338 | 6-8 | 0.00% | 0.00% | 0.00% |
+| B | 30' | 1,911 | 1,148 | 6-9 | 0.00% | 0.00% | 0.00% |
+| B | 1 deg | 4,134 | 2,695 | 6-9 | 0.00% | 0.00% | 0.00% |
+| B | 3 deg | 15,043 | 10,136 | 5-8 | 0.03% | 0.03% | 0.00% |
+| C | 30' | 22,925 | 3,557 | 9-10 | 57.5% | 49.1% | 48.7% |
+| C | 1 deg | 22,950 | 2,859 | 7-9 | 83.8% | 79.2% | 79.7% |
+| C | 3 deg | 32,777 | 3,321 | 6-8 | 97.2% | 96.7% | 95.6% |
+
+(Measured with statistics target 1000 on the cell index, as
+REPRODUCING.md section 4 specifies. A first pass ran on 100-bucket
+histograms -- the loader's `ANALYZE` inside a `DO` block ignored the
+target set on the index in the same block, fixed in
+`bench/19_gaia_load.sh` -- and gave the same picture: A 0.00%, B 0.04%,
+C identical to the last digit, since the fields' estimates moved by under
+12% and the walk there is held by its cell budget, not by density.)
+
+**On all-sky real data round thirteen replicates.** Zero empty cells in
+47,090 visits with data-drawn centres, and 0.02% with uniform centres --
+the latter all at 3 deg in the sparsest sky, where the visited
+order-8 cells average about 60 rows and the thinned (0.55%) sample
+occasionally leaves one at zero. That is sampling, not footprint. So the
+0% was not an artefact of the synthetic corpus's uniform background:
+`choose_order()` stops at cells that real all-sky density keeps populated.
+
+**Where real gaps exist, the walk does not see them.** On `gaia_fields`
+half to almost all of the visits, and of the final cells kept, are empty
+sky. The cost model reads density from the ANALYZE histogram, which
+round thirteen already found prorates a bucket over every sub-cell
+inside it and so can never report emptiness -- near a field it reads
+crowded-field density and refines further (orders 9-10 at 30', against
+6-9 on `gaia_realc`), spending the extra resolution on empty sky. The
+premise of round thirteen's data-aware covering -- that the walk wastes
+work on unoccupied cells -- is therefore true for a catalogue with a
+footprint, and false only for an all-sky one.
+
+**What this does not establish.** `gaia_fields` is an extreme footprint
+(eight small disks queried with cones up to 12x their radius); a real
+survey footprint (stripes, tiles, pointed fields with partial overlap)
+sits somewhere between B and C, and Gaia, being all-sky, cannot supply
+one. Nor was cost measured: an empty cell visited costs one `classify`
+step at plan time (microseconds, round thirteen's profile), and an empty
+cell kept costs a B-tree descent that finds nothing at execution, before
+`merge_gaps()` may absorb it into a neighbouring range. Whether skipping
+them would pay is a separate measurement against a footprint-limited
+catalogue; this round only removes "0% empty" as the reason not to try.
+
+**STATUS**: measurement only; no code changed (instrumentation reverted,
+`git status` clean on `ext/src/cover.c`). Handoff open item 9 updated.
+
+**Addendum: the paper's Baade's Window row.** `bench/19_gaia_real.sh`
+queried Baade's Window at RA 18.17 deg (its RA in hours), a high-latitude
+cone of 578 sources, until this branch moved it to 270.904, -30.035
+(225,522). The paper's estimator table (`tab:estimator`) is not produced by
+any script in the repo, so it was reconstructed: rho-hat from
+`skycell_cover_info()` against the counted density, radii 0.01-1 deg,
+statistics target 1000, three independent `ANALYZE` samples.
+
+- On `gaia_realc` the reconstruction reproduces the paper's other rows
+  (omega Cen 0.06-0.08 vs 0.08; LMC 0.74-0.84 vs 0.76; Galactic centre
+  3.71-3.81 vs 3.74), so that is the table it was measured on. Baade
+  gives median 0.90-0.94 (range 0.44-1.16) at the corrected position and
+  0.71-0.74 (0.55-1.03) at the old one; the paper's 0.80 (0.68-1.01) sits
+  between and does not identify either. Both are ordinary-sky values, so
+  the row's role in the paper -- an accurate field, not a failure case --
+  holds at either position.
+- On the full-density fields the old position cannot produce the second
+  referee response's figures: its 578 sources are invisible to the
+  histogram (rho-hat/rho = 0.00 at every radius), whereas the corrected
+  field gives 0.96 at 0.05 deg and 0.23 at 0.2 deg, matching the response's
+  "0.97-1.05 at <= 0.05 deg ... collapses to 0.15-0.23 at 0.2 deg". With the
+  1.6M row count, this says the published corpus used the correct
+  position and only the script had drifted.
+
+The measurement is now scripted as `bench/29_estimator.sql`, and the
+paper's table and text were updated from it (ten `ANALYZE` samples).
+Sampling moves the estimate more than the three samples above suggested
+-- 47 Tuc's median ranges over 0.01-0.08 -- and the cluster-core
+underestimate is 10-100x, not the 8-12x the paper had. Re-measuring what
+that costs (part (b) of the script): the chosen covering in a cluster
+core is within 0.96-1.55 of the best fixed order (1.76 in one sample
+with 47 Tuc at 0.01) against 0.96-1.25 where the estimate is accurate,
+so the paper's "no worse than where the estimate is accurate" was
+withdrawn; "does not cost a wrong covering" (vs 243-830x for a bad fixed
+order) stands.
+
+## Round sixty-eight: the cone-search comparison on real Gaia DR3
+## positions -- buffer counts reproduce the paper's direction, wall-clock
+## does not below 1 deg, and the whole gap is planning time
+
+Asked to run `tab:cones`'s comparison (skycell's B-tree rewrite against
+pgSphere's native GiST, shipped defaults) on `gaia_realc` -- 10M real DR3
+positions, heap in skycell cell order -- with round sixty-six's method:
+isolated per-method warm-up, several repetitions, buffer counts and median
+wall-clock.
+
+**One caveat before any number**: `tab:cones`' "Gaia corpus" column and
+`tab:scale` were measured on the `gaia_map`-*resampled* corpus (positions
+placed at random within each order-9 cell, REPRODUCING.md section 3), not
+on `gaia_realc`. This round therefore compares against a related but
+different corpus; the paper's own Discussion says so ("a density field
+standing in for real positions").
+
+**Setup.** PostgreSQL 16, `shared_buffers` 2GB, JIT and parallelism off,
+skycell 0.26 with every `skycell.*` GUC at its boot value
+(`probe_orders` 0, `split_cost` 1). `gaia_realc` heap 731MB, cell B-tree
+214MB, pgSphere GiST 683MB: the two methods' working sets (945MB and
+1,414MB) together exceed `shared_buffers`, round sixty-six's thrashing
+condition. Queries mirror `03_cone.sql`'s `cone_sql()` -- `skycell_cone()`
+on the expression index, `pos <@ scircle(...)` -- with `sum(random_index)`
+standing in for `sum(mag)` to force the heap visit. 1,456 centres at the
+paper's radii and counts (400/400/300/200/100/40/16), half drawn from
+`gaia_realc`, half uniform, `setseed(0.68)`. Per method: three unlogged
+warm-up passes over all centres, then five measured `EXPLAIN (ANALYZE,
+BUFFERS, TIMING OFF, SUMMARY ON)` passes, then the other method; the whole
+thing twice, skycell first and pgSphere first. Per query, the median of
+its ten measurements; per radius, the median paired skycell/pgSphere
+ratio with a 4,000-resample percentile bootstrap over queries. Plans
+checked: bitmap OR of cell ranges for skycell, GiST index scan for
+pgSphere. Row counts compared on every centre: 0 mismatches in 1,456
+(720,710 rows).
+
+| radius | n | total time, skycell/pgSphere | paper, Gaia warm | execution only | planning, skycell - pgSphere | buffers, skycell / pgSphere |
+|---|---|---|---|---|---|---|
+| 1" | 400 | 1.12 [1.10, 1.16] | 0.89 | 0.59 [0.56, 0.61] | +0.017 ms | 4.3 / 5.8 |
+| 10" | 400 | 1.16 [1.14, 1.19] | 0.90 | 0.62 [0.60, 0.64] | +0.017 ms | 4.7 / 5.9 |
+| 1' | 300 | 1.23 [1.19, 1.26] | 0.93 | 0.73 [0.69, 0.75] | +0.019 ms | 5.1 / 6.4 |
+| 6' | 200 | 1.45 [1.38, 1.49] | 1.03 | 0.99 [0.93, 1.08] | +0.029 ms | 9.6 / 12.6 |
+| 30' | 100 | 1.29 [1.12, 1.47] | 0.92 | 0.99 [0.89, 1.12] | +0.058 ms | 35.4 / 95.2 |
+| 1 deg | 40 | 1.00 [0.89, 1.26] | 0.85 | 0.84 [0.75, 1.01] | +0.089 ms | 82.6 / 309.1 |
+| 3 deg | 16 | 0.73 [0.62, 0.85] | 0.69 | 0.67 [0.60, 0.74] | +0.254 ms | 537.8 / 961.4 |
+
+Buffer counts were identical in both block orders, as they must be: they
+depend only on the covering chosen, not on timing or on what is cached.
+
+**Buffers reproduce the paper's direction, and more strongly.** skycell
+touches fewer pages than pgSphere at every radius: 0.74 of pgSphere's at
+1", 0.37 at 30', 0.27 at 1 deg, against the paper's 55/154 = 0.36 at
+1 deg on the resampled corpus (and 152/514 = 0.30 at 50M rows). Absolute
+counts are higher than the paper's (82.6/309.1 against 55/154 at 1 deg)
+on this different corpus; the ratio is what carries across.
+
+**Wall-clock does not reproduce below 1 deg, and the reason is
+planning, not the index.** In total time skycell is 12-45% *slower* from
+1" to 30', level at 1 deg (interval spans 1), and 27% faster at 3 deg
+(the paper's 0.69 reproduces there). Execution alone, skycell is faster
+or level at every radius (0.59-0.99). The whole deficit is skycell's
+extra planning -- covering computation and the rewrite, 0.017 ms per
+query at small radii rising to 0.25 ms at 3 deg -- which on this host is a
+large share of queries pgSphere answers in about 0.05 ms in total. This
+is round sixty-six's finding again on a different corpus ("skycell's
+planning time alone runs 2-5x pgSphere's here") and the paper's own
+Discussion ("what remains expensive is planning: a covering costs
+0.015-0.12 ms even cached"). Whether the paper's host gave execution a
+larger share, which would explain its sub-1 ratios, cannot be checked
+from this container; the published numbers are not contradicted by
+anything measured here, only not reproduced, and "only the comparisons
+travel" (Reproducibility subsection) does not quite cover it, since here the comparison
+itself moves with the host's balance of planning against execution.
+
+**A discrepancy with the second referee response.** That response
+reports, on real positions, skycell "1.0-1.8x slower at 10" and 0.1 deg"
+-- consistent with the totals above -- and attributes it to the data:
+"sub-cell clustering increases the number of rows a coarse covering
+admits". On this host that mechanism is not visible: skycell reads fewer
+pages and executes faster at those radii, and the deficit is planning
+alone. The response also says Sect. 6.2 "now reports the real-position
+numbers as the primary result"; the current `tab:cones` carries only the
+designed and resampled corpora. Neither is changed here -- both are the
+author's call -- but the response's diagnosis should not be repeated
+without re-measuring execution and planning separately on the paper's
+own host.
+
+**Not measured.** *Cold cache*: both methods read the same `gaia_realc`
+heap, so a centre probed by one warms it for the other, and dropping the
+VM page cache here does not reach the host's cache below it (the GiST
+file read in 3,100 ms first ever, 113 ms warm, 432 ms after
+`drop_caches`) -- round forty-four's limitation, unsolved, so no cold
+column is reported rather than a misleadingly warm one. *`tab:scale`'s
+50M column*: there is no 50M real-position corpus here (it would need a
+5x larger fetch); its 10M column is `tab:cones`' Gaia column, compared
+above.
+
+**STATUS**: measurement only -- no code, GUC, or paper change. Scratch
+objects `r68_centers`, `r68_x`, `r68_sql()`, `r68_block()` dropped after
+measurement, as were round sixty-seven's ad hoc `est`, `est2`, `est3`,
+`walk`, `walk_cells` and `gaia_fields_old`; `bench/29_estimator.sql`'s own
+result tables (`est_fields`, `est_truth`, `est_runs`, `est_decision`)
+kept, as that script's output.
+
+## Round sixty-nine: the cone-search comparison on real Gaia DR3
+## positions, cold -- skycell wins from 30' up, mixed below, and the
+## planning constant no longer decides it
+
+Round sixty-eight measured `tab:cones`' comparison on `gaia_realc` warm and
+could not measure it cold: both methods read the same heap, so a centre
+probed by one warmed the other's pages. Asked to fix that and add a cold
+column to `tab:cones`, using round forty-four's protocol.
+
+**Setup.** Two per-method tables built from the same 10M CSV rows
+(`bench/19_gaia_real.sh`), mirroring `02_build.sql`'s `cat_cell` /
+`cat_sphere` split, by a new committed loader,
+`bench/19_gaia_load_split.sh`: `gaia_real_cell` (stored `cell int8`,
+plain B-tree, statistics target 1000; heap 652MB, index 214MB) and
+`gaia_real_sphere` (`spoint` + pgSphere GiST; heap 731MB, index 684MB),
+both heaps in cell order, `VACUUM (FREEZE)` and `ANALYZE` as `02_build.sql`
+does. PostgreSQL 16, `shared_buffers` 2GB, JIT and parallelism off,
+`track_io_timing` on, every `skycell.*` GUC at its boot value. Queries are
+`03_cone.sql`'s `cone_sql()` shapes on the two tables (`skycell_cone(cell,
+...)`, `pos <@ scircle(...)`), with `sum(random_index)` standing in for
+`sum(mag)`.
+
+**Centres: never touched, and kept apart.** 1,456 new centres at
+`tab:cones`' radii and counts (400/400/300/200/100/40/16), half drawn from
+`gaia_realc` rows (a different table, so drawing reads none of the two
+tables' pages), half uniform, `setseed(0.69)`. Placed greedily, largest
+radii first, so that no two cones come within 2 deg of each other
+(centre distance at least r1 + r2 + 2 deg) and none comes near the four
+1-deg regions this round's own latency tests touched. A heap page in
+sparse sky spans up to about half a degree and an index leaf more, so
+without the gap one centre's first touch could warm the next one's
+pages; round forty-four's centres, drawn with `03_cone.sql`'s pool
+formula, did not have this guarantee. Only the inner index pages are
+shared between centres, and those are read once per pass by its first
+query.
+
+**Protocol.** For each of the seven radius labels in turn, both methods
+in an order drawn per label (seeded): stop the server, `sync`, `echo 3 >
+/proc/sys/vm/drop_caches`, start the server, then run that method's
+centres for that label once each with `EXPLAIN (ANALYZE, BUFFERS, TIMING
+OFF, SUMMARY ON)` -- fourteen restarts. Reported per centre: planning
+and execution time, buffer hits and reads, I/O read time, and the scan's
+row count. Paired skycell/pgSphere ratio of total (planning + execution)
+time per centre; median per label with a 4,000-resample percentile
+bootstrap over centres. Plans checked first: a bitmap OR of cell ranges,
+and a GiST index scan. Row counts: 0 mismatches in 1,456 pairs (662,651
+rows). The first query of each pass also pays catalog loading and the
+index's top levels after the restart (3-10 ms for skycell, 9-26 ms for
+pgSphere, against medians of 0.27-45 ms); it is kept, as it is part of
+a first touch, and the median absorbs it.
+
+**How cold "cold" is here -- measured, not assumed.** After a restart
+and `drop_caches`, a first-touch read costs about 0.08 ms per page
+(`track_io_timing`: 15 reads in 2.1 ms, 61 in 4.3 ms, 27 in 2.1 ms on
+three 1-deg probes), against round forty-four's tens of milliseconds for
+a handful of reads on genuinely cold storage. Streaming 4.6GB of other
+relations through the cache first (127 s) did not change that. The
+container's page cache is dropped, but the host's cache below the
+virtual disk evidently holds these freshly written tables and cannot be
+reached from here. So this is cold for PostgreSQL and for the virtual
+machine -- every page is a real read, counted exactly -- but not for the
+disk.
+
+| radius | n | total time, skycell/pgSphere | execution only | planning, skycell - pgSphere | I/O ms, skycell / pgSphere | reads, skycell / pgSphere | buffers, skycell / pgSphere |
+|---|---|---|---|---|---|---|---|
+| 1" | 400 | 1.06 [1.01, 1.11] | 0.93 [0.90, 0.98] | +0.027 ms | 0.19 / 0.20 | 1.7 / 2.5 | 4.1 / 5.6 |
+| 10" | 400 | 0.91 [0.87, 0.95] | 0.78 [0.74, 0.82] | +0.024 ms | 0.19 / 0.24 | 1.8 / 2.6 | 4.4 / 5.6 |
+| 1' | 300 | 1.21 [1.11, 1.27] | 1.05 [0.99, 1.15] | +0.036 ms | 0.25 / 0.25 | 2.6 / 2.9 | 5.0 / 5.8 |
+| 6' | 200 | 0.95 [0.91, 1.04] | 0.89 [0.85, 0.98] | +0.027 ms | 0.37 / 0.42 | 4.8 / 5.6 | 7.7 / 9.5 |
+| 30' | 100 | 0.89 [0.81, 0.98] | 0.83 [0.77, 0.90] | +0.090 ms | 0.66 / 0.97 | 17.6 / 25.6 | 25.0 / 54.8 |
+| 1 deg | 40 | 0.65 [0.58, 0.70] | 0.59 [0.52, 0.64] | +0.129 ms | 0.95 / 2.42 | 57.1 / 97.5 | 69.9 / 246.6 |
+| 3 deg | 16 | 0.62 [0.49, 0.82] | 0.56 [0.48, 0.77] | +0.332 ms | 5.98 / 17.32 | 470.0 / 887.8 | 500.1 / 890.1 |
+
+Times and ratios are medians; reads and buffers are means.
+
+**From 30' up, cold favours skycell clearly**: 0.89 at 30', 0.65 at
+1 deg, 0.62 at 3 deg, against warm 1.29, 1.00 and 0.73 (round
+sixty-eight). skycell reads 0.53-0.69 of pgSphere's pages there, and with
+every one a real read, I/O decides: at 1 deg skycell spends 0.95 ms on
+reads to pgSphere's 2.42. The planning difference (0.09-0.33 ms) is
+real but small beside that.
+
+**Below 30', the warm finding does not explain cold, and cold does not
+give a clean verdict either.** Warm, the whole small-cone deficit was
+skycell's 0.017-0.03 ms of extra planning, set against pgSphere answering
+in about 0.05 ms. Cold, each query spends 0.2-0.4 ms on first-touch reads
+alone, so the same planning constant is a tenth of the total and stops
+deciding the result. The verdict is mixed instead: 1.06 at 1", 0.91 at
+10", 1.21 at 1', level at 6'. skycell reads fewer pages at every one of
+these radii (0.68-0.90 of pgSphere's), but at about 0.08 ms a read the
+saving is one or two tenths of a millisecond, and its I/O time is not
+consistently lower: level at 1" and 1' despite the fewer reads, as reads
+from different files and offsets do not cost the same here. So the
+cold small-cone result is set by a few page reads either way, not by
+planning -- the question the request posed, answered "a different
+story", though not a uniform one.
+
+**What this predicts on real storage, and what it does not prove.** With
+true disk latency each read would cost tens of times more, which should
+push every ratio towards skycell's page ratio (0.68-0.90 below 30',
+0.53-0.69 above) and make planning negligible -- round forty-four's
+result on the synthetic corpus, where skycell won at every radius cold.
+That is an expectation from the read counts, not a measurement: this
+container cannot produce disk-cold reads, so the small-radius cold
+numbers here are the conservative case for skycell.
+
+**Against the paper.** The resampled corpus's cold column (0.78, 0.80,
+0.95, 0.90, 0.57, 0.53, 0.40) is uniformly in skycell's favour; the real
+corpus, measured here with cheap reads, agrees from 30' up in direction
+though less strongly, and disagrees at 1" and 1'. `tab:cones` now
+carries this as a "real corpus, cold" column beside round sixty-eight's
+warm one, with the caption stating what kind of cold it is, and
+`sec:realcones` gains a paragraph with the result above. The rest of
+that section is unchanged: the warm interpretation stands.
+
+**STATUS**: measurement plus a paper update and a new loader
+(`bench/19_gaia_load_split.sh`); no extension code or GUC changed. The
+per-method tables `gaia_real_cell` and `gaia_real_sphere` are kept as a
+corpus, like `gaia_realc`, rebuilt by that script. Scratch objects
+`r69_centers`, `r69_x`, `r69_cand`, `r69_sql()` and `r69_pass()` dropped
+after measurement; `track_io_timing` was a server start option for this
+round only, and the server was restarted without it.
+
+## Round seventy: lazy per-order fill for a cone's out_c2[]/in_c2[] --
+## a real but modest cut to the covering-computation cost rounds
+## sixty-eight/sixty-nine pinned the whole warm small-radius deficit on
+
+Asked whether warm cone-search performance can be improved, since rounds
+sixty-eight and sixty-nine (and the paper's own Discussion) already
+localised the small-radius deficit to planning time, not the index or
+execution: "a covering costs 0.015-0.12 ms even cached" against pgSphere's
+0.006-0.008 ms GiST predicate needing no such step.
+
+**What `sc_region_cone()` was doing.** With `need_covering=true` it filled
+`out_c2[k]`/`in_c2[k]` for every HEALPix order `k` from 0 to `SC_MAX_ORDER`
+(30 entries, up to 4 `sin()`/`pow()` calls each -- spgist_region.c's own
+comment already called this "on the order of 120+ transcendental calls")
+unconditionally, every time a cone region is constructed. But
+`sc_region_classify_cap()`, the only reader of either table, is only ever
+called with the small band of orders a single covering actually visits:
+with the shipped defaults (`skycell.probe_orders = 0`, `skycell.direct =
+1`), `sc_cover_compute()` calls `choose_order()` once (reads only
+`r->radius`/`r->area`/density, no table) and `cover_cone_direct()` once,
+which finds a seed order by descending from the chosen order with
+`seed_cone_at()` (pure spherical geometry, no table either) and then
+splits from there up to the chosen order -- a handful of orders out of
+30, confirmed by instrumentation during this round. Filling all 30 was
+work thrown away on every single query, repeating-query caching
+(`cover_cached()`) aside -- and 1,456 distinct centres against no cache
+hits is exactly the realistic case rounds sixty-eight/sixty-nine already
+measured warm cone search under.
+
+**The fix.** `out_c2[]`/`in_c2[]` are now filled lazily, one order at a
+time, by `ensure_cone_bounds()` (new, `cover.c`), called from
+`sc_region_classify_cap()`'s cone branch immediately before either value
+is read. A `filled` bitmask (new field on `sc_region`, 30 of 32 bits used)
+tracks which orders are already computed. `sc_region_cone()` no longer
+fills anything; `memset()`'s zeroing of the struct is already the lazy
+starting state. `ensure_cone_bounds()` takes a `const sc_region *` and
+casts the const away internally to mutate the cache -- safe because every
+`sc_region` in this codebase is backend-local and constructed fresh per
+call, never shared across backends or reused concurrently (confirmed by
+grep: only `cover.c`, `skycell.c`'s MOC walk, and `spgist_region.c`'s
+descent ever read these fields, and each constructs or caches its own
+region value, never shares one by pointer across calls that could race).
+`need_covering` is kept as the call site's declaration of intent (cover.h)
+even though the cone branch no longer does anything eager either way; the
+flag still matters for a polygon, whose `sin_rho[]` -- one `sin()` per
+order, a sixth of the cone table's cost -- is still filled eagerly and
+was not worth the same treatment.
+
+**Measurement, and a trap in the obvious way to make one.**
+`cover_selftest`'s own radius sweep calls `sc_region_cone()` once
+*outside* its timing loop and reuses that one region for 5 repeated
+`sc_cover_compute()` calls -- which hid this change almost entirely,
+since in the old code the eager fill already happened before the clock
+started, and in the new code only the first of the 5 reps pays the lazy
+fill, diluted 5x by the average. (First attempt at measuring this round
+used exactly that harness and found no difference -- the harness, not
+the fix, as confirmed by moving construction inside the timed loop.) A
+standalone harness instead builds a fresh `sc_region` and calls
+`sc_cover_compute()` once per distinct query -- what a real backend does
+for 1,456 non-repeating centres -- at `tab:cones`' radii, a clustered
+density histogram, 3,000 queries per radius, 5 trials per build, medians
+compared:
+
+| radius | old (us/query, median of 5) | new | ratio |
+|---|---|---|---|
+| 1" | 2.985 | 2.569 | 0.86 |
+| 10" | 3.614 | 2.815 | 0.78 |
+| 1' | 3.123 | 2.652 | 0.85 |
+| 6' | 3.516 | 2.953 | 0.84 |
+| 30' | 7.029 | 6.526 | 0.93 |
+| 1 deg | 9.446 | 8.201 | 0.87 |
+| 3 deg | 32.413 | 29.051 | 0.90 |
+
+A real, consistent 7-22% cut at every radius tested, no regression
+anywhere -- the first attempt's apparent 3 deg regression (one run each,
+not medians) did not reproduce over 5 trials either way; both builds
+simply have high single-run variance at that radius (step counts there
+run into the thousands). `ensure_cone_bounds()` is marked
+`always_inline`; without it the numbers were noisier but not
+systematically worse, so this is a minor hygiene choice, not load-bearing.
+
+**What this is not.** It is the cost of `sc_region_cone()` +
+`sc_cover_compute()` alone, in a standalone C harness -- not the
+PostgreSQL-side planning cost rounds sixty-eight/sixty-nine measured
+(0.017-0.03 ms per query at small radii), which also includes
+`density_for_var()`'s cache lookups, `lookup_sibling_func()`'s syscache
+hits, and building the rewritten `Expr` tree. This round only touches one
+component of that total, so a 7-22% cut here is not a 7-22% cut to the
+paper's warm planning-time numbers; it should move them by some smaller
+fraction. Re-running the actual `tab:cones` comparison inside PostgreSQL
+to measure that fraction was not done this round -- worth doing before
+claiming any specific number for the paper.
+
+**Correctness.** `make selftest` (pure C, both `healpix_selftest` and
+`cover_selftest`): "ALL OK", 0 failures, 0 false negatives, identical
+range/step/order/fp_frac columns to before the change (only timing
+differs). `make installcheck` (`skycell`, `adql` regression suites):
+2/2 pass, unchanged expected output.
+
+**STATUS**: `ext/src/cover.c`, `cover.h` (new `filled` field),
+`spgist_region.c` and `adql.c` (comments only, updated for accuracy).
+No SQL, GUC, or catalog change, so no version bump. Not yet re-run against
+the paper's own `tab:cones` benchmark or folded into any paper claim.
+
+## Round seventy-one: re-running round seventy's fix against `tab:cones`
+## itself -- a real methodological trap found and fixed, and a real
+## noise floor that then hides whatever the fix is worth here
+
+Asked to re-run the actual `tab:cones` comparison (not the standalone
+harness) with round seventy's fix, on whichever corpus is available in
+this container. Only the designed corpus (`cat_cell`/`cat_sphere`/
+`cat_q3c`, 10M rows) is loaded; the Gaia-resampled 10M corpus needs
+`gaia_map`, built from a per-order-9-cell count fetched from the same ESA
+TAP host round sixty-nine's instructions needed and this container's
+egress policy denies (confirmed again this round) -- so only the designed
+corpus could be re-measured, and round sixty-six already found this
+specific container does not reproduce `tab:cones`' own wall-clock ratios
+on it anyway (`cat_cell`+`cat_sphere` together exceed `shared_buffers`,
+and "this container is simply not that [paper's] machine").
+
+**A real trap, caught before trusting any number.** First attempt: build
+before (pre-fix) and after (post-fix), each with three isolated per-method
+warm-up passes over all 1,456 `bench_centers` before the timed
+`bench_cone_explain()` pass, matching round sixty-six's own fix for
+cache-thrashing. Buffers matched exactly (16916 total, both builds, every
+radius) -- expected, since the fix changes nothing about which cells are
+chosen. But `plan_ms` showed no consistent direction at all (some radii
+up, some down, overall ratio 1.065 -- *slower* after the fix) and,
+suspiciously, `exec_ms` moved by similar amounts in both directions too,
+which round seventy's fix cannot touch at all (it runs during planning,
+not execution). That inconsistency was the tell: `cover_cached()`
+memoises a covering per backend, keyed on `(ra0, dec0, radius, ...)`, and
+the warm-up passes -- run to settle the *heap/index* page cache -- also
+populate that *covering* cache for every one of the 1,456 centres before
+the timed pass ever runs. The timed `EXPLAIN` was measuring a cache hit
+(a hash lookup plus the unrelated `Expr`-tree rebuild) on both builds,
+never reaching `sc_region_cone()`/`sc_cover_compute()` at all -- the exact
+code this round's fix changed. `SET skycell.cache_coverings = off` (a
+GUC already there for this purpose) forces every query through a genuine
+recomputation, matching the "1,456 distinct centres, no reuse" framing
+rounds sixty-eight/sixty-nine and the paper's own Sect. 6.2 already use
+for the realistic case.
+
+**With caching off, three repetitions each, paired per query, median of
+3 compared:** `plan_ms` ratio (after/before) by radius: 1" 1.048, 10"
+0.781, 1' 0.878, 6' 0.798, 30' 0.774, 1 deg 1.013, 3 deg 1.147 -- faster
+at four of seven radii, slower at three, no pattern by radius size that
+matches round seventy's own clean, monotonic-ish 7-22% win in the
+standalone harness.
+
+**Why, measured rather than assumed: the noise floor here is as large as
+the effect.** Comparing the three *before* repetitions against each
+other (same binary, same everything) gives `exec_ms` -- which this fix
+cannot affect at all -- swinging 11-45% across radii from run to run
+alone (`plan_ms`'s own same-code spread: 6-45%). A 7-22% signal cannot be
+read off a comparison whose noise floor, on this specific container,
+already spans that range or wider. More repetitions would narrow it (the
+standalone harness needed none of `cover_cached()`, `shared_buffers`
+contention, or a live backend's own allocation noise, which is why it
+could see the effect cleanly with the same 3-5 repetitions), but how many
+is itself unknown without running them, and this round's return on that
+effort looked low given everything else already pointing the same way:
+round seventy's own caveat already said a cut to one minority component
+of total planning time "should move [the paper's numbers] by some
+smaller fraction", and round sixty-six already established this
+container cannot reproduce `tab:cones`' wall-clock ratios at all,
+independent of this fix.
+
+**Conclusion.** Buffers (the one thing this round could check cleanly)
+confirm the fix changes nothing about correctness or the covering chosen,
+on top of round seventy's own `make installcheck`. Whether round
+seventy's real, measured 7-22% cut to `sc_region_cone()`+
+`sc_cover_compute()` moves `tab:cones`' own published ratios by a
+noticeable amount is not established either way by this round -- not
+confirmed, and not ruled out, only shown to be smaller than what three
+repetitions can resolve against this container's own noise. No paper
+change from this round: nothing here is a number worth publishing,
+honestly.
+
+**STATUS**: measurement only, no code or GUC change (the fix stands as
+round seventy left it; `skycell.cache_coverings` already existed).
+`r70_snap` (scratch) dropped after measurement. If this matters enough to
+settle, the next step is either many more repetitions here (cost:
+`shared_buffers`-thrashing noise may not average out fast) or the actual
+`tab:cones` re-run on a host that matches the paper's own (not available
+from this container).
+
+**Follow-up, same round: asked to push repetitions until the signal
+clears the noise. It does -- and it is not the clean, uniform win the
+standalone harness showed.** The container had restarted between this
+request and the one above (fresh boot, load average ~0, nothing else
+running -- about as quiet as this host gets); `cat_cell`/`cat_sphere`/
+`bench_centers`/the installed extension all survived on the persistent
+data directory, confirmed before reusing them. 30 repetitions per build
+(not 3), `skycell.cache_coverings` still off, one warm-up before all 30
+measured passes rather than one per pass. A `pgSphere` control run
+immediately after each skycell capture (same session, same chronological
+position) measures this container's own session-to-session drift
+independent of anything round seventy touched -- `pgSphere`'s own
+total-time ratio between the two sessions ran 1.02-1.06 across every
+radius, confirming real ambient drift of that size exists here even with
+nothing in pgSphere's code or data changing, so any skycell comparison
+has to be read net of it, not at face value.
+
+Per query, median of 30, bootstrapped (4000 resamples over queries) 95%
+CI on skycell's own after/before ratio *divided by* pgSphere's same-session
+drift ratio (the net effect, drift cancelled):
+
+| radius | skycell ratio | pgSphere drift | net (skycell / drift) | 95% CI |
+|---|---|---|---|---|
+| 1" | 1.006 | 1.065 | 0.945 | [0.932, 0.958] |
+| 10" | 1.080 | 1.021 | 1.057 | [1.042, 1.074] |
+| 1' | 1.078 | 1.065 | 1.012 | [0.998, 1.027] |
+| 6' | 1.025 | 1.017 | 1.009 | [0.987, 1.028] |
+| 30' | 1.001 | 1.021 | 0.981 | [0.967, 0.996] |
+| 1 deg | 1.005 | 1.017 | 0.988 | [0.974, 1.001] |
+| 3 deg | 0.942 | 1.036 | 0.909 | [0.878, 0.961] |
+
+Four of seven intervals exclude 1 -- the signal does clear this
+container's noise floor at 30 repetitions, which it could not at 3. But
+it is not one signal: **a real, resolved win at 1" (5.5%), 30' (1.9%) and
+3 deg (9%); a real, resolved** ***loss*** **at 10" (5.7%); not resolved
+either way at 1', 6', 1 deg** (interval straddles 1). Buffers were
+already confirmed identical before/after at every radius (round seventy
+and the first pass above), so the covering chosen cannot be the cause --
+whatever is responsible lives in how the lazy-fill change interacts with
+the rest of a real backend (syscache lookups, memory context switching,
+code layout/inlining effects elsewhere in the binary once this function's
+boundary moved) that the standalone harness, by construction, has none
+of. That harness measured a real, reproducible property of
+`sc_region_cone()`+`sc_cover_compute()` in isolation (round seventy's
+7-22% figure stands, unchanged, for what it measured) -- it is just not
+a reliable predictor of the fix's net effect once embedded in a live
+backend, at least on this container, at least on this corpus.
+
+**What this means for round seventy.** Not a clean win to report, and
+not a regression to revert on reflex either: three of seven radii
+improve, one gets reliably worse, three are a wash, and the two that
+matter most to the motivating problem (the real-corpus warm deficit,
+rounds sixty-eight/sixty-nine, worst at 1"-30') include both a win (1",
+30') and the one loss (10"). Whether that net is worth the added
+`filled`-bitmask complexity is a judgement call this round does not
+make unilaterally -- it surfaces the honest, now-resolved number instead
+of the earlier "probably smaller than noise" hedge, which turned out to
+be wrong in an interesting way: the effect is bigger than 3-repetition
+noise, just not uniform.
+
+**STATUS (follow-up)**: measurement only, still no code or GUC change.
+Tighter repetitions confirm the fix is correctness-neutral (identical
+buffers, `make installcheck` re-passed after restoring the fixed build)
+and reveal a real but mixed timing effect this round does not resolve
+into a keep/revert decision.
+
+## Round seventy-two: why 10" specifically regresses -- it doesn't,
+## mechanically; the fix behaves identically at 1" and 10", so whatever
+## diverges between them isn't in the code round seventy changed
+
+Asked to dig into the one resolved loss (10", net 1.057). Instrumented
+the installed extension directly (temporary global counters in
+`ensure_cone_bounds()`/`sc_region_classify_cap()`'s cone branch, a
+throwaway SQL-callable accessor reading and resetting them, declared ad
+hoc against the built `.so` rather than touching any committed `.sql` --
+all reverted after this round, nothing here is kept) to count, per
+query, how many times `sc_region_classify_cap()` is called
+(`classify_calls`) and how many of those are a genuine first-touch fill
+rather than an already-filled bitmask hit (`fill_calls`) -- run against
+the real `bench_centers` rows, the exact queries round seventy-one
+measured, `skycell.cache_coverings` off as before.
+
+**The fix's own code path is essentially identical at 1" and 10".**
+`fill_calls` is exactly 1 for *every single query* at both radii, no
+exceptions (400/400 at each). `classify_calls` -- how many times that one
+order gets hit, filled once then read from the bitmask the rest of the
+way -- averages 1.47 at 1" and 1.60 at 10", with near-identical
+distributions (1", 2 or 4 total calls, both radii, similar proportions).
+At these radii the entire covering is one HEALPix order, found
+immediately by `seed_cone_at()` with no splitting -- the direct-cone
+fast path at its simplest, and the two radii exercise it the same way.
+
+**This is the wrong place to look for a mechanism, because there isn't
+one here to find.** Eager fill always paid for 30 orders regardless;
+lazy fill pays for 1, at both radii, by an equal margin (saving the same
+~29 unneeded `sin()`/`pow()` pairs either way). A branch-check difference
+of 0.13 calls (1.60 - 1.47) is sub-nanosecond-scale against the
+microsecond totals involved -- nowhere close to accounting for a 5-point
+swing in opposite directions between the two radii. Whatever produces
+round seventy-one's resolved divergence, it is not `sc_region_cone()`/
+`sc_cover_compute()`/`sc_region_classify_cap()` behaving differently at
+1" versus 10": they don't.
+
+**What this implies about round seventy-one's own method.** The
+drift-correction there (dividing by a same-session pgSphere ratio)
+removes whatever noise is common to both tables -- global scheduler or
+thermal effects, mainly -- but pgSphere and skycell touch different
+physical heap and index pages, so table-specific buffer-placement noise
+between two separately-launched sessions (same warm-up protocol, not
+necessarily the same physical page-cache state) is not something a
+cross-table ratio can cancel, and pgSphere's own drift ratio already
+varied by radius in that round (1.065 at 1"/1', 1.02 at 10"/1deg/30') for
+reasons having nothing to do with skycell's code -- confirming such
+radius-correlated, table-specific noise is real and already visible in
+the one series that is supposed to be a clean reference. A bootstrap
+interval excluding 1 means the observed difference is unlikely under
+*that* null (pure sampling noise around a stable mean), not that the
+cause is necessarily the code change being tested -- and here, with the
+mechanism directly instrumented and shown not to differ, the more likely
+account is exactly that kind of session-level, radius-correlated
+confound, not round seventy's fix.
+
+**Revised picture for round seventy.** Nothing found here argues for
+reverting it: `make installcheck` and `make selftest` are unaffected,
+buffers are identical at every radius in every round that checked, and
+the call-count instrumentation confirms the change is exactly what it
+was written to be -- fewer trig calls per covering, pure constant-factor
+cheaper, radius-independent in its own behaviour. The mixed per-radius
+timing picture in round seventy-one is better explained by this
+container's own session-to-session noise than by anything the fix does
+differently by radius, which removes most of the pressure to treat
+10"'s regression as a real cost of the change -- though without a
+cleaner host to confirm that on, "better explained by" is the honest
+ceiling, not proof.
+
+**STATUS**: measurement only. Temporary debug counters and accessor
+function reverted in full (`git diff` against the fixed commit is empty
+after this round); `make installcheck` re-confirmed green on the
+restored build.
+
+## Round seventy-three: a genuinely controlled A/B, same session --
+## supersedes round seventy-one's cross-session comparison; the 10"
+## "regression" does not reproduce
+
+Round seventy-two argued the 10" result was more likely a cross-session
+artefact than a property of the fix, but could not prove it without a
+cleaner test. Built one: rather than rebuild and reinstall the extension
+between "before" and "after" (two separate backend sessions, two separate
+warm-up runs, the source of the session-to-session noise rounds
+seventy-one/seventy-two kept running into), load the pre-fix source as a
+*second* shared library in the *same* session, alongside the already-
+installed fixed one, and compare both against identical queries, back to
+back, randomized order, one warm-up, no rebuild in between.
+
+**How.** Pre-fix `cover.c`/`cover.h`/`adql.c`/`spgist_region.c` (commit
+`365b4f4`) copied into a scratch build directory, compiled to a
+separately-named `skycell_old.so` -- `_PG_init` renamed to a dead symbol
+(so PostgreSQL never calls it: this process already has every
+`skycell.*` GUC registered by the production library, and a second
+`DefineCustomRealVariable` call for the same name errors) and
+`skycell_cache_coverings`'s compiled-in default flipped to `false` (the
+production library's own copy is controlled by `SET
+skycell.cache_coverings`, but a GUC is one process-global name bound to
+whichever library registered it first -- the old library's same-named
+static is a separate, unreachable variable, so this is the only way to
+stop *its* covering cache from hiding repeat measurements of the same
+query the way round seventy-one's warm-up accidentally did). Declared
+ad hoc (no extension, no commit) against the running database:
+`skycell_support_old`/`skycell_cone_old`, pointing at `skycell_old.so`'s
+`skycell_support`/`skycell_cone` symbols, `skycell_cone_old` given
+`SUPPORT skycell_support_old`. `lookup_sibling_func()` resolves
+`skycell_in_cone` by name in the schema regardless of which library
+calls it, so both versions' rewritten quals share the exact same
+production exact-test function -- confirmed identical plans, identical
+filter conditions, identical buffers (12 vs 12) on a sample query before
+trusting anything further.
+
+**Protocol.** One combined warm-up pass (both versions, same queries,
+same table). Then 30 repetitions over all 1,456 `bench_centers`, and
+*within each repetition, for each query*, a coin flip on which version
+runs first -- the paired, randomized-order-per-trial discipline
+`tab:cones`' own protocol uses, now actually possible because both
+versions live in the same backend and touch the same warm pages.
+`skycell.cache_coverings` off throughout (controls the new side; the old
+side's own cache is permanently off by the build above). 87,360 EXPLAIN
+calls, 23 seconds.
+
+**Buffers matched exactly** -- 507,480 for both versions, every
+repetition -- the correctness check this round could run for free.
+
+**Per query, median of 30, bootstrapped (4000 resamples) 95% CI on the
+planning-time ratio (new/old):**
+
+| radius | n | plan ratio | 95% CI | total-time ratio | 95% CI |
+|---|---|---|---|---|---|
+| 1" | 400 | 0.997 | [0.989, 1.006] | 0.998 | [0.990, 1.006] |
+| 10" | 400 | 0.989 | [0.980, 0.998] | 0.992 | [0.985, 1.000] |
+| 1' | 300 | 0.997 | [0.987, 1.007] | 0.995 | [0.987, 1.004] |
+| 6' | 200 | 0.999 | [0.985, 1.014] | 0.999 | [0.988, 1.010] |
+| 30' | 100 | 1.005 | [0.983, 1.025] | 0.995 | [0.985, 1.006] |
+| 1 deg | 40 | 0.972 | [0.947, 0.998] | 0.997 | [0.983, 1.012] |
+| 3 deg | 16 | 0.964 | [0.928, 0.996] | 0.994 | [0.978, 1.009] |
+| **all pooled** | 1456 | **0.991** | **[0.985, 0.998]** | 0.995 | [0.990, 1.001] |
+
+**The 10" result reverses.** Round seventy-one's cross-session
+comparison found a resolved 5.7% *loss* there; this same-session,
+randomized A/B finds a resolved 1.1% *win* instead -- the opposite sign,
+from the same real queries on the same table, differing only in whether
+the comparison crossed a session boundary. That is exactly what round
+seventy-two's instrumentation predicted (the mechanism is identical at
+1" and 10"; whatever drove round seventy-one's divergence had to be
+something else) and now has direct confirmation: it was something else.
+
+**The honest result: a small, real, mostly-resolved win in planning
+time; a smaller and mostly-unresolved one in total time.** Pooled across
+every radius, planning time is 0.9% faster, resolved (CI excludes 1).
+Individually, 10", 1 deg and 3 deg resolve; 1", 1', 6', 30' do not (CI
+straddles 1) -- consistent with a real effect of a percent or two that
+this container's remaining noise, even controlled this well, does not
+fully resolve at every radius individually. No radius, pooled or
+individual, shows a resolved loss. Total time (plan+exec, what actually
+answers a query) is directionally the same but smaller and not resolved
+anywhere except at the pooled level it's close (0.995 [0.990, 1.001]) --
+expected, since execution time (unaffected by this fix, roughly 2x
+planning time here) dilutes a planning-only saving once summed in.
+
+This is a real answer to the question round seventy opened with a 7-22%
+number from a standalone harness with no backend, no syscache, no
+`Expr`-tree construction around it: embedded in an actual backend, on
+this corpus, on this container, the fix is worth roughly 1% of planning
+time and under 1% of total query time -- smaller than the isolated
+measurement suggested, exactly the direction the caveat in round
+seventy's own writeup predicted, and, now that the comparison is
+controlled properly, a real win rather than a mixed bag.
+
+**What this does not settle.** One container, one corpus (designed,
+10M rows, the only one loaded), one host that round sixty-six already
+found does not reproduce `tab:cones`' own published ratios for unrelated
+reasons (`shared_buffers` thrashing). A ~1% win is real here; whether it
+is 1% on the paper's own host, where the planning/execution balance
+round sixty-six found to differ, is not something this container can
+answer.
+
+**STATUS**: measurement only. `skycell_old.so`, the scratch build
+directory, and every ad hoc function/table this round created were
+removed after measurement; confirmed via a sample query that the
+production `skycell_cone` still answers correctly post-cleanup. No
+code, GUC, or paper change.

@@ -77,24 +77,49 @@ sc_region_cone(sc_region *r, double ra_deg, double dec_deg, double radius_deg,
 		r->radius = M_PI;
 	r->area = (r->radius < 0) ? 0.0 : 4.0 * M_PI * pow(sin(r->radius / 2.0), 2);
 
-	if (!need_covering)
-		return NULL;				/* out_c2[]/in_c2[]: only sc_region_classify_cap() reads these */
-
-	for (int k = 0; k <= SC_MAX_ORDER; k++)
-	{
-		double		rho = sc_pixrad(k);
-		double		a = r->radius + rho,
-					b = r->radius - rho;
-
-		if (r->radius < 0)
-			r->out_c2[k] = -1.0;	/* empty region: everything OUT */
-		else if (a >= M_PI)
-			r->out_c2[k] = 5.0;		/* chord^2 <= 4: never OUT */
-		else
-			r->out_c2[k] = 4.0 * pow(sin(fmin(M_PI, a + SC_ANG_EPS) / 2.0), 2);
-		r->in_c2[k] = (b < 0) ? -1.0 : 4.0 * pow(sin(b / 2.0), 2);
-	}
+	/*
+	 * out_c2[]/in_c2[] are filled lazily, order by order, by
+	 * ensure_cone_bounds() below -- need_covering is kept only as the call
+	 * site's declaration of intent (see cover.h); memset() above already
+	 * zeroed filled[] and both tables, which is the lazy state.
+	 */
+	(void) need_covering;
 	return NULL;
+}
+
+/*
+ * Fill out_c2[order]/in_c2[order] for a cone, if not already done.
+ *
+ * Called from sc_region_classify_cap(), the only reader, immediately before
+ * it uses either value -- one order at a time, so a covering that only ever
+ * visits a handful of the 30 orders (the common case: a seed order up to
+ * whatever order the cost model chose) pays for a handful, not for every
+ * order whether visited or not.  sc_region itself is always backend-local
+ * and never shared across calls, so mutating it through a cast-away-const
+ * pointer here is safe; see cover.h on why the parameter stays const.
+ */
+static inline __attribute__((always_inline)) void
+ensure_cone_bounds(const sc_region *r_in, int order)
+{
+	sc_region  *r = (sc_region *) r_in;
+	double		rho,
+				a,
+				b;
+
+	if (r->filled & ((uint32_t) 1 << order))
+		return;
+
+	rho = sc_pixrad(order);
+	a = r->radius + rho;
+	b = r->radius - rho;
+	if (r->radius < 0)
+		r->out_c2[order] = -1.0;	/* empty region: everything OUT */
+	else if (a >= M_PI)
+		r->out_c2[order] = 5.0;		/* chord^2 <= 4: never OUT */
+	else
+		r->out_c2[order] = 4.0 * pow(sin(fmin(M_PI, a + SC_ANG_EPS) / 2.0), 2);
+	r->in_c2[order] = (b < 0) ? -1.0 : 4.0 * pow(sin(b / 2.0), 2);
+	r->filled |= (uint32_t) 1 << order;
 }
 
 static const char *
@@ -268,8 +293,10 @@ arc_dist(sc_vec3 p, sc_vec3 a, sc_vec3 b, sc_vec3 n)
  * inflating them by 4x the edge's departure from its chord at the midpoint.
  * That is not a bound: where an edge crosses its chord plane near the midpoint
  * the estimate collapses, and healpix_selftest measures the true departure at
- * up to 64x the midpoint value (order 18).  The absolute error was ~1e-8 rad,
- * below the 0.4 mas leaf cell, but small is not zero, so the test is gone.
+ * up to 159x the midpoint value (order 18, deterministic -- fixed seed).  The
+ * absolute error was ~1e-8 rad, below the 0.4 mas leaf cell, but small is not
+ * zero, so the test is gone.  healpix_selftest prints this ratio itself each
+ * run; if it changes, this comment (and the paper's Sect. 2.4) are stale.
  */
 static sc_class
 classify_cone_exact(const sc_region *r, int order, int64_t pix, double *f_out)
@@ -343,6 +370,7 @@ sc_region_classify_cap(const sc_region *r, int order, int64_t pix, double *f_out
 		double		c2 = sc_chord2(c, r->center);
 		double		d;
 
+		ensure_cone_bounds(r, order);
 		if (c2 > r->out_c2[order])
 		{
 			*f_out = 1.0;

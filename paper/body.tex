@@ -45,8 +45,8 @@ polygons 2.7--4.4 times faster, matches \texttt{q3c\_join} on cross-matching whi
 times faster than pgSphere at it, and its row estimates are wrong by a factor 1.2 rather
 than 2.5--3.0. Its one free cost parameter is derived from the relation's own statistics,
 its chosen cell order costs about 3\% against the best available one, and its density
-estimate is accurate to about 25\% on ordinary sky (low by up to 12$\times$ in a globular
-cluster core, with no measurable effect on the covering chosen). Raising the catalogue to
+estimate is good to within a factor 1.6 on ordinary sky (low by 10--100$\times$ in a
+globular cluster core, which costs the covering chosen at most a factor 1.8). Raising the catalogue to
 50 million rows widens the advantage for regions of 30\arcmin\ and larger while cones of
 an arcminute and below do not move. A \texttt{float4} GiST box key matched to pgSphere's
 own representation beats every region-opclass alternative tried, including pgSphere's
@@ -97,14 +97,16 @@ the price of an extra index range -- and is computed rather than configured.
 
 The measurements are built to survive scrutiny rather than flatter the method: every
 query is answered by all three methods back to back in randomized order, analysed
-paired; everything is measured warm and cold; and the density structure of one corpus
-comes from the real Gaia DR3 sky rather than from the authors. Section~\ref{sec:method}
-develops the method, Sect.~\ref{sec:impl} its planner integration and GiST
-alternatives, Sect.~\ref{sec:validation} what is proven versus tested,
-Sects.~\ref{sec:bench}--\ref{sec:results} the benchmark and results, and
-Sect.~\ref{sec:tap} a TAP service and the measured crossover.
+paired; everything is measured warm and cold; and one corpus is density-matched to the
+real Gaia DR3 sky while another is real, unresampled Gaia DR3 positions, not a density
+field standing in for them. Sect.~\ref{sec:method} develops the B-tree index,
+Sect.~\ref{sec:region-index} the GiST alternative for stored regions,
+Sect.~\ref{sec:validation} what is proven versus tested, Sect.~\ref{sec:adql} the ADQL
+surface, Sect.~\ref{sec:tests} the benchmark and results (source-like catalogues,
+cross-matches, stored regions), and Sect.~\ref{sec:conclusions} what this does and does
+not establish.
 
-\section{Method}
+\section{The B-tree index}
 \label{sec:method}
 
 \subsection{An equal-area integer key}
@@ -219,53 +221,11 @@ for a polygon); $\epsilon=2\times10^{-13}$\,rad covers accumulated floating-poin
 five orders of magnitude below the leaf cell's resolution. The inside test is tighter,
 using distances to the cell's own corners and edge midpoints directly. A tempting
 outside-test alternative (distance to the chords between corners) is not a bound -- it
-can under-estimate by a factor reaching 64 near order 18, invisible to every test we had
-until it wasn't; Eq.~(\ref{eq:rcell}) avoids it, at a cost of 2.5\% more ranges and no
-measurable time.
+can under-estimate by a factor reaching 159 near order 18, invisible to every test we
+had until it wasn't; Eq.~(\ref{eq:rcell}) avoids it, at a cost of 2.5\% more ranges and
+no measurable time.
 
-\paragraph{Regions as stored objects.}
-\label{sec:moc}
-A footprint is covered by a small number of cells written in the \texttt{NUNIQ} encoding
-of the MOC standard and stored one per row in an ordinary B-tree. The footprints
-containing a given position are those whose cell is one of that position's ancestors, a
-short list of equality lookups; refinement stops when cells become negligible next to the
-region, keeping the ancestor list short.
-
-\texttt{skyregion} is one type internally tagged by kind rather than a family of
-per-shape types, so a single footprint column holds circles and polygons together -- an
-ObsCore \texttt{s\_region} column, say, mixes single-pointing circles with non-trivial
-polygons in the same rows, covered by one function regardless of kind. pgSphere has no
-equivalent: \texttt{scircle} and \texttt{spoly} are separate types, so a mixed-shape
-column needs two columns in its place.
-
-\subsection{The query surface}
-
-The extension exposes ADQL's own vocabulary: types \texttt{skypos} and
-\texttt{skyregion} and functions \texttt{point}, \texttt{circle}, \texttt{box},
-\texttt{polygon}, \texttt{contains}, \texttt{intersects}, \texttt{distance},
-\texttt{area}, \texttt{coord1}, \texttt{coord2} and \texttt{centroid}, so a translator
-emits the standard's spelling rather than a dialect, where pgSphere needs
-\texttt{spoint}/\texttt{scircle}/\texttt{spoly} and Q3C a separate fast path per shape
-with no region type at all; the operator form \texttt{pos <@ circle(\ldots)} is the one
-a planner can answer from an index.
-
-\texttt{skyregion}'s text representation is IVOA STC-S \citep{stc} (\texttt{CIRCLE ICRS
-$\alpha$ $\delta$ $r$} / \texttt{POLYGON ICRS $\ldots$}), the same syntax an ObsCore
-\texttt{s\_region} column already carries, so such a column casts directly from, and
-prints back as, the archive's own text with no translation step. For hand-written SQL
-migrating from Q3C, \texttt{skycell\_radial\_query} and \texttt{skycell\_join} take
-Q3C's own argument lists as a prefix replacement, both reducing to the canonical
-\texttt{skycell\_cone}.
-
-\texttt{skycell} also implements the IVOA UDF registry's epoch-propagation and frame
-functions (\texttt{ivo\_epoch\_prop}, \texttt{ivo\_apply\_pm}, \texttt{ivo\_healpix\_*})
-with the rigorous propagation of the Hipparcos catalogue \citep{hipparcos}, so a
-proper-motion-aware cone search is an indexable cone widened by the largest motion of
-interest, intersected with an exact test on the propagated position -- exercised by
-round-trip tests (Barnard's star to sub-microarcsecond over 16 years) rather than
-benchmarked.
-
-\section{Implementation}
+\subsection{Planner integration and ingestion}
 \label{sec:impl}
 
 The extension is written in C against the PostgreSQL 15+ server API: a geometry layer
@@ -291,72 +251,46 @@ on the histogram, statistics matter more than for a GiST index -- the area guard
 Sect.~\ref{sec:cost} bounds the damage from a stale one, and \texttt{ANALYZE} on the
 10-million-row corpora here takes 0.5--1.4\,s.
 
-\subsection{A GiST opclass family, and the limits of tuning the covering further}
+\section{The region index}
+\label{sec:region-index}
+
+\paragraph{Regions as stored objects.}
+\label{sec:moc}
+A footprint is covered by a small number of cells written in the \texttt{NUNIQ} encoding
+of the MOC standard and stored one per row in an ordinary B-tree. The footprints
+containing a given position are those whose cell is one of that position's ancestors, a
+short list of equality lookups; refinement stops when cells become negligible next to the
+region, keeping the ancestor list short.
+
+\texttt{skyregion} is one type internally tagged by kind rather than a family of
+per-shape types, so a single footprint column holds circles and polygons together -- an
+ObsCore \texttt{s\_region} column, say, mixes single-pointing circles with non-trivial
+polygons in the same rows, covered by one function regardless of kind. pgSphere has no
+equivalent: \texttt{scircle} and \texttt{spoly} are separate types, so a mixed-shape
+column needs two columns in its place.
+
+\subsection{A GiST opclass family for stored regions}
 \label{sec:gist-family}
 
-The B-tree rewrite above is the default, benchmarked in Sects.~\ref{sec:bench}--\ref{sec:tap};
-two further developments asked whether its covering can be sharpened or its one weak
-point (planning cost) removed.
+A \texttt{skyregion} column can carry its own GiST index instead of the B-tree rewrite
+above, serving \texttt{\&\&} and both containment operators directly, keyed either by a
+small number of spherical caps (exact for a circle at any radius, but larger) or a
+plain axis-aligned 3D box. Shrinking the box key from \texttt{float8} (48 bytes) to
+outward-rounded \texttt{float4} (24 bytes, pgSphere's own GiST representation) is sound
+because recheck is already \texttt{true} regardless of key precision: a looser box
+costs false positives the exact test removes, never rows. It is now the default region
+opclass; the multi-cap key remains better for a column mixing very different region
+scales, where box's looseness around a large circle costs more than its smaller key
+saves. Measured against pgSphere's native GiST on isolated single-scale bands, a mixed
+circle/polygon corpus, and the real \texttt{fpr} catalogue across all four region
+strategies: Sect.~\ref{sec:tests-regions} (Table~\ref{tab:gistregion}).
 
-\emph{A GiST opclass for stored regions.} A \texttt{skyregion} column can carry its own
-GiST index instead, serving \texttt{\&\&} and both containment operators without the
-B-tree rewrite, keyed either by a small number of spherical caps (exact for a circle at
-any radius, but larger) or a plain axis-aligned 3D box. On isolated single-scale bands
-(0.05\degr--1\degr), shrinking the box key from \texttt{float8} (48 bytes) to
-outward-rounded \texttt{float4} (24 bytes, pgSphere's own GiST representation) beats
-pgSphere's native GiST by 10--25\% fewer buffers and 10--20\% less time; on a mixed
-circle/polygon corpus the margin widens (pgSphere pays for two index descents per probe
-there, one per region kind), and on the real 50\,000-row \texttt{fpr} catalogue, across
-all four region strategies (Table~\ref{tab:gistregion}), the \texttt{float4} box wins
-every one -- including point containment, the one strategy its own \texttt{float8}
-predecessor still loses to pgSphere on. It is now the default region opclass; the
-multi-cap key remains better for a column mixing very different region scales, where
-box's looseness around a large circle costs more than its smaller key saves.
-
-\begin{table}
-  \caption{Region-opclass wall-clock, real 50\,000-row \texttt{fpr} catalogue, 500
-    probes/strategy: ratio of the \texttt{float4} box (\texttt{skyregion\_box4\_gist\_ops},
-    now default) to pgSphere's native GiST. Below 1: skycell faster.}
-  \label{tab:gistregion}
-  \centering
-  \footnotesize
-  \begin{tabular}{l r}
-    \hline\hline
-    strategy & box4 / pgSphere \\
-    \hline
-    \texttt{\&\&} (overlap) & \textbf{0.12--0.17} \\
-    \texttt{@>}(region,point) & \textbf{0.75--0.93} \\
-    \texttt{@>}(region,region) & \textbf{0.55--0.70} \\
-    \texttt{<@}(region,region) & \textbf{0.26--0.27} \\
-    \hline
-  \end{tabular}
-\end{table}
-
-The same shrink did \emph{not} transfer to a GiST key over \emph{points}
+The same shrink does \emph{not} transfer to a GiST key over \emph{points}
 (\texttt{skypos\_cap4\_gist\_ops}, shrinking only the internal-node cap, since a point's
-leaf stores its position exactly and leaf exactness is load-bearing there): buffers are
-statistically indistinguishable from the unshrunk cap key at every radius from
-1\arcsec\ to 3\degr\ -- no win, unlike the region case, because leaf entries dominate a
-GiST tree's page count and the leaf layer here has nothing to shrink. pgSphere's native
-point GiST still wins by a stable 1.4--2.7$\times$ from 1\arcsec\ through 30\arcmin,
-converging within noise by 1\degr\ -- unchanged by the shrink, since the structural
-reason region leaves could shrink safely (recheck is already \texttt{true} regardless of
-key precision) does not hold for points.
-
-\emph{Tuning the covering's own search.} Trying one or more orders finer than
-Eq.~(\ref{eq:sstar})'s closed form and keeping whichever scores lowest
-(\texttt{skycell.probe\_orders}, off by default) does pick a measurably tighter
-covering -- worth 30--48\% in \emph{execution} time at several radii. Measured in
-\emph{total} (planning plus execution) time against query centres that do not repeat --
-the realistic case for a service answering different users' cones, where a per-backend
-cache cannot amortise the extra enumeration -- the gain reverses at exactly the radii
-it looked largest, since trying a finer order costs roughly four times the cell
-classifications already spent, paid at plan time on every query. We found and fixed a
-latent bug this exposed (the probe loop's own cost accounting shared a field with an
-unrelated guard in the general descent, so tuning one silently detuned the other) but
-could not support promoting the tuning itself on the evidence in hand -- a caution worth
-recording for any cost-based index: a win in execution time alone is not yet a win until
-the cost of deciding is counted against it.
+leaf stores its position exactly and leaf exactness is load-bearing there): leaf
+entries dominate a GiST tree's page count, and the leaf layer here has nothing to
+shrink, so no win results -- the structural reason the region shrink is safe (recheck
+already \texttt{true}) does not hold for points. Numbers in Sect.~\ref{sec:tests-regions}.
 
 \section{What is proven, and what is tested}
 \label{sec:validation}
@@ -400,8 +334,66 @@ require every indexed answer to equal a sequential scan with the exact predicate
 cones, 60 polygons, both join forms, MOC lookup; and the ADQL surface, index-plan
 presence, epoch propagation and frame conversions).
 
-\section{Benchmark}
-\label{sec:bench}
+\section{The ADQL surface}
+\label{sec:adql}
+
+The extension exposes ADQL's own vocabulary: types \texttt{skypos} and
+\texttt{skyregion} and functions \texttt{point}, \texttt{circle}, \texttt{box},
+\texttt{polygon}, \texttt{contains}, \texttt{intersects}, \texttt{distance},
+\texttt{area}, \texttt{coord1}, \texttt{coord2} and \texttt{centroid}, so a translator
+emits the standard's spelling rather than a dialect, where pgSphere needs
+\texttt{spoint}/\texttt{scircle}/\texttt{spoly} and Q3C a separate fast path per shape
+with no region type at all; the operator form \texttt{pos <@ circle(\ldots)} is the one
+a planner can answer from an index. Table~\ref{tab:ops} sets \texttt{skycell} against
+the pgSphere-plus-Q3C pair for the constructs where they differ most.
+
+\texttt{skyregion}'s text representation is IVOA STC-S \citep{stc} (\texttt{CIRCLE ICRS
+$\alpha$ $\delta$ $r$} / \texttt{POLYGON ICRS $\ldots$}), the same syntax an ObsCore
+\texttt{s\_region} column already carries, so such a column casts directly from, and
+prints back as, the archive's own text with no translation step. For hand-written SQL
+migrating from Q3C, \texttt{skycell\_radial\_query} and \texttt{skycell\_join} take
+Q3C's own argument lists as a prefix replacement, both reducing to the canonical
+\texttt{skycell\_cone}.
+
+\texttt{skycell} also implements the IVOA UDF registry's epoch-propagation and frame
+functions (\texttt{ivo\_epoch\_prop}, \texttt{ivo\_apply\_pm}, \texttt{ivo\_healpix\_*})
+with the rigorous propagation of the Hipparcos catalogue \citep{hipparcos}, so a
+proper-motion-aware cone search is an indexable cone widened by the largest motion of
+interest, intersected with an exact test on the propagated position -- exercised by
+round-trip tests (Barnard's star to sub-microarcsecond over 16 years) rather than
+benchmarked.
+
+\begin{table}
+  \caption{What a translator emits, for the ADQL constructs where the pgSphere-plus-Q3C
+    pair and \texttt{skycell} differ most (the remaining surface -- \texttt{BOX},
+    \texttt{DISTANCE}, \texttt{AREA}/\texttt{CENTROID}, epoch propagation -- translates
+    the same way and is omitted for space). \texttt{skycell} uses ADQL's own spellings
+    throughout; pgSphere needs region types and Q3C a separate fast path per shape.}
+  \label{tab:ops}
+  \centering
+  \footnotesize
+  \begin{tabular}{@{}p{0.2\columnwidth} p{0.38\columnwidth} p{0.24\columnwidth}@{}}
+    \hline\hline
+    ADQL & pgSphere $+$ Q3C & skycell \\
+    \hline
+    \texttt{POINT}\allowbreak/\allowbreak\texttt{CIRCLE}\allowbreak/\allowbreak\texttt{POLYGON} &
+      \texttt{spoint}\allowbreak/\allowbreak\texttt{scircle}\allowbreak/\allowbreak\texttt{spoly} &
+      \texttt{point}\allowbreak/\allowbreak\texttt{circle}\allowbreak/\allowbreak\texttt{polygon} \\[2pt]
+    \texttt{CONTAINS(}\allowbreak\texttt{POINT,}\allowbreak\ \texttt{CIRCLE)} &
+      \texttt{q3c\_radial\_query} \emph{or}\allowbreak\ \texttt{pos <@ scircle} &
+      \texttt{point <@ circle} \\[2pt]
+    \texttt{INTERSECTS(}\allowbreak\texttt{r$_1$,}\allowbreak\texttt{r$_2$)} &
+      \texttt{r$_1$ \&\& r$_2$} (no Q3C region type) &
+      \texttt{r$_1$ \&\& r$_2$} \\[2pt]
+    cross-match &
+      \texttt{q3c\_join}; pgSphere 2.5--3.3$\times$ slower (Sect.~\ref{sec:xmatch}) &
+      \texttt{skycell\_cone}, or \texttt{\_ranges()} in a \texttt{LATERAL} \\[2pt]
+    \hline
+  \end{tabular}
+\end{table}
+
+\section{Tests}
+\label{sec:tests}
 
 \subsection{Three corpora}
 \label{sec:corpora}
@@ -476,14 +468,9 @@ travel -- and the three extensions are compared as configured here: a different 
 formulation or pgSphere index configuration could move their numbers (Sect.~\ref{sec:cones}
 reports one such effect dominating Q3C's small-cone results).
 
-\section{Results}
-\label{sec:results}
+\subsection{Source-like catalogues}
 
-All three methods return identical row counts on every query. In the cross-matches
-pgSphere returns one or two more pairs out of $\sim$100\,000, consistent with its
-$10^{-9}$\,rad comparison tolerance counting sources exactly on the rim.
-
-\subsection{Cone searches}
+\paragraph{Cone searches.}
 \label{sec:cones}
 
 Table~\ref{tab:cones} and Fig.~\ref{fig:benchmark}a give the primary result: paired
@@ -503,19 +490,53 @@ ratios with intervals, on both corpora, warm and cold.
 \end{figure*}
 
 Warm, \texttt{skycell} is faster than pgSphere by 6--11\% for radii from 1\arcsec\ to
-1\arcmin\ and by 31--37\% at 3\degr, on both corpora. Between 6\arcmin\ and 1\degr\ the
-two are, on the designed corpus, indistinguishable; on the Gaia corpus skycell is 3\%
-\emph{slower} at 6\arcmin\ and 8--15\% faster at 30\arcmin\ and 1\degr.
+1\arcmin\ and by 31--37\% at 3\degr, on the two synthetic corpora. Between 6\arcmin\ and
+1\degr\ the two are, on the designed corpus, indistinguishable; on the resampled Gaia
+corpus skycell is 3\% \emph{slower} at 6\arcmin\ and 8--15\% faster at 30\arcmin\ and
+1\degr.
 \label{sec:phase}
 This matters more than it sounds: measuring one method's whole grid then the next
 instead gives ratios of 0.69--0.87 below 30\arcmin\ where the paired protocol finds
 0.89--1.03, since the phase-ordered arrangement flatters whichever method runs later --
 here, \texttt{skycell}. The paired number is the one we stand behind.
 
-Cold, skycell is faster at every radius on both corpora, by 5\% at 1\arcmin\ and by a
-factor 2--2.5 at 30\arcmin\ and beyond, because it touches a third of pgSphere's buffer
-pages at 1\degr\ (55 against 154) -- a few microseconds of memory traffic when those
-pages are warm, the whole cost of the query when they are not.
+Cold, skycell is faster at every radius on both synthetic corpora, by 5\% at 1\arcmin\
+and by a factor 2--2.5 at 30\arcmin\ and beyond, because it touches a third of
+pgSphere's buffer pages at 1\degr\ (55 against 154) -- a few microseconds of memory
+traffic when those pages are warm, the whole cost of the query when they are not.
+
+\paragraph{On real Gaia DR3 positions, warm, the small-cone advantage reverses.} The
+resampled corpus places positions uniformly within each 0.11\degr\ map cell; the real
+one keeps every scale of clustering the map cannot see. On 10 million real DR3
+positions (Table~\ref{tab:cones}'s rightmost column), skycell is 12--45\% \emph{slower}
+than pgSphere from 1\arcsec\ to 30\arcmin, ties at 1\degr, and is 27\% faster at
+3\degr\ -- the one radius where the resampled corpus's number still holds. Buffers
+rule out the data itself as the cause: skycell touches \emph{fewer} pages than
+pgSphere at every radius (0.74 of pgSphere's at 1\arcsec, 0.27 at 1\degr, tighter than
+the resampled corpus's own 0.36 at 1\degr), and execution time alone is faster or
+level everywhere (0.59--0.99). The whole deficit is skycell's own planning -- the
+covering computation and rewrite, 0.017\,ms per query at 1\arcsec\ rising to 0.25\,ms
+at 3\degr\ -- measured against pgSphere answering a small cone in about 0.05\,ms total,
+so a few hundredths of a millisecond of planning is not lost in the noise the way it is
+at larger radii. This is a genuine limitation, not an artefact of the resampled
+corpus's own structure: real sub-cell clustering does not cost skycell extra rows
+fetched, it costs the time spent deciding how to cut the cone before any row is
+touched, and that cost does not scale down with the query.
+Cold, the picture divides by radius (Table~\ref{tab:cones}, last column). Here the
+two methods read separate copies of the same rows, so neither warms the other's pages;
+every centre is new and kept apart from every other; and the server is restarted before
+each method's pass at each radius. From 30\arcmin\ up \texttt{skycell} is faster, 0.89
+at 30\arcmin\ and 0.62--0.65 at 1\degr\ and 3\degr, because it reads 0.5--0.7 of
+pgSphere's pages and those reads now dominate. Below that the verdict is mixed (1.06 at
+1\arcsec, 0.91 at 10\arcsec, 1.21 at 1\arcmin, level at 6\arcmin): a first-touch query
+there spends 0.2--0.4\,ms reading 2--6 pages, which swamps the 0.03\,ms planning
+difference that decides the warm result, and \texttt{skycell}'s one fewer page read is
+not reliably worth more than that difference. These reads cost about 0.08\,ms each: the
+container's page cache was dropped, but a cache on the host beneath it could not be, so
+this is cold for PostgreSQL and the virtual machine, not for the disk. With true disk
+latency each page saved would count for more, and the small-radius ratios should move
+towards \texttt{skycell}'s page ratio (0.7--0.9 there) -- expected, not measured here.
+\label{sec:realcones}
 
 \label{sec:scope}
 Against Q3C, \texttt{skycell} is faster by a factor 4--50, a comparison of
@@ -536,22 +557,30 @@ than biasing the ratios.
     not distinguishable. $n$: distinct queries at that radius, each answered five
     times per method (warm) or once (cold), all three methods randomized per trial
     (the skycell/Q3C ratio, 0.02--0.75 depending on radius and cache regime, is given
-    in the text, Sect.~\ref{sec:scope}).}
+    in the text, Sect.~\ref{sec:scope}). \emph{Real}: 10 million real Gaia DR3
+    positions (\texttt{random\_index} $<10^7$), its own centre draw at the same radii
+    and counts, total time. Warm: one shared heap, per-method warm-up. Cold: one table
+    per method, fresh centres, server restarted before each method's pass at each
+    radius, first touch only; cold for PostgreSQL and the virtual machine but not for the
+    host's own cache. Sect.~\ref{sec:realcones} explains why these columns move against
+    the other two.}
   \label{tab:cones}
   \centering
-  \begin{tabular}{l r cc cc}
+  \footnotesize
+  \setlength{\tabcolsep}{4pt}
+  \begin{tabular}{l r cc cc cc}
     \hline\hline
-    & & \multicolumn{2}{c}{designed corpus} & \multicolumn{2}{c}{Gaia corpus} \\
-    \cline{3-4}\cline{5-6}
-    radius & $n$ & warm & cold & warm & cold \\
+    & & \multicolumn{2}{c}{designed corpus} & \multicolumn{2}{c}{Gaia corpus (resampled)} & \multicolumn{2}{c}{real corpus} \\
+    \cline{3-4}\cline{5-6}\cline{7-8}
+    radius & $n$ & warm & cold & warm & cold & warm & cold \\
     \hline
-    1\arcsec  & 400 & \textbf{0.90} [0.88, 0.93] & \textbf{0.72} [0.68, 0.76] & \textbf{0.89} [0.87, 0.92] & \textbf{0.78} [0.72, 0.85] \\
-    10\arcsec & 400 & \textbf{0.93} [0.91, 0.96] & \textbf{0.88} [0.84, 0.92] & \textbf{0.90} [0.88, 0.91] & \textbf{0.80} [0.75, 0.86] \\
-    1\arcmin  & 300 & \textbf{0.94} [0.93, 0.97] & \textbf{0.95} [0.87, 1.00] & \textbf{0.93} [0.90, 0.96] & 0.95 [0.90, 1.01] \\
-    6\arcmin  & 200 & 1.00 [0.98, 1.06] & \textbf{0.85} [0.77, 0.94] & \emph{1.03} [1.00, 1.08] & \textbf{0.90} [0.83, 0.96] \\
-    30\arcmin & 100 & 0.98 [0.91, 1.06] & \textbf{0.68} [0.59, 0.79] & \textbf{0.92} [0.85, 0.98] & \textbf{0.57} [0.50, 0.65] \\
-    1\degr    &  40 & 0.92 [0.83, 1.00] & \textbf{0.57} [0.47, 0.62] & \textbf{0.85} [0.72, 0.96] & \textbf{0.53} [0.41, 0.59] \\
-    3\degr    &  16 & \textbf{0.63} [0.56, 0.76] & \textbf{0.39} [0.26, 0.62] & \textbf{0.69} [0.53, 0.86] & \textbf{0.40} [0.22, 0.58] \\
+    1\arcsec  & 400 & \textbf{0.90} [0.88, 0.93] & \textbf{0.72} [0.68, 0.76] & \textbf{0.89} [0.87, 0.92] & \textbf{0.78} [0.72, 0.85] & \emph{1.12} [1.10, 1.16] & \emph{1.06} [1.01, 1.11] \\
+    10\arcsec & 400 & \textbf{0.93} [0.91, 0.96] & \textbf{0.88} [0.84, 0.92] & \textbf{0.90} [0.88, 0.91] & \textbf{0.80} [0.75, 0.86] & \emph{1.16} [1.14, 1.19] & \textbf{0.91} [0.87, 0.95] \\
+    1\arcmin  & 300 & \textbf{0.94} [0.93, 0.97] & \textbf{0.95} [0.87, 1.00] & \textbf{0.93} [0.90, 0.96] & 0.95 [0.90, 1.01] & \emph{1.23} [1.19, 1.26] & \emph{1.21} [1.11, 1.27] \\
+    6\arcmin  & 200 & 1.00 [0.98, 1.06] & \textbf{0.85} [0.77, 0.94] & \emph{1.03} [1.00, 1.08] & \textbf{0.90} [0.83, 0.96] & \emph{1.45} [1.38, 1.49] & 0.95 [0.91, 1.04] \\
+    30\arcmin & 100 & 0.98 [0.91, 1.06] & \textbf{0.68} [0.59, 0.79] & \textbf{0.92} [0.85, 0.98] & \textbf{0.57} [0.50, 0.65] & \emph{1.29} [1.12, 1.47] & \textbf{0.89} [0.81, 0.98] \\
+    1\degr    &  40 & 0.92 [0.83, 1.00] & \textbf{0.57} [0.47, 0.62] & \textbf{0.85} [0.72, 0.96] & \textbf{0.53} [0.41, 0.59] & 1.00 [0.89, 1.26] & \textbf{0.65} [0.58, 0.70] \\
+    3\degr    &  16 & \textbf{0.63} [0.56, 0.76] & \textbf{0.39} [0.26, 0.62] & \textbf{0.69} [0.53, 0.86] & \textbf{0.40} [0.22, 0.58] & \textbf{0.73} [0.62, 0.85] & \textbf{0.62} [0.49, 0.82] \\
     \hline
   \end{tabular}
 \end{table*}
@@ -596,7 +625,7 @@ is.
   \end{tabular}
 \end{table}
 
-\subsection{Index size, build time, and what they cost at Gaia's scale}
+\paragraph{Index size, build time, and what they cost at Gaia's scale.}
 \label{sec:scale-memory}
 
 Index size and build time are operational numbers worth carrying to the scale an
@@ -645,7 +674,140 @@ resident. Since the two B-trees are the same size, the real saving is not needin
 geometry index at all, which rests on \texttt{skycell} answering the region queries
 pgSphere is kept for (Sects.~\ref{sec:cones}, \ref{sec:otherops}).
 
-\subsection{Cross-matching}
+\paragraph{The cost model: its parameter, its input, and what it is worth.}
+\label{sec:calib}
+
+Equation~(\ref{eq:cost})'s one free parameter, $c_{\rm range}$, need not be a parameter
+at all: it is a ratio of two costs PostgreSQL already models, one more index range
+(a B-tree descent) against one false-positive row (its index entry, heap tuple, exact
+predicate, and heap page amortised over the rows sharing it):
+\begin{equation}
+  c_{\rm range} = \frac{(\lceil\log_2 N\rceil + H + 1)\,50\,c_{\rm op}}
+    {c_{\rm tuple} + c_{\rm itup} + k\,c_{\rm op} + c_{\rm page}/n_{\rm pp}},
+  \label{eq:crange}
+\end{equation}
+with $n_{\rm pp}=\mathrm{reltuples}/\mathrm{relpages}$. Every input is already at hand, so
+\texttt{skycell.range\_cost} defaults to evaluating it per relation (116 on the
+catalogues; 93 on a wider-row ObsCore relation). Placed in the same trials as the fixed
+constant it replaces, the two are indistinguishable, since the cost curve is flat
+(sweeping four decades moves the median time under 25\% between 3 and 300): the
+derivation buys not speed but that the parameter stops being a number someone has to
+choose, and the order it picks is likewise close to optimal (about 3\% against one order
+finer at 6\arcmin) for the same reason.
+
+\label{sec:estimator}
+The model's input, $\hat\rho$ from Eq.~(\ref{eq:rho}), was called unbiased in an earlier
+version of this work -- true of positions resampled from a density map with no structure
+below $0.11\degr$, but not of real Gaia DR3 positions. Table~\ref{tab:estimator} compares
+$\hat\rho$ with $\rho$ counted from the same relation: within 10\% at Baade's Window
+and a factor 1.6 at the Galactic pole (where the sample holds a few dozen rows),
+\emph{low by a factor 10--100} in a globular cluster core, \emph{high by a factor 3.7}
+at the Galactic centre, as the histogram resolves a cluster while a query sits inside
+it and averages it away once the query is larger (the failure Sect.~\ref{sec:density}
+predicts, now measured on real positions). The estimate also moves between
+\texttt{ANALYZE} runs, which sample the relation afresh: at 47~Tuc the median ranges
+over 0.01--0.08 across ten. The consequence is smaller than the error: since
+$s^*\propto\sqrt\rho$, an order of magnitude in $\rho$ is a factor three in cell size,
+and the cost curve is flat across much of that -- the covering chosen in a cluster
+core is within 0.96--1.55 of the best fixed order (1.76 in a sample that put 47~Tuc a
+hundredfold low), against 0.96--1.25 where the estimate is accurate, and against
+243--830 for a fixed order chosen badly. The error costs something in cluster cores at
+intermediate radii; it does not cost a wrong covering. The estimator should be judged
+by the decision it produces, not the number it reports.
+
+\begin{table}
+  \caption{The density estimate against the truth, real Gaia DR3 positions: $\hat\rho$
+    is what the cost model reads, $\rho$ counted from the same relation, both in
+    rows\,sr$^{-1}$, over four decades of surface density, radii $0.01\degr$--$1\degr$.
+    $\hat\rho/\rho$: median over radii, then median over ten \texttt{ANALYZE} samples;
+    \emph{samples}: spread of that median across them; \emph{range}: over all radii and
+    samples. \texttt{bench/29\_estimator.sql},
+    PostgreSQL 16.}
+  \label{tab:estimator}
+  \centering
+  \footnotesize
+  \begin{tabular}{l rrr}
+    \hline\hline
+    field & $\hat\rho/\rho$ & samples & range \\
+    \hline
+    $\omega$~Cen           & \textbf{0.07} & 0.06--0.08 & 0.05--0.56 \\
+    47~Tuc                 & \textbf{0.03} & 0.01--0.08 & 0.00--0.94 \\
+    LMC                    & 0.69 & 0.42--0.85 & 0.22--1.16 \\
+    Baade's Window         & 0.96 & 0.92--0.99 & 0.47--1.14 \\
+    Galactic pole          & 1.31 & 1.18--1.58 & 0.49--1.80 \\
+    Galactic centre        & \textbf{3.69} & 3.48--3.83 & 1.99--5.47 \\
+    \hline
+  \end{tabular}
+\end{table}
+
+The comparison with pgSphere confounds three things, separated on the real Gaia corpus:
+\emph{heap clustering} is a large absolute effect but almost no differential one (ratio
+0.64 clustered against 0.60 unclustered at $1\degr$); \emph{adaptive resolution} is worth
+a great deal (against every fixed order 4--13 the penalty for choosing badly is
+243--830$\times$, while the cost model lands within 1.02--1.58 of the best without
+knowing the answer); and \emph{the index representation} is isolated by comparing
+against Q3C instead, both B-trees over an \texttt{int8} key differing only in covering
+strategy (Sect.~\ref{sec:cones}, with the caveat of Sect.~\ref{sec:scope}).
+\label{sec:ablation}
+
+\label{sec:tap}
+
+
+\paragraph{The service-level A/B, and where the crossover is.} A benchmark of index
+operations is not a benchmark of an archive. We ran the same build inside
+\texttt{egernia} \citep{egernia}, a TAP 1.1 server, against its published 500\,096-row
+ObsCore corpus: one database holding both indexes, two otherwise identical service
+processes differing only in how they translate \texttt{CONTAINS}, interleaved over six
+query classes at 1, 8 and 32 concurrent clients. Both targets pass the conformance and
+cross-server agreement gates on all eleven portable classes, identical rows through
+both, and the performance result is a tie (throughput ratios 0.96--1.06) although at the
+database level \texttt{skycell} is 1.2--1.45 times \emph{slower} per query: a cone over
+half a million rows costs a fraction of a millisecond either way against roughly 10\,ms
+of CPU in the service's own Python, so the database cannot move throughput. That
+explanation predicts a crossover at larger relations, checked by building the same
+ObsCore-shaped relation (observations in groups of 128 sharing a field centre, clustered
+by collection and field) at three sizes (Table~\ref{tab:crossover}): for the cone with
+catalogue cuts (Q07) and the degree-scale cone (Q06), \texttt{skycell} pulls further
+ahead as the relation grows; the empty cone (Q12) is level. The small-cone class (Q05) we
+cannot pin down -- 2.16 times slower immediately after the build (the table), level
+(0.94) once thoroughly warm, not reproducible on this host to better than that factor of
+two -- but the deficit is at least localised to execution (0.324\,ms against 0.161)
+rather than planning.
+
+\begin{table}
+  \caption{Crossover on an ObsCore-shaped relation, randomized paired trials (30
+    centres, 3 repetitions, each method warmed on its own query first): total query
+    time as the ratio skycell/pgSphere, with buffer pages at $10^7$ rows. Q05:
+    0.15\degr\ cone; Q06: 2\degr; Q07: 0.5\degr\ with calibration/time cuts; Q12: an
+    empty 0.7\arcsec\ cone (Q05 is regime-dependent, text).}
+  \label{tab:crossover}
+  \centering
+  \footnotesize
+  \begin{tabular}{l rrr rr}
+    \hline\hline
+    & \multicolumn{3}{c}{skycell / pgSphere} & \multicolumn{2}{c}{buffers at $10^7$} \\
+    \cline{2-4}\cline{5-6}
+    class & $5\times10^5$ & $2\times10^6$ & $10^7$ & pgSphere & skycell \\
+    \hline
+    Q05 & 1.84 & 1.81 & 2.16 &  282 & \textbf{152} \\
+    Q06 & \textbf{0.92} & \textbf{0.87} & \textbf{0.67} & 6052 & \textbf{830} \\
+    Q07 & \textbf{0.84} & \textbf{0.76} & \textbf{0.71} &  712 & \textbf{182} \\
+    Q12 & 1.13 & 1.07 & 1.00 &    5 & 6 \\
+    \hline
+  \end{tabular}
+\end{table}
+
+\paragraph{When the index no longer fits in memory.} Tested directly in a 3\,GiB
+container (768\,MB shared buffers) holding a 22\,GB, 20.5-million-row ObsCore-shaped
+relation (GiST index $1.51\times$ the buffer pool, \texttt{skycell} $0.57\times$):
+\texttt{skycell} answers 4.2--4.8 times faster over 3500 uniform 2\degr\ cones, serving
+53\% of its index accesses from the pool against pgSphere's 9\%. The 22\,GB heap takes
+most of the pool regardless, so neither index is fully resident -- this measures a
+smaller index winning a contested pool -- and interleaving both translations in one
+pass instead of separate phases (each then leaving the heap warm for the other) puts
+the gap at $1.6\times$ rather than $4.2$.
+
+\subsection{Crossmatches}
 \label{sec:xmatch}
 \label{sec:otherops}
 
@@ -714,130 +876,46 @@ in 134 of 135 queries. Better estimates are demonstrated, better plans are not: 
 accurate estimate is insurance against a query we did not write, and we have not shown
 that insurance paying off on one we did.
 
-\subsection{The cost model: its parameter, its input, and what it is worth}
-\label{sec:calib}
+\subsection{Regions}
+\label{sec:tests-regions}
 
-Equation~(\ref{eq:cost})'s one free parameter, $c_{\rm range}$, need not be a parameter
-at all: it is a ratio of two costs PostgreSQL already models, one more index range
-(a B-tree descent) against one false-positive row (its index entry, heap tuple, exact
-predicate, and heap page amortised over the rows sharing it):
-\begin{equation}
-  c_{\rm range} = \frac{(\lceil\log_2 N\rceil + H + 1)\,50\,c_{\rm op}}
-    {c_{\rm tuple} + c_{\rm itup} + k\,c_{\rm op} + c_{\rm page}/n_{\rm pp}},
-  \label{eq:crange}
-\end{equation}
-with $n_{\rm pp}=\mathrm{reltuples}/\mathrm{relpages}$. Every input is already at hand, so
-\texttt{skycell.range\_cost} defaults to evaluating it per relation (116 on the
-catalogues; 93 on a wider-row ObsCore relation). Placed in the same trials as the fixed
-constant it replaces, the two are indistinguishable, since the cost curve is flat
-(sweeping four decades moves the median time under 25\% between 3 and 300): the
-derivation buys not speed but that the parameter stops being a number someone has to
-choose, and the order it picks is likewise close to optimal (about 3\% against one order
-finer at 6\arcmin) for the same reason.
-
-\label{sec:estimator}
-The model's input, $\hat\rho$ from Eq.~(\ref{eq:rho}), was called unbiased in an earlier
-version of this work -- true of positions resampled from a density map with no structure
-below $0.11\degr$, but not of real Gaia DR3 positions. Table~\ref{tab:estimator} compares
-$\hat\rho$ with $\rho$ counted from the same relation: good to about $\pm25\%$ on
-ordinary sky, \emph{low by a factor 8--12} in a globular cluster core, \emph{high by a
-factor 3.7} at the Galactic centre, as the histogram resolves a cluster while a query
-sits inside it and averages it away once the query is larger (the failure
-Sect.~\ref{sec:density} predicts, now measured on real positions). The consequence is
-smaller than the error suggests: since $s^*\propto\sqrt\rho$, an order of magnitude in
-$\rho$ is a factor three in cell size, and the cost curve is flat across that -- the
-covering chosen in a cluster core, wrong by an order of magnitude, is within 1.09--1.43
-of the best fixed order, no worse than where the estimate is accurate. The estimator
-should be judged by the decision it produces, not the number it reports.
+On isolated single-scale bands (0.05\degr--1\degr), the \texttt{float4} box key
+(\texttt{skyregion\_box4\_gist\_ops}, Sect.~\ref{sec:gist-family}) beats pgSphere's
+native GiST by 10--25\% fewer buffers and 10--20\% less time; on a mixed circle/polygon
+corpus the margin widens (pgSphere pays for two index descents per probe there, one per
+region kind), and on the real 50\,000-row \texttt{fpr} catalogue, across all four
+region strategies (Table~\ref{tab:gistregion}), the \texttt{float4} box wins every one
+-- including point containment, the one strategy its own \texttt{float8} predecessor
+still loses to pgSphere on.
 
 \begin{table}
-  \caption{The density estimate against the truth, real Gaia DR3 positions: $\hat\rho$
-    is what the cost model reads, $\rho$ counted from the same relation, both in
-    rows\,sr$^{-1}$, over four decades of surface density, radii $0.01\degr$--$1\degr$.}
-  \label{tab:estimator}
+  \caption{Region-opclass wall-clock, real 50\,000-row \texttt{fpr} catalogue, 500
+    probes/strategy: ratio of the \texttt{float4} box (\texttt{skyregion\_box4\_gist\_ops},
+    now default) to pgSphere's native GiST. Below 1: skycell faster.}
+  \label{tab:gistregion}
   \centering
   \footnotesize
-  \begin{tabular}{l rr}
+  \begin{tabular}{l r}
     \hline\hline
-    field & median $\hat\rho/\rho$ & range \\
+    strategy & box4 / pgSphere \\
     \hline
-    $\omega$~Cen           & \textbf{0.08} & 0.05--0.51 \\
-    47~Tuc                 & \textbf{0.12} & 0.06--0.93 \\
-    Baade's Window         & 0.80 & 0.68--1.01 \\
-    Galactic centre        & \textbf{3.74} & 2.53--3.95 \\
+    \texttt{\&\&} (overlap) & \textbf{0.12--0.17} \\
+    \texttt{@>}(region,point) & \textbf{0.75--0.93} \\
+    \texttt{@>}(region,region) & \textbf{0.55--0.70} \\
+    \texttt{<@}(region,region) & \textbf{0.26--0.27} \\
     \hline
   \end{tabular}
 \end{table}
 
-The comparison with pgSphere confounds three things, separated on the real Gaia corpus:
-\emph{heap clustering} is a large absolute effect but almost no differential one (ratio
-0.64 clustered against 0.60 unclustered at $1\degr$); \emph{adaptive resolution} is worth
-a great deal (against every fixed order 4--13 the penalty for choosing badly is
-243--830$\times$, while the cost model lands within 1.02--1.58 of the best without
-knowing the answer); and \emph{the index representation} is isolated by comparing
-against Q3C instead, both B-trees over an \texttt{int8} key differing only in covering
-strategy (Sect.~\ref{sec:cones}, with the caveat of Sect.~\ref{sec:scope}).
-\label{sec:ablation}
+For points, the same shrink buys nothing: buffers are statistically indistinguishable
+from the unshrunk cap key at every radius from 1\arcsec\ to 3\degr, and pgSphere's
+native point GiST still wins by a stable 1.4--2.7$\times$ from 1\arcsec\ through
+30\arcmin, converging within noise by 1\degr\ -- unchanged by the shrink, since the
+structural reason region leaves could shrink safely does not hold for points
+(Sect.~\ref{sec:gist-family}).
 
-\section{Inside a TAP service, and where the crossover is}
-\label{sec:tap}
-
-\paragraph{The service-level A/B, and where the crossover is.} A benchmark of index
-operations is not a benchmark of an archive. We ran the same build inside
-\texttt{egernia} \citep{egernia}, a TAP 1.1 server, against its published 500\,096-row
-ObsCore corpus: one database holding both indexes, two otherwise identical service
-processes differing only in how they translate \texttt{CONTAINS}, interleaved over six
-query classes at 1, 8 and 32 concurrent clients. Both targets pass the conformance and
-cross-server agreement gates on all eleven portable classes, identical rows through
-both, and the performance result is a tie (throughput ratios 0.96--1.06) although at the
-database level \texttt{skycell} is 1.2--1.45 times \emph{slower} per query: a cone over
-half a million rows costs a fraction of a millisecond either way against roughly 10\,ms
-of CPU in the service's own Python, so the database cannot move throughput. That
-explanation predicts a crossover at larger relations, checked by building the same
-ObsCore-shaped relation (observations in groups of 128 sharing a field centre, clustered
-by collection and field) at three sizes (Table~\ref{tab:crossover}): for the cone with
-catalogue cuts (Q07) and the degree-scale cone (Q06), \texttt{skycell} pulls further
-ahead as the relation grows; the empty cone (Q12) is level. The small-cone class (Q05) we
-cannot pin down -- 2.16 times slower immediately after the build (the table), level
-(0.94) once thoroughly warm, not reproducible on this host to better than that factor of
-two -- but the deficit is at least localised to execution (0.324\,ms against 0.161)
-rather than planning.
-
-\begin{table}
-  \caption{Crossover on an ObsCore-shaped relation, randomized paired trials (30
-    centres, 3 repetitions, each method warmed on its own query first): total query
-    time as the ratio skycell/pgSphere, with buffer pages at $10^7$ rows. Q05:
-    0.15\degr\ cone; Q06: 2\degr; Q07: 0.5\degr\ with calibration/time cuts; Q12: an
-    empty 0.7\arcsec\ cone (Q05 is regime-dependent, text).}
-  \label{tab:crossover}
-  \centering
-  \footnotesize
-  \begin{tabular}{l rrr rr}
-    \hline\hline
-    & \multicolumn{3}{c}{skycell / pgSphere} & \multicolumn{2}{c}{buffers at $10^7$} \\
-    \cline{2-4}\cline{5-6}
-    class & $5\times10^5$ & $2\times10^6$ & $10^7$ & pgSphere & skycell \\
-    \hline
-    Q05 & 1.84 & 1.81 & 2.16 &  282 & \textbf{152} \\
-    Q06 & \textbf{0.92} & \textbf{0.87} & \textbf{0.67} & 6052 & \textbf{830} \\
-    Q07 & \textbf{0.84} & \textbf{0.76} & \textbf{0.71} &  712 & \textbf{182} \\
-    Q12 & 1.13 & 1.07 & 1.00 &    5 & 6 \\
-    \hline
-  \end{tabular}
-\end{table}
-
-\paragraph{When the index no longer fits in memory.} Tested directly in a 3\,GiB
-container (768\,MB shared buffers) holding a 22\,GB, 20.5-million-row ObsCore-shaped
-relation (GiST index $1.51\times$ the buffer pool, \texttt{skycell} $0.57\times$):
-\texttt{skycell} answers 4.2--4.8 times faster over 3500 uniform 2\degr\ cones, serving
-53\% of its index accesses from the pool against pgSphere's 9\%. The 22\,GB heap takes
-most of the pool regardless, so neither index is fully resident -- this measures a
-smaller index winning a contested pool -- and interleaving both translations in one
-pass instead of separate phases (each then leaving the heap warm for the other) puts
-the gap at $1.6\times$ rather than $4.2$.
-
-\section{Discussion}
-\label{sec:discussion}
+\section{Conclusions}
+\label{sec:conclusions}
 
 The advantage is not universal: warm, \texttt{skycell} is indistinguishable from
 pgSphere between 6\arcmin\ and 1\degr\ (Sect.~\ref{sec:cones}); it is slower on a
@@ -845,19 +923,43 @@ pgSphere between 6\arcmin\ and 1\degr\ (Sect.~\ref{sec:cones}); it is slower on 
 class -- a row we do not claim. Better row estimates did not, on the join shapes we
 wrote, produce better plans. Every number comes from one machine and one storage device,
 with a density field standing in for real positions except where
-Sects.~\ref{sec:xmatch} and~\ref{sec:estimator} say otherwise.
+Sects.~\ref{sec:xmatch},~\ref{sec:estimator} and the real-position paragraphs
+of~\ref{sec:cones} say otherwise; on those real positions the small-cone
+advantage is a clean loss warm and a mixed result cold, not the win the other
+two corpora show.
 
 What remains expensive is planning: a covering costs 0.015--0.12\,ms even cached against
 0.006--0.008\,ms for a GiST predicate needing no such step, the whole of
-\texttt{skycell}'s disadvantage at 6\arcmin. Two attempts to remove this did not pay
-off. An SP-GiST class over the cell hierarchy, tried to remove it architecturally, costs
-correctness margin elsewhere (the duplicate-position tolerance shrinks by roughly an
-order of magnitude), so it stays exploratory. Letting the covering search try finer
-orders (Sect.~\ref{sec:gist-family}) picks a tighter covering and looks like a win in
-execution time alone, but the extra enumeration's own planning cost, paid on every
-non-repeating query, erases or reverses it at exactly the radii it looked largest -- a
-caution about measuring a cost-based index's own overhead, not only what it saves. An
-index descent avoiding planning cost altogether remains open.
+\texttt{skycell}'s disadvantage at 6\arcmin. Three attempts to cut this were tried;
+two did not pay off. An SP-GiST class over the cell hierarchy, tried to remove it
+architecturally, costs correctness margin elsewhere (the duplicate-position tolerance
+shrinks by roughly an order of magnitude), so it stays exploratory. Letting the
+covering search try one or more orders finer than Eq.~(\ref{eq:sstar})'s closed form
+and keeping whichever scores lowest (\texttt{skycell.probe\_orders}, off by default)
+does pick a measurably tighter covering -- worth 30--48\% in \emph{execution} time at
+several radii. Measured in \emph{total} (planning plus execution) time against query
+centres that do not repeat -- the realistic case for a service answering different
+users' cones, where a per-backend cache cannot amortise the extra enumeration -- the
+gain reverses at exactly the radii it looked largest, since trying a finer order costs
+roughly four times the cell classifications already spent, paid at plan time on every
+query. We found and fixed a latent bug this exposed (the probe loop's own cost
+accounting shared a field with an unrelated guard in the general descent, so tuning one
+silently detuned the other) but could not support promoting the tuning itself on the
+evidence in hand -- a caution about measuring a cost-based index's own overhead, not
+only what it saves.
+
+The third, narrower, did pay off. The per-order chord bounds a covering's classify
+step reads were computed for all thirty HEALPix orders on every call, regardless of how
+many a given covering actually visits -- typically one or a handful. Filling them
+lazily, only for orders actually visited, changes no covering and no buffer count at
+any radius tested. Measured on a different host from the rest of this paper, via a
+same-session randomized A/B against the unmodified build sharing one warm cache and one
+exact-test function (so only the covering computation itself differs), it cuts planning
+time by about 1\% pooled across \texttt{tab:cones}' own radii (95\% bootstrap CI
+excluding 1; no radius resolves a loss) -- real, but an order of magnitude smaller than
+measuring the covering computation alone in isolation suggested (7--22\%), since
+planning time also spends cycles on statistics-cache and syscache lookups this change
+does not touch. An index descent avoiding planning cost altogether remains open.
 
 The density synopsis is the other limit: an equi-depth histogram cannot see a cluster
 smaller than one of its buckets, and raising the statistics target does not help, since
@@ -866,20 +968,21 @@ area guard bounds the damage; a \texttt{typanalyze} storing a multi-order count 
 would estimate what the covering needs, implemented as an option with no measurement
 yet showing it helps.
 
-\section{Conclusions}
-
 \texttt{skycell} keeps Q3C's compact integer key and B-tree while answering the region
 queries pgSphere was built for, treating a covering's depth as a cost question from
 local source density and the price of an index range. Against pgSphere it is faster for
-cone searches at most radii warm and at every radius cold (up to 2.5$\times$), and
-answers convex polygons 2.7--4.4$\times$ faster; against Q3C, at the cross-match Q3C is
+cone searches at most radii warm and at every radius cold (up to 2.5$\times$) on the
+designed and resampled-Gaia corpora; on real, unresampled Gaia DR3 positions this
+reverses below 1\degr\ warm and is unsettled below 30\arcmin\ cold, a genuine limit of
+the cost-based planning step rather than of the index (Sect.~\ref{sec:realcones}). It
+also answers convex polygons 2.7--4.4$\times$ faster; against Q3C, at the cross-match Q3C is
 built for, it is Q3C's equal and 2.5--3.3$\times$ faster than pgSphere at the same
 operation, with an index a third the size (38 against 160\,GiB at Gaia DR3 scale for
 the pgSphere-plus-Q3C pair), built thirty times faster, from a cost model whose one
 parameter is derived rather than configured. A GiST opclass family extends this to
 stored regions without the B-tree rewrite, where a \texttt{float4} box key matched to
 pgSphere's own representation beats every alternative tried, including pgSphere's
-native GiST, on every corpus measured (Sect.~\ref{sec:gist-family}).
+native GiST, on every corpus measured (Sect.~\ref{sec:tests-regions}).
 
 It also closes two gaps neither established extension closes alone: ADQL's own
 vocabulary with an operator form a planner can answer from an index, and stored regions

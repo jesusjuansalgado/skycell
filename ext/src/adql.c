@@ -172,12 +172,12 @@ skycell_region_from_datum(Datum d, sc_region *out)
 }
 
 /*
- * Same, but skips out_c2[]/in_c2[]/sin_rho[] -- the ~90%-of-the-cost tables
- * that only an index/covering descent via sc_region_classify_cap() reads
- * (see cover.h). For a call site that only ever reaches sc_region_contains(),
- * sc_region_contains_region() or sc_region_overlaps() -- the exact test
- * region_region() below runs -- building those tables is pure waste, repeated
- * on every row.
+ * Same, but skips sin_rho[] (a cone's out_c2[]/in_c2[] are lazy regardless --
+ * see cover.h) -- tables only an index/covering descent via
+ * sc_region_classify_cap() reads. For a call site that only ever reaches
+ * sc_region_contains(), sc_region_contains_region() or sc_region_overlaps()
+ * -- the exact test region_region() below runs -- building sin_rho[] for a
+ * polygon region is pure waste, repeated on every row.
  */
 void
 skycell_region_from_datum_lite(Datum d, sc_region *out)
@@ -527,10 +527,11 @@ pos_vec(SkyPos *p)
  * to rebuild. A point-in-region caller below only ever uses slot 0 (there
  * is only one region argument to cache); region_region() below uses both.
  * The lite build (skycell_region_from_datum_lite(), skipping the 30-level
- * out_c2[]/in_c2[]/sin_rho[] table sc_region_classify_cap() alone reads)
- * is always safe here: nothing cached through this function ever reaches
- * an index descent or covering, only sc_region_contains()/
- * sc_region_contains_region()/sc_region_overlaps().
+ * sin_rho[] table -- a cone's out_c2[]/in_c2[] are lazy either way, see
+ * cover.h -- sc_region_classify_cap() alone reads) is always safe here:
+ * nothing cached through this function ever reaches an index descent or
+ * covering, only sc_region_contains()/sc_region_contains_region()/
+ * sc_region_overlaps().
  */
 typedef struct
 {
