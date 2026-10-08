@@ -169,7 +169,9 @@ for stage in $STAGES; do
     step "  sensitivity (16) and ablation (17)"
     q -f 16_sensitivity.sql >/dev/null
     q -c "SELECT sens_cost_run('real', 'gaia_real_cell', 'cell')" \
-      -c "SELECT sens_dens_run('real', 'gaia_real_cell', 'gaia_real_cell_idx', 'cell', 'cell')" >/dev/null
+      -c "CALL sens_dens_run('real', 'gaia_realc', 'gaia_realc_cell', 'cell', 'skycell_ang2cell')" >/dev/null
+    # sens_dens_run varies the statistics target on gaia_realc_cell; put it back
+    q -c "ALTER INDEX gaia_realc_cell ALTER COLUMN 1 SET STATISTICS 1000" -c "ANALYZE gaia_realc" 
     q -f 17_ablation.sql >/dev/null
     q -c "SELECT abl_layout()" -c "SELECT abl_order()" >/dev/null
     step "  cross-match sweep (18): tab:xmreal"

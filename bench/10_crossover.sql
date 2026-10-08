@@ -38,6 +38,9 @@ BEGIN
   CREATE INDEX oc_gist ON oc USING gist (pos);
   CREATE INDEX oc_cell ON oc (skycell_ang2cell(s_ra, s_dec));
   ALTER INDEX oc_cell ALTER COLUMN 1 SET STATISTICS 1000;
+  -- ANALYZE in the same transaction kept the index's previous target (100),
+  -- so commit the new one first
+  COMMIT;
   ANALYZE oc;
 END $$;
 
