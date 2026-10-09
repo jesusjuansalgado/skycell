@@ -42,6 +42,13 @@ extern bool gin_moc_index_for_region(PlannerInfo *root, Node *rg, Node **moc_exp
 									  int *max_order);
 extern Expr *array_overlap_expr(Node *left, Expr *right);
 
+extern bool skycell_const_cone_cover(PlannerInfo *root, List *args, sc_region *reg,
+									 sc_cover *cov, sc_density *dens);
+
+/* cone_scan.c: the custom scan for constant cones (skycell.custom_scan) */
+extern void cone_scan_init(void);
+extern bool cone_scan_keep(PlannerInfo *root, FuncExpr *fcall);
+
 /* adql.c: a skypos/skyregion datum, as cover.c understands it */
 extern sc_vec3 skycell_pos_from_datum(Datum d);
 extern void skycell_region_from_datum(Datum d, sc_region *r);

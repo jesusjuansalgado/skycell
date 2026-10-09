@@ -439,6 +439,40 @@ sc_region_classify(const sc_region *r, int order, int64_t pix, double *f_out)
 	return sc_region_classify_cap(r, order, pix, f_out);
 }
 
+/*
+ * sc_region_classify(...) == SC_OUT, for callers that keep IN and PARTIAL
+ * cells alike.  classify_cone_exact() answers OUT only when its OUT condition
+ * dcentre - rcell > radius + SC_ANG_EPS holds and its IN test does not fire
+ * first.  That condition needs the centre and corners alone, so evaluate it
+ * first, with the same vectors, sc_angle() calls and fmax/fmin as that
+ * function: when it fails the answer is "not OUT" without the edge midpoints
+ * (most of the trig), and only a cell about to be dropped pays for the full
+ * test.  The answer is identical, not close.
+ */
+static int
+cell_is_out(const sc_region *r, int order, int64_t pix)
+{
+	double		fo;
+
+	if (r->kind == SC_REGION_CONE && sc_exact_cells && r->radius >= 0)
+	{
+		sc_vec3		centre = sc_pix2vec(order, pix),
+					c[4];
+		double		dcentre = sc_angle(r->center, centre),
+					rcell = 0;
+
+		if (dcentre <= r->radius + SC_ANG_EPS)
+			return 0;			/* rcell >= 0: the OUT condition cannot hold */
+		sc_pix_corners(order, pix, c);
+		for (int e = 0; e < 4; e++)
+			rcell = fmax(rcell, sc_angle(centre, c[e]));
+		rcell = fmin(rcell, sc_pixrad(order));
+		if (!(dcentre - rcell > r->radius + SC_ANG_EPS))
+			return 0;
+	}
+	return sc_region_classify(r, order, pix, &fo) == SC_OUT;
+}
+
 /* distance from p to the region's boundary, 0 if inside (radians) */
 double
 sc_region_distance(const sc_region *r, sc_vec3 p)
@@ -1184,10 +1218,8 @@ cover_cone_direct(const sc_region *r, const sc_density *d,
 
 	for (int i = 0; i < ncur; i++)
 	{
-		double		fo;
-
 		(*steps)++;
-		if (sc_region_classify(r, k, cur[i], &fo) == SC_OUT)
+		if (cell_is_out(r, k, cur[i]))
 			continue;
 		rlist_add(kept, sc_pix_lo(k, cur[i]), sc_pix_hi(k, cur[i]));
 	}

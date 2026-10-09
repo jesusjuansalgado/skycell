@@ -203,7 +203,75 @@ _PG_init(void)
 							"the one the cost model chooses (-1 = let the model choose).",
 							NULL, &skycell_force_order, -1, -1, SC_MAX_ORDER,
 							PGC_USERSET, 0, NULL, NULL, NULL);
+	cone_scan_init();
 	MarkGUCPrefixReserved("skycell");
+}
+
+/*
+ * The fraction of the relation the shared buffer pool can hold: 1 when it
+ * fits, falling as it outgrows NBuffers.  Read from NBuffers rather than
+ * effective_cache_size for the reasons rewrite_waste_threshold() gives below.
+ */
+static double
+cache_fraction(const sc_density *d)
+{
+	double		relpages = (d && d->relpages > 0) ? d->relpages : 0;
+
+	return (relpages > 0) ? fmin(1.0, (double) NBuffers / relpages) : 1.0;
+}
+
+/*
+ * The price of one index range, in rows, when the custom scan (cone_scan.c)
+ * answers the cone, from the relation's own statistics and the planner's cost
+ * parameters.
+ *
+ * cost(s) in cover.h is in rows, so range_cost converts "one more B-tree range
+ * scan" into "the number of false-positive rows it is worth avoiding".  Both
+ * sides are things PostgreSQL already costs:
+ *
+ *   one more range  = a B-tree descent, as btcostestimate charges it:
+ *                     ceil(log2(N)) * cpu_operator_cost for the comparisons
+ *                     and (H + 1) * 50 * cpu_operator_cost for the pages
+ *                     descended through -- plus two pages read: the leaf the
+ *                     descent lands on and the heap page the new range starts
+ *                     on, where the scan stops running sequentially.
+ *   one false row   = its index entry, its heap tuple, the exact predicate,
+ *                     and the heap page amortised over the rows that share it
+ *                     (reltuples / relpages of this very relation).
+ *
+ * The page term is what makes this per-relation rather than per-installation:
+ * a narrow catalogue row packs 120 to a page and amortises it away, while a
+ * wide observation row packs a handful and makes every false positive cost
+ * real page traffic, so the same query should be covered more finely there.
+ *
+ * A page is priced by where it is expected to come from.  One that must be
+ * read costs random_page_cost; one already in shared buffers costs what
+ * btcostestimate charges for touching an index page, 50 * cpu_operator_cost.
+ * cache_fraction() blends the two.  On the warm 10M-row catalogue this comes
+ * out at ~34 rows (~87 for a relation far larger than the buffer pool), where
+ * auto_range_cost() below gives ~110; measured in-trial against it, the
+ * custom scan is 3-5% faster on the catalogue warm, as fast or faster cold,
+ * and up to 11% faster on the ObsCore-shaped relation.
+ */
+static double
+scan_range_cost(const sc_density *d)
+{
+	double		n = (d && d->ntotal > 1) ? d->ntotal : 1e6;
+	double		rpp = (d && d->relpages > 0 && d->ntotal > 0)
+		? d->ntotal / d->relpages : 100.0;
+	double		height = fmax(1.0, ceil(log(n) / log(300.0)));	/* btree fanout ~300 */
+	double		cached = cache_fraction(d);
+	double		page = cached * 50.0 * cpu_operator_cost + (1.0 - cached) * random_page_cost;
+	double		range = ceil(log(n) / log(2.0)) * cpu_operator_cost
+		+ (height + 1.0) * 50.0 * cpu_operator_cost
+		+ 2.0 * page;
+	double		per_row = cpu_tuple_cost + cpu_index_tuple_cost
+		+ 3.0 * cpu_operator_cost				/* the exact predicate */
+		+ page / fmax(rpp, 1.0);
+
+	if (!(per_row > 0))
+		return 30.0;
+	return fmin(1e6, fmax(1.0, range / per_row));
 }
 
 /*
@@ -230,6 +298,15 @@ _PG_init(void)
  * random_page_cost is used unblended, which is the pessimistic end (it assumes
  * the page is not resident).  That errs towards finer coverings; the cost
  * curve is flat near its minimum, so the error is small either way.
+ *
+ * This is the price the range rewrite uses, and it is knowingly high: the
+ * comparisons term is charged at 50x where btcostestimate charges 1x, and
+ * every page at random_page_cost.  For the rewrite that over-pricing stands
+ * in for a cost it does not model -- each range also becomes an OR arm that
+ * PostgreSQL's planner builds a path for and estimates, about 10 us apiece on
+ * the paper's catalogue -- and measured in-trial, pricing the rewrite's ranges
+ * like the custom scan's (scan_range_cost() above) made it up to 5% slower
+ * warm.  The custom scan has no per-range planning and uses that price.
  */
 static double
 auto_range_cost(const sc_density *d)
@@ -308,12 +385,19 @@ auto_range_cost(const sc_density *d)
 double
 rewrite_waste_threshold(const sc_density *d)
 {
-	double		relpages = (d && d->relpages > 0) ? d->relpages : 0;
-	double		cache_frac = (relpages > 0)
-		? fmin(1.0, (double) NBuffers / relpages) : 1.0;
+	double		cache_frac = cache_fraction(d);
 	double		min_frac = 1.0 / fmax(skycell_rewrite_waste_scale_cap, 1.0);
 
 	return skycell_rewrite_max_waste / fmax(cache_frac, min_frac);
+}
+
+/* current_params() with the custom scan's range price (scan_range_cost()) */
+static void
+current_params_scan(sc_cover_params *p, int max_ranges, const sc_density *d)
+{
+	current_params(p, max_ranges, d);
+	if (skycell_range_cost < 0)
+		p->range_cost = scan_range_cost(d);
 }
 
 void
@@ -1587,11 +1671,77 @@ simplify_cone5(PlannerInfo *root, FuncExpr *fexpr)
 	return simplify_cone(root, six);
 }
 
+/*
+ * The covering of a constant skycell_cone(cell, ra, dec, ra0, dec0, radius)
+ * for the custom scan, through the same density model and memo the rewrite
+ * uses but the custom scan's range price (scan_range_cost()).  False when the
+ * cone's parameters are not all non-null constants.  The ranges are owned by
+ * the memo (or the current context when it is off): copy them before anything
+ * else can flush it.
+ */
+bool
+skycell_const_cone_cover(PlannerInfo *root, List *args, sc_region *reg,
+						 sc_cover *cov, sc_density *dens)
+{
+	bool		anynull;
+	Oid			statrel;
+	bool		uses_cell_ops;
+	sc_cover_params p;
+	double		ra0,
+				dec0,
+				radius;
+
+	if (list_length(args) != 6 || !all_const(args, 3, 5, &anynull) || anynull)
+		return false;
+	ra0 = DatumGetFloat8(((Const *) list_nth(args, 3))->constvalue);
+	dec0 = DatumGetFloat8(((Const *) list_nth(args, 4))->constvalue);
+	radius = DatumGetFloat8(((Const *) list_nth(args, 5))->constvalue);
+
+	density_for_var(root, linitial(args), dens, &statrel, &uses_cell_ops);
+	check_err(sc_region_cone(reg, ra0, dec0, radius, true));
+	current_params_scan(&p, skycell_max_ranges, dens);
+	cover_cached(reg, dens, &p, statrel, ra0, dec0, radius, cov);
+	return true;
+}
+
+/*
+ * Selectivity of a constant cone left unrewritten for the custom scan: the
+ * rows the covering expects, scaled by area(cone) / area(covering) -- the same
+ * product the rewrite's range quals and exact-test selectivity make.
+ */
+static double
+cone_selectivity(PlannerInfo *root, List *args)
+{
+	sc_region	reg;
+	sc_cover	cov;
+	sc_density	dens;
+	double		r = DatumGetFloat8(((Const *) list_nth(args, 5))->constvalue) * DEG2RAD;
+
+	if (skycell_const_cone_cover(root, args, &reg, &cov, &dens) &&
+		dens.ntotal > 0 && cov.area > 0)
+		return cov.exp_rows * fmin(1.0, reg.area / cov.area) / dens.ntotal;
+	return pow(sin(fmin(fmax(r, 0), M_PI) / 2.0), 2);	/* cap area / 4pi */
+}
+
 PG_FUNCTION_INFO_V1(skycell_support);
 Datum
 skycell_support(PG_FUNCTION_ARGS)
 {
 	Node	   *rawreq = (Node *) PG_GETARG_POINTER(0);
+
+	if (IsA(rawreq, SupportRequestSelectivity))
+	{
+		SupportRequestSelectivity *req = (SupportRequestSelectivity *) rawreq;
+		bool		anynull;
+
+		if (!req->is_join && req->root != NULL && list_length(req->args) == 6 &&
+			all_const(req->args, 3, 5, &anynull) && !anynull)
+		{
+			req->selectivity = fmin(1.0, fmax(cone_selectivity(req->root, req->args), 1e-12));
+			PG_RETURN_POINTER(req);
+		}
+		PG_RETURN_POINTER(NULL);
+	}
 
 	if (IsA(rawreq, SupportRequestSimplify))
 	{
@@ -1599,7 +1749,12 @@ skycell_support(PG_FUNCTION_ARGS)
 		int			nargs = list_length(req->fcall->args);
 
 		if (nargs == 6)
+		{
+			/* left as is for the custom scan (cone_scan.c), if it can take it */
+			if (cone_scan_keep(req->root, req->fcall))
+				PG_RETURN_POINTER(NULL);
 			PG_RETURN_POINTER(simplify_cone(req->root, req->fcall));
+		}
 		if (nargs == 3)
 			PG_RETURN_POINTER(simplify_poly3(req->root, req->fcall));
 		if (nargs == 5)
