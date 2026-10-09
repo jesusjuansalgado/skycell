@@ -65,8 +65,12 @@ LANGUAGE sql IMMUTABLE AS $$
                             WHEN 'Q07' THEN 0.5 ELSE 0.0002 END AS r) rr) p
 $$;
 
+-- methods: 'pgsphere', 'skycell' (the range rewrite) and 'skycell+cs' (skycell
+-- answered by its custom scan, skycell.custom_scan)
+DROP FUNCTION IF EXISTS bench_cross_run(float8, int, float8, int);
 CREATE OR REPLACE FUNCTION bench_cross_run(rows_m float8, nq int DEFAULT 40,
-                                           seed float8 DEFAULT 0.19, reps int DEFAULT 3)
+                                           seed float8 DEFAULT 0.19, reps int DEFAULT 3,
+                                           methods text[] DEFAULT ARRAY['pgsphere', 'skycell'])
 RETURNS void
 LANGUAGE plpgsql AS $$
 DECLARE cls text; ms text[]; i int; rep int; j json; p json; nn bigint; ctr record;
@@ -95,9 +99,11 @@ BEGIN
   FOREACH cls IN ARRAY ARRAY['Q05', 'Q06', 'Q07', 'Q12'] LOOP
     FOR rep IN 1 .. reps LOOP
       FOR ctr IN SELECT * FROM oc_centers ORDER BY random() LOOP
-        SELECT array_agg(m ORDER BY random()) INTO ms
-        FROM unnest(ARRAY['pgsphere', 'skycell']) m;
-        FOR i IN 1 .. 2 LOOP
+        SELECT array_agg(m ORDER BY random()) INTO ms FROM unnest(methods) m;
+        FOR i IN 1 .. array_length(ms, 1) LOOP
+          -- set_config(..., true) lasts the whole run, so every method sets it
+          PERFORM set_config('skycell.custom_scan',
+                             CASE WHEN ms[i] = 'skycell+cs' THEN 'on' ELSE 'off' END, true);
           EXECUTE oc_sql(cls, ms[i], ctr.ra, ctr.dec) INTO nn;     -- warm this one
           EXECUTE 'EXPLAIN (ANALYZE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON) '
                   || oc_sql(cls, ms[i], ctr.ra, ctr.dec) INTO j;
