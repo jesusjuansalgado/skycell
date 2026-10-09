@@ -16,9 +16,15 @@ UPDATE cs_cat SET cell = skycell_ang2cell(ra, dec);
 CREATE INDEX cs_cat_cell ON cs_cat (cell);
 CREATE INDEX cs_cat_expr ON cs_cat (skycell_ang2cell(ra, dec));
 VACUUM ANALYZE cs_cat;
+-- the same rows stored in cell order: cs_cat's heap does not follow the cell
+-- order, so the scan runs in bitmap mode there and in ordered mode here
+CREATE TABLE cs_sorted AS SELECT * FROM cs_cat ORDER BY cell;
+CREATE INDEX cs_sorted_cell ON cs_sorted (cell);
+CREATE INDEX cs_sorted_expr ON cs_sorted (skycell_ang2cell(ra, dec));
+VACUUM ANALYZE cs_sorted;
 
--- result with the custom scan off and on, and whether "on" planned it
-CREATE FUNCTION cs_both(q text, OUT same bool, OUT custom bool)
+-- result with the custom scan off and on, and how "on" planned it
+CREATE FUNCTION cs_both(q text, OUT same bool, OUT custom text)
 LANGUAGE plpgsql AS $$
 DECLARE a text; b text; j json;
 BEGIN
@@ -28,11 +34,12 @@ BEGIN
   EXECUTE 'SELECT (' || q || ')::text' INTO b;
   EXECUTE 'EXPLAIN (FORMAT JSON) ' || q INTO j;
   same := a IS NOT DISTINCT FROM b;
-  custom := j::text LIKE '%SkycellCone%';
+  custom := CASE WHEN j::text LIKE '%"Mode": "bitmap"%' THEN 'bitmap'
+                 WHEN j::text LIKE '%SkycellCone%' THEN 'ordered' ELSE 'no' END;
 END $$;
 
-SELECT t.name, (cs_both(t.q)).*
-FROM (VALUES
+SELECT t.name, tbl, (cs_both(replace(t.q, 'cs_cat', tbl))).*
+FROM unnest(ARRAY['cs_cat', 'cs_sorted']) tbl, (VALUES
   ('1 deg',           'SELECT count(*) || '':'' || sum(id) FROM cs_cat WHERE skycell_cone(cell, ra, dec, 10, 20, 1)'),
   ('3 arcmin',        'SELECT count(*) || '':'' || sum(id) FROM cs_cat WHERE skycell_cone(cell, ra, dec, 200, -45, 0.05)'),
   ('zero radius',     'SELECT count(*) FROM cs_cat WHERE skycell_cone(cell, ra, dec, 10, 20, 0)'),
@@ -47,19 +54,26 @@ FROM (VALUES
   ('cone or id',      'SELECT count(*) || '':'' || sum(id) FROM cs_cat WHERE skycell_cone(cell, ra, dec, 10, 20, 3) OR id = 7'),
   ('ordered, limit',  'SELECT string_agg(id::text, '','') FROM (SELECT id FROM cs_cat WHERE skycell_cone(cell, ra, dec, 10, 20, 3) ORDER BY id LIMIT 4) s'),
   ('non-constant',    'SELECT count(*) FROM cs_cat WHERE skycell_cone(cell, ra, dec, (SELECT 10.0::float8), 20, 1)')
-) t(name, q);
+) t(name, q)
+ORDER BY tbl, t.name;
 
 SET skycell.custom_scan = on;
 EXPLAIN (COSTS OFF)
 SELECT count(*) FROM cs_cat WHERE skycell_cone(cell, ra, dec, 10, 20, 1);
+EXPLAIN (COSTS OFF)
+SELECT count(*) FROM cs_sorted WHERE skycell_cone(cell, ra, dec, 10, 20, 1);
 
--- rescanned as the inner side of a nested loop: three times the single count
+-- rescanned as the inner side of a nested loop: three times the single count,
+-- in both modes
 SET enable_hashjoin = off;
 SET enable_mergejoin = off;
 SET enable_material = off;
 SELECT count(*) = 3 * (SELECT count(*) FROM cs_cat WHERE skycell_cone(cell, ra, dec, 10, 20, 3))
-       AS rescan_ok
+       AS rescan_bitmap_ok
 FROM (VALUES (1), (2), (3)) v(x) JOIN cs_cat c ON skycell_cone(c.cell, c.ra, c.dec, 10, 20, 3) AND v.x > 0;
+SELECT count(*) = 3 * (SELECT count(*) FROM cs_sorted WHERE skycell_cone(cell, ra, dec, 10, 20, 3))
+       AS rescan_ordered_ok
+FROM (VALUES (1), (2), (3)) v(x) JOIN cs_sorted c ON skycell_cone(c.cell, c.ra, c.dec, 10, 20, 3) AND v.x > 0;
 RESET enable_hashjoin;
 RESET enable_mergejoin;
 RESET enable_material;
@@ -84,4 +98,4 @@ COMMIT;
 
 RESET skycell.custom_scan;
 DROP FUNCTION cs_both(text);
-DROP TABLE cs_cat;
+DROP TABLE cs_cat, cs_sorted;
