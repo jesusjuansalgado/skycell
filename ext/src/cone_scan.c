@@ -25,7 +25,8 @@
  * Limits of this first version: only the six-argument skycell_cone with
  * constant parameters (joins, generic plans and the Q3C-shaped spellings keep
  * the rewrite); a cone inside an OR is no longer indexable while the GUC is
- * on; and the bitmap mode does not prefetch (effective_io_concurrency).
+ * on; and before PostgreSQL 18 the bitmap mode does not prefetch (18's
+ * table AM reads the bitmap through a read stream, which does).
  */
 #include "postgres.h"
 
@@ -42,6 +43,9 @@
 #include "catalog/pg_type_d.h"
 #include "catalog/pg_statistic.h"
 #include "commands/explain.h"
+#if PG_VERSION_NUM >= 180000
+#include "commands/explain_format.h"	/* ExplainProperty*() moved here in 18 */
+#endif
 #include "miscadmin.h"
 #include "executor/executor.h"
 #include "nodes/extensible.h"
@@ -115,8 +119,10 @@ typedef struct ConeScanState
 	bool		bitmap;			/* bitmap mode, else ordered */
 	TableScanDesc hscan;		/* bitmap: heap scan over the TID bitmap */
 	TIDBitmap  *tbm;			/* bitmap: NULL until the first fetch */
+#if PG_VERSION_NUM < 180000
 	TBMIterator *it;
 	TBMIterateResult *tbmres;	/* bitmap: page being returned, or NULL */
+#endif
 } ConeScanState;
 
 /* ------------------------------------------------------------------ */
@@ -493,6 +499,18 @@ cone_begin(CustomScanState *node, EState *estate, int eflags)
 				Int64GetDatum(0));
 	if (table_slot_callbacks(heap) != &TTSOpsBufferHeapTuple)
 		elog(ERROR, "skycell: custom cone scan on a non-heap relation");
+	/*
+	 * PostgreSQL 18 gave index_beginscan()/_bitmap() an instrumentation
+	 * argument (EXPLAIN's index search counts) and has the table AM walk a
+	 * bitmap itself, so its heap scan is begun with the first bitmap, as
+	 * BitmapHeapScan does.
+	 */
+#if PG_VERSION_NUM >= 180000
+	if (st->bitmap)
+		st->iscan = index_beginscan_bitmap(st->index, estate->es_snapshot, NULL, 2);
+	else
+		st->iscan = index_beginscan(heap, st->index, estate->es_snapshot, NULL, 2, 0);
+#else
 	if (st->bitmap)
 	{
 		st->iscan = index_beginscan_bitmap(st->index, estate->es_snapshot, 2);
@@ -500,6 +518,7 @@ cone_begin(CustomScanState *node, EState *estate, int eflags)
 	}
 	else
 		st->iscan = index_beginscan(heap, st->index, estate->es_snapshot, 2, 0);
+#endif
 }
 
 /* point the scan keys at range i and restart the index scan there */
@@ -533,17 +552,48 @@ cone_next_ordered(ConeScanState *st, TupleTableSlot *slot)
  * plan's quals hold the exact test, and the ranges cover the cone, so that
  * test alone decides -- no range condition needs rechecking.
  */
+static void
+cone_build_bitmap(ConeScanState *st)
+{
+	st->tbm = tbm_create(work_mem * (Size) 1024, NULL);
+	for (int i = 0; i < st->nranges; i++)
+	{
+		cone_range(st, i);
+		index_getbitmap(st->iscan, st->tbm);
+	}
+}
+
+#if PG_VERSION_NUM >= 180000
+/* PostgreSQL 18: the table AM walks the bitmap itself, through a read stream */
+static TupleTableSlot *
+cone_next_bitmap(ConeScanState *st, TupleTableSlot *slot)
+{
+	bool		recheck;
+	uint64		lossy = 0,
+				exact = 0;
+
+	if (st->tbm == NULL)
+	{
+		TBMIterator it;
+
+		cone_build_bitmap(st);
+		it = tbm_begin_iterate(st->tbm, NULL, InvalidDsaPointer);
+		if (st->hscan == NULL)
+			st->hscan = table_beginscan_bm(st->css.ss.ss_currentRelation,
+										   st->css.ss.ps.state->es_snapshot, 0, NULL);
+		st->hscan->st.rs_tbmiterator = it;
+	}
+	if (table_scan_bitmap_next_tuple(st->hscan, slot, &recheck, &lossy, &exact))
+		return slot;
+	return ExecClearTuple(slot);
+}
+#else
 static TupleTableSlot *
 cone_next_bitmap(ConeScanState *st, TupleTableSlot *slot)
 {
 	if (st->tbm == NULL)
 	{
-		st->tbm = tbm_create(work_mem * (Size) 1024, NULL);
-		for (int i = 0; i < st->nranges; i++)
-		{
-			cone_range(st, i);
-			index_getbitmap(st->iscan, st->tbm);
-		}
+		cone_build_bitmap(st);
 		st->it = tbm_begin_iterate(st->tbm);
 		st->tbmres = NULL;
 	}
@@ -564,6 +614,7 @@ cone_next_bitmap(ConeScanState *st, TupleTableSlot *slot)
 		st->tbmres = NULL;
 	}
 }
+#endif
 
 static TupleTableSlot *
 cone_next(ScanState *ss)
@@ -587,16 +638,45 @@ cone_exec(CustomScanState *node)
 	return ExecScan(&node->ss, cone_next, cone_recheck);
 }
 
+/*
+ * Releasing the bitmap mode, in the order each version's own BitmapHeapScan
+ * uses.  On PostgreSQL 18 the iterator lives in the heap scan, and the heap
+ * scan's read stream may still reference the bitmap's pages, so the iterator
+ * is ended and the scan reset or ended before the bitmap is freed.
+ */
 static void
-cone_free_bitmap(ConeScanState *st)
+cone_release_bitmap(ConeScanState *st, bool end)
 {
+#if PG_VERSION_NUM >= 180000
+	if (st->hscan)
+	{
+		if (!tbm_exhausted(&st->hscan->st.rs_tbmiterator))
+			tbm_end_iterate(&st->hscan->st.rs_tbmiterator);
+		if (end)
+			table_endscan(st->hscan);
+		else
+			table_rescan(st->hscan, NULL);
+	}
+	if (st->tbm)
+		tbm_free(st->tbm);
+#else
 	if (st->it)
 		tbm_end_iterate(st->it);
 	if (st->tbm)
 		tbm_free(st->tbm);
 	st->it = NULL;
-	st->tbm = NULL;
 	st->tbmres = NULL;
+	if (st->hscan)
+	{
+		if (end)
+			table_endscan(st->hscan);
+		else
+			table_rescan(st->hscan, NULL);
+	}
+#endif
+	st->tbm = NULL;
+	if (end)
+		st->hscan = NULL;
 }
 
 static void
@@ -604,9 +684,7 @@ cone_end(CustomScanState *node)
 {
 	ConeScanState *st = (ConeScanState *) node;
 
-	cone_free_bitmap(st);
-	if (st->hscan)
-		table_endscan(st->hscan);
+	cone_release_bitmap(st, true);
 	if (st->iscan)
 		index_endscan(st->iscan);
 	if (st->index)
@@ -619,9 +697,7 @@ cone_rescan(CustomScanState *node)
 	ConeScanState *st = (ConeScanState *) node;
 
 	st->cur = -1;
-	cone_free_bitmap(st);
-	if (st->hscan)
-		table_rescan(st->hscan, NULL);
+	cone_release_bitmap(st, false);
 	ExecScanReScan(&node->ss);
 }
 
