@@ -95,7 +95,7 @@ bench/run.sh                 # 01..06: build corpora, indexes, the phase-ordered
 psql -f bench/07_ab.sql      # randomized paired trials  (the protocol the paper uses)
 psql -f bench/08_costmodel.sql
 psql -f bench/09_joins.sql
-psql -f bench/10_crossover.sql
+(cd bench && psql -f 10_crossover.sql)   # reads data/oc_fields.csv.gz, data/oc_queries.csv
 psql -f bench/11_xmatch_ab.sql
 psql -f bench/13_pressure.sql        # driver: bench/13_pressure_run.sh
 psql -f bench/14_shapes.sql
@@ -139,6 +139,16 @@ does both. A PostgreSQL restart alone only clears `shared_buffers`.
 - **`ANALYZE` with a statistics target of 10000** was OOM-killed on a 10M-row
   table in this container. Results are reported at targets 10, 100 and 1000.
 - **Bootstrap intervals** are seeded; `bench/ab_report.py` prints the seed.
+- **The ObsCore crossover's sky.** `10_crossover.sql` used to take its field
+  centres from the first rows of whichever `src` corpus was live, and its query
+  centres from a random draw of the relation it had just built. The resampled
+  Gaia `src` is generated in HEALPix order, so those first rows were one small
+  patch of sky and every observation was packed into it; on the designed corpus
+  they fell elsewhere, and the result moved with the corpus. Field and query
+  centres are now a stored set (`bench/data/oc_fields.csv.gz`, `oc_queries.csv`,
+  made once by `bench/data/make_oc_fields.sql` from the DR3 density map), the
+  offsets are seeded, and every size answers the same 40 (or first `nq`)
+  queries, so a size builds the same relation on every run.
 
 ## 7. Maturity
 

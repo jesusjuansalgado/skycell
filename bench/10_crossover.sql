@@ -9,9 +9,24 @@
 -- The rows are observations, not sources: products come in groups that share a
 -- field centre, and the table is clustered by collection and field, which is
 -- what makes a GiST bitmap scan read so few pages in the TAP corpus.  That
--- structure is reproduced here; field centres are drawn from the current `src`
--- corpus, so the sky distribution matches the catalogue runs.
+-- structure is reproduced here.  Field and query centres are a stored set
+-- (bench/data/oc_fields.csv.gz, oc_queries.csv, made once by
+-- data/make_oc_fields.sql from the DR3 density map), not a draw from whichever
+-- `src` corpus is live: the first rows of the resampled-Gaia `src` are in
+-- HEALPix order, so taking them as fields packed every observation into one
+-- patch of sky, and the result changed with the corpus.  Run from bench/.
 \set ON_ERROR_STOP 1
+
+CREATE TABLE IF NOT EXISTS oc_fields (field_id int PRIMARY KEY, ra float8, "dec" float8);
+CREATE TABLE IF NOT EXISTS oc_queries (qid int PRIMARY KEY, field_id int, ra float8, "dec" float8);
+SELECT (SELECT count(*) FROM oc_fields) = 0 AS oc_load_fields,
+       (SELECT count(*) FROM oc_queries) = 0 AS oc_load_queries \gset
+\if :oc_load_fields
+  \copy oc_fields FROM PROGRAM 'gzip -dc data/oc_fields.csv.gz' WITH CSV HEADER
+\endif
+\if :oc_load_queries
+  \copy oc_queries FROM 'data/oc_queries.csv' WITH CSV HEADER
+\endif
 
 CREATE TABLE IF NOT EXISTS bench_cross (rows_m float8, class text, method text,
   plan_ms float8, exec_ms float8, buffers float8, n bigint);
@@ -20,7 +35,13 @@ CREATE OR REPLACE PROCEDURE build_obscore(nrows bigint, per_field int DEFAULT 12
 LANGUAGE plpgsql AS $$
 DECLARE nfields bigint := greatest(1, nrows / per_field);
 BEGIN
+  IF nfields > (SELECT count(*) FROM oc_fields) THEN
+    RAISE EXCEPTION 'build_obscore: % fields needed, oc_fields has %',
+      nfields, (SELECT count(*) FROM oc_fields);
+  END IF;
   DROP TABLE IF EXISTS oc;
+  -- the offsets are seeded, so a given size is the same relation every run
+  PERFORM setseed(0.29);
   EXECUTE format(
     'CREATE TABLE oc AS
      SELECT row_number() OVER () AS obs_id,
@@ -29,7 +50,7 @@ BEGIN
             55000 + (f.rn %% 3000) + random() AS t_min,
             (f.rn %% 3)::int AS calib_level,
             ''C'' || (f.rn %% 8)::text AS obs_collection
-     FROM (SELECT row_number() OVER () AS rn, ra, dec FROM src ORDER BY id LIMIT %s) f,
+     FROM (SELECT field_id AS rn, ra, dec FROM oc_fields ORDER BY field_id LIMIT %s) f,
           LATERAL generate_series(1, %s) k
      ORDER BY f.rn %% 8, f.rn', nfields, per_field);
 
@@ -80,11 +101,15 @@ DECLARE cls text; ms text[]; i int; rep int; j json; p json; nn bigint; ctr reco
 BEGIN
   DELETE FROM bench_cross b WHERE b.rows_m = bench_cross_run.rows_m;
 
+  -- the stored query centres, the same at every size; seed orders the trials
+  IF nq > (SELECT count(*) FROM oc_queries) THEN
+    RAISE EXCEPTION 'bench_cross_run: % centres asked, oc_queries has %',
+      nq, (SELECT count(*) FROM oc_queries);
+  END IF;
   PERFORM setseed(seed);
   DROP TABLE IF EXISTS oc_centers;
   CREATE TEMP TABLE oc_centers AS
-  SELECT row_number() OVER () AS qid, s_ra AS ra, s_dec AS dec
-  FROM oc ORDER BY random() LIMIT nq;
+  SELECT qid, ra, "dec" FROM oc_queries ORDER BY qid LIMIT nq;
 
   /*
    * Randomized and paired, like the cone benchmark: within a trial the two
