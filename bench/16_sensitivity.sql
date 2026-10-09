@@ -14,7 +14,7 @@
 CREATE TABLE IF NOT EXISTS sens_cost (corpus text, rpc float8, spc float8,
   c_range float8, radius float8, nranges int, chosen_order int, area_ratio float8);
 CREATE TABLE IF NOT EXISTS sens_dens (corpus text, stat_target int, radius float8,
-  rho_est float8, rho_true float8, ratio float8, nranges int, area_ratio float8);
+  rho_est float8, rho_true float8, ratio float8, nranges int, area_ratio float8, buckets int);
 
 -- ------------------------------------------------------------------
 -- (a) does the covering follow the planner's cost parameters?
@@ -50,24 +50,38 @@ END $$;
 -- targets.  The quantity that matters operationally is not the estimate but the
 -- covering it produces, so the number of ranges and the area ratio are recorded
 -- with it.
-CREATE OR REPLACE FUNCTION sens_dens_run(corpus text, tbl regclass, idx regclass,
-                                         col name, statcol name)
-RETURNS void LANGUAGE plpgsql AS $$
-DECLARE st int; r float8; info record; true_rho float8; n bigint;
+-- A procedure, not a function, so that it can COMMIT between setting the
+-- statistics target and running ANALYZE: inside one transaction ANALYZE kept
+-- the target the index had when the transaction began, so every "target"
+-- measured the same histogram.  The bucket count each pass actually got is
+-- recorded, so a result shows whether the target took effect.  rho_true is in
+-- rows per steradian, the unit skycell_cover_info().rho uses (it was per square
+-- degree, which put every ratio 3,283 times too high).
+DROP ROUTINE IF EXISTS sens_dens_run(text, regclass, regclass, name, name);
+ALTER TABLE sens_dens ADD COLUMN IF NOT EXISTS buckets int;
+CREATE OR REPLACE PROCEDURE sens_dens_run(corpus text, tbl regclass, idx regclass,
+                                          col name, statcol name)
+LANGUAGE plpgsql AS $$
+DECLARE st int; r float8; info record; true_rho float8; n bigint; nb int;
 BEGIN
   DELETE FROM sens_dens s WHERE s.corpus = sens_dens_run.corpus;
+  COMMIT;
   FOREACH st IN ARRAY ARRAY[10, 100, 1000] LOOP
     EXECUTE format('ALTER INDEX %s ALTER COLUMN 1 SET STATISTICS %s', idx, st);
+    COMMIT;
     EXECUTE format('ANALYZE %s', tbl);
+    SELECT array_length(histogram_bounds::text::text[], 1) - 1 INTO nb
+      FROM pg_stats WHERE (schemaname || '.' || tablename)::regclass = idx;
     FOREACH r IN ARRAY ARRAY[0.0028, 0.1, 1.0] LOOP
-      -- truth: count what is really inside the cone, per square degree
+      -- truth: count what is really inside the cone, per steradian
       EXECUTE format('SELECT count(*) FROM %s WHERE skycell_in_cone(ra, dec, 266.4, -29.0, %s)', tbl, r)
         INTO n;
-      true_rho := n / (2*pi()*(1 - cos(radians(r))) * pow(180/pi(), 2));
+      true_rho := n / (2*pi()*(1 - cos(radians(r))));
       EXECUTE format('SELECT * FROM skycell_cover_info(266.4, -29.0, %s, %L, %L)', r, idx, statcol)
         INTO info;
       INSERT INTO sens_dens VALUES (corpus, st, r, info.rho, true_rho,
-        CASE WHEN true_rho > 0 THEN info.rho / true_rho END, info.nranges, info.area_ratio);
+        CASE WHEN true_rho > 0 THEN info.rho / true_rho END, info.nranges, info.area_ratio, nb);
     END LOOP;
+    COMMIT;
   END LOOP;
 END $$;

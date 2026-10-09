@@ -1,7 +1,17 @@
+-- A corpus resampled from the Gaia DR3 density map: -v n rows (default 5e7, the
+-- scale run of tab:scale; 1e7 gives the paper's 10M "Gaia corpus"), each placed
+-- uniformly at random inside an order-9 cell drawn in proportion to that
+-- cell's DR3 source count.  Needs gaia_map (bench/19_gaia_map.sh, or the copy
+-- in bench/data/gaia_map_hpx9.csv.gz).  Replaces src; an existing src is kept
+-- as src_prev.
 \set ON_ERROR_STOP 1
 \timing on
-DROP TABLE IF EXISTS oc, cat_q3c, cat_sphere, cat_cell;
-ALTER TABLE src RENAME TO src_g10;
+\if :{?n}
+\else
+  \set n 5e7
+\endif
+DROP TABLE IF EXISTS oc, cat_q3c, cat_sphere, cat_cell, src_prev;
+ALTER TABLE IF EXISTS src RENAME TO src_prev;
 
 SELECT setseed(0.5);
 CREATE TABLE src AS
@@ -12,5 +22,8 @@ SELECT row_number() OVER () AS id,
 FROM (SELECT ivo_healpix_center(29, g.hpx9 * 1099511627776::bigint
                                     + floor(random() * 1099511627776)::bigint) AS p
       FROM gaia_map g, tot,
-           LATERAL generate_series(1, floor(5e7 * g.n / tot.s + random())::int) k) q;
+           LATERAL generate_series(1, floor(:n * g.n / tot.s + random())::int) k) q;
 SELECT count(*) AS src50_rows FROM src;
+-- 04_xmatch.sql sizes its sample from pg_class.reltuples, which is -1 until
+-- the table has been analysed.
+ANALYZE src;
