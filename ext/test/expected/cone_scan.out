@@ -95,7 +95,7 @@ SELECT count(*) FROM cs_cat WHERE skycell_cone(cell, ra, dec, 10, 20, 1);
    ->  Custom Scan (SkycellCone) on cs_cat
          Filter: skycell_in_cone((ra)::double precision, "dec", '10'::double precision, '20'::double precision, '1'::double precision, '-1'::double precision)
          Index: cs_cat_cell
-         Ranges: 1
+         Ranges: 2
          Mode: bitmap
 (6 rows)
 
@@ -107,7 +107,7 @@ SELECT count(*) FROM cs_sorted WHERE skycell_cone(cell, ra, dec, 10, 20, 1);
    ->  Custom Scan (SkycellCone) on cs_sorted
          Filter: skycell_in_cone((ra)::double precision, "dec", '10'::double precision, '20'::double precision, '1'::double precision, '-1'::double precision)
          Index: cs_sorted_cell
-         Ranges: 1
+         Ranges: 2
          Mode: ordered
 (6 rows)
 
