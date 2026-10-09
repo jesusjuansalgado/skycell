@@ -1,0 +1,132 @@
+-- skycell.custom_scan: a constant cone answered by the SkycellCone custom scan
+-- must return exactly what the range rewrite returns.
+CREATE EXTENSION IF NOT EXISTS skycell;
+NOTICE:  extension "skycell" already exists, skipping
+SET extra_float_digits = 0;
+SET max_parallel_workers_per_gather = 0;
+-- a deterministic Fibonacci-sphere catalogue, small enough (20,000 rows) that
+-- ANALYZE samples all of it, so the histogram and the coverings are stable
+CREATE TABLE cs_cat AS
+SELECT i AS id,
+       mod(i * 137.50776405003785, 360.0) AS ra,
+       degrees(asin(1 - 2 * (i + 0.5) / 20000.0)) AS dec
+FROM generate_series(0, 19999) i;
+ALTER TABLE cs_cat ADD COLUMN cell int8;
+UPDATE cs_cat SET cell = skycell_ang2cell(ra, dec);
+CREATE INDEX cs_cat_cell ON cs_cat (cell);
+CREATE INDEX cs_cat_expr ON cs_cat (skycell_ang2cell(ra, dec));
+VACUUM ANALYZE cs_cat;
+-- result with the custom scan off and on, and whether "on" planned it
+CREATE FUNCTION cs_both(q text, OUT same bool, OUT custom bool)
+LANGUAGE plpgsql AS $$
+DECLARE a text; b text; j json;
+BEGIN
+  PERFORM set_config('skycell.custom_scan', 'off', true);
+  EXECUTE 'SELECT (' || q || ')::text' INTO a;
+  PERFORM set_config('skycell.custom_scan', 'on', true);
+  EXECUTE 'SELECT (' || q || ')::text' INTO b;
+  EXECUTE 'EXPLAIN (FORMAT JSON) ' || q INTO j;
+  same := a IS NOT DISTINCT FROM b;
+  custom := j::text LIKE '%SkycellCone%';
+END $$;
+SELECT t.name, (cs_both(t.q)).*
+FROM (VALUES
+  ('1 deg',           'SELECT count(*) || '':'' || sum(id) FROM cs_cat WHERE skycell_cone(cell, ra, dec, 10, 20, 1)'),
+  ('3 arcmin',        'SELECT count(*) || '':'' || sum(id) FROM cs_cat WHERE skycell_cone(cell, ra, dec, 200, -45, 0.05)'),
+  ('zero radius',     'SELECT count(*) FROM cs_cat WHERE skycell_cone(cell, ra, dec, 10, 20, 0)'),
+  ('north pole',      'SELECT count(*) || '':'' || sum(id) FROM cs_cat WHERE skycell_cone(cell, ra, dec, 0, 90, 4)'),
+  ('south pole',      'SELECT count(*) || '':'' || sum(id) FROM cs_cat WHERE skycell_cone(cell, ra, dec, 123, -89.5, 2)'),
+  ('ra wrap',         'SELECT count(*) || '':'' || sum(id) FROM cs_cat WHERE skycell_cone(cell, ra, dec, 359.8, 1, 3)'),
+  ('10 deg',          'SELECT count(*) || '':'' || sum(id) FROM cs_cat WHERE skycell_cone(cell, ra, dec, 300, 30, 10)'),
+  ('whole sky',       'SELECT count(*) FROM cs_cat WHERE skycell_cone(cell, ra, dec, 0, 0, 180)'),
+  ('expression',      'SELECT count(*) || '':'' || sum(id) FROM cs_cat WHERE skycell_cone(skycell_ang2cell(ra, dec), ra, dec, 10, 20, 1)'),
+  ('two cones',       'SELECT count(*) || '':'' || sum(id) FROM cs_cat WHERE skycell_cone(cell, ra, dec, 10, 20, 3) AND skycell_cone(cell, ra, dec, 11, 20, 2)'),
+  ('cone and filter', 'SELECT count(*) || '':'' || sum(id) FROM cs_cat WHERE skycell_cone(cell, ra, dec, 10, 20, 3) AND id % 3 = 0'),
+  ('cone or id',      'SELECT count(*) || '':'' || sum(id) FROM cs_cat WHERE skycell_cone(cell, ra, dec, 10, 20, 3) OR id = 7'),
+  ('ordered, limit',  'SELECT string_agg(id::text, '','') FROM (SELECT id FROM cs_cat WHERE skycell_cone(cell, ra, dec, 10, 20, 3) ORDER BY id LIMIT 4) s'),
+  ('non-constant',    'SELECT count(*) FROM cs_cat WHERE skycell_cone(cell, ra, dec, (SELECT 10.0::float8), 20, 1)')
+) t(name, q);
+      name       | same | custom 
+-----------------+------+--------
+ 1 deg           | t    | t
+ 3 arcmin        | t    | t
+ zero radius     | t    | t
+ north pole      | t    | t
+ south pole      | t    | t
+ ra wrap         | t    | t
+ 10 deg          | t    | t
+ whole sky       | t    | f
+ expression      | t    | t
+ two cones       | t    | t
+ cone and filter | t    | t
+ cone or id      | t    | f
+ ordered, limit  | t    | t
+ non-constant    | t    | f
+(14 rows)
+
+SET skycell.custom_scan = on;
+EXPLAIN (COSTS OFF)
+SELECT count(*) FROM cs_cat WHERE skycell_cone(cell, ra, dec, 10, 20, 1);
+                                                                          QUERY PLAN                                                                           
+---------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Aggregate
+   ->  Custom Scan (SkycellCone) on cs_cat
+         Filter: skycell_in_cone((ra)::double precision, "dec", '10'::double precision, '20'::double precision, '1'::double precision, '-1'::double precision)
+         Index: cs_cat_cell
+         Ranges: 1
+(5 rows)
+
+-- rescanned as the inner side of a nested loop: three times the single count
+SET enable_hashjoin = off;
+SET enable_mergejoin = off;
+SET enable_material = off;
+SELECT count(*) = 3 * (SELECT count(*) FROM cs_cat WHERE skycell_cone(cell, ra, dec, 10, 20, 3))
+       AS rescan_ok
+FROM (VALUES (1), (2), (3)) v(x) JOIN cs_cat c ON skycell_cone(c.cell, c.ra, c.dec, 10, 20, 3) AND v.x > 0;
+ rescan_ok 
+-----------
+ t
+(1 row)
+
+RESET enable_hashjoin;
+RESET enable_mergejoin;
+RESET enable_material;
+-- a generic plan (parameters, not constants) keeps the run-time range slots
+PREPARE cs_p(float8, float8, float8) AS
+  SELECT count(*) FROM cs_cat WHERE skycell_cone(cell, ra, dec, $1, $2, $3);
+SET plan_cache_mode = force_custom_plan;
+EXECUTE cs_p(10, 20, 1);
+ count 
+-------
+     2
+(1 row)
+
+SET plan_cache_mode = force_generic_plan;
+EXECUTE cs_p(10, 20, 1);
+ count 
+-------
+     2
+(1 row)
+
+RESET plan_cache_mode;
+-- a scrollable cursor reads backwards (the planner adds a Material)
+BEGIN;
+DECLARE cs_cur SCROLL CURSOR FOR
+  SELECT id FROM cs_cat WHERE skycell_cone(cell, ra, dec, 10, 20, 1) ORDER BY cell;
+FETCH FIRST FROM cs_cur;
+  id  
+------
+ 6697
+(1 row)
+
+MOVE LAST IN cs_cur;
+FETCH ABSOLUTE 1 FROM cs_cur;
+  id  
+------
+ 6697
+(1 row)
+
+COMMIT;
+RESET skycell.custom_scan;
+DROP FUNCTION cs_both(text);
+DROP TABLE cs_cat;

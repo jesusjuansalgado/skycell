@@ -1,11 +1,11 @@
 MODULE_big = skycell
-OBJS = src/skycell.o src/adql.o src/astro.o src/cover.o src/healpix.o src/gist_region.o src/spgist_region.o src/gist_region_box.o src/gist_region_box4.o src/gist_point_cap.o src/gist_point_cap4.o
+OBJS = src/skycell.o src/cone_scan.o src/adql.o src/astro.o src/cover.o src/healpix.o src/gist_region.o src/spgist_region.o src/gist_region_box.o src/gist_region_box4.o src/gist_point_cap.o src/gist_point_cap4.o
 EXTENSION = skycell
 # Every version script and every upgrade script, so that adding a version means
 # adding a file and nothing else.
 DATA = $(wildcard sql/skycell--*.sql)
 PG_CPPFLAGS = -DSKYCELL_PG
-REGRESS = skycell adql
+REGRESS = skycell adql cone_scan
 REGRESS_OPTS = --inputdir=test --outputdir=test
 PG_CONFIG ?= pg_config
 PGXS := $(shell $(PG_CONFIG) --pgxs)

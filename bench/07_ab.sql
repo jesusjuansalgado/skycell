@@ -22,28 +22,45 @@ CREATE TABLE IF NOT EXISTS bench_ab_x (
   corpus text, qid bigint, label text, method text,
   est float8, act float8, buffers bigint, plan_ms float8, exec_ms float8);
 
--- one trial: the three methods on the same query, in the given order
+/*
+ * The settings a method name stands for, applied before its query.
+ *
+ * skycell@<x> is skycell with skycell.range_cost set to <x> for this query, so
+ * that two settings can be compared inside a trial rather than across runs.
+ * Comparing them across runs measures machine drift: the cost curve is flat to
+ * ~10% over a factor 30 in this parameter, which is the same size as the drift.
+ * skycell#<n> sets skycell.probe_orders, and skycell+cs is skycell answered by
+ * its custom scan (skycell.custom_scan) instead of the range rewrite.  Each
+ * skycell method sets custom_scan explicitly, since set_config(..., true) lasts
+ * for the rest of the transaction and a run is one transaction.
+ */
+CREATE OR REPLACE FUNCTION ab_method_gucs(method text) RETURNS void
+LANGUAGE plpgsql AS $$
+BEGIN
+  IF method LIKE 'skycell@%' THEN
+    PERFORM set_config('skycell.range_cost', split_part(method, '@', 2), true);
+    PERFORM set_config('skycell.custom_scan', 'off', true);
+  ELSIF method LIKE 'skycell#%' THEN
+    PERFORM set_config('skycell.probe_orders', split_part(method, '#', 2), true);
+    PERFORM set_config('skycell.range_cost', '-1', true);
+    PERFORM set_config('skycell.custom_scan', 'off', true);
+  ELSIF method = 'skycell+cs' THEN
+    PERFORM set_config('skycell.range_cost', '-1', true);
+    PERFORM set_config('skycell.custom_scan', 'on', true);
+  ELSIF method = 'skycell' THEN
+    PERFORM set_config('skycell.range_cost', '-1', true);
+    PERFORM set_config('skycell.custom_scan', 'off', true);
+  END IF;
+END $$;
+
+-- one trial: the methods on the same query, in the given order
 CREATE OR REPLACE FUNCTION ab_trial(corpus text, cache text, rep int, c bench_centers,
                                     methods text[]) RETURNS void
 LANGUAGE plpgsql AS $$
 DECLARE i int; n bigint; s float8; t0 timestamptz;
 BEGIN
   FOR i IN 1 .. array_length(methods, 1) LOOP
-    /*
-     * A method name of the form skycell@<x> is skycell with
-     * skycell.range_cost set to <x> for this query, so that two settings can
-     * be compared inside a trial rather than across runs.  Comparing them
-     * across runs measures machine drift: the cost curve is flat to ~10% over
-     * a factor 30 in this parameter, which is the same size as the drift.
-     */
-    IF methods[i] LIKE 'skycell@%' THEN
-      PERFORM set_config('skycell.range_cost', split_part(methods[i], '@', 2), true);
-    ELSIF methods[i] LIKE 'skycell#%' THEN
-      PERFORM set_config('skycell.probe_orders', split_part(methods[i], '#', 2), true);
-      PERFORM set_config('skycell.range_cost', '-1', true);
-    ELSIF methods[i] = 'skycell' THEN
-      PERFORM set_config('skycell.range_cost', '-1', true);
-    END IF;
+    PERFORM ab_method_gucs(methods[i]);
     t0 := clock_timestamp();
     EXECUTE cone_sql(methods[i], c) INTO n, s;
     INSERT INTO bench_ab VALUES (corpus, cache, rep, c.qid, c.label, methods[i], i, n,
@@ -96,6 +113,7 @@ BEGIN
   FOR c IN SELECT * FROM bench_centers ORDER BY random() LOOP
     SELECT array_agg(m ORDER BY random()) INTO ms FROM unnest(methods) m;
     FOR i IN 1 .. array_length(ms, 1) LOOP
+      PERFORM ab_method_gucs(ms[i]);
       EXECUTE 'EXPLAIN (ANALYZE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON) '
               || cone_sql(ms[i], c) INTO j;
       p := j -> 0 -> 'Plan';

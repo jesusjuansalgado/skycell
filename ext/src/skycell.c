@@ -203,6 +203,7 @@ _PG_init(void)
 							"the one the cost model chooses (-1 = let the model choose).",
 							NULL, &skycell_force_order, -1, -1, SC_MAX_ORDER,
 							PGC_USERSET, 0, NULL, NULL, NULL);
+	cone_scan_init();
 	MarkGUCPrefixReserved("skycell");
 }
 
@@ -1587,11 +1588,76 @@ simplify_cone5(PlannerInfo *root, FuncExpr *fexpr)
 	return simplify_cone(root, six);
 }
 
+/*
+ * The covering of a constant skycell_cone(cell, ra, dec, ra0, dec0, radius),
+ * through the same density model and memo the rewrite uses.  False when the
+ * cone's parameters are not all non-null constants.  The ranges are owned by
+ * the memo (or the current context when it is off): copy them before anything
+ * else can flush it.
+ */
+bool
+skycell_const_cone_cover(PlannerInfo *root, List *args, sc_region *reg,
+						 sc_cover *cov, sc_density *dens)
+{
+	bool		anynull;
+	Oid			statrel;
+	bool		uses_cell_ops;
+	sc_cover_params p;
+	double		ra0,
+				dec0,
+				radius;
+
+	if (list_length(args) != 6 || !all_const(args, 3, 5, &anynull) || anynull)
+		return false;
+	ra0 = DatumGetFloat8(((Const *) list_nth(args, 3))->constvalue);
+	dec0 = DatumGetFloat8(((Const *) list_nth(args, 4))->constvalue);
+	radius = DatumGetFloat8(((Const *) list_nth(args, 5))->constvalue);
+
+	density_for_var(root, linitial(args), dens, &statrel, &uses_cell_ops);
+	check_err(sc_region_cone(reg, ra0, dec0, radius, true));
+	current_params(&p, skycell_max_ranges, dens);
+	cover_cached(reg, dens, &p, statrel, ra0, dec0, radius, cov);
+	return true;
+}
+
+/*
+ * Selectivity of a constant cone left unrewritten for the custom scan: the
+ * rows the covering expects, scaled by area(cone) / area(covering) -- the same
+ * product the rewrite's range quals and exact-test selectivity make.
+ */
+static double
+cone_selectivity(PlannerInfo *root, List *args)
+{
+	sc_region	reg;
+	sc_cover	cov;
+	sc_density	dens;
+	double		r = DatumGetFloat8(((Const *) list_nth(args, 5))->constvalue) * DEG2RAD;
+
+	if (skycell_const_cone_cover(root, args, &reg, &cov, &dens) &&
+		dens.ntotal > 0 && cov.area > 0)
+		return cov.exp_rows * fmin(1.0, reg.area / cov.area) / dens.ntotal;
+	return pow(sin(fmin(fmax(r, 0), M_PI) / 2.0), 2);	/* cap area / 4pi */
+}
+
 PG_FUNCTION_INFO_V1(skycell_support);
 Datum
 skycell_support(PG_FUNCTION_ARGS)
 {
 	Node	   *rawreq = (Node *) PG_GETARG_POINTER(0);
+
+	if (IsA(rawreq, SupportRequestSelectivity))
+	{
+		SupportRequestSelectivity *req = (SupportRequestSelectivity *) rawreq;
+		bool		anynull;
+
+		if (!req->is_join && req->root != NULL && list_length(req->args) == 6 &&
+			all_const(req->args, 3, 5, &anynull) && !anynull)
+		{
+			req->selectivity = fmin(1.0, fmax(cone_selectivity(req->root, req->args), 1e-12));
+			PG_RETURN_POINTER(req);
+		}
+		PG_RETURN_POINTER(NULL);
+	}
 
 	if (IsA(rawreq, SupportRequestSimplify))
 	{
@@ -1599,7 +1665,12 @@ skycell_support(PG_FUNCTION_ARGS)
 		int			nargs = list_length(req->fcall->args);
 
 		if (nargs == 6)
+		{
+			/* left as is for the custom scan (cone_scan.c), if it can take it */
+			if (cone_scan_keep(req->root, req->fcall))
+				PG_RETURN_POINTER(NULL);
 			PG_RETURN_POINTER(simplify_cone(req->root, req->fcall));
+		}
 		if (nargs == 3)
 			PG_RETURN_POINTER(simplify_poly3(req->root, req->fcall));
 		if (nargs == 5)
