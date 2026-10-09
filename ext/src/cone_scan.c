@@ -9,7 +9,7 @@
  * catalogue, more than skycell's own covering, and the whole of its warm
  * deficit against pgSphere at small radii.
  *
- * With skycell.custom_scan on, a constant cone on a single base relation is
+ * With skycell.custom_scan on (the default), a constant cone on a single base relation is
  * left as the opaque function call (skycell_support declines to rewrite it),
  * so the planner sees one restriction clause whose selectivity skycell
  * itself supplies.  set_rel_pathlist_hook then adds one CustomPath per such
@@ -67,7 +67,7 @@
 #include "cover.h"
 #include "skycell_internal.h"
 
-static bool skycell_custom_scan = false;
+static bool skycell_custom_scan = true;
 
 /* the six-argument skycell_cone, as last seen by cone_scan_keep() */
 static Oid	cone_funcid = InvalidOid;
@@ -718,12 +718,12 @@ cone_scan_init(void)
 {
 	DefineCustomBoolVariable("skycell.custom_scan",
 							 "Answer constant cones with skycell's own scan node instead of "
-							 "rewriting them into B-tree range conditions (experimental).",
+							 "rewriting them into B-tree range conditions.",
 							 "The planner sees one clause and one path, instead of building "
 							 "and estimating a path per range; the scan walks the ranges in "
 							 "cell order, or through a TID bitmap when the heap is not "
 							 "ordered by cell.",
-							 &skycell_custom_scan, false,
+							 &skycell_custom_scan, true,
 							 PGC_USERSET, 0, NULL, NULL, NULL);
 	RegisterCustomScanMethods(&cone_scan_methods);
 	prev_set_rel_pathlist_hook = set_rel_pathlist_hook;

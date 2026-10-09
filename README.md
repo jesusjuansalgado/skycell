@@ -544,7 +544,8 @@ WHERE point('ICRS', ra, dec) <@ circle('ICRS', 269.45, 4.69, 0.05 + 0.006)
 
 | GUC | default | meaning |
 |---|---|---|
-| `skycell.range_cost` | -1 (derive) | price of one index range, in rows; -1 derives it from the relation's rows/page and the planner's cost factors |
+| `skycell.custom_scan` | on | answer a constant `skycell_cone` with skycell's own scan node (one planner path, ranges walked in cell order or through a TID bitmap when the heap is not ordered by cell) instead of rewriting it into B-tree range conditions; joins, generic plans and the Q3C-shaped spellings always use the rewrite; off restores the rewrite for constant cones too |
+| `skycell.range_cost` | -1 (derive) | price of one index range, in rows; -1 derives it from the relation's rows/page and the planner's cost factors (for the custom scan, also from how much of the relation `shared_buffers` holds) |
 | `skycell.max_ranges` | 64 | cap on ranges per covering |
 | `skycell.max_area_ratio` | 64 | a partly covered cell may not exceed this × the region's area |
 | `skycell.use_stats` | on | use the histogram as a density map |

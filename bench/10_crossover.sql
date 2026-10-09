@@ -65,9 +65,10 @@ LANGUAGE sql IMMUTABLE AS $$
                             WHEN 'Q07' THEN 0.5 ELSE 0.0002 END AS r) rr) p
 $$;
 
--- methods: 'pgsphere', 'skycell' (the range rewrite) and 'skycell+cs' (skycell
--- answered by its custom scan, skycell.custom_scan); a skycell method name
--- ending in @<x> runs with skycell.range_cost = <x>, as in 07_ab.sql
+-- methods: 'pgsphere', 'skycell' (skycell's defaults: the custom scan),
+-- 'skycell-rw' (the range rewrite) and 'skycell+cs' (the custom scan, named
+-- explicitly); a skycell method name ending in @<x> runs with
+-- skycell.range_cost = <x>, as in 07_ab.sql
 DROP FUNCTION IF EXISTS bench_cross_run(float8, int, float8, int);
 CREATE OR REPLACE FUNCTION bench_cross_run(rows_m float8, nq int DEFAULT 40,
                                            seed float8 DEFAULT 0.19, reps int DEFAULT 3,
@@ -104,7 +105,7 @@ BEGIN
         FOR i IN 1 .. array_length(ms, 1) LOOP
           -- set_config(..., true) lasts the whole run, so every method sets both
           PERFORM set_config('skycell.custom_scan',
-                             CASE WHEN ms[i] LIKE 'skycell+cs%' THEN 'on' ELSE 'off' END, true);
+                             CASE WHEN ms[i] LIKE 'skycell-rw%' THEN 'off' ELSE 'on' END, true);
           PERFORM set_config('skycell.range_cost',
                              CASE WHEN ms[i] LIKE '%@%' THEN split_part(ms[i], '@', 2) ELSE '-1' END, true);
           EXECUTE oc_sql(cls, ms[i], ctr.ra, ctr.dec) INTO nn;     -- warm this one
