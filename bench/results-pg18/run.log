@@ -1,0 +1,44 @@
+[22:40:05] STAGE designed (corpus from 01/02 already in paper18)
+[22:41:41]   designed: query centres (03) + 07
+[22:41:42]   designed: warm A/B, 5 repetitions
+[22:42:57]   designed: cold A/B
+[22:43:08]   designed: EXPLAIN pass
+[22:43:21] STAGE gaia: 1e7 rows resampled from the DR3 order-9 map
+Time: 638.281 ms
+Time: 2.621 ms
+ setseed 
+---------
+ 
+(1 row)
+
+Time: 0.609 ms
+Time: 15710.286 ms (00:15.710)
+ src50_rows 
+------------
+   10001306
+(1 row)
+
+Time: 2630.949 ms (00:02.631)
+Time: 193.525 ms
+  method  |  step   |  s   |  mb   
+----------+---------+------+-------
+ pgsphere | analyze |  0.5 |      
+ pgsphere | index   | 68.6 | 685.2
+ pgsphere | table   | 14.3 | 730.5
+ q3c      | analyze |  0.2 |      
+ q3c      | index   |  5.6 | 214.3
+ q3c      | table   | 13.8 | 575.0
+ skycell  | analyze |  1.1 |      
+ skycell  | index   |  6.0 | 214.3
+ skycell  | table   | 13.1 | 651.5
+(9 rows)
+
+[22:45:56]   gaia: query centres (03) + 07
+[22:45:56]   gaia: warm A/B, 5 repetitions
+[22:46:32]   gaia: cold A/B
+[22:46:43]   gaia: EXPLAIN pass
+[22:46:56]   ObsCore crossover (10)
+[22:46:56]     0.5 M rows
+[22:47:14]     2 M rows
+[22:47:57]     10 M rows
+[22:50:46] DONE
