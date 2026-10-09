@@ -30,7 +30,8 @@ CREATE TABLE IF NOT EXISTS bench_ab_x (
  * Comparing them across runs measures machine drift: the cost curve is flat to
  * ~10% over a factor 30 in this parameter, which is the same size as the drift.
  * skycell#<n> sets skycell.probe_orders, and skycell+cs is skycell answered by
- * its custom scan (skycell.custom_scan) instead of the range rewrite.  Each
+ * its custom scan (skycell.custom_scan) instead of the range rewrite, with
+ * skycell+cs@<x> also setting range_cost.  Each
  * skycell method sets custom_scan explicitly, since set_config(..., true) lasts
  * for the rest of the transaction and a run is one transaction.
  */
@@ -44,6 +45,9 @@ BEGIN
     PERFORM set_config('skycell.probe_orders', split_part(method, '#', 2), true);
     PERFORM set_config('skycell.range_cost', '-1', true);
     PERFORM set_config('skycell.custom_scan', 'off', true);
+  ELSIF method LIKE 'skycell+cs@%' THEN
+    PERFORM set_config('skycell.range_cost', split_part(method, '@', 2), true);
+    PERFORM set_config('skycell.custom_scan', 'on', true);
   ELSIF method = 'skycell+cs' THEN
     PERFORM set_config('skycell.range_cost', '-1', true);
     PERFORM set_config('skycell.custom_scan', 'on', true);
