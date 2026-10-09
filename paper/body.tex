@@ -766,20 +766,31 @@ half a million rows costs a fraction of a millisecond either way against roughly
 of CPU in the service's own Python, so the database cannot move throughput. That
 explanation predicts a crossover at larger relations, checked by building the same
 ObsCore-shaped relation (observations in groups of 128 sharing a field centre, clustered
-by collection and field) at three sizes (Table~\ref{tab:crossover}): for the cone with
-catalogue cuts (Q07) and the degree-scale cone (Q06), \texttt{skycell} pulls further
-ahead as the relation grows; the empty cone (Q12) is level. The small-cone class (Q05) we
-cannot pin down -- 2.16 times slower immediately after the build (the table), level
-(0.94) once thoroughly warm, not reproducible on this host to better than that factor of
-two -- but the deficit is at least localised to execution (0.324\,ms against 0.161)
-rather than planning.
+by collection and field) at three sizes (Table~\ref{tab:crossover}). It does not hold up
+on this host: \texttt{skycell} stays slower than pgSphere on the degree-scale cone (Q06)
+and the cone with catalogue cuts (Q07) at every size, drifting toward parity on Q06
+(1.07--1.14 across three repeated trials at $10^7$ rows) but never crossing it; the empty
+cone (Q12) stays level, around 1.1--1.3. This is not a correctness problem -- both
+methods return identical row counts at every size and class -- nor is it the
+statistics-target bug an earlier version of this benchmark carried, where
+\texttt{ANALYZE} run in the same transaction as \texttt{ALTER INDEX ... SET STATISTICS}
+silently kept the index's previous target: fixing that bug leaves
+\texttt{skycell\_cover\_info()}'s chosen order, range count and area ratio unchanged for
+the same query, so the covering itself is not what moved. What we have not pinned down
+is why the result differs from the previously published run: this script draws its field
+centres from whichever draw of the resampled-Gaia \texttt{src} corpus happens to be
+live, not a fixed snapshot across this paper's revisions, and the original run was on a
+different, far more memory-constrained container (REPRODUCING.md \S6). The small-cone
+class (Q05) remains the one we cannot pin down -- 2.2--3.1 times slower across repeated
+trials at $10^7$ rows, not reproducible on this host to better than that spread.
 
 \begin{table}
   \caption{Crossover on an ObsCore-shaped relation, randomized paired trials (30
     centres, 3 repetitions, each method warmed on its own query first): total query
     time as the ratio skycell/pgSphere, with buffer pages at $10^7$ rows. Q05:
     0.15\degr\ cone; Q06: 2\degr; Q07: 0.5\degr\ with calibration/time cuts; Q12: an
-    empty 0.7\arcsec\ cone (Q05 is regime-dependent, text).}
+    empty 0.7\arcsec\ cone. Not reproducible on this host to better than about 10\% on
+    Q06/Q07/Q12, or a factor of two on Q05 (text).}
   \label{tab:crossover}
   \centering
   \footnotesize
@@ -789,10 +800,10 @@ rather than planning.
     \cline{2-4}\cline{5-6}
     class & $5\times10^5$ & $2\times10^6$ & $10^7$ & pgSphere & skycell \\
     \hline
-    Q05 & 1.84 & 1.81 & 2.16 &  282 & \textbf{152} \\
-    Q06 & \textbf{0.92} & \textbf{0.87} & \textbf{0.67} & 6052 & \textbf{830} \\
-    Q07 & \textbf{0.84} & \textbf{0.76} & \textbf{0.71} &  712 & \textbf{182} \\
-    Q12 & 1.13 & 1.07 & 1.00 &    5 & 6 \\
+    Q05 & 2.73 & 2.47 & 2.53 &   13 & 350 \\
+    Q06 & 1.44 & 1.34 & 1.07 &  241 & 246 \\
+    Q07 & 1.70 & 1.73 & 1.46 &   35 &  52 \\
+    Q12 & 1.21 & 1.34 & 1.19 &    5 &   7 \\
     \hline
   \end{tabular}
 \end{table}
@@ -918,10 +929,12 @@ structural reason region leaves could shrink safely does not hold for points
 \label{sec:conclusions}
 
 The advantage is not universal: warm, \texttt{skycell} is indistinguishable from
-pgSphere between 6\arcmin\ and 1\degr\ (Sect.~\ref{sec:cones}); it is slower on a
-500\,000-row ObsCore relation and, in one cache regime, on that relation's small-cone
-class -- a row we do not claim. Better row estimates did not, on the join shapes we
-wrote, produce better plans. Every number comes from one machine and one storage device,
+pgSphere between 6\arcmin\ and 1\degr\ (Sect.~\ref{sec:cones}); on an ObsCore-shaped
+relation from 500\,000 to $10^7$ rows it is slower on every query class we measured
+except an empty cone, and the crossover to larger relations that the service-level A/B
+predicted does not reproduce on this host (Sect.~\ref{sec:cones}) -- a result we flag
+rather than explain. Better row estimates did not, on the join shapes we wrote, produce
+better plans. Every number comes from one machine and one storage device,
 with a density field standing in for real positions except where
 Sects.~\ref{sec:xmatch},~\ref{sec:estimator} and the real-position paragraphs
 of~\ref{sec:cones} say otherwise; on those real positions the small-cone
