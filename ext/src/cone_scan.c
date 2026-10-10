@@ -347,6 +347,22 @@ keep_cone(PlannerInfo *root, FuncExpr *written, FuncExpr *fcall)
 		return false;
 	if (cone_kind(args, varno) == CONE_NONE)
 		return false;
+	/* the scan reads heap tuples; any other table AM keeps the rewrite */
+	{
+		RangeTblEntry *rte = rt_fetch(varno, root->parse->rtable);
+
+		if (rte->relkind == RELKIND_RELATION || rte->relkind == RELKIND_MATVIEW)
+		{
+			Relation	r = table_open(rte->relid, NoLock);	/* locked by the parser */
+			bool		heap = table_slot_callbacks(r) == &TTSOpsBufferHeapTuple;
+
+			table_close(r, NoLock);
+			if (!heap)
+				return false;
+		}
+		else if (rte->relkind != RELKIND_PARTITIONED_TABLE)
+			return false;
+	}
 	if (!jointree_has_term(root, (Node *) root->parse->jointree, written))
 		return false;
 	cone_funcid = fcall->funcid;
