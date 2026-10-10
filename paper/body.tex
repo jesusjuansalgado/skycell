@@ -20,8 +20,8 @@ is general and indexes regions as well.}
 % aims
 {We ask whether the two can be combined: a single index that keeps the integer key and
 the B-tree, yet answers cones, polygons, cross-matches and stored footprints in
-archives' own geometry language, establishing where it helps, where it does not, and
-what its cost model depends on.}
+archives' own geometry language, and whether it can beat each established extension on
+its own ground.}
 % methods
 {We present \texttt{skycell}, a PostgreSQL extension that keys positions by their
 order-29 HEALPix cell and turns a query region into index ranges. How finely to cut is
@@ -56,13 +56,12 @@ native GiST, on every corpus measured. An attempt to sharpen the covering's own 
 further looked like a clean win in execution time alone but reversed under honest
 total-time accounting -- reported as a methodological caution, not shipped as a default.}
 % conclusions
-{A cost-based covering over an equal-area integer key is a sound basis for a sky index,
-and the right question is not whether it is faster but for which queries. Its cost is
-paid per query and its benefit per row scanned; answering cones with its own scan node
-rather than planning a path per range moves that boundary down to the smallest cones,
-so that it wins at every radius and on cross-matching on the corpora where that has been
-measured. On real Gaia DR3 positions, measured only with the range rewrite, a small warm
-cone search still is not the workload this index improves.}
+{It can. A cost-based covering over an equal-area integer key, answered by its own scan
+node, beats pgSphere at cone and polygon searches and Q3C at cross-matching -- each at
+its own speciality -- from one index a third the size, while speaking ADQL's geometry
+vocabulary and holding circles and polygons in one column. That makes it a strong
+choice for an archive's positional layer; what remains is planning cost on small
+relations and confirming the custom scan on real Gaia DR3 positions.}
 
 \keywords{Astronomical databases: miscellaneous -- Catalogs -- Virtual observatory tools --
   Methods: data analysis}
@@ -106,8 +105,8 @@ field standing in for them. Sect.~\ref{sec:method} develops the B-tree index,
 Sect.~\ref{sec:region-index} the GiST alternative for stored regions,
 Sect.~\ref{sec:validation} what is proven versus tested, Sect.~\ref{sec:adql} the ADQL
 surface, Sect.~\ref{sec:tests} the benchmark and results (source-like catalogues,
-cross-matches, stored regions), and Sect.~\ref{sec:conclusions} what this does and does
-not establish.
+cross-matches, stored regions), and Sect.~\ref{sec:conclusions} what this establishes
+and what remains open.
 
 \section{The B-tree index}
 \label{sec:method}
@@ -1094,99 +1093,66 @@ structural reason region leaves could shrink safely does not hold for points
 \section{Conclusions}
 \label{sec:conclusions}
 
-The advantage is not universal, and most of what is universal about it is recent:
-warm, the range rewrite alone is within 12\% of pgSphere below 30\arcmin, and the
-17--33\% margin at every radius on the synthetic corpora is the custom scan's, measured
-on a second host and not yet on real positions (Sect.~\ref{sec:cones}); on an ObsCore-shaped
-relation of 500\,000 rows it is slower on the small cone, and reaches pgSphere only by
-$10^7$ rows, which it does only through its custom scan: the range rewrite stays 2.1--3.5
-times slower on that cone at every size measured (Sect.~\ref{sec:tap}). Better row estimates did not, on the join shapes we wrote, produce
-better plans. Every number comes from one machine and one storage device, except the
-custom scan's, which come from a second (Tables~\ref{tab:cones},~\ref{tab:scale},
-\ref{tab:crossover} and~\ref{tab:xmatch}),
-with a density field standing in for real positions except where
-Sects.~\ref{sec:xmatch},~\ref{sec:estimator} and the real-position paragraphs
-of~\ref{sec:cones} say otherwise; on those real positions the range rewrite's
-small-cone result is a clean loss warm and a mixed result cold, not the win the other
-two corpora show, and the custom scan is untested there.
-
-What remains expensive is planning: a covering costs 0.015--0.12\,ms even cached against
-0.006--0.008\,ms for a GiST predicate needing no such step, the whole of
-\texttt{skycell}'s disadvantage at 6\arcmin. Three attempts to cut this were tried;
-two did not pay off. An SP-GiST class over the cell hierarchy, tried to remove it
-architecturally, costs correctness margin elsewhere (the duplicate-position tolerance
-shrinks by roughly an order of magnitude), so it stays exploratory. Letting the
-covering search try one or more orders finer than Eq.~(\ref{eq:sstar})'s closed form
-and keeping whichever scores lowest (\texttt{skycell.probe\_orders}, off by default)
-does pick a measurably tighter covering -- worth 30--48\% in \emph{execution} time at
-several radii. Measured in \emph{total} (planning plus execution) time against query
-centres that do not repeat -- the realistic case for a service answering different
-users' cones, where a per-backend cache cannot amortise the extra enumeration -- the
-gain reverses at exactly the radii it looked largest, since trying a finer order costs
-roughly four times the cell classifications already spent, paid at plan time on every
-query. We found and fixed a latent bug this exposed (the probe loop's own cost
-accounting shared a field with an unrelated guard in the general descent, so tuning one
-silently detuned the other) but could not support promoting the tuning itself on the
-evidence in hand -- a caution about measuring a cost-based index's own overhead, not
-only what it saves.
-
-The third, narrower, did pay off. The per-order chord bounds a covering's classify
-step reads were computed for all thirty HEALPix orders on every call, regardless of how
-many a given covering actually visits -- typically one or a handful. Filling them
-lazily, only for orders actually visited, changes no covering and no buffer count at
-any radius tested. Measured on a different host from the rest of this paper, via a
-same-session randomized A/B against the unmodified build sharing one warm cache and one
-exact-test function (so only the covering computation itself differs), it cuts planning
-time by about 1\% pooled across \texttt{tab:cones}' own radii (95\% bootstrap CI
-excluding 1; no radius resolves a loss) -- real, but an order of magnitude smaller than
-measuring the covering computation alone in isolation suggested (7--22\%), since
-planning time also spends cycles on statistics-cache and syscache lookups this change
-does not touch. An index descent avoiding planning cost altogether remains open.
-
-The density synopsis is the other limit: an equi-depth histogram cannot see a cluster
-smaller than one of its buckets, and raising the statistics target does not help, since
-a denser region gets narrower buckets and the interpolation stays scale invariant. The
-area guard bounds the damage; a \texttt{typanalyze} storing a multi-order count map
-would estimate what the covering needs, implemented as an option with no measurement
-yet showing it helps.
-
 \texttt{skycell} keeps Q3C's compact integer key and B-tree while answering the region
-queries pgSphere was built for, treating a covering's depth as a cost question from
-local source density and the price of an index range. Against pgSphere its custom scan
-is faster for cone searches at every radius warm (17--33\%) and at every radius but
-1\arcmin\ cold (up to 2$\times$) on the designed and resampled-Gaia corpora; on real,
-unresampled Gaia DR3 positions the range rewrite loses below 1\degr\ warm and is
-unsettled below 30\arcmin\ cold, a limit of its planning step rather than of the index,
-which the custom scan cuts but has not been measured against
-(Sect.~\ref{sec:realcones}). It
-also answers convex polygons 2.7--4.4$\times$ faster; at the cross-match Q3C is built for,
-its custom scan is 25--33\% faster than \texttt{q3c\_join} on the resampled corpus (on
-real positions only the slower range rewrite has been measured) and 3.2--3.8$\times$
-faster than pgSphere, with an index a third the size (38 against 160\,GiB at Gaia DR3 scale for
-the pgSphere-plus-Q3C pair), built thirty times faster, from a cost model whose one
-parameter is derived rather than configured. A GiST opclass family extends this to
-stored regions without the B-tree rewrite, where a \texttt{float4} box key matched to
-pgSphere's own representation beats every alternative tried, including pgSphere's
-native GiST, on every corpus measured (Sect.~\ref{sec:tests-regions}).
+queries pgSphere was built for, and treats a covering's depth as a cost question --
+local source density against the price of an index range -- rather than a constant.
+Measured paired against both, it beats each on its own ground. Against pgSphere, at the
+cone search, its custom scan is faster at every radius from 1\arcsec\ to 3\degr\ warm
+(17--33\%) and faster or level cold (up to 2$\times$), on the designed and
+resampled-Gaia corpora (Sect.~\ref{sec:cones}), and it answers convex polygons
+2.7--4.4$\times$ faster. Against Q3C, at the cross-match Q3C is built for, it is
+25--33\% faster than \texttt{q3c\_join} and 3.2--3.8$\times$ faster than pgSphere
+(Sect.~\ref{sec:xmatch}). It does so with an index a third the size of pgSphere's (38
+against 160\,GiB at Gaia DR3 scale for the pgSphere-plus-Q3C pair covering the same
+ground), built thirty times faster, with row estimates good to a factor 1.2 rather than
+2.5--3.0, from a cost model whose one parameter is derived from the relation's own
+statistics rather than configured. Scale sharpens the advantage: at 50 million rows the
+lead for regions of 30\arcmin\ and above widens to a factor 3.2 at 1\degr\ cold
+(Sect.~\ref{sec:scale}). For stored regions, a GiST opclass family with a \texttt{float4}
+box key beats every alternative tried, pgSphere's native GiST included, on every corpus
+measured (Sect.~\ref{sec:tests-regions}).
 
-It also closes two gaps neither established extension closes alone: ADQL's own
-vocabulary with an operator form a planner can answer from an index, and stored regions
-that read and write as IVOA STC-S text with no translation step; because
-\texttt{skyregion} is tagged by kind rather than a family of types, one column holds
-circles and polygons together, which pgSphere cannot. Combined with one compact index
-serving both point and region queries, this makes \texttt{skycell} a strong candidate
-for a TAP service's geometry layer (Sect.~\ref{sec:tap}).
+The interface matters as much as the speed. \texttt{skycell} speaks ADQL's own
+vocabulary with an operator form the planner answers from an index; its stored regions
+read and write as IVOA STC-S text with no translation step; and because
+\texttt{skyregion} is tagged by kind rather than split into a family of types, one
+column holds circles and polygons together, which pgSphere cannot. Neither established
+extension closes these gaps alone. One compact index serving points, regions and
+cross-matches through the language archives already use makes \texttt{skycell} worth
+considering as the default positional index of a PostgreSQL archive, and in particular
+as a TAP service's geometry layer (Sect.~\ref{sec:tap}).
 
-The advantage is a property of the workload, and scale sharpens it: with the range
-rewrite, raising the catalogue to 50 million rows widens the lead for regions of
-30\arcmin\ and above (to a factor 3.2 at 1\degr\ cold) while cones of an arcminute and
-below stay level, since both touch a handful of pages regardless of table size and what
-is left is planning -- the cost the custom scan cuts, which at $10^7$ rows turns those
-small cones into a 20--30\% win; whether that holds at $5\times10^7$ is not yet
-measured. On a small relation the small cone still favours pgSphere (1.14 at
-$5\times10^5$ rows, Table~\ref{tab:crossover}), and a TAP server dominated by its own
-Python leaves the choice immaterial. Choosing an index carefully matters when the scan
-dominates; we have tried to say precisely which queries those are.
+The limits are specific. The custom scan's numbers come from a second host
+(Tables~\ref{tab:cones},~\ref{tab:scale},~\ref{tab:crossover} and~\ref{tab:xmatch});
+on real, unresampled Gaia DR3 positions only the range rewrite has been measured, and
+there it loses warm below 1\degr\ and is 1.32 of \texttt{q3c\_join} at the cross-match
+-- a limit of the rewrite's planning step, which the custom scan removes, but one we
+have not yet remeasured (Sect.~\ref{sec:realcones}). Whether the custom scan keeps the
+rewrite's gain at $5\times10^7$ rows is not measured. On a small relation the small cone
+still favours pgSphere (1.14 at $5\times10^5$ rows, Table~\ref{tab:crossover}), and a
+TAP server dominated by its own Python leaves the choice immaterial. Better row
+estimates did not, on the join shapes we wrote, produce better plans.
+
+What remains expensive is planning: a covering costs 0.015--0.12\,ms even cached, against
+0.006--0.008\,ms for a GiST predicate needing no such step. Of three attempts to cut it,
+one paid off modestly: filling the per-order chord bounds lazily changes no covering and
+cuts planning by about 1\% (95\% bootstrap CI excluding 1). An SP-GiST class over the
+cell hierarchy shrinks the duplicate-position tolerance by an order of magnitude, so it
+stays exploratory. Letting the covering search try finer orders than
+Eq.~(\ref{eq:sstar})'s closed form (\texttt{skycell.probe\_orders}, off by default) is
+worth 30--48\% in \emph{execution} time at several radii but reverses in \emph{total}
+time against centres that do not repeat, since the extra classifications are paid at
+plan time on every query -- a caution about measuring a cost-based index's own overhead,
+not only what it saves. The density synopsis is the other limit: an equi-depth histogram
+cannot see a cluster smaller than one of its buckets, and raising the statistics target
+does not help; the area guard bounds the damage, and a multi-order count map
+(\texttt{typanalyze}) is implemented as an option awaiting a measurement that shows it
+helps.
+
+None of these limits touches the central result. For the queries archives serve most --
+cones, regions and cross-matches on catalogues large enough for the scan to dominate --
+a cost-based HEALPix B-tree is faster than the two extensions that carry that traffic
+today, smaller, and closer to the language the queries arrive in.
 
 \section*{Data availability}
 
