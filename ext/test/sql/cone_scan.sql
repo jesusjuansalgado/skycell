@@ -167,6 +167,37 @@ FROM unnest(ARRAY['cs_cat', 'cs_sorted']) tbl, (VALUES
 ) t(name, q)
 ORDER BY tbl, t.name;
 
+-- ADQL's own spelling, the operator a translator emits for CONTAINS, is the
+-- same cone: a circle (constant, STC-S or built per row) goes to the custom
+-- scan exactly as skycell_cone would, and returns what the rewrite returns;
+-- a polygon, or a circle under an OR, keeps the rewrite
+CREATE TABLE cs_spos AS SELECT id, skycell_point(ra, dec) AS pos FROM cs_cat;
+CREATE INDEX cs_spos_cell ON cs_spos (skycell_cell(pos));
+ANALYZE cs_spos;
+SELECT t.name, tbl, (cs_join(replace(t.q, 'cs_cat', tbl))).*
+FROM unnest(ARRAY['cs_cat', 'cs_sorted']) tbl, (VALUES
+  ('adql cone',     'SELECT count(*) || '':'' || sum(id) FROM cs_cat WHERE point(''ICRS'', ra, dec) <@ circle(''ICRS'', 10, 20, 1)'),
+  ('adql @>',       'SELECT count(*) || '':'' || sum(id) FROM cs_cat WHERE circle(''ICRS'', 10, 20, 1) @> point(''ICRS'', ra, dec)'),
+  ('adql aliases',  'SELECT count(*) || '':'' || sum(id) FROM cs_cat WHERE skycell_point(ra, dec) <@ skycell_circle(359.8, 1, 3)'),
+  ('adql stc-s',    'SELECT count(*) || '':'' || sum(id) FROM cs_cat WHERE point(''ICRS'', ra, dec) <@ ''CIRCLE ICRS 0 90 4''::skyregion'),
+  ('adql join',     'SELECT count(*) || '':'' || sum(c.id) FROM cs_probe p JOIN cs_cat c ON point(''ICRS'', c.ra, c.dec) <@ circle(''ICRS'', p.ra, p.dec, 0.3)'),
+  ('adql radius',   'SELECT count(*) || '':'' || sum(c.id) FROM cs_probe p JOIN cs_cat c ON circle(''ICRS'', p.ra, p.dec, p.r) @> point(''ICRS'', c.ra, c.dec)'),
+  ('adql left',     'SELECT count(*) || '':'' || count(c.id) FROM cs_probe p LEFT JOIN cs_cat c ON point(''ICRS'', c.ra, c.dec) <@ circle(''ICRS'', p.ra, p.dec, 0.3)'),
+  ('adql or',       'SELECT count(*) || '':'' || sum(id) FROM cs_cat WHERE point(''ICRS'', ra, dec) <@ circle(''ICRS'', 10, 20, 1) OR id = 7'),
+  ('adql polygon',  'SELECT count(*) || '':'' || sum(id) FROM cs_cat WHERE point(''ICRS'', ra, dec) <@ polygon(''ICRS'', 10, 20, 12, 20, 11, 22)')
+) t(name, q)
+ORDER BY tbl, t.name;
+SELECT t.name, (cs_join(t.q)).* FROM (VALUES
+  ('stored skypos', 'SELECT count(*) || '':'' || sum(id) FROM cs_spos WHERE pos <@ circle(''ICRS'', 10, 20, 1)'),
+  ('stored, join',  'SELECT count(*) || '':'' || sum(s.id) FROM cs_probe p JOIN cs_spos s ON s.pos <@ circle(''ICRS'', p.ra, p.dec, 0.3)')
+) t(name, q);
+EXPLAIN (COSTS OFF)
+SELECT count(*) FROM cs_probe p JOIN cs_cat c ON point('ICRS', c.ra, c.dec) <@ circle('ICRS', p.ra, p.dec, 0.3);
+-- the coordinate system is still checked, at plan time
+SELECT count(*) FROM cs_cat WHERE point('ICRS', ra, dec) <@ circle('GALACTIC', 10, 20, 1);
+SELECT count(*) FROM cs_probe p JOIN cs_cat c ON point('FK4', c.ra, c.dec) <@ circle('ICRS', p.ra, p.dec, 0.3);
+DROP TABLE cs_spos;
+
 -- the join's row estimate: half the probes sit on catalogue sources, which a
 -- density model cannot know; sampled probes' cones measure it (within 3x)
 CREATE FUNCTION cs_est(q text) RETURNS text LANGUAGE plpgsql AS $$

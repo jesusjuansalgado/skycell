@@ -329,20 +329,24 @@ all exist there), either install into a schema that precedes it in
 
 | Operator | Meaning |
 |---|---|
-| `skypos <@ skyregion` | position inside region — **the one the planner rewrites into index ranges**, against a constant region and an indexed point catalogue |
+| `skypos <@ skyregion` | position inside region — **the indexable ADQL `CONTAINS`**: against a circle (constant, or built per row as in a cross-match) it is planned exactly as `skycell_cone`, through the custom scan; against a polygon it is rewritten into index ranges |
 | `skyregion @> skypos` | the same, reversed — the same rewrite, or, when `skyregion` is itself a stored column with a GiST index on it, indexed that way instead (the region side need not be constant then); with a GIN index on `skycell_region_moc(region)` instead (or as well), rewritten into that array-overlap test automatically — see below |
 | `skyregion && skyregion` | regions overlap — indexed by a plain `CREATE INDEX ON t USING gist (region)` on a `skyregion` column, no side table and no manual recipe needed (new; see the caveat below) |
 | `skyregion @> skyregion` | region wholly contains region — indexed the same way, either spelling (new; see the caveat below) |
 | `skyregion <@ skyregion` | the same, reversed — the same index, either spelling (new; see the caveat below) |
 
-`<@`/`@>` against a constant region and a plain `ra`/`dec` (or `skypos`) catalogue
-go through the B-tree cell rewrite described above. A `skyregion` column with its
+`<@`/`@>` against a circle and a plain `ra`/`dec` (or `skypos`) catalogue go
+through the custom scan, like `skycell_cone`, whether the circle is a constant or
+comes from another table's row (`JOIN cat c ON point('ICRS', c.ra, c.dec) <@
+circle('ICRS', p.ra, p.dec, r)` is a cross-match); against a constant polygon or
+box they go through the B-tree cell rewrite described above. A `skyregion` column with its
 own GiST index additionally indexes `&&` and both region-region containment
 operators (`@>`/`<@`, in either argument order — they're commutators of each
 other) directly against it, region side non-constant included — what a stored
-footprint column (an ObsCore `s_region`, say) should carry. For a per-row region
-cross-matched against a plain point catalogue with no `skyregion` column of its
-own, use `skycell_cone()` or `skycell_cone_ranges()` instead.
+footprint column (an ObsCore `s_region`, say) should carry. A per-row region
+matched against a plain point catalogue needs no `skyregion` column of its own:
+a per-row circle goes to the custom scan and a per-row polygon to the rewrite's
+run-time range slots.
 
 **Two alternative index types for a `skypos` column itself**, instead of the
 B-tree cell rewrite above, exist as opt-in opclasses — competitors to pgSphere's
@@ -591,7 +595,7 @@ WHERE point('ICRS', ra, dec) <@ circle('ICRS', 269.45, 4.69, 0.05 + 0.006)
 
 | GUC | default | meaning |
 |---|---|---|
-| `skycell.custom_scan` | on | answer `skycell_cone` (and `skycell_join`, `skycell_radial_query`) with the `SkycellCone` scan node instead of rewriting it into B-tree range conditions — constant cones, cross-match cones (a parameterized scan, one covering per outer row) and cones over parameters alone (generic plans, correlated sub-selects). A cone that is not a top-level `AND` term of a `WHERE`/`JOIN ON` (one under an `OR`, say) keeps the rewrite, so it stays indexable. Off restores the rewrite everywhere |
+| `skycell.custom_scan` | on | answer `skycell_cone` (and `skycell_join`, `skycell_radial_query`, and ADQL's `point <@ circle`) with the `SkycellCone` scan node instead of rewriting it into B-tree range conditions — constant cones, cross-match cones (a parameterized scan, one covering per outer row) and cones over parameters alone (generic plans, correlated sub-selects). A cone that is not a top-level `AND` term of a `WHERE`/`JOIN ON` (one under an `OR`, say) keeps the rewrite, so it stays indexable. Off restores the rewrite everywhere |
 | `skycell.range_cost` | -1 (derive) | price of one index range, in rows; -1 derives it from the relation's rows/page and the planner's cost factors (for the custom scan, also from how much of the relation `shared_buffers` holds) |
 | `skycell.max_ranges` | 64 | cap on ranges per covering |
 | `skycell.max_area_ratio` | 64 | a partly covered cell may not exceed this × the region's area |
