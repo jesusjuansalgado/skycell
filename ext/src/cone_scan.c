@@ -37,6 +37,7 @@
 #include "access/skey.h"
 #include "access/stratnum.h"
 #include "access/table.h"
+#include "executor/tuptable.h"
 #include "access/tableam.h"
 #include "catalog/pg_am_d.h"
 #include "catalog/pg_class_d.h"
@@ -53,6 +54,7 @@
 #include "nodes/nodeFuncs.h"
 #include "nodes/tidbitmap.h"
 #include "optimizer/cost.h"
+#include "optimizer/planner.h"
 #include "optimizer/optimizer.h"
 #include "optimizer/pathnode.h"
 #include "optimizer/paths.h"
@@ -61,7 +63,10 @@
 #include "utils/array.h"
 #include "utils/guc.h"
 #include "utils/lsyscache.h"
+#include "storage/bufmgr.h"
+#include "utils/memutils.h"
 #include "utils/rel.h"
+#include "utils/snapmgr.h"
 #include "utils/syscache.h"
 
 #include "cover.h"
@@ -431,10 +436,300 @@ typedef struct
 	double		steps;			/* cell classifications per covering */
 	double		ntotal;			/* rows in the relation */
 	Oid			statrel;		/* where its density comes from */
+	bool		sampled;		/* measured on sampled probes (join_cone_sample) */
 } join_estimate;
+
+/*
+ * A column, or a plain cast of one, of a numeric type: safe to evaluate at
+ * plan time (no cast here can fail on a value the column holds).
+ */
+static bool
+plain_column(Node *n)
+{
+	Oid			t;
+
+	if (IsA(n, RelabelType))
+		n = (Node *) ((RelabelType *) n)->arg;
+	else if (IsA(n, FuncExpr) && ((FuncExpr *) n)->funcformat == COERCE_IMPLICIT_CAST &&
+			 list_length(((FuncExpr *) n)->args) == 1)
+		n = linitial(((FuncExpr *) n)->args);
+	if (!IsA(n, Var) || ((Var *) n)->varlevelsup != 0 || ((Var *) n)->varattno <= 0)
+		return false;
+	t = ((Var *) n)->vartype;
+	return t == FLOAT8OID || t == FLOAT4OID || t == NUMERICOID ||
+		t == INT2OID || t == INT4OID || t == INT8OID;
+}
+
+static bool
+sampleable_rel(PlannerInfo *root, int varno, RangeTblEntry **rte)
+{
+	*rte = planner_rt_fetch(varno, root);
+	return (*rte)->rtekind == RTE_RELATION && !(*rte)->inh &&
+		((*rte)->relkind == RELKIND_RELATION || (*rte)->relkind == RELKIND_MATVIEW);
+}
+
+/*
+ * What a cross-match's cones hold, measured: the density model cannot know
+ * that the targets of a cross-match usually sit on catalogue sources (a
+ * probe drawn from another survey has its counterpart in the cone), so it
+ * underestimates the matches by orders of magnitude for small radii.  When
+ * the centre (and radius, unless constant) are plain columns of one outer
+ * table and the cones are small, read PROBE_SAMPLES of its rows spread over
+ * its pages, cover each probe as the scan will, and count the inner rows
+ * the ranges hold and the cone keeps -- as get_actual_variable_range() reads
+ * an index to estimate a range.  Anything else keeps the density estimate.
+ */
+#define PROBE_SAMPLES	32
+#define PROBE_MAX_CAND	4000	/* inner rows read in all, before giving up */
+
+static bool
+join_cone_sample(PlannerInfo *root, List *args, const sc_density *dens, join_estimate *e)
+{
+	Node	   *rarg = (Node *) list_nth(args, 5);
+	bool		rconst = IsA(rarg, Const);
+	Relids		ov,
+				iv;
+	int			ovarno,
+				ivarno;
+	RangeTblEntry *orte,
+			   *irte;
+	RelOptInfo *irelinfo;
+	IndexOptInfo *ix;
+	Relation	orel,
+				irel,
+				ind;
+	BlockNumber nblocks;
+	MemoryContext cxt,
+				old;
+	EState	   *estate;
+	ExprContext *econtext;
+	ExprState  *x_ra0,
+			   *x_dec0,
+			   *x_r = NULL,
+			   *x_ra,
+			   *x_dec;
+	TupleTableSlot *oslot,
+			   *islot;
+	TableScanDesc tscan = NULL;
+	IndexScanDesc iscan;
+	ScanKeyData keys[2];
+	Oid			opfamily;
+	sc_cover_params p;
+	double		sum_n = 0,
+				sum_r = 0,
+				sum_c = 0,
+				sum_m = 0,
+				read = 0;
+	int			nblk,
+				per_blk;
+	bool		ok = true;
+
+	/* centre and radius: plain columns of one table; cell, ra, dec: of another */
+	if (!plain_column(list_nth(args, 3)) || !plain_column(list_nth(args, 4)) ||
+		!(rconst ? !((Const *) rarg)->constisnull : plain_column(rarg)) ||
+		!plain_column(lsecond(args)) || !plain_column(lthird(args)))
+		return false;
+	ov = pull_varnos(root, (Node *) list_make3(list_nth(args, 3), list_nth(args, 4), rarg));
+	iv = pull_varnos(root, (Node *) list_make3(linitial(args), lsecond(args), lthird(args)));
+	if (!bms_get_singleton_member(ov, &ovarno) || !bms_get_singleton_member(iv, &ivarno) ||
+		ovarno == ivarno || !sampleable_rel(root, ovarno, &orte) || !sampleable_rel(root, ivarno, &irte))
+		return false;
+	irelinfo = find_base_rel(root, ivarno);
+	if ((ix = cell_index(irelinfo, linitial(args))) == NULL || !ActiveSnapshotSet())
+		return false;
+
+	cxt = AllocSetContextCreate(CurrentMemoryContext, "skycell probe sample", ALLOCSET_DEFAULT_SIZES);
+	old = MemoryContextSwitchTo(cxt);
+	orel = table_open(orte->relid, NoLock);	/* locked by the parser */
+	irel = table_open(irte->relid, NoLock);
+	nblocks = RelationGetNumberOfBlocks(orel);
+	if (nblocks == 0 || orel->rd_tableam->scan_set_tidrange == NULL ||
+		table_slot_callbacks(irel) != &TTSOpsBufferHeapTuple)
+	{
+		table_close(irel, NoLock);
+		table_close(orel, NoLock);
+		MemoryContextSwitchTo(old);
+		MemoryContextDelete(cxt);
+		return false;
+	}
+	ind = index_open(ix->indexoid, AccessShareLock);
+	estate = CreateExecutorState();
+	econtext = GetPerTupleExprContext(estate);
+	x_ra0 = ExecPrepareExpr((Expr *) copyObject(list_nth(args, 3)), estate);
+	x_dec0 = ExecPrepareExpr((Expr *) copyObject(list_nth(args, 4)), estate);
+	if (!rconst)
+		x_r = ExecPrepareExpr((Expr *) copyObject(rarg), estate);
+	x_ra = ExecPrepareExpr((Expr *) copyObject(lsecond(args)), estate);
+	x_dec = ExecPrepareExpr((Expr *) copyObject(lthird(args)), estate);
+	oslot = table_slot_create(orel, NULL);
+	islot = table_slot_create(irel, NULL);
+
+	opfamily = ind->rd_opfamily[0];
+	ScanKeyInit(&keys[0], 1, BTGreaterEqualStrategyNumber,
+				get_opcode(get_opfamily_member(opfamily, INT8OID, INT8OID,
+											   BTGreaterEqualStrategyNumber)), Int64GetDatum(0));
+	ScanKeyInit(&keys[1], 1, BTLessEqualStrategyNumber,
+				get_opcode(get_opfamily_member(opfamily, INT8OID, INT8OID,
+											   BTLessEqualStrategyNumber)), Int64GetDatum(0));
+#if PG_VERSION_NUM >= 180000
+	iscan = index_beginscan(irel, ind, GetActiveSnapshot(), NULL, 2, 0);
+#else
+	iscan = index_beginscan(irel, ind, GetActiveSnapshot(), 2, 0);
+#endif
+	skycell_scan_params(&p, dens);
+
+	nblk = (int) Min((BlockNumber) PROBE_SAMPLES, nblocks);
+	per_blk = (PROBE_SAMPLES + nblk - 1) / nblk;
+	for (int k = 0; k < nblk && ok; k++)
+	{
+		BlockNumber b = (BlockNumber) (((uint64) k * nblocks) / nblk);
+		ItemPointerData lo,
+					hi;
+		int			got = 0;
+
+		ItemPointerSet(&lo, b, FirstOffsetNumber);
+		ItemPointerSet(&hi, b, MaxOffsetNumber);
+		if (tscan == NULL)
+			tscan = table_beginscan_tidrange(orel, GetActiveSnapshot(), &lo, &hi);
+		else
+			table_rescan_tidrange(tscan, &lo, &hi);
+		while (got < per_blk && ok &&
+			   table_scan_getnextslot_tidrange(tscan, ForwardScanDirection, oslot))
+		{
+			bool		n1,
+						n2,
+						n3 = false;
+			double		ra0,
+						dec0,
+						radius;
+			double		thr,
+						cosdec0;
+			sc_region	reg;
+			sc_cover	cov;
+
+			got++;
+			ResetExprContext(econtext);
+			econtext->ecxt_scantuple = oslot;
+			ra0 = DatumGetFloat8(ExecEvalExprSwitchContext(x_ra0, econtext, &n1));
+			dec0 = DatumGetFloat8(ExecEvalExprSwitchContext(x_dec0, econtext, &n2));
+			radius = rconst ? DatumGetFloat8(((Const *) rarg)->constvalue)
+				: DatumGetFloat8(ExecEvalExprSwitchContext(x_r, econtext, &n3));
+			sum_n += 1;			/* a NULL probe is a probe that matches nothing */
+			if (n1 || n2 || n3 || sc_region_cone(&reg, ra0, dec0, radius, true) != NULL)
+				continue;
+			sc_cover_compute(&reg, dens, &p, &cov);
+			thr = radius < 0 ? -1.0 : (radius >= 180.0 ? 2.0 : pow(sin(radius * M_PI / 360.0), 2));
+			cosdec0 = cos(dec0 * M_PI / 180.0);
+			sum_r += cov.n;
+			for (int i = 0; i < cov.n && ok; i++)
+			{
+				keys[0].sk_argument = Int64GetDatum(cov.r[i].lo);
+				keys[1].sk_argument = Int64GetDatum(cov.r[i].hi);
+				index_rescan(iscan, keys, 2, NULL, 0);
+				while (index_getnext_slot(iscan, ForwardScanDirection, islot))
+				{
+					bool		m1,
+								m2;
+					double		ra,
+								dec,
+								sdd,
+								sda;
+
+					econtext->ecxt_scantuple = islot;
+					ra = DatumGetFloat8(ExecEvalExprSwitchContext(x_ra, econtext, &m1));
+					dec = DatumGetFloat8(ExecEvalExprSwitchContext(x_dec, econtext, &m2));
+					sum_c += 1;
+					if (++read > PROBE_MAX_CAND)
+					{
+						ok = false;
+						break;
+					}
+					if (m1 || m2)
+						continue;
+					/* skycell_in_cone's haversine */
+					sdd = sin((dec - dec0) * M_PI / 360.0);
+					sda = sin((ra - ra0) * M_PI / 360.0);
+					if (sdd * sdd + cos(dec * M_PI / 180.0) * cosdec0 * sda * sda <= thr)
+						sum_m += 1;
+				}
+			}
+			sc_cover_free(&cov);
+		}
+	}
+
+	index_endscan(iscan);
+	if (tscan)
+		table_endscan(tscan);
+	ExecDropSingleTupleTableSlot(oslot);
+	ExecDropSingleTupleTableSlot(islot);
+	FreeExecutorState(estate);
+	index_close(ind, NoLock);
+	table_close(irel, NoLock);
+	table_close(orel, NoLock);
+	MemoryContextSwitchTo(old);
+	MemoryContextDelete(cxt);
+
+	if (!ok || sum_n == 0)
+		return false;
+	e->nranges = sum_r / sum_n;
+	e->cand = sum_c / sum_n;
+	e->matches = sum_m / sum_n;
+	e->sampled = true;
+	return true;
+}
+
+/*
+ * join_cone_estimate() is asked for the same clause by the selectivity
+ * request, the parameterized path's row count and its cost: keep the last
+ * few answers for the query being planned (planner_hook bumps the
+ * generation, so nothing carries over to the next query).
+ */
+#define EST_CACHE 8
+static uint64 plan_generation = 0;
+static struct
+{
+	uint64		gen;
+	List	   *args;
+	join_estimate e;
+}			est_cache[EST_CACHE];
+static int	est_next = 0;
+static planner_hook_type prev_planner_hook = NULL;
+
+static PlannedStmt *
+cone_planner(Query *parse, const char *query_string, int cursorOptions, ParamListInfo boundParams)
+{
+	plan_generation++;
+	if (prev_planner_hook)
+		return prev_planner_hook(parse, query_string, cursorOptions, boundParams);
+	return standard_planner(parse, query_string, cursorOptions, boundParams);
+}
+
+static bool join_cone_estimate_uncached(PlannerInfo *root, List *args, join_estimate *e);
 
 static bool
 join_cone_estimate(PlannerInfo *root, List *args, join_estimate *e)
+{
+	bool		ok;
+
+	for (int i = 0; i < EST_CACHE; i++)
+		if (est_cache[i].gen == plan_generation && plan_generation != 0 && est_cache[i].args == args)
+		{
+			*e = est_cache[i].e;
+			return true;
+		}
+	ok = join_cone_estimate_uncached(root, args, e);
+	if (ok && plan_generation != 0)
+	{
+		est_cache[est_next].gen = plan_generation;
+		est_cache[est_next].args = args;
+		est_cache[est_next].e = *e;
+		est_next = (est_next + 1) % EST_CACHE;
+	}
+	return ok;
+}
+
+static bool
+join_cone_estimate_uncached(PlannerInfo *root, List *args, join_estimate *e)
 {
 	Node	   *cell = linitial(args);
 	Node	   *rarg = estimate_expression_value(root, (Node *) list_nth(args, 5));
@@ -490,6 +785,9 @@ join_cone_estimate(PlannerInfo *root, List *args, join_estimate *e)
 	e->cand /= n;
 	e->matches /= n;
 	e->steps /= n;
+	/* small cones: measure what sampled probes' cones actually hold */
+	if (e->cand * PROBE_SAMPLES <= PROBE_MAX_CAND)
+		(void) join_cone_sample(root, args, &dens, e);
 	return true;
 }
 
@@ -1208,6 +1506,8 @@ cone_scan_init(void)
 							 &skycell_custom_scan, true,
 							 PGC_USERSET, 0, NULL, NULL, NULL);
 	RegisterCustomScanMethods(&cone_scan_methods);
+	prev_planner_hook = planner_hook;
+	planner_hook = cone_planner;
 	prev_set_rel_pathlist_hook = set_rel_pathlist_hook;
 	set_rel_pathlist_hook = cone_set_rel_pathlist;
 }

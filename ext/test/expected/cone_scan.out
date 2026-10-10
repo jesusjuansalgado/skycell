@@ -276,6 +276,29 @@ ORDER BY tbl, t.name;
  where         | cs_sorted | t    | custom
 (14 rows)
 
+-- the join's row estimate: half the probes sit on catalogue sources, which a
+-- density model cannot know; sampled probes' cones measure it (within 3x)
+CREATE FUNCTION cs_est(q text) RETURNS text LANGUAGE plpgsql AS $$
+DECLARE j json; est float8; act float8;
+BEGIN
+  EXECUTE 'EXPLAIN (FORMAT JSON) ' || q INTO j;
+  est := (j -> 0 -> 'Plan' ->> 'Plan Rows')::float8;
+  EXECUTE 'SELECT count(*) FROM (' || q || ') s' INTO act;
+  RETURN CASE WHEN est BETWEEN act / 3 AND act * 3 THEN 'within 3x' ELSE est || ' vs ' || act END;
+END $$;
+SELECT r, tbl, cs_est(format('SELECT c.id FROM cs_probe p JOIN %s c ON skycell_cone(c.cell, c.ra, c.dec, p.ra, p.dec, %s)', tbl, r))
+FROM unnest(ARRAY['cs_cat', 'cs_sorted']) tbl, unnest(ARRAY[0.01, 0.3, 3]) r ORDER BY tbl, r;
+  r   |    tbl    |  cs_est   
+------+-----------+-----------
+ 0.01 | cs_cat    | within 3x
+  0.3 | cs_cat    | within 3x
+    3 | cs_cat    | within 3x
+ 0.01 | cs_sorted | within 3x
+  0.3 | cs_sorted | within 3x
+    3 | cs_sorted | within 3x
+(6 rows)
+
+DROP FUNCTION cs_est(text);
 -- an invalid centre is an error, as it is for the rewrite
 SELECT count(*) FROM (VALUES (10.0::float8, 95.0::float8)) p(ra, dec)
   JOIN cs_cat c ON skycell_cone(c.cell, c.ra, c.dec, p.ra, p.dec, 0.1);
