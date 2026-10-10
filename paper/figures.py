@@ -85,7 +85,7 @@ def fig_benchmark():
     ab = load_ab("bench_ab", RESPG18)
     abx = load_ab("bench_ab_x", RESPG18)
 
-    fig, axes = plt.subplots(1, 3, figsize=(10.5, 3.3))
+    fig, axes = plt.subplots(1, 2, figsize=(7.0, 3.1))
     styles = [("designed", "warm", "#1b7f3b", "o", "-", "designed, warm"),
               ("designed", "cold", "#1b7f3b", "s", "--", "designed, cold"),
               ("gaia", "warm", "#1f6f8b", "o", "-", "Gaia, warm"),
@@ -125,30 +125,8 @@ def fig_benchmark():
     axes[1].legend(frameon=False, fontsize=7)
     axes[1].grid(alpha=0.25, which="both")
 
-    sweep = defaultdict(dict)
-    for r in load_ab("cm_sweep"):
-        if r["corpus"] in ("designed", "gaia"):
-            sweep[(r["corpus"], r["label"])][float(r["range_cost"])] = float(r["ms"])
-    for (corpus, label), series in sorted(sweep.items()):
-        if label not in ("30'", "1deg"):
-            continue
-        xs = sorted(series)
-        ys = [series[x] / min(series.values()) for x in xs]
-        axes[2].plot(xs, ys, marker="o", ms=3.5, lw=1.2,
-                     color="#1b7f3b" if corpus == "designed" else "#1f6f8b",
-                     ls="-" if label == "1deg" else "--",
-                     label=f"{corpus}, {label}")
-    axes[2].axvline(30, color="0.35", lw=1, ls=":")
-    axes[2].text(33, 1.9, "default", fontsize=7, color="0.35", rotation=90)
-    axes[2].set_xscale("log")
-    axes[2].set_xlabel(r"skycell.range_cost (rows)")
-    axes[2].set_ylabel("time / best at that radius")
-    axes[2].legend(frameon=False, fontsize=6.5)
-    axes[2].grid(alpha=0.25, which="both")
-
     for ax, t in zip(axes, ("(a) controlled cone searches",
-                            "(b) pages touched",
-                            "(c) cost-model calibration")):
+                            "(b) pages touched")):
         ax.set_title(t, fontsize=9)
     fig.tight_layout()
     fig.savefig(os.path.join(HERE, "fig_benchmark.pdf"))

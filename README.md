@@ -28,7 +28,7 @@ It **beats each established PostgreSQL sky index at its own speciality**:
   resampled and real positions, and 2.9–3.8× faster than pgSphere.
 
 It also answers convex polygons 2.7–4.4× faster than pgSphere. Its index is a
-third the size of pgSphere's and builds 30× faster, and its row estimates are
+third the size of pgSphere's and builds 11–30× faster, and its row estimates are
 1.2× off instead of 2–3×.
 
 The interface follows ADQL. The functions carry ADQL's own names (`CONTAINS`,
