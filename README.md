@@ -618,7 +618,10 @@ through the range rewrite, stored regions through the GiST opclass.
 back in a **randomized order**, and the analysis is **paired** (the ratio is
 formed per query, so its difficulty cancels), with 95% bootstrap intervals.
 Warm means one untimed pass and then five timed repetitions. Cold means the
-server is restarted and the page cache dropped before each timed pass. Cache
+server is restarted and the page cache dropped before each timed pass. On the
+second host a cold page read costs 0.06–0.1 ms (local flash storage); on the
+first host's laptop disk it cost about 16 ms, so the two hosts' cold results are
+different regimes. Cache
 residency has to be controlled: an uncontrolled run of ours once reported
 skycell at 2× Q3C on a cross-match, an artefact of which method ran first.
 
@@ -951,9 +954,9 @@ cross-match and crossover reports compare them across methods.
   the condition. It is not parallel-aware, and before PostgreSQL 18 its bitmap
   mode does not prefetch.
 - **One host type.** Every custom-scan number comes from one 4-vCPU cloud
-  host type. A cold read there costs about 0.1 ms, because a cache beneath the
-  VM serves it rather than a disk, so the cold margins are probably
-  conservative. On real positions, small cold cones are level rather than won.
+  host type, on fast flash storage (0.06–0.1 ms per cold page read), so the
+  cold margins are those of fast storage. On a slow disk, where each page
+  saved costs more, they would likely be wider. On real positions, small cold cones are level rather than won.
 - **Small tables.** On a 0.5M-row field-clustered table, pgSphere still wins
   the small cone (skycell takes 1.14× its time). Inside a TAP service whose own
   code dominates each request, the index choice is immaterial: in our
