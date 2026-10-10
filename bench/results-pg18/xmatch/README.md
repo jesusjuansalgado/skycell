@@ -13,3 +13,8 @@ it (a join's cone has no constant centre), and their plans are identical with
 fifth method, `skycell_cs`: the same join query as `skycell_slots`, answered
 by the custom scan's parameterized node, one covering per probe
 (`skycell_slots` now runs with `skycell.custom_scan` off).
+
+`bench_xm_ab_join.csv` (`report_join.md`) adds `skycell_join`, the Q3C-shaped
+spelling, through the custom scan on the expression index that
+`11_xmatch_ab.sql` now builds (`cat_cell_a2c`, 214 MB); methods q3c,
+pgsphere, skycell_slots, skycell_cs, skycell_join.
