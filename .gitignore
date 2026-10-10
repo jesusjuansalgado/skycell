@@ -13,6 +13,14 @@ paper/*.log
 paper/*.out
 paper/preview.pdf
 paper/paper.pdf
+paper/ac/*.aux
+paper/ac/*.log
+paper/ac/*.out
+paper/ac/*.spl
+paper/ac/submission/*.aux
+paper/ac/submission/*.log
+paper/ac/submission/*.out
+paper/ac/submission/*.spl
 
 # journal class files -- EDP Sciences, not ours to redistribute.
 # Fetch from https://www.aanda.org/for-authors/latex-issues/latex-tools

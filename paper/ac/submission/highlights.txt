@@ -1,0 +1,5 @@
+A HEALPix B-tree index for PostgreSQL answering cones, polygons and cross-matches
+A cost model sets each covering's depth from local density and index range price
+Faster than pgSphere at every cone radius from 1 arcsec to 3 deg, real Gaia DR3 too
+Cross-matches 20-33% faster than q3c_join, from an index a third of pgSphere's size
+Speaks ADQL; one column holds circles and polygons, read and written as IVOA STC-S
