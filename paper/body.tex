@@ -58,10 +58,11 @@ total-time accounting -- reported as a methodological caution, not shipped as a 
 % conclusions
 {A cost-based covering over an equal-area integer key is a sound basis for a sky index,
 and the right question is not whether it is faster but for which queries. Its cost is
-paid per query and its benefit per row scanned, so it wins where enough rows are scanned
-to amortise a covering -- degree-scale regions, polygons, cross-matching, cold caches --
-and that boundary moves up in radius as the catalogue grows denser. On a Gaia-sized
-catalogue a small cone search is not the workload this index improves.}
+paid per query and its benefit per row scanned; answering cones with its own scan node
+rather than planning a path per range moves that boundary down to the smallest cones,
+so that it wins at every radius and on cross-matching on the corpora where that has been
+measured. On real Gaia DR3 positions, measured only with the range rewrite, a small warm
+cone search still is not the workload this index improves.}
 
 \keywords{Astronomical databases: miscellaneous -- Catalogs -- Virtual observatory tools --
   Methods: data analysis}
@@ -1151,11 +1152,13 @@ yet showing it helps.
 
 \texttt{skycell} keeps Q3C's compact integer key and B-tree while answering the region
 queries pgSphere was built for, treating a covering's depth as a cost question from
-local source density and the price of an index range. Against pgSphere it is faster for
-cone searches at most radii warm and at every radius cold (up to 2.5$\times$) on the
-designed and resampled-Gaia corpora; on real, unresampled Gaia DR3 positions this
-reverses below 1\degr\ warm and is unsettled below 30\arcmin\ cold, a genuine limit of
-the cost-based planning step rather than of the index (Sect.~\ref{sec:realcones}). It
+local source density and the price of an index range. Against pgSphere its custom scan
+is faster for cone searches at every radius warm (17--33\%) and at every radius but
+1\arcmin\ cold (up to 2$\times$) on the designed and resampled-Gaia corpora; on real,
+unresampled Gaia DR3 positions the range rewrite loses below 1\degr\ warm and is
+unsettled below 30\arcmin\ cold, a limit of its planning step rather than of the index,
+which the custom scan cuts but has not been measured against
+(Sect.~\ref{sec:realcones}). It
 also answers convex polygons 2.7--4.4$\times$ faster; at the cross-match Q3C is built for,
 its custom scan is 25--33\% faster than \texttt{q3c\_join} on the resampled corpus (on
 real positions only the slower range rewrite has been measured) and 3.2--3.8$\times$
@@ -1174,12 +1177,15 @@ circles and polygons together, which pgSphere cannot. Combined with one compact 
 serving both point and region queries, this makes \texttt{skycell} a strong candidate
 for a TAP service's geometry layer (Sect.~\ref{sec:tap}).
 
-The advantage is a property of the workload, and scale sharpens it: raising the
-catalogue to 50 million rows widens the lead for regions of 30\arcmin\ and above (to a
-factor 3.2 at 1\degr\ cold) while cones of an arcminute and below stay level, since both
-touch a handful of pages regardless of table size and what is left is planning -- also
-where a small relation, or a TAP server dominated by its own Python, favours pgSphere
-or leaves the choice immaterial. Choosing an index carefully matters when the scan
+The advantage is a property of the workload, and scale sharpens it: with the range
+rewrite, raising the catalogue to 50 million rows widens the lead for regions of
+30\arcmin\ and above (to a factor 3.2 at 1\degr\ cold) while cones of an arcminute and
+below stay level, since both touch a handful of pages regardless of table size and what
+is left is planning -- the cost the custom scan cuts, which at $10^7$ rows turns those
+small cones into a 20--30\% win; whether that holds at $5\times10^7$ is not yet
+measured. On a small relation the small cone still favours pgSphere (1.14 at
+$5\times10^5$ rows, Table~\ref{tab:crossover}), and a TAP server dominated by its own
+Python leaves the choice immaterial. Choosing an index carefully matters when the scan
 dominates; we have tried to say precisely which queries those are.
 
 \section*{Data availability}
