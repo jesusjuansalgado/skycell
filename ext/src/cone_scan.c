@@ -232,21 +232,22 @@ cone_kind(List *args, Index varno)
 }
 
 /*
- * Does the qual contain fcall as one of its top-level AND terms?  The call the
+ * Does the qual contain fcall as one of its top-level AND terms, written as the
+ * call or as an operator over it?  The call the
  * support function sees is a rebuilt copy whose arguments are already folded,
  * so the query's own terms are compared by value: an argument matches if it is
  * equal as written or once folded the same way.
  */
 static bool
-call_matches(PlannerInfo *root, FuncExpr *term, FuncExpr *fcall)
+call_matches(PlannerInfo *root, Oid funcid, List *args, FuncExpr *fcall)
 {
 	ListCell   *a,
 			   *b;
 
-	if (term->funcid != fcall->funcid ||
-		list_length(term->args) != list_length(fcall->args))
+	if (funcid != fcall->funcid ||
+		list_length(args) != list_length(fcall->args))
 		return false;
-	forboth(a, term->args, b, fcall->args)
+	forboth(a, args, b, fcall->args)
 	{
 		Node	   *x = (Node *) lfirst(a);
 
@@ -276,7 +277,17 @@ qual_has_term(PlannerInfo *root, Node *qual, FuncExpr *fcall)
 	}
 	if (is_andclause(qual))
 		return qual_has_term(root, (Node *) ((BoolExpr *) qual)->args, fcall);
-	return IsA(qual, FuncExpr) && call_matches(root, (FuncExpr *) qual, fcall);
+	if (IsA(qual, FuncExpr))
+		return call_matches(root, ((FuncExpr *) qual)->funcid, ((FuncExpr *) qual)->args, fcall);
+	/* an operator (the ADQL <@ and @>): the support function sees its function */
+	if (IsA(qual, OpExpr))
+	{
+		OpExpr	   *op = (OpExpr *) qual;
+
+		return call_matches(root, OidIsValid(op->opfuncid) ? op->opfuncid : get_opcode(op->opno),
+							op->args, fcall);
+	}
+	return false;
 }
 
 /* ...in any WHERE or JOIN ON of the join tree (pulled-up subqueries included) */

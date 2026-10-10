@@ -902,6 +902,106 @@ gin_region_rewrite(Oid funcid, Node *pt, Node *rg, Node *cell,
 	return (Node *) makeBoolExpr(AND_EXPR, list_make2(overlap, (Expr *) exact), -1);
 }
 
+/*
+ * The ADQL circle as the custom scan's cone.  `point(...) <@ circle(...)` (or
+ * `@>`, either order) whose circle is a constant or is built per row by
+ * circle()/skycell_circle() is the same predicate as skycell_cone(cell, ra,
+ * dec, ra0, dec0, radius), and skycell_join already reaches the custom scan by
+ * becoming that call (simplify_cone5 in skycell.c).  This does the same for
+ * the operator spelling, so that an ADQL translation is planned exactly like
+ * the function it stands for: the cone is kept for SkycellCone when the scan
+ * can take it, and NULL leaves the caller's range rewrite to run as before.
+ * A coordinate-system argument has to be a constant, checked here as the
+ * constructor would check it; skycell_cone's exact test (a haversine) and
+ * the region's (a chord) are the same predicate up to rounding at the edge.
+ */
+static Node *
+circle_as_cone(SupportRequestSimplify *req, Oid funcid, Node *pt, Node *rg, Node *cell)
+{
+	Oid			cone_types[6] = {INT8OID, FLOAT8OID, FLOAT8OID, FLOAT8OID, FLOAT8OID, FLOAT8OID};
+	Node	   *ra,
+			   *dec;
+	List	   *c;
+	FuncExpr   *cone6;
+
+	/* the position: point([coordsys,] ra, dec), or a stored skypos */
+	if (IsA(pt, FuncExpr))
+	{
+		List	   *a = ((FuncExpr *) pt)->args;
+
+		if (list_length(a) == 3)
+		{
+			Node	   *cs = linitial(a);
+
+			if (!IsA(cs, Const) || ((Const *) cs)->constisnull)
+				return NULL;
+			check_coordsys(DatumGetTextPP(((Const *) cs)->constvalue));
+			a = list_delete_first(list_copy(a));
+		}
+		if (list_length(a) != 2)
+			return NULL;
+		ra = copyObject(linitial(a));
+		dec = copyObject(lsecond(a));
+	}
+	else if (IsA(pt, Var))
+	{
+		Oid			one[1] = {exprType(pt)};
+
+		ra = (Node *) makeFuncExpr(lookup_sibling_func(funcid, "coord1", 1, one), FLOAT8OID,
+								   list_make1(copyObject(pt)), InvalidOid, InvalidOid,
+								   COERCE_EXPLICIT_CALL);
+		dec = (Node *) makeFuncExpr(lookup_sibling_func(funcid, "coord2", 1, one), FLOAT8OID,
+									list_make1(copyObject(pt)), InvalidOid, InvalidOid,
+									COERCE_EXPLICIT_CALL);
+	}
+	else
+		return NULL;
+
+	/* the circle: a constant, or circle([coordsys,] ra0, dec0, radius) */
+	if (IsA(rg, Const))
+	{
+		SkyRegion  *r;
+
+		if (((Const *) rg)->constisnull)
+			return NULL;
+		r = DatumGetSkyRegion(((Const *) rg)->constvalue);
+		if (r->kind != SKY_CONE)
+			return NULL;
+		c = list_make3(float8_const(r->v[0]), float8_const(r->v[1]), float8_const(r->v[2]));
+	}
+	else if (IsA(rg, FuncExpr))
+	{
+		FuncExpr   *f = (FuncExpr *) rg;
+		char	   *name = get_func_name(f->funcid);
+
+		if (name == NULL || (strcmp(name, "circle") != 0 && strcmp(name, "skycell_circle") != 0) ||
+			get_func_namespace(f->funcid) != get_func_namespace(funcid))
+			return NULL;
+		c = f->args;
+		if (list_length(c) == 4)
+		{
+			Node	   *cs = linitial(c);
+
+			if (!IsA(cs, Const) || ((Const *) cs)->constisnull)
+				return NULL;
+			check_coordsys(DatumGetTextPP(((Const *) cs)->constvalue));
+			c = list_delete_first(list_copy(c));
+		}
+		if (list_length(c) != 3)
+			return NULL;
+		c = copyObject(c);
+	}
+	else
+		return NULL;
+
+	cone6 = makeFuncExpr(lookup_sibling_func(funcid, "skycell_cone", 6, cone_types), BOOLOID,
+						 lcons(copyObject(cell), lcons(ra, lcons(dec, c))),
+						 InvalidOid, InvalidOid, COERCE_EXPLICIT_CALL);
+	if (cone_scan_keep_as(req->root, req->fcall, cone6))
+		return (Node *) cone6;
+	return NULL;
+}
+
 static Node *
 region_support_simplify(SupportRequestSimplify *req, Oid funcid, Node *pt, Node *rg)
 {
@@ -933,6 +1033,14 @@ region_support_simplify(SupportRequestSimplify *req, Oid funcid, Node *pt, Node 
 			gin_moc_index_for_region(req->root, rg, &moc_expr, &max_order))
 			return gin_region_rewrite(funcid, pt, rg, cell, moc_expr, max_order);
 		return NULL;
+	}
+
+	/* a circle goes to the custom scan, as skycell_cone() would */
+	{
+		Node	   *cone = circle_as_cone(req, funcid, pt, rg, cell);
+
+		if (cone != NULL)
+			return cone;
 	}
 
 	exact_types[0] = exprType(pt);

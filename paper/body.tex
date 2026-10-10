@@ -268,9 +268,9 @@ the scan pays for it (Eq.~\ref{eq:crange-cs}). A cross-match cone, whose centre 
 from another relation's row, gets the node parameterized by that row on the inner side of
 a nested loop, covering each row's cone with the ranges it needs; its row estimate is
 measured at plan time on 32 sampled outer rows, since a density model cannot know that
-cross-match targets sit on catalogue sources. Generic plans, correlated sub-selects and
-the Q3C-shaped spellings (\texttt{skycell\_join}, \texttt{skycell\_radial\_query}) take
-the same paths; a cone under an \texttt{OR}, and every non-cone region, keep the rewrite.
+cross-match targets sit on catalogue sources. Generic plans, correlated sub-selects,
+the Q3C-shaped spellings (\texttt{skycell\_join}, \texttt{skycell\_radial\_query}) and
+ADQL's own \texttt{point <@ circle}, constant or built per row, take the same paths; a cone under an \texttt{OR}, and every non-cone region, keep the rewrite.
 A regression suite checks the same rows with the scan on and off, in both modes, on
 PostgreSQL 16 and 18.
 
