@@ -1,28 +1,26 @@
-%% skycell --- manuscript for Astronomy and Computing (Elsevier).
+%% skycell --- manuscript for Astronomy and Computing (Elsevier), on the journal's
+%% template (elsarticle-template-harv.tex, elsarticle v3.3): final 5p two-column
+%% layout, author-year citations.
 %%
-%% Build from paper/:   make ac     (needs elsarticle.cls, in TeX Live)
-%% The text is ../content.tex, shared with the A&A version (../body.tex);
-%% this file holds only the journal's own front and back matter.
-%% Highlights go in as a separate file at submission: highlights.txt.
-\documentclass[preprint,12pt]{elsarticle}
+%% Build:  make            -> skycell.pdf
+%%         make submission -> submission/, one self-contained .tex with the figure
+%%                            and the highlights, ready to upload
+%% The text is content.tex; the references are refs.tex.
+\documentclass[final,5p,times,twocolumn,authoryear]{elsarticle}
 
-\usepackage{graphicx}
+%% graphicx is loaded by elsarticle
 \usepackage{amsmath}
 \usepackage{amssymb}
 \usepackage{url}
 \usepackage[bookmarks=false,colorlinks=true,linkcolor=black,citecolor=black,urlcolor=blue]{hyperref}
-\graphicspath{{../}}
 
-%% the A&A class's astronomical units, and the section-reference word
+%% astronomical units, and the word used for section references
 \newcommand{\arcsec}{\ensuremath{^{\prime\prime}}}
 \newcommand{\arcmin}{\ensuremath{^{\prime}}}
 \newcommand{\degr}{\ensuremath{^{\circ}}}
 \newcommand{\Sect}{Section}
-\usepackage{rotating}
-\newenvironment{widetable}{\begin{sidewaystable}}{\end{sidewaystable}}
-\emergencystretch=2em
 
-\journal{Astronomy and Computing}
+\journal{Astronomy $\&$ Computing}
 
 \begin{document}
 
@@ -72,13 +70,14 @@ for an archive's positional layer.
 \end{highlights}
 
 \begin{keyword}
+%% up to 6 keywords
 Astronomical databases \sep Spatial indexing \sep HEALPix \sep PostgreSQL \sep
-Cross-matching \sep Virtual Observatory \sep ADQL
+Cross-matching \sep Virtual Observatory
 \end{keyword}
 
 \end{frontmatter}
 
-\input{../content}
+\input{content}
 
 \section*{CRediT authorship contribution statement}
 
@@ -124,6 +123,6 @@ institutions participating in the \emph{Gaia} Multilateral Agreement.
 This research did not receive any specific grant from funding agencies in the public,
 commercial, or not-for-profit sectors.
 
-\input{../refs}
+\input{refs}
 
 \end{document}

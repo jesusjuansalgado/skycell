@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""The paper's figures: the benchmark curves, and a covering seen up close.
+"""The paper's figure (fig_benchmark.pdf, the cone-search ratios and pages read),
+and optionally a covering seen up close (not used in the paper).
 
-    python3 paper/figures.py            # needs bench/results/*.csv
-    CONTAINER=skycell-pg python3 paper/figures.py --covering
+    python3 paper/figures.py                                 # fig_benchmark.pdf
+    CONTAINER=skycell-pg python3 paper/figures.py --covering # fig_covering.pdf
 
 The covering figure asks a live database for real coverings (the ones the
 planner would use), so it needs the benchmark corpus loaded.
@@ -197,4 +198,3 @@ if __name__ == "__main__":
         fig_covering()
     else:
         fig_benchmark()
-        fig_covering()
