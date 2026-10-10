@@ -233,7 +233,8 @@ The extension is written in C against the PostgreSQL 15+ server API: a geometry 
 with no database dependencies and a layer connecting it to the planner via a
 \emph{planner support function} (\texttt{SupportRequestSimplify}, the mechanism PostGIS
 uses for \texttt{ST\_DWithin}). Before path generation, a predicate such as
-\texttt{point <@ circle(\ldots)} is replaced by a disjunction of range conditions on the
+\texttt{point <@ circle(\ldots)} -- any region, unless it is a constant cone, which has a
+scan of its own (below) -- is replaced by a disjunction of range conditions on the
 key (\texttt{cell BETWEEN lo1 AND hi1 OR \ldots}) conjoined with an exact test, kept
 only if the relation carries an index on the position. The index conditions are
 ordinary range predicates, so the planner estimates their selectivity from the same
@@ -245,6 +246,37 @@ plan on a TAP corpus). For joins, where the region is not constant, the rewrite 
 fixed number of range slots per outer row (as \texttt{q3c\_join} does), while
 \texttt{skycell\_cone\_ranges()} offers a variable number through a \texttt{LATERAL}
 join -- Sect.~\ref{sec:xmatch} shows this plan-shape difference matters.
+
+\paragraph{A custom scan for constant cones.}
+\label{sec:customscan}
+The rewrite leaves the ranges to PostgreSQL, which builds an index path for every arm
+of the disjunction, estimates each against the histogram and costs a
+\texttt{BitmapOr} over them: about 10\,\textmu s per range on the catalogues here, more
+than computing the covering, and enough to decide a small cone warm
+(Sect.~\ref{sec:cones}). A cone search by constant centre and radius on one relation,
+the common case, is therefore answered by a planner custom scan instead
+(\texttt{skycell.custom\_scan}, the default; heap tables only). The support
+function declines to rewrite such a cone and answers the planner's selectivity request
+for it instead, with the rows the covering expects scaled by the cone's share of the
+covering's area, the same product the rewrite's two estimates make; the planner sees one
+clause where it saw one per range. A path hook then offers one custom path wherever a
+B-tree on the cell expression can serve it, costed from the covering as PostgreSQL costs
+the same work (a descent per range, the index entries, the heap, the recheck). The node
+walks the covering's ranges in one of two modes, chosen at plan time the way PostgreSQL
+chooses between an index and a bitmap scan, from the column's correlation statistic:
+\emph{ordered}, one index scan per range in cell order, when the heap follows the cell
+order; \emph{bitmap}, every range's TIDs collected into one bitmap and each heap page
+read once in physical order, when it does not -- an ObsCore table clustered by
+collection, say. Rows are rechecked with the exact test, which needs no cell
+computed per row. Because no range is planned, a range is priced as the scan pays for
+it rather than as the rewrite does (Eq.~\ref{eq:crange-cs}), and coverings come out
+finer. Joins, prepared statements planned generically, the Q3C-shaped spellings without
+a cell argument and every non-cone region keep the rewrite; a cone inside an
+\texttt{OR} is not indexable while the custom scan is on; before PostgreSQL 18 the
+bitmap mode does not prefetch heap pages. A regression suite checks that every query it
+holds returns the same rows with the custom scan on and off, in both modes, rescanned
+in a nested loop, under a generic plan and through a scrollable cursor, on
+PostgreSQL 16 and 18.
 
 \paragraph{Ingestion and maintenance.} The index is an ordinary B-tree on an expression:
 one 8-byte key per insert, no method-specific rebalancing. Because the covering depends
@@ -492,12 +524,8 @@ ratios with intervals, on both corpora, warm and cold.
   \label{fig:benchmark}
 \end{figure*}
 
-These two columns are \texttt{skycell}'s planner custom scan, its default
-(\texttt{skycell.custom\_scan}): a constant cone on one relation is left as one clause
-whose selectivity \texttt{skycell} supplies, and a scan node of its own walks the
-covering's ranges, in cell order or, when the heap is not in cell order, through a TID
-bitmap, instead of the planner receiving the rewrite's disjunction of B-tree ranges and
-pricing a path per range. Warm, it is faster than pgSphere at every radius on both
+These two columns are \texttt{skycell}'s custom scan, its default
+(Sect.~\ref{sec:customscan}). Warm, it is faster than pgSphere at every radius on both
 synthetic corpora, by 17--33\% (ratios 0.67--0.83), every interval excluding 1. The
 range rewrite, run in the same trials on the same host, is 0.88--1.07 of pgSphere up to
 30\arcmin\ and 0.69--0.91 at 1\degr\ and 3\degr\ -- where the original measurement on the
@@ -736,6 +764,27 @@ constant it replaces, the two are indistinguishable, since the cost curve is fla
 derivation buys not speed but that the parameter stops being a number someone has to
 choose, and the order it picks is likewise close to optimal (about 3\% against one order
 finer at 6\arcmin) for the same reason.
+
+Equation~(\ref{eq:crange}) is the rewrite's price, and knowingly high: it charges the
+descent's comparisons at 50 times what \texttt{btcostestimate} does and every page as a
+random read, which stands in for the per-range planning the rewrite incurs and
+Eq.~(\ref{eq:cost}) does not model. The custom scan plans no range, so it prices one as
+it pays for it: the descent as \texttt{btcostestimate} charges it, plus two pages -- the
+leaf the descent lands on and the heap page where the scan stops running sequentially
+-- each priced at $p = f\,50\,c_{\rm op} + (1-f)\,c_{\rm page}$ by where it is expected
+to come from,
+\begin{equation}
+  c^{\rm cs}_{\rm range} = \frac{\lceil\log_2 N\rceil\,c_{\rm op} + 50(H+1)\,c_{\rm op} + 2p}
+    {c_{\rm tuple} + c_{\rm itup} + k\,c_{\rm op} + p/n_{\rm pp}},
+  \label{eq:crange-cs}
+\end{equation}
+with $f=\min(1, \mathrm{shared\_buffers}/\mathrm{relpages})$ the fraction of the
+relation the buffer pool can hold: a page in the pool costs what touching an index page
+does, one outside it a random read. For the 10-million-row Gaia catalogue of the
+custom-scan runs ($\texttt{random\_page\_cost}=1.1$, 120 rows per page) this is 34 rows
+with the relation in the pool and 87 with none of it there, against 110 from
+Eq.~(\ref{eq:crange}) for the same relation, so the custom scan cuts its coverings
+finer.
 
 \label{sec:estimator}
 The model's input, $\hat\rho$ from Eq.~(\ref{eq:rho}), was called unbiased in an earlier
