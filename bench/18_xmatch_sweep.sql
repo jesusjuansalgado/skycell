@@ -92,7 +92,11 @@ BEGIN
         EXECUTE 'EXPLAIN (COSTS OFF, FORMAT JSON) ' || q INTO plan;
         shape := CASE WHEN plan LIKE '%Seq Scan%gaia_realc%' OR plan LIKE '%"Relation Name": "gaia_realc"%Seq Scan%'
                       THEN 'seqscan' ELSE 'index' END;
+        -- the probe table xp is always sequentially scanned; what matters is
+        -- whether gaia_realc is reached through an index (a custom scan walks
+        -- the cell index itself)
         IF plan LIKE '%Seq Scan%' AND plan NOT LIKE '%Index Scan%' AND plan NOT LIKE '%Bitmap Index Scan%'
+           AND plan NOT LIKE '%"Custom Plan Provider": "SkycellCone"%'
           THEN shape := 'seqscan'; ELSE shape := 'index'; END IF;
       EXCEPTION WHEN OTHERS THEN shape := 'explain_failed'; END;
       PERFORM set_config('statement_timeout', timeout_ms::text, true);
