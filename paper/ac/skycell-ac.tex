@@ -1,0 +1,130 @@
+%% skycell --- manuscript for Astronomy and Computing (Elsevier).
+%%
+%% Build from paper/:   make ac     (needs elsarticle.cls, in TeX Live)
+%% The text is ../content.tex, shared with the A&A version (../body.tex);
+%% this file holds only the journal's own front and back matter.
+%% Highlights go in as a separate file at submission: highlights.txt.
+\documentclass[preprint,12pt]{elsarticle}
+
+\usepackage{graphicx}
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{url}
+\usepackage[bookmarks=false,colorlinks=true,linkcolor=black,citecolor=black,urlcolor=blue]{hyperref}
+\graphicspath{{../}}
+
+%% the A&A class's astronomical units, and the section-reference word
+\newcommand{\arcsec}{\ensuremath{^{\prime\prime}}}
+\newcommand{\arcmin}{\ensuremath{^{\prime}}}
+\newcommand{\degr}{\ensuremath{^{\circ}}}
+\newcommand{\Sect}{Section}
+\usepackage{rotating}
+\newenvironment{widetable}{\begin{sidewaystable}}{\end{sidewaystable}}
+\emergencystretch=2em
+
+\journal{Astronomy and Computing}
+
+\begin{document}
+
+\begin{frontmatter}
+
+\title{skycell: a cost-based HEALPix index for sky positions in PostgreSQL}
+
+\author[skao]{Jes\'us Salgado\corref{cor}}
+\ead{jesus.salgado@skao.int}
+\author[skao]{Michele Delli Veneri}
+\ead{michele.delliveneri@skao.int}
+\cortext[cor]{Corresponding author}
+\affiliation[skao]{organization={SKA Observatory},
+  addressline={Jodrell Bank, Lower Withington},
+  city={Macclesfield},
+  postcode={SK11 9FT},
+  country={United Kingdom}}
+
+\begin{abstract}
+Astronomical archives answer positional queries from relational databases, and in
+PostgreSQL two extensions dominate: Q3C, which keys sources by a cube quad-tree index in
+a B-tree, and pgSphere, which stores spherical geometry in a GiST tree and also indexes
+regions. We present \texttt{skycell}, a PostgreSQL extension that keeps the integer key
+and the B-tree yet answers cones, polygons, cross-matches and stored footprints in the
+archives' own ADQL vocabulary. Positions are keyed by their order-29 HEALPix cell, and a
+query region is covered by cells whose depth is chosen by a cost model: the price of an
+extra index range against the false-positive rows it removes, with local source density
+read from the histogram PostgreSQL already keeps. Cones and cross-matches are answered by
+a planner custom scan that walks the covering's ranges, polygons by a rewrite into range
+conditions, and stored regions by a GiST operator class. Coverings are validated by
+brute force over millions of points. In randomized paired trials on PostgreSQL 18.6 with
+10- and 50-million-row catalogues, including real Gaia DR3 positions, \texttt{skycell}
+is faster than pgSphere at every cone radius from 1\arcsec\ to 3\degr, by 4--33\% with a
+warm cache and up to 2.7 times cold. It cross-matches 20--33\% faster than Q3C's
+\texttt{q3c\_join} and three times faster than pgSphere, and answers convex polygons
+2.7--4.4 times faster than pgSphere, from an index a third the size. One index serving
+points, regions and cross-matches through ADQL makes \texttt{skycell} a strong default
+for an archive's positional layer.
+\end{abstract}
+
+\begin{highlights}
+\item A HEALPix B-tree index for PostgreSQL answering cones, polygons and cross-matches
+\item A cost model sets each covering's depth from local density and index range price
+\item Faster than pgSphere at every cone radius from 1 arcsec to 3 deg, real Gaia DR3 too
+\item Cross-matches 20--33\% faster than q3c\_join, from an index a third of pgSphere's size
+\item Speaks ADQL; one column holds circles and polygons, read and written as IVOA STC-S
+\end{highlights}
+
+\begin{keyword}
+Astronomical databases \sep Spatial indexing \sep HEALPix \sep PostgreSQL \sep
+Cross-matching \sep Virtual Observatory \sep ADQL
+\end{keyword}
+
+\end{frontmatter}
+
+\input{../content}
+
+\section*{CRediT authorship contribution statement}
+
+%% TO BE COMPLETED BY THE AUTHORS: assign the CRediT roles
+%% (https://www.elsevier.com/researcher/author/policies-and-guidelines/credit-author-statement).
+\textbf{Jes\'us Salgado:} [roles]. \textbf{Michele Delli Veneri:} [roles].
+
+\section*{Declaration of competing interest}
+
+%% TO BE CONFIRMED BY THE AUTHORS
+The authors declare that they have no known competing financial interests or personal
+relationships that could have appeared to influence the work reported in this paper.
+
+\section*{Declaration of generative AI and AI-assisted technologies in the writing process}
+
+%% TO BE CONFIRMED BY THE AUTHORS: Elsevier's required wording, adapted
+During the preparation of this work the authors used Claude Code (Anthropic) in order to
+develop the software, the benchmark harness and the analysis, and to draft and edit the
+manuscript. After using this tool, the authors reviewed and edited the content as needed
+and take full responsibility for the content of the published article. The geometric
+predicates and coverings are checked by the brute-force suites of
+Section~\ref{sec:validation} against independent computations over millions of
+adversarially placed points rather than expected outputs, and every indexed answer in the
+regression suites must equal a sequential scan with the exact predicate.
+
+\section*{Data availability}
+
+The extension, its test suites, the benchmark harness and the raw results of every
+measurement quoted here are available at
+\url{https://github.com/jesusjuansalgado/skycell} under the MIT licence, together with
+the history of the measurements that led to the current defaults. All corpora but the
+real one are generated from seeds; the real one is drawn from the Gaia archive by a
+recorded query.
+
+\section*{Acknowledgements}
+
+This work has made use of data from the European Space Agency (ESA) mission \emph{Gaia}
+(\url{https://www.cosmos.esa.int/gaia}), processed by the \emph{Gaia} Data Processing and
+Analysis Consortium (DPAC, \url{https://www.cosmos.esa.int/web/gaia/dpac/consortium}).
+Funding for the DPAC has been provided by national institutions, in particular the
+institutions participating in the \emph{Gaia} Multilateral Agreement.
+
+%% TO BE COMPLETED BY THE AUTHORS: Elsevier asks for a funding statement, e.g.
+%% "This research did not receive any specific grant from funding agencies in the
+%% public, commercial, or not-for-profit sectors."
+
+\input{../refs}
+
+\end{document}
