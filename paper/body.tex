@@ -766,44 +766,60 @@ half a million rows costs a fraction of a millisecond either way against roughly
 of CPU in the service's own Python, so the database cannot move throughput. That
 explanation predicts a crossover at larger relations, checked by building the same
 ObsCore-shaped relation (observations in groups of 128 sharing a field centre, clustered
-by collection and field) at three sizes (Table~\ref{tab:crossover}). It does not hold up
-on this host: \texttt{skycell} stays slower than pgSphere on the degree-scale cone (Q06)
-and the cone with catalogue cuts (Q07) at every size, drifting toward parity on Q06
-(1.07--1.14 across three repeated trials at $10^7$ rows) but never crossing it; the empty
-cone (Q12) stays level, around 1.1--1.3. This is not a correctness problem -- both
-methods return identical row counts at every size and class -- nor is it the
-statistics-target bug an earlier version of this benchmark carried, where
-\texttt{ANALYZE} run in the same transaction as \texttt{ALTER INDEX ... SET STATISTICS}
-silently kept the index's previous target: fixing that bug leaves
-\texttt{skycell\_cover\_info()}'s chosen order, range count and area ratio unchanged for
-the same query, so the covering itself is not what moved. What we have not pinned down
-is why the result differs from the previously published run: this script draws its field
-centres from whichever draw of the resampled-Gaia \texttt{src} corpus happens to be
-live, not a fixed snapshot across this paper's revisions, and the original run was on a
-different, far more memory-constrained container (REPRODUCING.md \S6). The small-cone
-class (Q05) remains the one we cannot pin down -- 2.2--3.1 times slower across repeated
-trials at $10^7$ rows, not reproducible on this host to better than that spread.
+by collection and field) at three sizes and asking each the same 30 queries
+(Table~\ref{tab:crossover}). Field and query centres are a stored set drawn once from the
+DR3 density map (\texttt{bench/data/}), and the relation at a given size is the same on
+every run. Earlier revisions of this table took the field centres from the first rows of
+whichever catalogue corpus was loaded; the resampled-Gaia corpus is generated in HEALPix
+order, so those rows were one patch of sky and every observation was packed into it (a
+2\degr\ cone returned $1.2\times10^5$ rows at $10^7$, against $8\times10^3$ now), and the
+result moved with the corpus -- the irreproducibility those revisions reported, not a
+property of either index. This measurement is the only one in the paper made with
+\texttt{skycell}'s planner custom scan, its default since this revision
+(\texttt{skycell.custom\_scan}): a constant cone stays one clause with one access path,
+whose covering is walked range by range in cell order, or through a TID bitmap when the
+heap is not in cell order, instead of being rewritten into a disjunction of B-tree ranges
+that the planner prices one by one. It ran on PostgreSQL 18.6 in a 4-core, 15\,GB cloud
+container, not the host of Table~\ref{tab:repro}. The predicted crossover is there. The
+small cone (Q05) is 1.14 times slower than pgSphere at $5\times10^5$ rows and at parity
+by $10^7$; the cone with catalogue cuts (Q07) is at parity up to $2\times10^6$ and 20\%
+faster at $10^7$; the degree-scale cone (Q06) is never slower and 25\% faster at $10^7$,
+where pgSphere reads 939 buffer pages to \texttt{skycell}'s 591; the empty cone (Q12),
+a few hundredths of a millisecond either way, is faster at every size. Run with the range
+rewrite instead, the same queries reach nearly the same ratio on Q06 at $10^7$ (0.78), but the small cone
+stays 2.1--3.5 times slower and Q07 does not cross: for degree-scale cones the margin is
+the index, for the small ones it is the custom scan, which at $10^7$ plans Q05 in
+0.024\,ms against the rewrite's 0.086 and executes it in 0.091\,ms against 0.168: the
+rewrite's plan is a \texttt{BitmapOr} with an index descent and a bitmap per range, where
+the custom scan walks all its ranges into one bitmap. The three translations return identical rows
+for every query, size and run.
 
 \begin{table}
-  \caption{Crossover on an ObsCore-shaped relation, randomized paired trials (30
-    centres, 3 repetitions, each method warmed on its own query first): total query
-    time as the ratio skycell/pgSphere, with buffer pages at $10^7$ rows. Q05:
-    0.15\degr\ cone; Q06: 2\degr; Q07: 0.5\degr\ with calibration/time cuts; Q12: an
-    empty 0.7\arcsec\ cone. Not reproducible on this host to better than about 10\% on
-    Q06/Q07/Q12, or a factor of two on Q05 (text).}
+  \caption{Crossover on an ObsCore-shaped relation, randomized paired trials (30 stored
+    centres, the same at every size; each method warmed on its own query first): total
+    query time as the ratio to pgSphere, pooled over two complete runs of 3 repetitions
+    that differ only in trial order, for \texttt{skycell}'s custom scan (its default) and
+    its range rewrite (pgS.: pgSphere); median buffer pages at $10^7$ rows. Q05: 0.15\degr\ cone (median
+    126 rows at $10^7$); Q06: 2\degr\ (8350); Q07: 0.5\degr\ with calibration/time cuts
+    (502); Q12: an empty 0.7\arcsec\ cone. Between the two runs the custom-scan ratio
+    differs by at most 0.19 (Q07, $5\times10^5$), and by 0.02 or less at $10^7$ except
+    Q12 (0.12). PostgreSQL 18.6, 4-core cloud container (text).
+    \texttt{bench/10\_crossover.sql}, \texttt{bench/results-pg18/crossover-stored/}.}
   \label{tab:crossover}
   \centering
   \footnotesize
-  \begin{tabular}{l rrr rr}
+  \setlength{\tabcolsep}{2.5pt}
+  \begin{tabular}{l rrr rr rr}
     \hline\hline
-    & \multicolumn{3}{c}{skycell / pgSphere} & \multicolumn{2}{c}{buffers at $10^7$} \\
-    \cline{2-4}\cline{5-6}
-    class & $5\times10^5$ & $2\times10^6$ & $10^7$ & pgSphere & skycell \\
+    & \multicolumn{3}{c}{custom scan / pgS.} & \multicolumn{2}{c}{rewrite / pgS.}
+    & \multicolumn{2}{c}{buffers, $10^7$} \\
+    \cline{2-4}\cline{5-6}\cline{7-8}
+    rows ($10^6$) & 0.5 & 2 & 10 & 0.5 & 10 & pgS. & skycell \\
     \hline
-    Q05 & 2.73 & 2.47 & 2.53 &   13 & 350 \\
-    Q06 & 1.44 & 1.34 & 1.07 &  241 & 246 \\
-    Q07 & 1.70 & 1.73 & 1.46 &   35 &  52 \\
-    Q12 & 1.21 & 1.34 & 1.19 &    5 &   7 \\
+    Q05 & 1.14 & 1.07 & 0.97 & 3.52 & 2.14 &  32 &  32 \\
+    Q06 & 0.92 & 0.93 & 0.75 & 1.30 & 0.78 & 939 & 591 \\
+    Q07 & 0.94 & 0.99 & 0.80 & 1.89 & 1.05 & 113 &  89 \\
+    Q12 & 0.71 & 0.68 & 0.47 & 1.01 & 0.79 &   7 &   3 \\
     \hline
   \end{tabular}
 \end{table}
@@ -930,10 +946,9 @@ structural reason region leaves could shrink safely does not hold for points
 
 The advantage is not universal: warm, \texttt{skycell} is indistinguishable from
 pgSphere between 6\arcmin\ and 1\degr\ (Sect.~\ref{sec:cones}); on an ObsCore-shaped
-relation from 500\,000 to $10^7$ rows it is slower on every query class we measured
-except an empty cone, and the crossover to larger relations that the service-level A/B
-predicted does not reproduce on this host (Sect.~\ref{sec:cones}) -- a result we flag
-rather than explain. Better row estimates did not, on the join shapes we wrote, produce
+relation of 500\,000 rows it is slower on the small cone, and reaches pgSphere only by
+$10^7$ rows, which it does only through its custom scan: the range rewrite stays 2.1--3.5
+times slower on that cone at every size measured (Sect.~\ref{sec:tap}). Better row estimates did not, on the join shapes we wrote, produce
 better plans. Every number comes from one machine and one storage device,
 with a density field standing in for real positions except where
 Sects.~\ref{sec:xmatch},~\ref{sec:estimator} and the real-position paragraphs
