@@ -65,24 +65,31 @@ RETURNS text LANGUAGE sql AS $$
     WHEN 'pgsphere' THEN format('SELECT count(*), sum(random_index) FROM %I WHERE pos <@ scircle(spoint(radians(%s), radians(%s)), radians(%s))', tbl, ra0, dec0, r)
   END $$;
 
--- one method's block: `warm` untimed passes, then `meas` measured ones
+-- one method's block: `warm` untimed passes, then `meas` measured ones.
+-- 'skycell' is skycell's default plan (the SkycellCone custom scan where the
+-- build has one); 'skycell-rw' is the range rewrite, skycell.custom_scan off
+-- for the block.
 CREATE OR REPLACE FUNCTION realcone_block(method text, blk text, warm int DEFAULT 3, meas int DEFAULT 5)
 RETURNS void LANGUAGE plpgsql AS $$
-DECLARE c realcone_centers; j json; p json; n bigint; s numeric; i int;
+DECLARE c realcone_centers; j json; p json; n bigint; s numeric; i int; m text := method;
 BEGIN
   DELETE FROM bench_realcone b WHERE b.method = realcone_block.method AND b.blk = realcone_block.blk;
+  IF method = 'skycell-rw' THEN
+    PERFORM set_config('skycell.custom_scan', 'off', true);
+    m := 'skycell';
+  END IF;
   FOR i IN 1 .. warm LOOP
     FOR c IN SELECT * FROM realcone_centers ORDER BY qid LOOP
-      EXECUTE realcone_sql(method, 'gaia_realc', c.ra0, c.dec0, c.r) INTO n, s;
+      EXECUTE realcone_sql(m, 'gaia_realc', c.ra0, c.dec0, c.r) INTO n, s;
     END LOOP;
   END LOOP;
   FOR i IN 1 .. meas LOOP
     FOR c IN SELECT * FROM realcone_centers ORDER BY qid LOOP
       EXECUTE 'EXPLAIN (ANALYZE, BUFFERS, TIMING OFF, SUMMARY ON, FORMAT JSON) '
-              || realcone_sql(method, 'gaia_realc', c.ra0, c.dec0, c.r) INTO j;
+              || realcone_sql(m, 'gaia_realc', c.ra0, c.dec0, c.r) INTO j;
       p := j -> 0 -> 'Plan';
       INSERT INTO bench_realcone VALUES (blk, method, i, c.qid,
-        (p -> 'Plans' -> 0 ->> 'Actual Rows')::bigint,
+        (p -> 'Plans' -> 0 ->> 'Actual Rows')::float8::bigint,
         (p ->> 'Shared Hit Blocks')::bigint + (p ->> 'Shared Read Blocks')::bigint,
         (j -> 0 ->> 'Planning Time')::float8, (j -> 0 ->> 'Execution Time')::float8);
     END LOOP;
@@ -132,7 +139,7 @@ BEGIN
             || realcone_sql(method, CASE method WHEN 'skycell' THEN 'gaia_real_cell' ELSE 'gaia_real_sphere' END,
                             c.ra0, c.dec0, c.r) INTO j;
     p := j -> 0 -> 'Plan';
-    INSERT INTO bench_realcone_cold VALUES (method, lbl, c.qid, k, (p -> 'Plans' -> 0 ->> 'Actual Rows')::bigint,
+    INSERT INTO bench_realcone_cold VALUES (method, lbl, c.qid, k, (p -> 'Plans' -> 0 ->> 'Actual Rows')::float8::bigint,
       (p ->> 'Shared Hit Blocks')::bigint, (p ->> 'Shared Read Blocks')::bigint,
       coalesce((p ->> 'I/O Read Time')::float8, (p ->> 'Shared I/O Read Time')::float8),
       (j -> 0 ->> 'Planning Time')::float8, (j -> 0 ->> 'Execution Time')::float8);

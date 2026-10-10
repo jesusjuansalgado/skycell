@@ -1,0 +1,38 @@
+[19:00:17] STAGE gaia50: 5e7 rows resampled from the DR3 order-9 map
+Time: 0.355 ms
+Time: 0.238 ms
+ setseed 
+---------
+ 
+(1 row)
+
+Time: 0.495 ms
+Time: 67313.525 ms (01:07.314)
+ src50_rows 
+------------
+   50000049
+(1 row)
+
+Time: 12397.504 ms (00:12.398)
+Time: 278.560 ms
+  method  |  step   |   s   |  mb  
+----------+---------+-------+------
+ pgsphere | analyze |   0.8 |     
+ pgsphere | freeze  |  17.7 |     
+ pgsphere | index   | 387.4 | 3439
+ pgsphere | table   |  66.2 | 3651
+ q3c      | analyze |   0.4 |     
+ q3c      | freeze  |  15.4 |     
+ q3c      | index   |  25.3 | 1071
+ q3c      | table   |  76.0 | 2873
+ skycell  | analyze |   3.4 |     
+ skycell  | freeze  |  16.9 |     
+ skycell  | index   |  16.7 | 1071
+ skycell  | table   |  58.0 | 3256
+(12 rows)
+
+[19:13:09]   query centres (03) + 07
+[19:13:18]   warm A/B, 5 repetitions
+[19:14:15]   cold A/B
+[19:14:34]   EXPLAIN pass
+[19:15:05] DONE
