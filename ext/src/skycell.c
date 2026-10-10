@@ -1668,7 +1668,9 @@ simplify_poly3(PlannerInfo *root, FuncExpr *fexpr)
  * arguments and hand the six-argument form to simplify_cone.  The planner then
  * matches skycell_ang2cell(ra, dec) against an expression index exactly as it
  * does when the caller writes it out; with no such index the rewrite still
- * yields a correct sequential plan, which is what q3c does too.
+ * yields a correct sequential plan, which is what q3c does too.  When the
+ * custom scan can take the cone (cone_scan_keep_as()), the six-argument
+ * skycell_cone is returned unrewritten instead, for its path.
  */
 static Node *
 simplify_cone5(PlannerInfo *root, FuncExpr *fexpr)
@@ -1685,6 +1687,18 @@ simplify_cone5(PlannerInfo *root, FuncExpr *fexpr)
 								 InvalidOid, InvalidOid, COERCE_EXPLICIT_CALL);
 
 	six->args = lcons(cell, six->args);
+
+	/* left for the custom scan as the skycell_cone it stands for, if it can take it */
+	{
+		Oid			cone_types[6] = {INT8OID, FLOAT8OID, FLOAT8OID, FLOAT8OID, FLOAT8OID, FLOAT8OID};
+		FuncExpr   *cone6 = makeFuncExpr(lookup_sibling_func(fexpr->funcid, "skycell_cone",
+															 6, cone_types),
+										 BOOLOID, six->args, InvalidOid, InvalidOid,
+										 COERCE_EXPLICIT_CALL);
+
+		if (cone_scan_keep_as(root, fexpr, cone6))
+			return (Node *) cone6;
+	}
 	return simplify_cone(root, six);
 }
 

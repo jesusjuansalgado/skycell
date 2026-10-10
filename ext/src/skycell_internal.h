@@ -51,6 +51,7 @@ extern void skycell_scan_params(sc_cover_params *p, const sc_density *d);
 /* cone_scan.c: the custom scan for constant and cross-match cones (skycell.custom_scan) */
 extern void cone_scan_init(void);
 extern bool cone_scan_keep(PlannerInfo *root, FuncExpr *fcall);
+extern bool cone_scan_keep_as(PlannerInfo *root, FuncExpr *written, FuncExpr *cone6);
 extern double cone_join_selectivity(PlannerInfo *root, List *args);
 
 /* adql.c: a skypos/skyregion datum, as cover.c understands it */

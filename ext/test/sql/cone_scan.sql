@@ -159,6 +159,10 @@ FROM unnest(ARRAY['cs_cat', 'cs_sorted']) tbl, (VALUES
   ('left join',     'SELECT count(*) || '':'' || count(c.id) FROM cs_probe p LEFT JOIN cs_cat c ON skycell_cone(c.cell, c.ra, c.dec, p.ra, p.dec, 0.3)'),
   ('exists',        'SELECT count(*) FROM cs_probe p WHERE EXISTS (SELECT 1 FROM cs_cat c WHERE skycell_cone(c.cell, c.ra, c.dec, p.ra, p.dec, 0.3))'),
   ('expression',    'SELECT count(*) || '':'' || sum(c.id) FROM cs_probe p JOIN cs_cat c ON skycell_cone(skycell_ang2cell(c.ra, c.dec), c.ra, c.dec, p.ra, p.dec, 0.3)'),
+  ('skycell_join',  'SELECT count(*) || '':'' || sum(c.id) FROM cs_probe p JOIN cs_cat c ON skycell_join(c.ra, c.dec, p.ra, p.dec, 0.3)'),
+  ('join, left',    'SELECT count(*) || '':'' || count(c.id) FROM cs_probe p LEFT JOIN cs_cat c ON skycell_join(c.ra, c.dec, p.ra, p.dec, 0.3)'),
+  ('join, radius',  'SELECT count(*) || '':'' || sum(c.id) FROM cs_probe p JOIN cs_cat c ON skycell_join(c.ra, c.dec, p.ra, p.dec, p.r)'),
+  ('radial query',  'SELECT count(*) || '':'' || sum(c.id) FROM cs_cat c WHERE skycell_radial_query(c.ra, c.dec, 10, 20, 1)'),
   ('nearest',       'SELECT string_agg(pid || ''='' || n, '','' ORDER BY pid) FROM (SELECT p.pid, (SELECT c.id FROM cs_cat c WHERE skycell_cone(c.cell, c.ra, c.dec, p.ra, p.dec, 0.3) ORDER BY skycell_dist(c.ra, c.dec, p.ra, p.dec), c.id LIMIT 1) n FROM cs_probe p WHERE p.pid < 2000) s')
 ) t(name, q)
 ORDER BY tbl, t.name;

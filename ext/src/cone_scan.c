@@ -22,11 +22,16 @@
  * skycell_in_cone(ra, dec, ...), which, unlike skycell_cone(), does not need
  * the cell expression evaluated per row.
  *
- * Limits of this first version: only the six-argument skycell_cone with
- * constant parameters, as a top-level AND term of a WHERE or JOIN ON (joins,
- * generic plans, the Q3C-shaped spellings and a cone under an OR keep the
- * rewrite); and before PostgreSQL 18 the bitmap mode does not prefetch (18's
- * table AM reads the bitmap through a read stream, which does).
+ * A cross-match cone (centre or radius from another relation's row) gets the
+ * same node parameterized by that row, computing each row's covering on
+ * rescan; a cone over parameters alone (a generic plan, a correlated
+ * sub-select) is covered per rescan as well.  skycell_join and
+ * skycell_radial_query take these paths as the skycell_cone they stand for.
+ *
+ * Limits: only a cone that is a top-level AND term of a WHERE or JOIN ON (one
+ * under an OR keeps the rewrite, which a BitmapOr can serve); and before
+ * PostgreSQL 18 the bitmap mode does not prefetch (18's table AM reads the
+ * bitmap through a read stream, which does).
  */
 #include "postgres.h"
 
@@ -316,8 +321,8 @@ jointree_has_term(PlannerInfo *root, Node *jt, FuncExpr *fcall)
  * index can serve it is only known once the planner has the relation's index
  * list, and a relation without one gets a sequential scan either way.
  */
-bool
-cone_scan_keep(PlannerInfo *root, FuncExpr *fcall)
+static bool
+keep_cone(PlannerInfo *root, FuncExpr *written, FuncExpr *fcall)
 {
 	List	   *args = fcall->args;
 	List	   *vars;
@@ -342,10 +347,28 @@ cone_scan_keep(PlannerInfo *root, FuncExpr *fcall)
 		return false;
 	if (cone_kind(args, varno) == CONE_NONE)
 		return false;
-	if (!jointree_has_term(root, (Node *) root->parse->jointree, fcall))
+	if (!jointree_has_term(root, (Node *) root->parse->jointree, written))
 		return false;
 	cone_funcid = fcall->funcid;
 	return true;
+}
+
+bool
+cone_scan_keep(PlannerInfo *root, FuncExpr *fcall)
+{
+	return keep_cone(root, fcall, fcall);
+}
+
+/*
+ * The same for a Q3C-shaped spelling (skycell_join, skycell_radial_query):
+ * cone6 is the six-argument skycell_cone it stands for, with the cell
+ * expression synthesised; written is the call as the query wrote it, which is
+ * what has to be a top-level AND term.
+ */
+bool
+cone_scan_keep_as(PlannerInfo *root, FuncExpr *written, FuncExpr *cone6)
+{
+	return keep_cone(root, written, cone6);
 }
 
 /* a B-tree on the cell expression, comparing int8; the smallest if several */

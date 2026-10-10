@@ -278,8 +278,9 @@ other arm's index still serves it. A cross-match cone, whose centre or radius co
 another relation's row, gets the same node parameterized by that row, on the inner side of
 a nested loop: each outer row's cone is covered when the node is rescanned for it, with
 as many ranges as that cone needs rather than the rewrite's fixed slots; a generic plan
-or a correlated sub-select covers its cone per rescan likewise. The Q3C-shaped spellings without a cell argument and every
-non-cone region keep the rewrite; before PostgreSQL 18 the bitmap mode does not prefetch
+or a correlated sub-select covers its cone per rescan likewise, and so do the Q3C-shaped
+spellings (\texttt{skycell\_join}, \texttt{skycell\_radial\_query}) through the cell
+expression they synthesise. Every non-cone region keeps the rewrite; before PostgreSQL 18 the bitmap mode does not prefetch
 heap pages. A regression suite checks that every query it
 holds returns the same rows with the custom scan on and off, in both modes, rescanned
 in a nested loop, under a generic plan and through a scrollable cursor, on
