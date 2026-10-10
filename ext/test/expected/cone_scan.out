@@ -171,6 +171,46 @@ FETCH ABSOLUTE 1 FROM cs_cur;
 (1 row)
 
 COMMIT;
+-- where the cone sits decides the plan: only a top-level AND term of a WHERE
+-- or JOIN ON becomes the custom scan; under an OR it is rewritten, so the
+-- BitmapOr over the cell ranges and the id index still serves it
+CREATE INDEX cs_cat_id ON cs_cat (id);
+ANALYZE cs_cat;
+CREATE VIEW cs_view AS SELECT * FROM cs_cat WHERE skycell_cone(cell, ra, dec, 10, 20, 1);
+CREATE FUNCTION cs_plan(q text) RETURNS text LANGUAGE plpgsql AS $$
+DECLARE l text; p text := '';
+BEGIN
+  FOR l IN EXECUTE 'EXPLAIN (COSTS OFF) ' || q LOOP
+    IF l ~ 'SkycellCone' THEN RETURN 'custom'; END IF;
+    p := p || l;
+  END LOOP;
+  RETURN CASE WHEN p ~ 'Bitmap Index Scan on cs_cat_cell' THEN 'rewrite, indexed'
+              WHEN p ~ 'Seq Scan' THEN 'seq scan' ELSE 'other' END;
+END $$;
+SELECT t.name, (cs_both(t.q)).same, cs_plan(t.q) AS plan FROM (VALUES
+  ('or',            'SELECT count(*) FROM cs_cat WHERE skycell_cone(cell, ra, dec, 10, 20, 1) OR id = 7'),
+  ('or, and-ed',    'SELECT count(*) FROM cs_cat WHERE (skycell_cone(cell, ra, dec, 10, 20, 1) OR id = 7) AND id >= 0'),
+  ('and',           'SELECT count(*) FROM cs_cat WHERE id >= 0 AND skycell_cone(cell, ra, dec, 10, 20, 1)'),
+  ('view',          'SELECT count(*) FROM cs_view'),
+  ('join on',       'SELECT count(*) FROM cs_cat c JOIN (VALUES (1)) x(k) ON skycell_cone(c.cell, c.ra, c.dec, 10, 20, 1)'),
+  ('subquery',      'SELECT count(*) FROM (SELECT * FROM cs_cat WHERE skycell_cone(cell, ra, dec, 10, 20, 1) OFFSET 0) s'),
+  ('folded radius', 'SELECT count(*) FROM cs_cat WHERE skycell_cone(cell, ra, dec, 10, 20, 2.0 / 2)'),
+  ('target list',   'SELECT count(*) FILTER (WHERE skycell_cone(cell, ra, dec, 10, 20, 1)) FROM cs_cat')
+) t(name, q);
+     name      | same |       plan       
+---------------+------+------------------
+ or            | t    | rewrite, indexed
+ or, and-ed    | t    | rewrite, indexed
+ and           | t    | custom
+ view          | t    | custom
+ join on       | t    | custom
+ subquery      | t    | custom
+ folded radius | t    | custom
+ target list   | t    | seq scan
+(8 rows)
+
 RESET skycell.custom_scan;
+DROP VIEW cs_view;
 DROP FUNCTION cs_both(text);
+DROP FUNCTION cs_plan(text);
 DROP TABLE cs_cat, cs_sorted;

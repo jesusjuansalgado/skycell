@@ -270,10 +270,12 @@ read once in physical order, when it does not -- an ObsCore table clustered by
 collection, say. Rows are rechecked with the exact test, which needs no cell
 computed per row. Because no range is planned, a range is priced as the scan pays for
 it rather than as the rewrite does (Eq.~\ref{eq:crange-cs}), and coverings come out
-finer. Joins, prepared statements planned generically, the Q3C-shaped spellings without
-a cell argument and every non-cone region keep the rewrite; a cone inside an
-\texttt{OR} is not indexable while the custom scan is on; before PostgreSQL 18 the
-bitmap mode does not prefetch heap pages. A regression suite checks that every query it
+finer. Only a cone that is a top-level \texttt{AND} term of a \texttt{WHERE} or
+\texttt{JOIN ON} is kept for the scan, since only there can it restrict one; under an
+\texttt{OR} it is rewritten as before, so a \texttt{BitmapOr} over its ranges and the
+other arm's index still serves it. Joins, prepared statements planned generically, the
+Q3C-shaped spellings without a cell argument and every non-cone region keep the
+rewrite too; before PostgreSQL 18 the bitmap mode does not prefetch heap pages. A regression suite checks that every query it
 holds returns the same rows with the custom scan on and off, in both modes, rescanned
 in a nested loop, under a generic plan and through a scrollable cursor, on
 PostgreSQL 16 and 18.
@@ -493,7 +495,7 @@ contest the measurements.
     Settings & \multicolumn{2}{p{6.0cm}@{}}{\raggedright \texttt{shared\_buffers} 2\,GB,
       \texttt{effective\_cache\_size} 5\,GB, \texttt{random\_page\_cost} 1.1,
       \texttt{work\_mem} 64\,MB, JIT off, parallelism off} \tabularnewline
-    Extensions & \raggedright Q3C 2.0.5, pgSphere 1.5.2, skycell 0.4 (range rewrite)
+    Extensions & \raggedright Q3C 2.0.5, pgSphere 1.5.2, skycell 0.6 (range rewrite)
       & \raggedright the same Q3C and pgSphere built from source; skycell 0.26 (custom scan and
       range rewrite) \tabularnewline
     Range price & \raggedright Eq.~(\ref{eq:crange}), derived per relation, 116 here

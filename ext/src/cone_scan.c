@@ -23,9 +23,9 @@
  * the cell expression evaluated per row.
  *
  * Limits of this first version: only the six-argument skycell_cone with
- * constant parameters (joins, generic plans and the Q3C-shaped spellings keep
- * the rewrite); a cone inside an OR is no longer indexable while the GUC is
- * on; and before PostgreSQL 18 the bitmap mode does not prefetch (18's
+ * constant parameters, as a top-level AND term of a WHERE or JOIN ON (joins,
+ * generic plans, the Q3C-shaped spellings and a cone under an OR keep the
+ * rewrite); and before PostgreSQL 18 the bitmap mode does not prefetch (18's
  * table AM reads the bitmap through a read stream, which does).
  */
 #include "postgres.h"
@@ -130,12 +130,92 @@ typedef struct ConeScanState
 /* ------------------------------------------------------------------ */
 
 /*
+ * Does the qual contain fcall as one of its top-level AND terms?  The call the
+ * support function sees is a rebuilt copy whose arguments are already folded,
+ * so the query's own terms are compared by value: an argument matches if it is
+ * equal as written or once folded the same way.
+ */
+static bool
+call_matches(PlannerInfo *root, FuncExpr *term, FuncExpr *fcall)
+{
+	ListCell   *a,
+			   *b;
+
+	if (term->funcid != fcall->funcid ||
+		list_length(term->args) != list_length(fcall->args))
+		return false;
+	forboth(a, term->args, b, fcall->args)
+	{
+		Node	   *x = (Node *) lfirst(a);
+
+		if (equal(x, lfirst(b)))
+			continue;
+		if (IsA(x, Var) || IsA(x, Const))
+			return false;
+		if (!equal(eval_const_expressions(root, copyObject(x)), lfirst(b)))
+			return false;
+	}
+	return true;
+}
+
+static bool
+qual_has_term(PlannerInfo *root, Node *qual, FuncExpr *fcall)
+{
+	ListCell   *lc;
+
+	if (qual == NULL)
+		return false;
+	if (IsA(qual, List))
+	{
+		foreach(lc, (List *) qual)
+			if (qual_has_term(root, lfirst(lc), fcall))
+				return true;
+		return false;
+	}
+	if (is_andclause(qual))
+		return qual_has_term(root, (Node *) ((BoolExpr *) qual)->args, fcall);
+	return IsA(qual, FuncExpr) && call_matches(root, (FuncExpr *) qual, fcall);
+}
+
+/* ...in any WHERE or JOIN ON of the join tree (pulled-up subqueries included) */
+static bool
+jointree_has_term(PlannerInfo *root, Node *jt, FuncExpr *fcall)
+{
+	ListCell   *lc;
+
+	if (jt == NULL)
+		return false;
+	if (IsA(jt, FromExpr))
+	{
+		FromExpr   *f = (FromExpr *) jt;
+
+		if (qual_has_term(root, f->quals, fcall))
+			return true;
+		foreach(lc, f->fromlist)
+			if (jointree_has_term(root, lfirst(lc), fcall))
+				return true;
+		return false;
+	}
+	if (IsA(jt, JoinExpr))
+	{
+		JoinExpr   *j = (JoinExpr *) jt;
+
+		return qual_has_term(root, j->quals, fcall) ||
+			jointree_has_term(root, j->larg, fcall) ||
+			jointree_has_term(root, j->rarg, fcall);
+	}
+	return false;
+}
+
+/*
  * Called from skycell_support's SupportRequestSimplify: true to leave this
  * skycell_cone call unrewritten for the custom path.  Only a cone whose
- * parameters are constants and whose cell/ra/dec come from one base relation;
- * whether an index can serve it is only known once the planner has the
- * relation's index list, and a relation without one gets a sequential scan
- * either way.
+ * parameters are constants, whose cell/ra/dec come from one base relation, and
+ * which is a top-level AND term of a WHERE or JOIN ON: only there can it become
+ * a restriction a scan answers.  Under an OR, a NOT, a CASE or in a target list
+ * it is rewritten as before, which a BitmapOr can still serve.  Whether an
+ * index can serve it is only known once the planner has the relation's index
+ * list, and a relation without one gets a sequential scan either way.
  */
 bool
 cone_scan_keep(PlannerInfo *root, FuncExpr *fcall)
@@ -166,6 +246,8 @@ cone_scan_keep(PlannerInfo *root, FuncExpr *fcall)
 	}
 	if (varno == 0 || varno > list_length(root->parse->rtable) ||
 		rt_fetch(varno, root->parse->rtable)->rtekind != RTE_RELATION)
+		return false;
+	if (!jointree_has_term(root, (Node *) root->parse->jointree, fcall))
 		return false;
 	cone_funcid = fcall->funcid;
 	return true;
