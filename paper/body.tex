@@ -42,8 +42,8 @@ to 3\degr\ on both synthetic corpora, where the range rewrite alone is within 12
 below 30\arcmin; cold it is faster or level at every radius (ratios 0.51--0.99). Its index is
 214\,MB against pgSphere's 685\,MB -- 38\,GiB against 160\,GiB at Gaia DR3 scale for the
 pgSphere-plus-Q3C pair covering the same ground -- builds 30 times faster, answers convex
-polygons 2.7--4.4 times faster, cross-matches 20--27\% faster than \texttt{q3c\_join} and
-3.4--3.6 times faster than pgSphere through its custom scan (on the resampled corpus; on
+polygons 2.7--4.4 times faster, cross-matches 25--33\% faster than \texttt{q3c\_join} and
+3.2--3.8 times faster than pgSphere through its custom scan (on the resampled corpus; on
 real positions, through the range rewrite, it is 1.32 of \texttt{q3c\_join}), and its row estimates are wrong by a factor 1.2 rather
 than 2.5--3.0. Its one free cost parameter is derived from the relation's own statistics,
 its chosen cell order costs about 3\% against the best available one, and its density
@@ -427,8 +427,8 @@ benchmarked.
       \texttt{r$_1$ \&\& r$_2$} (no Q3C region type) &
       \texttt{r$_1$ \&\& r$_2$} \\[2pt]
     cross-match &
-      \texttt{q3c\_join}; pgSphere 2.0--3.6$\times$ slower (Sect.~\ref{sec:xmatch}) &
-      \texttt{skycell\_cone} in the join \\[2pt]
+      \texttt{q3c\_join}; pgSphere 2.0--3.8$\times$ slower (Sect.~\ref{sec:xmatch}) &
+      \texttt{skycell\_cone} or \texttt{skycell\_join} in the join \\[2pt]
     \hline
   \end{tabular}
 \end{table}
@@ -626,7 +626,7 @@ Against Q3C, \texttt{skycell} is faster by a factor 1.7--50, a comparison of
 \emph{implementations}: \texttt{q3c\_radial\_query} 2.0.5 expands every call into 100
 key ranges regardless of radius, about 300 buffer pages before any row is read. Against
 \texttt{q3c\_join}, intended for cross-matching and carrying no such fixed expansion,
-the rewrite's join is level with it and the custom scan's 20--27\% faster
+the rewrite's join is level with it and the custom scan's 25--33\% faster
 (Sect.~\ref{sec:xmatch}) -- informative about the two indexing \emph{approaches}; about the cube quad-tree as a method we make no claim, since a
 covering-aware radial query in Q3C would plausibly close most of the gap. Neither method
 was given prepared statements or plan reuse, which would help \texttt{skycell} most. The
@@ -976,10 +976,14 @@ On the first host, at $5\times10^7$ rows and with the rewrite, \texttt{q3c\_join
 fastest established method, 2.0--2.6 times faster than pgSphere, and \texttt{skycell}'s
 join is not distinguishable from it at 1\arcsec\ or 10\arcsec\ (1.04 and 1.07, two runs
 pooled), while 2.0--2.5 times faster than pgSphere. On the second host, at $10^7$ rows
-(Table~\ref{tab:xmatch}), the custom scan makes the same join 20--27\% faster than
-\texttt{q3c\_join} and 3.4--3.6 times faster than pgSphere, returning the same rows as
+(Table~\ref{tab:xmatch}), the custom scan makes the same join 25--29\% faster than
+\texttt{q3c\_join} and 3.2--3.7 times faster than pgSphere, returning the same rows as
 \texttt{q3c\_join} in every trial; run through the rewrite in the same trials it is
-again not distinguishable from \texttt{q3c\_join} (1.15--1.17). The difference is per-probe work, not the sky scanned: the rewrite's plan is
+again not distinguishable from \texttt{q3c\_join} (0.99--1.17). Written as
+\texttt{skycell\_join}, the spelling a \texttt{q3c\_join} user would write, over an
+expression index on \texttt{skycell\_ang2cell(ra, dec)}, it is the same node at the same
+speed (0.96--0.97 of the \texttt{skycell\_cone} form, not distinguishable), 27--33\%
+faster than \texttt{q3c\_join}. The difference is per-probe work, not the sky scanned: the rewrite's plan is
 fixed at four range slots per probe, a \texttt{BitmapOr} whose every arm descends the
 index whether the probe's covering filled it or not (12.6 buffer pages per probe in one
 block at 1\arcsec), where the custom scan walks the probe's own covering, 1.2 ranges on
@@ -991,21 +995,26 @@ cost model won't cut finer where extra ranges cost more than the area saved, and
 \begin{table}
   \caption{Cross-matching 200\,000 probes against the $10^7$-row resampled-Gaia
     catalogue on the second host (Table~\ref{tab:repro}): paired ratio over 16 trials
-    (8 blocks of 25\,000 probes, twice), 95\% bootstrap interval. \emph{Custom}: \texttt{skycell}'s
-    join answered by the custom scan; \emph{slots}: the same query through the range
-    rewrite; Q3C: \texttt{q3c\_join}. \textbf{Bold}: interval excludes 1. \texttt{bench/11\_xmatch\_ab.sql},
-    \texttt{bench/results-pg18/xmatch/}.}
+    (8 blocks of 25\,000 probes, twice), 95\% bootstrap interval. \emph{Cone}: the join
+    written with \texttt{skycell\_cone} on the stored cell column; \emph{join}: written as
+    \texttt{skycell\_join}, Q3C's spelling, on an expression index; \emph{custom}: answered
+    by the custom scan; \emph{slots}: through the range rewrite. \textbf{Bold}: interval
+    excludes 1. \texttt{bench/11\_xmatch\_ab.sql}, \texttt{bench/results-pg18/xmatch/}.}
   \label{tab:xmatch}
   \centering
   \footnotesize
   \setlength{\tabcolsep}{3pt}
-  \begin{tabular}{@{}l ccc@{}}
+  \begin{tabular}{@{}l cc@{}}
     \hline\hline
-    & custom & custom & slots \\
-    radius & / Q3C & / pgSphere & / Q3C \\
+    & 1\arcsec & 10\arcsec \\
     \hline
-    1\arcsec  & \textbf{0.73} [0.62, 0.84] & \textbf{0.28} [0.27, 0.32] & 1.15 [0.95, 1.33] \\
-    10\arcsec & \textbf{0.80} [0.64, 0.83] & \textbf{0.29} [0.26, 0.31] & 1.17 [0.97, 1.35] \\
+    \multicolumn{3}{@{}l}{against \texttt{q3c\_join}} \\
+    \quad cone, custom & \textbf{0.71} [0.64, 0.79] & \textbf{0.75} [0.69, 0.86] \\
+    \quad join, custom & \textbf{0.67} [0.60, 0.77] & \textbf{0.73} [0.63, 0.84] \\
+    \quad cone, slots  & 0.99 [0.85, 1.15]          & 1.17 [0.94, 1.40] \\
+    \multicolumn{3}{@{}l}{against pgSphere} \\
+    \quad cone, custom & \textbf{0.27} [0.23, 0.30] & \textbf{0.31} [0.24, 0.35] \\
+    \quad join, custom & \textbf{0.26} [0.23, 0.30] & \textbf{0.31} [0.26, 0.33] \\
     \hline
   \end{tabular}
 \end{table}
@@ -1162,8 +1171,8 @@ designed and resampled-Gaia corpora; on real, unresampled Gaia DR3 positions thi
 reverses below 1\degr\ warm and is unsettled below 30\arcmin\ cold, a genuine limit of
 the cost-based planning step rather than of the index (Sect.~\ref{sec:realcones}). It
 also answers convex polygons 2.7--4.4$\times$ faster; at the cross-match Q3C is built for,
-its custom scan is 20--27\% faster than \texttt{q3c\_join} on the resampled corpus (on
-real positions only the slower range rewrite has been measured) and 3.4--3.6$\times$
+its custom scan is 25--33\% faster than \texttt{q3c\_join} on the resampled corpus (on
+real positions only the slower range rewrite has been measured) and 3.2--3.8$\times$
 faster than pgSphere, with an index a third the size (38 against 160\,GiB at Gaia DR3 scale for
 the pgSphere-plus-Q3C pair), built thirty times faster, from a cost model whose one
 parameter is derived rather than configured. A GiST opclass family extends this to
