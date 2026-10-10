@@ -273,9 +273,14 @@ it rather than as the rewrite does (Eq.~\ref{eq:crange-cs}), and coverings come 
 finer. Only a cone that is a top-level \texttt{AND} term of a \texttt{WHERE} or
 \texttt{JOIN ON} is kept for the scan, since only there can it restrict one; under an
 \texttt{OR} it is rewritten as before, so a \texttt{BitmapOr} over its ranges and the
-other arm's index still serves it. Joins, prepared statements planned generically, the
-Q3C-shaped spellings without a cell argument and every non-cone region keep the
-rewrite too; before PostgreSQL 18 the bitmap mode does not prefetch heap pages. A regression suite checks that every query it
+other arm's index still serves it. A cross-match cone, whose centre or radius comes from
+another relation's row, gets the same node parameterized by that row, on the inner side of
+a nested loop: each outer row's cone is covered when the node is rescanned for it, which
+is what the \texttt{LATERAL} form of Sect.~\ref{sec:xmatch} does by hand, without its
+function scan and per-range loop; a generic plan or a correlated sub-select covers its
+cone per rescan likewise. The Q3C-shaped spellings without a cell argument and every
+non-cone region keep the rewrite; before PostgreSQL 18 the bitmap mode does not prefetch
+heap pages. A regression suite checks that every query it
 holds returns the same rows with the custom scan on and off, in both modes, rescanned
 in a nested loop, under a generic plan and through a scrollable cursor, on
 PostgreSQL 16 and 18.
