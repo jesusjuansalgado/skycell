@@ -248,42 +248,28 @@ fixed number of range slots per outer row, as \texttt{q3c\_join} does; the custo
 below covers each outer row's cone instead, and Sect.~\ref{sec:xmatch} shows the
 difference matters.
 
-\paragraph{A custom scan for constant cones.}
+\paragraph{A custom scan for cones.}
 \label{sec:customscan}
-The rewrite leaves the ranges to PostgreSQL, which builds an index path for every arm
-of the disjunction, estimates each against the histogram and costs a
-\texttt{BitmapOr} over them: about 10\,\textmu s per range on the catalogues here, more
-than computing the covering, and enough to decide a small cone warm
-(Sect.~\ref{sec:cones}). A cone search by constant centre and radius on one relation,
-the common case, is therefore answered by a planner custom scan instead
-(\texttt{skycell.custom\_scan}, the default; heap tables only). The support
-function declines to rewrite such a cone and answers the planner's selectivity request
-for it instead, with the rows the covering expects scaled by the cone's share of the
-covering's area, the same product the rewrite's two estimates make; the planner sees one
-clause where it saw one per range. A path hook then offers one custom path wherever a
-B-tree on the cell expression can serve it, costed from the covering as PostgreSQL costs
-the same work (a descent per range, the index entries, the heap, the recheck). The node
-walks the covering's ranges in one of two modes, chosen at plan time the way PostgreSQL
-chooses between an index and a bitmap scan, from the column's correlation statistic:
-\emph{ordered}, one index scan per range in cell order, when the heap follows the cell
-order; \emph{bitmap}, every range's TIDs collected into one bitmap and each heap page
-read once in physical order, when it does not -- an ObsCore table clustered by
-collection, say. Rows are rechecked with the exact test, which needs no cell
-computed per row. Because no range is planned, a range is priced as the scan pays for
-it rather than as the rewrite does (Eq.~\ref{eq:crange-cs}), and coverings come out
-finer. Only a cone that is a top-level \texttt{AND} term of a \texttt{WHERE} or
-\texttt{JOIN ON} is kept for the scan, since only there can it restrict one; under an
-\texttt{OR} it is rewritten as before, so a \texttt{BitmapOr} over its ranges and the
-other arm's index still serves it. A cross-match cone, whose centre or radius comes from
-another relation's row, gets the same node parameterized by that row, on the inner side of
-a nested loop: each outer row's cone is covered when the node is rescanned for it, with
-as many ranges as that cone needs rather than the rewrite's fixed slots; a generic plan
-or a correlated sub-select covers its cone per rescan likewise, and so do the Q3C-shaped
-spellings (\texttt{skycell\_join}, \texttt{skycell\_radial\_query}) through the cell
-expression they synthesise. Every non-cone region keeps the rewrite; before PostgreSQL 18 the bitmap mode does not prefetch
-heap pages. A regression suite checks that every query it
-holds returns the same rows with the custom scan on and off, in both modes, rescanned
-in a nested loop, under a generic plan and through a scrollable cursor, on
+The rewrite leaves the ranges to PostgreSQL, which builds, estimates and costs an index
+path for every arm of the disjunction: about 10\,\textmu s per range here, more than the
+covering, and enough to decide a small cone warm (Sect.~\ref{sec:cones}). A cone is
+therefore answered by a planner custom scan instead (\texttt{skycell.custom\_scan}, the
+default; heap tables). The support function leaves the cone as one clause and supplies
+its selectivity (the covering's expected rows times the cone's share of its area); a
+path hook offers one custom path wherever a B-tree on the cell expression can serve
+it, costed as PostgreSQL costs the same work. The node walks the covering in one of two
+modes, chosen from the column's correlation as PostgreSQL chooses between an index and
+a bitmap scan: one index scan per range in cell order when the heap follows the cell
+order, or every range's TIDs into one bitmap, each heap page read once, when it does not;
+rows are rechecked with the exact test. Since no range is planned, a range is priced as
+the scan pays for it (Eq.~\ref{eq:crange-cs}). A cross-match cone, whose centre comes
+from another relation's row, gets the node parameterized by that row on the inner side of
+a nested loop, covering each row's cone with the ranges it needs; its row estimate is
+measured at plan time on 32 sampled outer rows, since a density model cannot know that
+cross-match targets sit on catalogue sources. Generic plans, correlated sub-selects and
+the Q3C-shaped spellings (\texttt{skycell\_join}, \texttt{skycell\_radial\_query}) take
+the same paths; a cone under an \texttt{OR}, and every non-cone region, keep the rewrite.
+A regression suite checks the same rows with the scan on and off, in both modes, on
 PostgreSQL 16 and 18.
 
 \paragraph{Ingestion and maintenance.} The index is an ordinary B-tree on an expression:
