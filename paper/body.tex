@@ -455,8 +455,9 @@ query set traversed in random order each time. The analysis is paired -- median 
 repetitions per method, ratio between methods for that query, so its own difficulty
 cancels -- with a percentile bootstrap (4000 resamples) interval; a ratio is called a
 difference only when its interval excludes 1. Everything is measured \emph{warm} (an
-untimed pass precedes the measurement) and \emph{cold} (server restarted, caches empty,
-first repetition only), with a separate randomized \texttt{EXPLAIN (ANALYZE, BUFFERS)}
+untimed pass precedes the measurement) and \emph{cold} (first touch after a server restart
+and page-cache drop, first repetition only; a page read then costs about 16\,ms on the
+first host's disk and 0.06--0.1\,ms on the second host's flash), with a separate randomized \texttt{EXPLAIN (ANALYZE, BUFFERS)}
 pass recording planning time, execution time, buffer pages and row estimate apart from
 each other. Cone radii span 1\arcsec\ to 3\degr\ with 16--400 queries each, half from
 catalogue positions and half uniform on the sky; cross-matches join a 200\,000-row
