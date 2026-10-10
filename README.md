@@ -716,6 +716,30 @@ each method's row count in every trial and checks they agree.
   cluster smaller than one of its buckets; `max_area_ratio` bounds the damage
   rather than fixing it.
 
+## Paper
+
+[`paper/`](paper/) holds the paper describing skycell and its comparison with
+Q3C and pgSphere, in two versions built from one shared text
+([`paper/content.tex`](paper/content.tex)):
+
+- **Astronomy and Computing** (Elsevier), the version prepared for submission:
+  [`paper/ac/`](paper/ac/), with the self-contained files to upload — the
+  manuscript, its figure and the highlights — in
+  [`paper/ac/submission/`](paper/ac/submission/)
+  ([PDF](paper/ac/submission/skycell-ac.pdf)).
+- **Astronomy & Astrophysics**: [`paper/body.tex`](paper/body.tex), built with the
+  journal's `aa.cls` (not redistributed here) or, for reading, a stand-in class.
+
+```bash
+cd paper
+make ac-submission   # Astronomy and Computing: ac/skycell-ac.pdf and ac/submission/
+make aa              # A&A: paper.pdf (needs aa.cls from aanda.org)
+make                 # A&A text with a stand-in class: skycell-preview.pdf
+```
+
+Edit the shared text in `content.tex`; each journal's front and back matter
+lives in its own wrapper.
+
 ## License
 
 MIT. See [LICENSE](LICENSE).
