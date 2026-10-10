@@ -85,6 +85,8 @@ SET plan_cache_mode = force_custom_plan;
 EXECUTE cs_p(10, 20, 1);
 SET plan_cache_mode = force_generic_plan;
 EXECUTE cs_p(10, 20, 1);
+-- a generic plan covers the cone when it runs
+EXPLAIN (COSTS OFF) EXECUTE cs_p(10, 20, 1);
 RESET plan_cache_mode;
 
 -- a scrollable cursor reads backwards (the planner adds a Material)
@@ -123,7 +125,66 @@ SELECT t.name, (cs_both(t.q)).same, cs_plan(t.q) AS plan FROM (VALUES
   ('target list',   'SELECT count(*) FILTER (WHERE skycell_cone(cell, ra, dec, 10, 20, 1)) FROM cs_cat')
 ) t(name, q);
 
+-- cross-match: a cone whose centre (or radius) comes from another relation is
+-- answered by the scan parameterized by the outer row, one covering per row;
+-- it must return what the rewrite (run-time slots) returns, in both modes
+CREATE TABLE cs_probe AS
+SELECT id AS pid, ra + 0.0003 AS ra, dec, 0.05 + (id % 3) * 0.1 AS r
+FROM cs_cat WHERE id % 97 = 0
+UNION ALL SELECT 100000 + i, mod(i * 7.3, 360), -80 + mod(i * 11, 160), 0.2
+FROM generate_series(1, 120) i
+UNION ALL SELECT 200000, NULL, 10, 0.1         -- a NULL centre matches nothing
+UNION ALL SELECT 200001, 0, 89.99, 1           -- a cone around the pole
+UNION ALL SELECT 200002, 359.99, 0, 0.5;       -- and across ra = 0
+ANALYZE cs_probe;
+CREATE FUNCTION cs_join(q text, OUT same bool, OUT plan text)
+LANGUAGE plpgsql AS $$
+DECLARE a text; b text; l text;
+BEGIN
+  PERFORM set_config('skycell.custom_scan', 'off', true);
+  EXECUTE 'SELECT (' || q || ')::text' INTO a;
+  PERFORM set_config('skycell.custom_scan', 'on', true);
+  EXECUTE 'SELECT (' || q || ')::text' INTO b;
+  same := a IS NOT DISTINCT FROM b;
+  plan := 'other';
+  FOR l IN EXECUTE 'EXPLAIN (COSTS OFF) ' || q LOOP
+    IF l ~ 'Custom Scan \(SkycellCone\)' THEN plan := 'custom'; END IF;
+  END LOOP;
+END $$;
+SELECT t.name, tbl, (cs_join(replace(t.q, 'cs_cat', tbl))).*
+FROM unnest(ARRAY['cs_cat', 'cs_sorted']) tbl, (VALUES
+  ('join',          'SELECT count(*) || '':'' || sum(c.id) FROM cs_probe p JOIN cs_cat c ON skycell_cone(c.cell, c.ra, c.dec, p.ra, p.dec, 0.3)'),
+  ('radius column', 'SELECT count(*) || '':'' || sum(c.id) FROM cs_probe p JOIN cs_cat c ON skycell_cone(c.cell, c.ra, c.dec, p.ra, p.dec, p.r)'),
+  ('where',         'SELECT count(*) || '':'' || sum(c.id) FROM cs_probe p, cs_cat c WHERE skycell_cone(c.cell, c.ra, c.dec, p.ra, p.dec, 0.3) AND c.id >= 0'),
+  ('left join',     'SELECT count(*) || '':'' || count(c.id) FROM cs_probe p LEFT JOIN cs_cat c ON skycell_cone(c.cell, c.ra, c.dec, p.ra, p.dec, 0.3)'),
+  ('exists',        'SELECT count(*) FROM cs_probe p WHERE EXISTS (SELECT 1 FROM cs_cat c WHERE skycell_cone(c.cell, c.ra, c.dec, p.ra, p.dec, 0.3))'),
+  ('expression',    'SELECT count(*) || '':'' || sum(c.id) FROM cs_probe p JOIN cs_cat c ON skycell_cone(skycell_ang2cell(c.ra, c.dec), c.ra, c.dec, p.ra, p.dec, 0.3)'),
+  ('nearest',       'SELECT string_agg(pid || ''='' || n, '','' ORDER BY pid) FROM (SELECT p.pid, (SELECT c.id FROM cs_cat c WHERE skycell_cone(c.cell, c.ra, c.dec, p.ra, p.dec, 0.3) ORDER BY skycell_dist(c.ra, c.dec, p.ra, p.dec), c.id LIMIT 1) n FROM cs_probe p WHERE p.pid < 2000) s')
+) t(name, q)
+ORDER BY tbl, t.name;
+
+-- an invalid centre is an error, as it is for the rewrite
+SELECT count(*) FROM (VALUES (10.0::float8, 95.0::float8)) p(ra, dec)
+  JOIN cs_cat c ON skycell_cone(c.cell, c.ra, c.dec, p.ra, p.dec, 0.1);
+
+-- the plan, and a generic plan for a prepared cross-match
+EXPLAIN (COSTS OFF)
+SELECT count(*) FROM cs_probe p JOIN cs_sorted c ON skycell_cone(c.cell, c.ra, c.dec, p.ra, p.dec, 0.3);
+SET plan_cache_mode = force_generic_plan;
+PREPARE cs_xm(float8) AS
+  SELECT count(*) FROM cs_probe p JOIN cs_cat c ON skycell_cone(c.cell, c.ra, c.dec, p.ra, p.dec, $1);
+EXECUTE cs_xm(0.3);
+EXPLAIN (COSTS OFF) EXECUTE cs_xm(0.3);
+SET skycell.custom_scan = off;
+PREPARE cs_xm_rw(float8) AS
+  SELECT count(*) FROM cs_probe p JOIN cs_cat c ON skycell_cone(c.cell, c.ra, c.dec, p.ra, p.dec, $1);
+EXECUTE cs_xm_rw(0.3);
+SET skycell.custom_scan = on;
+RESET plan_cache_mode;
+
 RESET skycell.custom_scan;
+DROP TABLE cs_probe;
+DROP FUNCTION cs_join(text);
 DROP VIEW cs_view;
 DROP FUNCTION cs_both(text);
 DROP FUNCTION cs_plan(text);

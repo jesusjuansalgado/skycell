@@ -123,11 +123,103 @@ typedef struct ConeScanState
 	TBMIterator *it;
 	TBMIterateResult *tbmres;	/* bitmap: page being returned, or NULL */
 #endif
+
+	/* a cross-match cone: the covering is computed per outer row */
+	bool		runtime;
+	bool		joined;			/* parameterized by an outer row */
+	bool		need_cover;		/* on the first fetch after a (re)start */
+	List	   *args;			/* ExprStates of ra0, dec0, radius */
+	Oid			relid,
+				statrel;
+	AttrNumber	attnum;
+	bool		have_dens;
+	sc_density	dens;
+	int64	   *rt_bounds;		/* bounds' storage, rt_cap ranges */
+	int			rt_cap;
+	double		ncoverings,		/* for EXPLAIN ANALYZE */
+				nranges_total;
 } ConeScanState;
 
 /* ------------------------------------------------------------------ */
 /* planning                                                           */
 /* ------------------------------------------------------------------ */
+
+/*
+ * What the centre and radius (arguments 3-5) make of a cone over relation
+ * varno: a constant cone (all three constants), a cross-match cone (none of
+ * them reads varno, at least one reads another relation of this query level,
+ * so the scan is parameterized by the outer row and computes its covering
+ * per row), a run-time cone (no other relation, but parameters: a generic
+ * plan, or a correlated sub-select's outer columns, so the covering is
+ * computed per rescan), or neither -- left to the rewrite, as is anything
+ * volatile, set-returning or containing a sub-select or an aggregate.
+ */
+typedef enum
+{
+	CONE_NONE,
+	CONE_CONST,
+	CONE_JOIN,
+	CONE_RUNTIME
+} ConeKind;
+
+typedef struct
+{
+	Index		varno;
+	bool		outer;			/* reads another relation */
+	bool		param;			/* reads a parameter or an outer query's column */
+} cone_arg_ctx;
+
+static bool
+cone_arg_unsafe(Node *node, cone_arg_ctx *c)
+{
+	if (node == NULL)
+		return false;
+	if (IsA(node, SubLink) || IsA(node, SubPlan) || IsA(node, Aggref) ||
+		IsA(node, WindowFunc) || IsA(node, GroupingFunc) || IsA(node, PlaceHolderVar))
+		return true;
+	if (IsA(node, Var))
+	{
+		Var		   *v = (Var *) node;
+
+		if (v->varlevelsup == 0)
+		{
+			if (v->varno == c->varno)
+				return true;
+			c->outer = true;
+		}
+		else
+			c->param = true;
+		return false;
+	}
+	if (IsA(node, Param))
+		c->param = true;
+	return expression_tree_walker(node, cone_arg_unsafe, (void *) c);
+}
+
+static ConeKind
+cone_kind(List *args, Index varno)
+{
+	cone_arg_ctx c = {varno, false, false};
+	bool		all_const = true;
+
+	for (int i = 3; i <= 5; i++)
+	{
+		Node	   *a = list_nth(args, i);
+
+		if (IsA(a, Const))
+		{
+			if (((Const *) a)->constisnull)
+				return CONE_NONE;
+			continue;
+		}
+		all_const = false;
+		if (cone_arg_unsafe(a, &c) || contain_volatile_functions(a) || expression_returns_set(a))
+			return CONE_NONE;
+	}
+	if (all_const)
+		return CONE_CONST;
+	return c.outer ? CONE_JOIN : c.param ? CONE_RUNTIME : CONE_NONE;
+}
 
 /*
  * Does the qual contain fcall as one of its top-level AND terms?  The call the
@@ -212,7 +304,9 @@ jointree_has_term(PlannerInfo *root, Node *jt, FuncExpr *fcall)
  * skycell_cone call unrewritten for the custom path.  Only a cone whose
  * parameters are constants, whose cell/ra/dec come from one base relation, and
  * which is a top-level AND term of a WHERE or JOIN ON: only there can it become
- * a restriction a scan answers.  Under an OR, a NOT, a CASE or in a target list
+ * a restriction a scan answers.  A cross-match cone (centre or radius from
+ * another relation, cone_kind()) is kept as well, for the parameterized path
+ * of cone_set_rel_pathlist().  Under an OR, a NOT, a CASE or in a target list
  * it is rewritten as before, which a BitmapOr can still serve.  Whether an
  * index can serve it is only known once the planner has the relation's index
  * list, and a relation without one gets a sequential scan either way.
@@ -228,14 +322,8 @@ cone_scan_keep(PlannerInfo *root, FuncExpr *fcall)
 	if (!skycell_custom_scan || root == NULL || root->parse == NULL ||
 		list_length(args) != 6)
 		return false;
-	for (int i = 3; i <= 5; i++)
-	{
-		Node	   *a = list_nth(args, i);
-
-		if (!IsA(a, Const) || ((Const *) a)->constisnull)
-			return false;
-	}
-	vars = pull_var_clause((Node *) list_make3(linitial(args), lsecond(args), lthird(args)), 0);
+	vars = pull_var_clause((Node *) list_make3(linitial(args), lsecond(args), lthird(args)),
+						   PVC_INCLUDE_AGGREGATES | PVC_INCLUDE_WINDOWFUNCS | PVC_INCLUDE_PLACEHOLDERS);
 	foreach(lc, vars)
 	{
 		Var		   *v = (Var *) lfirst(lc);
@@ -246,6 +334,8 @@ cone_scan_keep(PlannerInfo *root, FuncExpr *fcall)
 	}
 	if (varno == 0 || varno > list_length(root->parse->rtable) ||
 		rt_fetch(varno, root->parse->rtable)->rtekind != RTE_RELATION)
+		return false;
+	if (cone_kind(args, varno) == CONE_NONE)
 		return false;
 	if (!jointree_has_term(root, (Node *) root->parse->jointree, fcall))
 		return false;
@@ -324,6 +414,128 @@ cell_correlation(RangeTblEntry *rte, IndexOptInfo *ix, Node *cell)
 }
 
 /*
+ * What a cross-match cone costs per outer row, estimated before any outer row
+ * is known: coverings computed at sample centres and averaged.  The centres
+ * are taken evenly through the cell column's histogram, so they fall where
+ * the rows are, as the targets of a cross-match usually do (uniform centres
+ * when there is no histogram).  The radius is the planner's estimate of the
+ * radius argument, or 1 arcsec when it has none.
+ */
+#define JOIN_SAMPLES 16
+
+typedef struct
+{
+	double		nranges;		/* ranges per covering */
+	double		cand;			/* rows the ranges hold */
+	double		matches;		/* rows inside the cone */
+	double		steps;			/* cell classifications per covering */
+	double		ntotal;			/* rows in the relation */
+	Oid			statrel;		/* where its density comes from */
+} join_estimate;
+
+static bool
+join_cone_estimate(PlannerInfo *root, List *args, join_estimate *e)
+{
+	Node	   *cell = linitial(args);
+	Node	   *rarg = estimate_expression_value(root, (Node *) list_nth(args, 5));
+	double		radius = 1.0 / 3600.0;
+	sc_density	dens;
+	sc_cover_params p;
+	bool		uses_cell_ops;
+	int			n = 0;
+
+	memset(e, 0, sizeof(*e));
+	if (IsA(rarg, Const) && !((Const *) rarg)->constisnull)
+		radius = DatumGetFloat8(((Const *) rarg)->constvalue);
+	density_for_var(root, cell, &dens, &e->statrel, &uses_cell_ops);
+	if (!(dens.ntotal > 0))
+		return false;
+	e->ntotal = dens.ntotal;
+	skycell_scan_params(&p, &dens);
+	for (int k = 0; k < JOIN_SAMPLES; k++)
+	{
+		double		ra,
+					dec;
+		sc_region	reg;
+		sc_cover	cov;
+
+		if (dens.nbounds >= 2)
+		{
+			sc_vec3		v = sc_pix2vec(29, dens.bounds[(int) ((k + 0.5) * dens.nbounds / JOIN_SAMPLES)]);
+
+			ra = atan2(v.y, v.x) * 180.0 / M_PI;
+			dec = asin(fmax(-1.0, fmin(1.0, v.z))) * 180.0 / M_PI;
+		}
+		else
+		{
+			/* a Fibonacci sphere */
+			ra = fmod(k * 137.50776405003785, 360.0);
+			dec = asin(1.0 - 2.0 * (k + 0.5) / JOIN_SAMPLES) * 180.0 / M_PI;
+		}
+		if (ra < 0)
+			ra += 360.0;
+		if (sc_region_cone(&reg, ra, dec, radius, true) != NULL)
+			continue;
+		sc_cover_compute(&reg, &dens, &p, &cov);
+		e->nranges += cov.n;
+		e->cand += cov.exp_rows;
+		e->matches += (cov.area > 0) ? cov.exp_rows * fmin(1.0, reg.area / cov.area) : 0;
+		e->steps += cov.steps;
+		sc_cover_free(&cov);
+		n++;
+	}
+	if (n == 0)
+		return false;
+	e->nranges /= n;
+	e->cand /= n;
+	e->matches /= n;
+	e->steps /= n;
+	return true;
+}
+
+/*
+ * Selectivity of a cross-match or run-time cone, for skycell_support's
+ * SupportRequestSelectivity: the rows one outer row's cone is expected to
+ * hold over the rows in the relation, so that the join's estimated size is
+ * the outer rows times the matches per row.  -1 when the cone is not one the
+ * custom scan takes (skycell_support then declines).
+ */
+double
+cone_join_selectivity(PlannerInfo *root, List *args)
+{
+	List	   *vars;
+	Index		varno = 0;
+	ListCell   *lc;
+	join_estimate e;
+
+	if (!skycell_custom_scan || list_length(args) != 6)
+		return -1;
+	vars = pull_var_clause((Node *) list_make3(linitial(args), lsecond(args), lthird(args)),
+						   PVC_INCLUDE_AGGREGATES | PVC_INCLUDE_WINDOWFUNCS | PVC_INCLUDE_PLACEHOLDERS);
+	foreach(lc, vars)
+	{
+		Var		   *v = (Var *) lfirst(lc);
+
+		if (!IsA(v, Var) || v->varlevelsup != 0 || (varno != 0 && v->varno != varno))
+			return -1;
+		varno = v->varno;
+	}
+	if (varno == 0)
+		return -1;
+	switch (cone_kind(args, varno))
+	{
+		case CONE_JOIN:
+		case CONE_RUNTIME:
+			break;
+		default:
+			return -1;
+	}
+	if (!join_cone_estimate(root, args, &e))
+		return -1;
+	return e.matches / e.ntotal;
+}
+
+/*
  * Cost of walking the covering, in the planner's units, for both ways the
  * executor can do it, mirroring what PostgreSQL charges for the same work:
  * a descent per range (btcostestimate), the leaf pages and index tuples the
@@ -337,11 +549,10 @@ cell_correlation(RangeTblEntry *rte, IndexOptInfo *ix, Node *cell)
  * *bitmap reports which is cheaper; that is the mode the scan runs in.
  */
 static void
-cone_cost(PlannerInfo *root, RelOptInfo *rel, IndexOptInfo *ix, const sc_cover *cov,
-		  double corr, Cost *startup, Cost *total, bool *bitmap)
+cone_cost(PlannerInfo *root, RelOptInfo *rel, IndexOptInfo *ix, double nr, double exp_rows,
+		  double rows, double corr, Cost *startup, Cost *total, bool *bitmap)
 {
-	double		nr = cov->n;
-	double		cand = fmax(cov->exp_rows, rel->rows);
+	double		cand = fmax(exp_rows, rows);
 	double		ituples = fmax(ix->tuples, 1.0);
 	double		ipages = fmax((double) ix->pages, 1.0);
 	double		T = fmax((double) rel->pages, 1.0);
@@ -356,7 +567,7 @@ cone_cost(PlannerInfo *root, RelOptInfo *rel, IndexOptInfo *ix, const sc_cover *
 		+ (nr + cand * ipages / ituples) * random_page_cost
 		+ cand * (cpu_index_tuple_cost + 2.0 * cpu_operator_cost)
 		+ cand * (cpu_tuple_cost + rel->baserestrictcost.per_tuple)
-		+ rel->rows * rel->reltarget->cost.per_tuple;
+		+ rows * rel->reltarget->cost.per_tuple;
 
 	/*
 	 * Both modes read the same few pages, in order, when the heap follows the
@@ -386,6 +597,59 @@ cone_cost(PlannerInfo *root, RelOptInfo *rel, IndexOptInfo *ix, const sc_cover *
 	*bitmap = bm < ordered;
 	*startup = rel->baserestrictcost.startup + rel->reltarget->cost.startup;
 	*total = *startup + common + Min(ordered, bm);
+}
+
+/*
+ * A path whose covering is computed at execution: per outer row for a
+ * cross-match cone (ppi, the parameterization by the outer relations), per
+ * rescan for a run-time one (ppi NULL).  Costed from coverings sampled at
+ * plan time (join_cone_estimate()).
+ */
+static void
+add_runtime_path(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte, FuncExpr *f,
+				 ParamPathInfo *ppi)
+{
+	Node	   *cell = linitial(f->args);
+	IndexOptInfo *ix;
+	join_estimate e;
+	CustomPath *cp;
+	bool		bitmap;
+	double		rows = ppi ? ppi->ppi_rows : rel->rows;
+	AttrNumber	attnum = IsA(cell, Var) ? ((Var *) cell)->varattno : 1;
+
+	if ((ix = cell_index(rel, cell)) == NULL || !join_cone_estimate(root, f->args, &e))
+		return;
+	cp = makeNode(CustomPath);
+	cp->path.pathtype = T_CustomScan;
+	cp->path.parent = rel;
+	cp->path.pathtarget = rel->reltarget;
+	cp->path.param_info = ppi;
+	cp->path.parallel_aware = false;
+	cp->path.parallel_safe = false;
+	cp->path.parallel_workers = 0;
+	cp->path.rows = rows;
+	cp->path.pathkeys = NIL;
+	cone_cost(root, rel, ix, e.nranges, e.cand, rows, cell_correlation(rte, ix, cell),
+			  &cp->path.startup_cost, &cp->path.total_cost, &bitmap);
+	/* the covering itself, each time: ten operator calls a classified cell */
+	cp->path.total_cost += e.steps * 10.0 * cpu_operator_cost;
+	cp->flags = 0;
+	cp->custom_paths = NIL;
+	/* no bounds: cone_begin() then computes the covering each time */
+	cp->custom_private = list_make4(makeConst(OIDOID, -1, InvalidOid, sizeof(Oid),
+											  ObjectIdGetDatum(ix->indexoid), false, true),
+									makeNullConst(INT8ARRAYOID, -1, InvalidOid),
+									makeBoolConst(bitmap, false), f);
+	cp->custom_private = lappend(cp->custom_private,
+								 list_make4(makeConst(OIDOID, -1, InvalidOid, sizeof(Oid),
+													  ObjectIdGetDatum(rte->relid), false, true),
+											makeConst(OIDOID, -1, InvalidOid, sizeof(Oid),
+													  ObjectIdGetDatum(e.statrel), false, true),
+											makeConst(INT2OID, -1, InvalidOid, sizeof(int16),
+													  Int16GetDatum(attnum), false, true),
+											makeBoolConst(ppi != NULL, false)));
+	cp->methods = &cone_path_methods;
+	add_path(rel, &cp->path);
 }
 
 static void
@@ -433,6 +697,11 @@ cone_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, Index rti, RangeTblEnt
 		if (ri->pseudoconstant || !IsA(f, FuncExpr) || f->funcid != cone_funcid ||
 			list_length(f->args) != 6)
 			continue;
+		if (cone_kind(f->args, rel->relid) == CONE_RUNTIME)
+		{
+			add_runtime_path(root, rel, rte, f, NULL);
+			continue;
+		}
 		if ((ix = cell_index(rel, linitial(f->args))) == NULL)
 			continue;
 		if (!skycell_const_cone_cover(root, f->args, &reg, &cov, &dens))
@@ -459,7 +728,8 @@ cone_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, Index rti, RangeTblEnt
 		cp->path.parallel_workers = 0;
 		cp->path.rows = rel->rows;
 		cp->path.pathkeys = NIL;
-		cone_cost(root, rel, ix, &cov, cell_correlation(rte, ix, linitial(f->args)),
+		cone_cost(root, rel, ix, cov.n, cov.exp_rows, rel->rows,
+				  cell_correlation(rte, ix, linitial(f->args)),
 				  &cp->path.startup_cost, &cp->path.total_cost, &bitmap);
 		cp->flags = 0;
 		cp->custom_paths = NIL;
@@ -469,6 +739,34 @@ cone_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, Index rti, RangeTblEnt
 										bounds, makeBoolConst(bitmap, false), f);
 		cp->methods = &cone_path_methods;
 		add_path(rel, &cp->path);
+	}
+
+	/*
+	 * A cross-match cone is a join clause: offer the scan parameterized by the
+	 * relations its centre and radius read, for the inner side of a nested
+	 * loop, where each outer row gets its own covering.
+	 */
+	foreach(lc, rel->joininfo)
+	{
+		RestrictInfo *ri = (RestrictInfo *) lfirst(lc);
+		FuncExpr   *f = (FuncExpr *) ri->clause;
+		Relids		inner,
+					outer;
+
+		if (ri->pseudoconstant || !IsA(f, FuncExpr) || f->funcid != cone_funcid ||
+			list_length(f->args) != 6 || !join_clause_is_movable_to(ri, rel))
+			continue;
+		inner = pull_varnos(root, (Node *) list_make3(linitial(f->args), lsecond(f->args),
+													 lthird(f->args)));
+		outer = pull_varnos(root, (Node *) list_make3(list_nth(f->args, 3), list_nth(f->args, 4),
+													 list_nth(f->args, 5)));
+		if (bms_is_empty(inner) || !bms_is_subset(inner, rel->relids) ||
+			bms_overlap(outer, rel->relids))
+			continue;
+		outer = bms_union(bms_difference(ri->clause_relids, rel->relids), rel->lateral_relids);
+		if (bms_is_empty(outer))
+			continue;
+		add_runtime_path(root, rel, rte, f, get_baserel_parampathinfo(root, rel, outer));
 	}
 }
 
@@ -529,6 +827,18 @@ cone_plan(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
 	cs->custom_private = list_make3(linitial(best_path->custom_private),
 									lsecond(best_path->custom_private),
 									lthird(best_path->custom_private));
+	if (list_length(best_path->custom_private) > 4)
+	{
+		/*
+		 * A cross-match cone: centre and radius are evaluated per outer row,
+		 * createplan having turned the outer relation's columns into nestloop
+		 * parameters, and the density they are covered against is loaded at
+		 * execution from (relid, statistics relation, attnum).
+		 */
+		cs->custom_exprs = list_copy_tail(copyObject(driving->args), 3);
+		cs->custom_private = list_concat(cs->custom_private,
+										 (List *) list_nth(best_path->custom_private, 4));
+	}
 	cs->custom_scan_tlist = NIL;
 	cs->methods = &cone_scan_methods;
 	return &cs->scan.plan;
@@ -556,14 +866,31 @@ cone_begin(CustomScanState *node, EState *estate, int eflags)
 	Const	   *oidc = linitial_node(Const, cscan->custom_private);
 	Const	   *bc = lsecond_node(Const, cscan->custom_private);
 	Const	   *modec = lthird_node(Const, cscan->custom_private);
-	ArrayType  *arr = DatumGetArrayTypeP(bc->constvalue);
 	Relation	heap = node->ss.ss_currentRelation;
 	LOCKMODE	lockmode = exec_rt_fetch(cscan->scan.scanrelid, estate)->rellockmode;
 	Oid			opfamily;
 
 	st->indexoid = DatumGetObjectId(oidc->constvalue);
-	st->nranges = ArrayGetNItems(ARR_NDIM(arr), ARR_DIMS(arr)) / 2;
-	st->bounds = (const int64 *) ARR_DATA_PTR(arr);
+	if (bc->constisnull)
+	{
+		/* a cross-match cone: covered per outer row, by cone_cover_row() */
+		st->runtime = true;
+		st->need_cover = true;
+		st->nranges = 0;
+		st->bounds = NULL;
+		st->relid = DatumGetObjectId(list_nth_node(Const, cscan->custom_private, 3)->constvalue);
+		st->statrel = DatumGetObjectId(list_nth_node(Const, cscan->custom_private, 4)->constvalue);
+		st->attnum = DatumGetInt16(list_nth_node(Const, cscan->custom_private, 5)->constvalue);
+		st->joined = DatumGetBool(list_nth_node(Const, cscan->custom_private, 6)->constvalue);
+		st->args = ExecInitExprList(cscan->custom_exprs, &node->ss.ps);
+	}
+	else
+	{
+		ArrayType  *arr = DatumGetArrayTypeP(bc->constvalue);
+
+		st->nranges = ArrayGetNItems(ARR_NDIM(arr), ARR_DIMS(arr)) / 2;
+		st->bounds = (const int64 *) ARR_DATA_PTR(arr);
+	}
 	st->bitmap = DatumGetBool(modec->constvalue);
 	st->cur = -1;
 	st->index = index_open(st->indexoid, lockmode);
@@ -601,6 +928,70 @@ cone_begin(CustomScanState *node, EState *estate, int eflags)
 	else
 		st->iscan = index_beginscan(heap, st->index, estate->es_snapshot, 2, 0);
 #endif
+}
+
+/*
+ * A cross-match cone's covering for the current outer row: centre and radius
+ * evaluated (the outer row's columns are nestloop parameters by now), covered
+ * against the relation's density with the custom scan's parameters, and the
+ * ranges copied into the scan state.  The covering is built in the per-tuple
+ * context, which ExecScan resets before every fetch.  NULL arguments match
+ * nothing, as the strict skycell_cone would; an invalid centre is an error, as
+ * it is in the rewrite's run-time bounds and in skycell_cone_ranges().
+ */
+static void
+cone_cover_row(ConeScanState *st)
+{
+	ExprContext *econtext = st->css.ss.ps.ps_ExprContext;
+	EState	   *estate = st->css.ss.ps.state;
+	double		v[3];
+	int			i = 0;
+	ListCell   *lc;
+	MemoryContext old;
+	sc_region	reg;
+	sc_cover	cov;
+	sc_cover_params p;
+
+	st->need_cover = false;
+	st->nranges = 0;
+	foreach(lc, st->args)
+	{
+		bool		isnull;
+		Datum		d = ExecEvalExpr((ExprState *) lfirst(lc), econtext, &isnull);
+
+		if (isnull)
+			return;
+		v[i++] = DatumGetFloat8(d);
+	}
+	if (!st->have_dens)
+	{
+		old = MemoryContextSwitchTo(estate->es_query_cxt);
+		skycell_load_density(st->relid, st->statrel, st->attnum, &st->dens);
+		MemoryContextSwitchTo(old);
+		st->have_dens = true;
+	}
+	old = MemoryContextSwitchTo(econtext->ecxt_per_tuple_memory);
+	check_err(sc_region_cone(&reg, v[0], v[1], v[2], true));
+	skycell_scan_params(&p, &st->dens);
+	sc_cover_compute(&reg, &st->dens, &p, &cov);
+	MemoryContextSwitchTo(old);
+	if (cov.n > st->rt_cap)
+	{
+		st->rt_cap = Max(cov.n, 2 * st->rt_cap);
+		st->rt_bounds = (st->rt_bounds == NULL)
+			? MemoryContextAlloc(estate->es_query_cxt, sizeof(int64) * 2 * st->rt_cap)
+			: repalloc(st->rt_bounds, sizeof(int64) * 2 * st->rt_cap);
+	}
+	for (int r = 0; r < cov.n; r++)
+	{
+		st->rt_bounds[2 * r] = cov.r[r].lo;
+		st->rt_bounds[2 * r + 1] = cov.r[r].hi;
+	}
+	st->bounds = st->rt_bounds;
+	st->nranges = cov.n;
+	st->ncoverings += 1;
+	st->nranges_total += cov.n;
+	sc_cover_free(&cov);
 }
 
 /* point the scan keys at range i and restart the index scan there */
@@ -703,6 +1094,8 @@ cone_next(ScanState *ss)
 {
 	ConeScanState *st = (ConeScanState *) ss;
 
+	if (st->need_cover)
+		cone_cover_row(st);
 	return st->bitmap ? cone_next_bitmap(st, ss->ss_ScanTupleSlot)
 		: cone_next_ordered(st, ss->ss_ScanTupleSlot);
 }
@@ -779,6 +1172,7 @@ cone_rescan(CustomScanState *node)
 	ConeScanState *st = (ConeScanState *) node;
 
 	st->cur = -1;
+	st->need_cover = st->runtime;	/* new outer row, new covering */
 	cone_release_bitmap(st, false);
 	ExecScanReScan(&node->ss);
 }
@@ -789,7 +1183,13 @@ cone_explain(CustomScanState *node, List *ancestors, ExplainState *es)
 	ConeScanState *st = (ConeScanState *) node;
 
 	ExplainPropertyText("Index", RelationGetRelationName(st->index), es);
-	ExplainPropertyInteger("Ranges", NULL, st->nranges, es);
+	if (!st->runtime)
+		ExplainPropertyInteger("Ranges", NULL, st->nranges, es);
+	else if (es->analyze && st->ncoverings > 0)
+		ExplainPropertyFloat("Ranges per Covering", NULL,
+							 st->nranges_total / st->ncoverings, 1, es);
+	else
+		ExplainPropertyText("Ranges", st->joined ? "per outer row" : "per rescan", es);
 	ExplainPropertyText("Mode", st->bitmap ? "bitmap" : "ordered", es);
 }
 

@@ -875,6 +875,23 @@ load_density(Oid relid, AttrNumber attnum, sc_density *d)
 }
 
 /*
+ * For cone_scan.c's run-time coverings (a cross-match cone, one per outer
+ * row): the backend's cached density for a relation's cell statistics, and
+ * the custom scan's covering parameters.
+ */
+void
+skycell_load_density(Oid relid, Oid statrel, AttrNumber attnum, sc_density *d)
+{
+	load_density_cached(relid, statrel, attnum, d);
+}
+
+void
+skycell_scan_params(sc_cover_params *p, const sc_density *d)
+{
+	current_params_scan(p, skycell_max_ranges, d);
+}
+
+/*
  * OID of skycell's own btree operator family (skycell--0.7.sql), whose
  * operators (#<, #<=, #=, #>=, #>) carry skycell_cellsel instead of the
  * stock int8 estimators.  InvalidOid before 0.7 or if the name was changed;
@@ -1739,6 +1756,17 @@ skycell_support(PG_FUNCTION_ARGS)
 		{
 			req->selectivity = fmin(1.0, fmax(cone_selectivity(req->root, req->args), 1e-12));
 			PG_RETURN_POINTER(req);
+		}
+		/* a cross-match cone the custom scan answers per outer row */
+		if (req->root != NULL && list_length(req->args) == 6)
+		{
+			double		sel = cone_join_selectivity(req->root, req->args);
+
+			if (sel >= 0)
+			{
+				req->selectivity = fmin(1.0, fmax(sel, 1e-12));
+				PG_RETURN_POINTER(req);
+			}
 		}
 		PG_RETURN_POINTER(NULL);
 	}
