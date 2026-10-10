@@ -1053,9 +1053,9 @@ Two layers, both in [`ext/test/`](ext/test/).
   the pole and one across RA = 0, match the rewrite; an invalid centre errors as
   the rewrite does; and the cross-match row estimate is within 3× of the truth.
 
-All three pass on PostgreSQL 16 and 18. The benchmark harness checks
-correctness too: every paired trial in `bench/` records each method's row
-count, and the reports flag any disagreement.
+All three pass on PostgreSQL 16 and 18. The benchmark harness records each
+method's row count in every trial too; the phase-grid (`bench/report.py`),
+cross-match and crossover reports compare them across methods.
 
 ## Limitations
 
