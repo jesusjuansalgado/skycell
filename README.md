@@ -1014,6 +1014,49 @@ histogram was accurate all along (3701 estimated vs ~4155 scanned).
 
 ---
 
+## Testing
+
+Two layers, both in [`ext/test/`](ext/test/).
+
+**Geometry, standalone** — `make selftest` in `ext/`, no PostgreSQL needed
+(about two minutes):
+
+- `healpix_selftest`: order-0 pixel centres, the pixel → centre → pixel round
+  trip at every order, nesting across orders, every point within `max_pixrad`
+  of its pixel's centre (the bound the covering's *outside* test relies on), and
+  equal area (χ²/dof 1.14 for uniform points over order-3 pixels).
+- `cover_selftest`: brute force on the covering itself. Two million catalogue
+  points; for cones from 1″ to 120° and for convex polygons, under a uniform
+  and a histogram density model, every point inside the region must have its
+  order-29 cell inside one of the ranges. Then the awkward places: 7,266
+  polygons at the poles, zone boundaries, RA wrap-around and face edges (869,117
+  points inside, half within a part per billion of an edge), and 2 × 30,000 cones
+  with 200 points each. It also prints ranges, cells examined, false-positive
+  fraction and µs per covering. Current run: **0 false negatives**.
+
+**SQL regression** — `make installcheck` in `ext/`, against a running server:
+
+- `skycell`: every indexed query must return exactly what the exact predicate
+  returns on a sequential scan — no false negatives, no false positives — on a
+  clustered catalogue with clusters at both poles and across RA = 0: cones,
+  polygons, the Q3C-shaped spellings, cross-matches, MOC-stored regions and the
+  GiST region operator classes.
+- `adql`: the ADQL surface — the standard's spelling, the indexable operator
+  form, and the IVOA UDF astronomy functions.
+- `cone_scan`: the custom scan. Every query returns the same rows with
+  `skycell.custom_scan` on and off, in both of its modes (a heap in cell order
+  and one that is not), rescanned in a nested loop, under a generic plan and
+  through a scrollable cursor; each placement of a cone (under `OR`, in a view,
+  a `JOIN ON`, a sub-select, a target list) gets the plan it should; cross-matches
+  (join, per-row radius, `WHERE` join, `LEFT JOIN`, `EXISTS`, expression index,
+  correlated nearest-neighbour, `skycell_join`), with a NULL centre, a cone round
+  the pole and one across RA = 0, match the rewrite; an invalid centre errors as
+  the rewrite does; and the cross-match row estimate is within 3× of the truth.
+
+All three pass on PostgreSQL 16 and 18. The benchmark harness checks
+correctness too: every paired trial in `bench/` records each method's row
+count, and the reports flag any disagreement.
+
 ## Limitations
 
 - Polygons must be convex, and there is no `REGION`, union of regions or
