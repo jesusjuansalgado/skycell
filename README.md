@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="docs/skycell-logo.png" alt="skycell" width="220">
+</p>
+
 # skycell
 
 A PostgreSQL extension for sky positions: one index for cone searches,
