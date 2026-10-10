@@ -29,31 +29,24 @@ CREATE TABLE IF NOT EXISTS bench_ab_x (
  * that two settings can be compared inside a trial rather than across runs.
  * Comparing them across runs measures machine drift: the cost curve is flat to
  * ~10% over a factor 30 in this parameter, which is the same size as the drift.
- * skycell#<n> sets skycell.probe_orders, and skycell+cs is skycell answered by
- * its custom scan (skycell.custom_scan) instead of the range rewrite, with
- * skycell+cs@<x> also setting range_cost.  Each
- * skycell method sets custom_scan explicitly, since set_config(..., true) lasts
- * for the rest of the transaction and a run is one transaction.
+ * skycell#<n> sets skycell.probe_orders.  skycell is skycell's defaults, which
+ * answer a constant cone with its custom scan (skycell.custom_scan); skycell-rw
+ * is the range rewrite instead, and skycell+cs names the custom scan
+ * explicitly.  The suffixes combine (skycell-rw@30).  Every skycell method sets
+ * custom_scan and range_cost explicitly, since set_config(..., true) lasts for
+ * the rest of the transaction and a run is one transaction.
  */
 CREATE OR REPLACE FUNCTION ab_method_gucs(method text) RETURNS void
 LANGUAGE plpgsql AS $$
 BEGIN
-  IF method LIKE 'skycell@%' THEN
-    PERFORM set_config('skycell.range_cost', split_part(method, '@', 2), true);
-    PERFORM set_config('skycell.custom_scan', 'off', true);
-  ELSIF method LIKE 'skycell#%' THEN
-    PERFORM set_config('skycell.probe_orders', split_part(method, '#', 2), true);
-    PERFORM set_config('skycell.range_cost', '-1', true);
-    PERFORM set_config('skycell.custom_scan', 'off', true);
-  ELSIF method LIKE 'skycell+cs@%' THEN
-    PERFORM set_config('skycell.range_cost', split_part(method, '@', 2), true);
-    PERFORM set_config('skycell.custom_scan', 'on', true);
-  ELSIF method = 'skycell+cs' THEN
-    PERFORM set_config('skycell.range_cost', '-1', true);
-    PERFORM set_config('skycell.custom_scan', 'on', true);
-  ELSIF method = 'skycell' THEN
-    PERFORM set_config('skycell.range_cost', '-1', true);
-    PERFORM set_config('skycell.custom_scan', 'off', true);
+  IF method LIKE 'skycell%' THEN
+    PERFORM set_config('skycell.custom_scan',
+                       CASE WHEN method LIKE 'skycell-rw%' THEN 'off' ELSE 'on' END, true);
+    PERFORM set_config('skycell.range_cost',
+                       CASE WHEN method LIKE '%@%' THEN split_part(method, '@', 2) ELSE '-1' END, true);
+    IF method LIKE '%#%' THEN
+      PERFORM set_config('skycell.probe_orders', split_part(method, '#', 2), true);
+    END IF;
   END IF;
 END $$;
 

@@ -875,6 +875,23 @@ load_density(Oid relid, AttrNumber attnum, sc_density *d)
 }
 
 /*
+ * For cone_scan.c's run-time coverings (a cross-match cone, one per outer
+ * row): the backend's cached density for a relation's cell statistics, and
+ * the custom scan's covering parameters.
+ */
+void
+skycell_load_density(Oid relid, Oid statrel, AttrNumber attnum, sc_density *d)
+{
+	load_density_cached(relid, statrel, attnum, d);
+}
+
+void
+skycell_scan_params(sc_cover_params *p, const sc_density *d)
+{
+	current_params_scan(p, skycell_max_ranges, d);
+}
+
+/*
  * OID of skycell's own btree operator family (skycell--0.7.sql), whose
  * operators (#<, #<=, #=, #>=, #>) carry skycell_cellsel instead of the
  * stock int8 estimators.  InvalidOid before 0.7 or if the name was changed;
@@ -1651,7 +1668,9 @@ simplify_poly3(PlannerInfo *root, FuncExpr *fexpr)
  * arguments and hand the six-argument form to simplify_cone.  The planner then
  * matches skycell_ang2cell(ra, dec) against an expression index exactly as it
  * does when the caller writes it out; with no such index the rewrite still
- * yields a correct sequential plan, which is what q3c does too.
+ * yields a correct sequential plan, which is what q3c does too.  When the
+ * custom scan can take the cone (cone_scan_keep_as()), the six-argument
+ * skycell_cone is returned unrewritten instead, for its path.
  */
 static Node *
 simplify_cone5(PlannerInfo *root, FuncExpr *fexpr)
@@ -1668,6 +1687,18 @@ simplify_cone5(PlannerInfo *root, FuncExpr *fexpr)
 								 InvalidOid, InvalidOid, COERCE_EXPLICIT_CALL);
 
 	six->args = lcons(cell, six->args);
+
+	/* left for the custom scan as the skycell_cone it stands for, if it can take it */
+	{
+		Oid			cone_types[6] = {INT8OID, FLOAT8OID, FLOAT8OID, FLOAT8OID, FLOAT8OID, FLOAT8OID};
+		FuncExpr   *cone6 = makeFuncExpr(lookup_sibling_func(fexpr->funcid, "skycell_cone",
+															 6, cone_types),
+										 BOOLOID, six->args, InvalidOid, InvalidOid,
+										 COERCE_EXPLICIT_CALL);
+
+		if (cone_scan_keep_as(root, fexpr, cone6))
+			return (Node *) cone6;
+	}
 	return simplify_cone(root, six);
 }
 
@@ -1739,6 +1770,17 @@ skycell_support(PG_FUNCTION_ARGS)
 		{
 			req->selectivity = fmin(1.0, fmax(cone_selectivity(req->root, req->args), 1e-12));
 			PG_RETURN_POINTER(req);
+		}
+		/* a cross-match cone the custom scan answers per outer row */
+		if (req->root != NULL && list_length(req->args) == 6)
+		{
+			double		sel = cone_join_selectivity(req->root, req->args);
+
+			if (sel >= 0)
+			{
+				req->selectivity = fmin(1.0, fmax(sel, 1e-12));
+				PG_RETURN_POINTER(req);
+			}
 		}
 		PG_RETURN_POINTER(NULL);
 	}

@@ -31,6 +31,15 @@ UPDATE probe SET blk = pid % 8 WHERE blk IS DISTINCT FROM pid % 8;
 CREATE INDEX IF NOT EXISTS probe_blk_idx ON probe (blk);
 ANALYZE probe;
 
+-- skycell_join, the Q3C-shaped spelling, synthesises skycell_ang2cell(ra, dec)
+-- from its first coordinate pair, so it needs an index on that expression;
+-- cat_cell's own (02_build.sql) is on the stored cell column.  Built here
+-- rather than there so that the build-cost tables do not count it; the same
+-- statistics target as the column, set before (not with) the ANALYZE.
+CREATE INDEX IF NOT EXISTS cat_cell_a2c ON cat_cell (skycell_ang2cell(ra, dec));
+ALTER INDEX cat_cell_a2c ALTER COLUMN 1 SET STATISTICS 1000;
+ANALYZE cat_cell;
+
 CREATE TABLE IF NOT EXISTS bench_xm_ab (
   rows_m float8, radius_arcsec float8, rep int, blk int,
   method text, slot int, n bigint, ms float8);
@@ -44,9 +53,20 @@ LANGUAGE sql IMMUTABLE AS $$
     WHEN 'pgsphere' THEN format(
       'SELECT count(*), sum(c.id) FROM probe p JOIN cat_sphere c '
       'ON c.pos <@ scircle(p.pos, radians(%s)) WHERE p.blk = %s', r, blk)
+    -- skycell_slots and skycell_cs are the same query: the rewrite's fixed
+    -- range slots (skycell.custom_scan off) and the custom scan's covering
+    -- per probe (on, the default); bench_xm_ab_run sets the GUC per method
     WHEN 'skycell_slots' THEN format(
       'SELECT count(*), sum(c.id) FROM probe p JOIN cat_cell c '
       'ON skycell_cone(c.cell, c.ra, c.dec, p.ra, p.dec, %s) WHERE p.blk = %s', r, blk)
+    WHEN 'skycell_cs' THEN format(
+      'SELECT count(*), sum(c.id) FROM probe p JOIN cat_cell c '
+      'ON skycell_cone(c.cell, c.ra, c.dec, p.ra, p.dec, %s) WHERE p.blk = %s', r, blk)
+    -- the Q3C-shaped spelling, as a q3c_join user would write it: the custom
+    -- scan through the expression index above
+    WHEN 'skycell_join' THEN format(
+      'SELECT count(*), sum(c.id) FROM probe p JOIN cat_cell c '
+      'ON skycell_join(c.ra, c.dec, p.ra, p.dec, %s) WHERE p.blk = %s', r, blk)
     WHEN 'skycell_lateral' THEN format(
       'SELECT count(*), sum(c.id) FROM probe p '
       'CROSS JOIN LATERAL skycell_cone_ranges(p.ra, p.dec, %s, ''cat_cell'') g '
@@ -58,7 +78,7 @@ $$;
 CREATE OR REPLACE FUNCTION bench_xm_ab_run(rows_m float8, radii float8[],
                                            reps int DEFAULT 2,
                                            methods text[] DEFAULT
-                                             ARRAY['q3c', 'pgsphere', 'skycell_slots', 'skycell_lateral'],
+                                             ARRAY['q3c', 'pgsphere', 'skycell_slots', 'skycell_cs', 'skycell_join'],
                                            seed float8 DEFAULT 0.53) RETURNS void
 LANGUAGE plpgsql AS $$
 DECLARE r float8; b int; i int; rep int; ms text[]; n bigint; s numeric;
@@ -75,6 +95,8 @@ BEGIN
         FOR i IN 1 .. array_length(ms, 1) LOOP
           -- memoize keyed on (lo, hi) never hits for distinct probes
           PERFORM set_config('enable_memoize', 'off', true);
+          PERFORM set_config('skycell.custom_scan',
+                             CASE WHEN ms[i] = 'skycell_slots' THEN 'off' ELSE 'on' END, true);
           -- warm this method on this block, then time the same query
           EXECUTE xm_block_sql(ms[i], r / 3600, b) INTO n, s;
           t0 := clock_timestamp();

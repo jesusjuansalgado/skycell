@@ -45,9 +45,14 @@ extern Expr *array_overlap_expr(Node *left, Expr *right);
 extern bool skycell_const_cone_cover(PlannerInfo *root, List *args, sc_region *reg,
 									 sc_cover *cov, sc_density *dens);
 
-/* cone_scan.c: the custom scan for constant cones (skycell.custom_scan) */
+extern void skycell_load_density(Oid relid, Oid statrel, AttrNumber attnum, sc_density *d);
+extern void skycell_scan_params(sc_cover_params *p, const sc_density *d);
+
+/* cone_scan.c: the custom scan for constant and cross-match cones (skycell.custom_scan) */
 extern void cone_scan_init(void);
 extern bool cone_scan_keep(PlannerInfo *root, FuncExpr *fcall);
+extern bool cone_scan_keep_as(PlannerInfo *root, FuncExpr *written, FuncExpr *cone6);
+extern double cone_join_selectivity(PlannerInfo *root, List *args);
 
 /* adql.c: a skypos/skyregion datum, as cover.c understands it */
 extern sc_vec3 skycell_pos_from_datum(Datum d);

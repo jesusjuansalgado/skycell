@@ -46,7 +46,7 @@ CREATE FUNCTION adql_plan_uses_index(q text) RETURNS bool LANGUAGE plpgsql AS $$
 DECLARE l text; found bool := false;
 BEGIN
   FOR l IN EXECUTE 'EXPLAIN (COSTS OFF) ' || q LOOP
-    IF l ~ 'Index (Only )?Scan|Bitmap Index Scan' THEN found := true; END IF;
+    IF l ~ 'Index (Only )?Scan|Bitmap Index Scan|SkycellCone' THEN found := true; END IF;
   END LOOP;
   RETURN found;
 END $$;

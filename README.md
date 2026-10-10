@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="docs/skycell-logo.png" alt="skycell" width="220">
+</p>
+
 # skycell
 
 A PostgreSQL extension for sky positions: one index for cone searches,
@@ -15,14 +19,16 @@ ANALYZE cat;
 SELECT * FROM cat WHERE point('ICRS', ra, dec) <@ circle('ICRS', 266.4, -28.9, 0.05);
 ```
 
-Its cost is paid per query and its benefit per row scanned, so it wins where
-enough rows are scanned to amortise a covering: **degree-scale regions
-(1.6–3.7× faster), polygons (2.7×), cross-matches (6–11×), cold caches** — with
-an index a third the size of pgSphere's that builds more than 10× faster and
-row estimates 1.2× off instead of 2–3×. For small warm cone searches it is a
-wash at 10M rows and **7–13% slower at 50M**. Measured in randomized paired
-trials on two corpora, one of them the real Gaia DR3 density field; the numbers,
-including where skycell loses, are in
+On 10M-row catalogues, with its planner custom scan (on by default),
+it answers **cone searches 17–33% faster than pgSphere at every radius from 1″
+to 3°** warm and up to 2× faster cold, **cross-matches 25–33% faster than
+`q3c_join`** and 3.2–3.8× faster than pgSphere, and convex polygons 2.7–4.4×
+faster — with an index a third the size of pgSphere's that builds 30× faster and
+row estimates 1.2× off instead of 2–3×. Measured in randomized paired trials on
+PostgreSQL 18.6, on a synthetic corpus and one resampled from the real Gaia DR3
+density field. The custom-scan numbers come from one host and those two corpora;
+on real DR3 positions only the older range rewrite has been measured, and there
+small warm cones lose. The numbers, including where skycell loses, are in
 [Comparison](#comparison-with-q3c-and-pgsphere).
 
 ---
@@ -99,7 +105,34 @@ indexes. Because the index conditions are then plain range predicates on a
 plain expression, the planner estimates their selectivity from the same
 histogram — which is why the row estimates come out close.
 
-**5. Regions are stored as MOC cells.** A footprint is covered by a handful of
+**5. Cones get a scan node of their own.** The rewrite above hands the planner
+one `OR` arm per range, and PostgreSQL builds, estimates and costs an index path
+for each — about 10 µs a range, more than computing the covering. So a cone is
+instead left as one opaque clause whose selectivity skycell supplies, and a
+planner *custom scan* (`SkycellCone` in `EXPLAIN`) walks the covering's ranges
+itself: one index scan per range in cell order when the heap follows the cell
+order, or every range's TIDs into one bitmap and each heap page read once when it
+does not (an ObsCore table clustered by collection, say) — chosen from the
+column's correlation statistic, as PostgreSQL chooses between an index and a
+bitmap scan. A **cross-match** cone, whose centre comes from another table's row,
+gets the same node parameterized by that row on the inner side of a nested loop:
+each probe is covered with as many ranges as its cone needs. The planner's row
+estimate for such a join is measured, not modelled: at plan time skycell reads 32
+probe rows, covers each and counts the catalogue rows its cone really holds,
+because a density model cannot know that cross-match targets sit on catalogue
+sources (it was 9 rows against 12,390 before; now 12,630).
+
+```
+Nested Loop
+  ->  Seq Scan on probe p
+  ->  Custom Scan (SkycellCone) on cat c
+        Filter: skycell_in_cone(ra, "dec", p.ra, p."dec", '0.0002777777777777778'::double precision, '-1'::double precision)
+        Index: cat_cell_idx
+        Ranges: per outer row
+        Mode: ordered
+```
+
+**6. Regions are stored as MOC cells.** A footprint is covered by a handful of
 cells written in the IVOA `NUNIQ` encoding and stored one per row in a
 B-tree. The footprints containing a point are those whose cell is one of the
 point's ancestors — a short `= ANY(…)` lookup, no second index type.
@@ -458,10 +491,10 @@ GIN rewrite always takes over — deliberately, not a bug to report.
 
 | Function | Notes |
 |---|---|
-| `skycell_cone(cell, ra, dec, ra0, dec0, radius)` | cone test; with a constant cone the planner turns it into index ranges, with a per-row cone into range slots (a cross-match) |
+| `skycell_cone(cell, ra, dec, ra0, dec0, radius)` | cone test, answered by the custom scan: a constant cone covered at plan time; a per-row cone (a cross-match, `JOIN cat c ON skycell_cone(c.cell, c.ra, c.dec, p.ra, p.dec, r)`) covered per outer row; a generic plan or correlated sub-select covered per rescan. With `skycell.custom_scan` off, index ranges and range slots instead |
 | `skycell_poly(cell, ra, dec, poly float8[])` | the same for a convex polygon |
-| `skycell_radial_query(ra, dec, ra0, dec0, radius)` | Q3C's spelling of the cone test — no cell argument, the planner synthesises it |
-| `skycell_join(ra1, dec1, ra2, dec2, radius)` | Q3C's spelling of the cross-match — likewise |
+| `skycell_radial_query(ra, dec, ra0, dec0, radius)` | Q3C's spelling of the cone test — no cell argument, the planner synthesises `skycell_ang2cell(ra, dec)`; the custom scan answers it through an expression index on that |
+| `skycell_join(ra1, dec1, ra2, dec2, radius)` | Q3C's spelling of the cross-match — likewise; the first pair is the indexed side, as in `q3c_join` |
 | `skycell_in_cone(ra, dec, ra0, dec0, radius [, sel])` | the exact test alone, no index |
 | `skycell_in_poly(ra, dec, poly [, sel])` | likewise |
 | `skycell_in_region(p skypos, r skyregion [, sel])` | likewise, on the types |
@@ -490,9 +523,11 @@ WHERE skycell_radial_query(ra, dec, 266.4, -29.0, 0.5)
 | `q3c_poly_query(ra, dec, poly)` | `skycell_poly(cell, ra, dec, poly)` | no 3-arg form yet — pass the cell |
 | `q3c_dist(ra1, dec1, ra2, dec2)` | `skycell_dist(ra1, dec1, ra2, dec2)` | degrees, as in Q3C |
 
-Both need an index on `skycell_ang2cell(ra, dec)` to be rewritten into ranges,
-exactly as Q3C needs one on `q3c_ang2ipix(ra, dec)`; without it you get a
-correct sequential scan. `skycell_cone(cell, ra, dec, ra0, dec0, radius)`
+Both need an index on `skycell_ang2cell(ra, dec)` to be indexed at all, exactly
+as Q3C needs one on `q3c_ang2ipix(ra, dec)`; without it you get a correct
+sequential scan. With it they take the custom scan: `skycell_join` is the same
+node at the same speed as the `skycell_cone` join (0.96–0.97 of it, not
+distinguishable), 27–33% faster than `q3c_join` on the 10M Gaia-density corpus. `skycell_cone(cell, ra, dec, ra0, dec0, radius)`
 remains the canonical spelling — one predicate covers both the cone search and
 the cross-match, which is why there is no separate join function underneath.
 
@@ -500,7 +535,7 @@ the cross-match, which is why there is no separate join function underneath.
 
 | Function | Returns | Notes |
 |---|---|---|
-| `skycell_cone_ranges(ra0, dec0, radius [, tbl, col])` | `SETOF (lo, hi)` | the covering as index ranges — the `LATERAL` cross-match form. Fastest at sub-arcsecond radii; **6× slower than `skycell_join` at 30″ on clustered targets** (see below) |
+| `skycell_cone_ranges(ra0, dec0, radius [, tbl, col])` | `SETOF (lo, hi)` | the covering as index ranges, for hand-built plans — the old `LATERAL` cross-match form. Superseded: the plain join through the custom scan does the same per probe without the function scan and is 8–11% faster |
 | `skycell_poly_ranges(poly [, tbl, col])` | `SETOF (lo, hi)` | the same for a polygon |
 | `skycell_cone_moc(ra0, dec0, radius [, max_cells, max_order])` | `int8[]` | the covering as IVOA MOC `NUNIQ` cells — store these to index a region |
 | `skycell_poly_moc(poly [, max_cells, max_order])` | `int8[]` | likewise |
@@ -544,12 +579,13 @@ WHERE point('ICRS', ra, dec) <@ circle('ICRS', 269.45, 4.69, 0.05 + 0.006)
 
 | GUC | default | meaning |
 |---|---|---|
-| `skycell.range_cost` | -1 (derive) | price of one index range, in rows; -1 derives it from the relation's rows/page and the planner's cost factors |
+| `skycell.custom_scan` | on | answer `skycell_cone` (and `skycell_join`, `skycell_radial_query`) with the `SkycellCone` scan node instead of rewriting it into B-tree range conditions — constant cones, cross-match cones (a parameterized scan, one covering per outer row) and cones over parameters alone (generic plans, correlated sub-selects). A cone that is not a top-level `AND` term of a `WHERE`/`JOIN ON` (one under an `OR`, say) keeps the rewrite, so it stays indexable. Off restores the rewrite everywhere |
+| `skycell.range_cost` | -1 (derive) | price of one index range, in rows; -1 derives it from the relation's rows/page and the planner's cost factors (for the custom scan, also from how much of the relation `shared_buffers` holds) |
 | `skycell.max_ranges` | 64 | cap on ranges per covering |
 | `skycell.max_area_ratio` | 64 | a partly covered cell may not exceed this × the region's area |
 | `skycell.use_stats` | on | use the histogram as a density map |
 | `skycell.cache_coverings` | on | memoise coverings per backend |
-| `skycell.join_slots` | 4 | range slots emitted for a non-constant region |
+| `skycell.join_slots` | 4 | range slots the rewrite emits for a non-constant region (used when the custom scan does not apply: `custom_scan` off, polygons and stored regions) |
 | `skycell.exact_cells` | on | tight cell geometry; off falls back to the `max_pixrad` cap |
 | `skycell.force_order` | -1 | diagnostics: cover cones at this order (-1 = let the model choose) |
 | `skycell.split_cost`, `skycell.max_steps` | 1, 4000 | refinement guards for polygons and very large cones |
@@ -561,6 +597,65 @@ WHERE point('ICRS', ra, dec) <@ circle('ICRS', 269.45, 4.69, 0.05 + 0.006)
 ---
 
 ## Comparison with Q3C and pgSphere
+
+### With the custom scan (PostgreSQL 18.6, second host)
+
+The current build, measured on a 4-vCPU x86-64 cloud VM (PostgreSQL 18.6, Q3C
+2.0.5 and pgSphere 1.5.2 built from source, the server settings of
+[REPRODUCING.md](REPRODUCING.md) §2) with the protocol described below. Raw
+results, drivers and reports in [`bench/results-pg18/`](bench/results-pg18/).
+
+**Cone searches, skycell ÷ pgSphere** (below 1 = skycell faster; **bold** =
+95% interval excludes 1):
+
+| radius | designed, warm | designed, cold | Gaia, warm | Gaia, cold |
+|---|---|---|---|---|
+| 1″ | **0.75** | **0.85** | **0.70** | **0.79** |
+| 10″ | **0.76** | **0.88** | **0.71** | **0.88** |
+| 1′ | **0.80** | 0.99 | **0.74** | 0.96 |
+| 6′ | **0.83** | **0.86** | **0.80** | **0.86** |
+| 30′ | **0.79** | **0.75** | **0.75** | **0.69** |
+| 1° | **0.75** | **0.61** | **0.71** | **0.51** |
+| 3° | **0.73** | **0.61** | **0.67** | **0.51** |
+
+The range rewrite, run in the same trials (`skycell.custom_scan = off`), is
+0.88–1.07 of pgSphere up to 30′ — where the first host's measurement below put it
+— so the gain is the custom scan's: 0.78–0.84 of the rewrite's time up to 30′.
+At 1″ it plans in 0.036 ms against the rewrite's 0.055 (pgSphere: 0.029) and
+wins in execution, 0.022 ms against pgSphere's 0.040.
+
+**Cross-match**, 200,000 probes (half catalogue sources displaced ~0.3″, half
+uniform) against the 10M Gaia-density catalogue, 16 paired trials
+(`bench/11_xmatch_ab.sql`); every skycell form returns `q3c_join`'s rows:
+
+| ratio | 1″ | 10″ |
+|---|---|---|
+| `skycell_cone` join, custom scan ÷ `q3c_join` | **0.71** | **0.75** |
+| `skycell_join`, custom scan ÷ `q3c_join` | **0.67** | **0.73** |
+| `skycell_cone` join, rewrite's slots ÷ `q3c_join` | 0.99 | 1.17 |
+| `skycell_join`, custom scan ÷ pgSphere | **0.26** | **0.31** |
+
+The rewrite's plan is four `BitmapOr` slots per probe, each descending the index
+whether filled or not (12.6 buffer pages per probe at 1″); the custom scan walks
+the probe's own covering, 1.2 ranges on average (4.3 pages).
+
+**ObsCore-shaped relation**, observations in groups of 128 per field, clustered
+by collection and field, at three sizes, from a stored set of field and query
+centres (`bench/10_crossover.sql`, `bench/data/`), total time skycell ÷ pgSphere,
+two runs pooled (they differ by at most 0.19, and by 0.02 or less at 10M except
+the empty cone):
+
+| class | 0.5M | 2M | 10M |
+|---|---|---|---|
+| 0.15° cone | 1.14 | 1.07 | 0.97 |
+| 2° cone | 0.92 | 0.93 | 0.75 |
+| 0.5° cone + catalogue cuts | 0.94 | 0.99 | 0.80 |
+| empty 0.7″ cone | 0.71 | 0.68 | 0.47 |
+
+Not yet measured with the custom scan: real DR3 positions (the archive was not
+reachable from the second host) and 50M rows (its disk).
+
+### Earlier measurements: the range rewrite (first host)
 
 Two 10M-row corpora, PostgreSQL 18.6, one core. The first is synthetic with
 Gaia-like crowding; the second is resampled from the **real Gaia DR3 density
@@ -742,7 +837,9 @@ worth knowing before you expect to reproduce it:
   1.6×. They answer the same cone from the same heap pages, so each leaves them
   warm for the other. Run one method per phase.
 
-**Cross-match — Q3C's own speciality.** 200k probes against 50M sources, each
+**Cross-match — Q3C's own speciality.** *(The range rewrite, before the custom
+scan; the join through the custom scan now beats `q3c_join` — see above — and
+supersedes the `LATERAL` form below.)* 200k probes against 50M sources, each
 method warmed on its own block before timing, paired over 16 block-repetitions
 (`bench/11_xmatch_ab.sql`). Identical row counts from all four:
 
@@ -757,8 +854,8 @@ skycell is **level with `q3c_join`** (not faster — the intervals reach 1) and
 2.5–3.3× faster than pgSphere. So one index is competitive with each of the two
 established ones on the workload each was built for.
 
-**At the radii cross-matching is actually done at, use the `LATERAL` form.**
-Optical matching uses 1–1.5″ and radio up to ~5″. On **10M real Gaia DR3
+**At the radii cross-matching is actually done at.** Optical matching uses
+1–1.5″ and radio up to ~5″. On **10M real Gaia DR3
 positions**, geometric mean of the paired per-cell ratio over three upload sizes
 (10³, 10⁴, 10⁵) × two target distributions (clustered and uniform), randomized
 method order, each method warmed, 3 reps (`bench/18_xmatch_sweep.sql`):
@@ -771,16 +868,13 @@ method order, each method warmed, 3 reps (`bench/18_xmatch_sweep.sql`):
 | 5″ | 1.08 | 1.29 | **0.35** |
 | **all** | **0.98** | 1.32 | **0.33** |
 
-So over 0.5–5″ skycell is **level with `q3c_join`** (0.98, faster in 16 of 24
-cells) and **3× faster than pgSphere** (faster in 23 of 24). The `LATERAL` form
-is the better of skycell's two here; the fixed-slot form runs 1.32 of
-`q3c_join`.
-
-Above that range the `LATERAL` form degrades — at 30″ on clustered targets it
-takes 5682 ms against the fixed-slot form's 896 ms. That is an association
-radius rather than a cross-match one, so treat it as a bound on the `LATERAL`
-form: use the fixed-slot `skycell_join` if you are matching at tens of
-arcseconds.
+So over 0.5–5″ the `LATERAL` form was **level with `q3c_join`** (0.98, faster
+in 16 of 24 cells) and **3× faster than pgSphere** (faster in 23 of 24); the
+fixed-slot form ran 1.32 of `q3c_join`. Above that range the `LATERAL` form
+degraded — 5682 ms at 30″ on clustered targets against the slots' 896 ms. The
+custom scan has not been measured on real positions yet; on the Gaia-density
+corpus it is faster than both forms (0.89–0.92 of `LATERAL`, 0.62–0.68 of the
+slots).
 
 **Fixing it: the `skycell_cell_ops` operator class (v0.7).** The cause is a
 missing selectivity estimator, and selectivity comes from the operator, so the
@@ -850,7 +944,9 @@ touches 387 pages against pgSphere's 1848. For cones ≤1′ nothing changes,
 because both methods touch 5–8 pages at any table size and what is left is
 skycell's ~0.02 ms of planning. **The rule is about pages, not rows.**
 
-**Where skycell loses.** On a 500k-row ObsCore table inside a real TAP service
+**Where skycell loses** *(the range rewrite, with field centres drawn from the
+live corpus — see the stored-centre run above for the custom scan)*. On a
+500k-row ObsCore table inside a real TAP service
 it is 1.2–1.45× *slower* per query, and all 18 end-to-end cells tie (the
 database is 1–3% of a request). Measuring the same ObsCore-shaped relation at
 three sizes puts the crossover between 0.5M and 2M rows for degree-scale cones —
@@ -922,30 +1018,91 @@ histogram was accurate all along (3701 estimated vs ~4155 scanned).
 
 ---
 
+## Testing
+
+Two layers, both in [`ext/test/`](ext/test/).
+
+**Geometry, standalone** — `make selftest` in `ext/`, no PostgreSQL needed
+(about two minutes):
+
+- `healpix_selftest`: order-0 pixel centres, the pixel → centre → pixel round
+  trip at every order, nesting across orders, every point within `max_pixrad`
+  of its pixel's centre (the bound the covering's *outside* test relies on), and
+  equal area (χ²/dof 1.14 for uniform points over order-3 pixels).
+- `cover_selftest`: brute force on the covering itself. Two million catalogue
+  points; for cones from 1″ to 120° and for convex polygons, under a uniform
+  and a histogram density model, every point inside the region must have its
+  order-29 cell inside one of the ranges. Then the awkward places: 7,266
+  polygons at the poles, zone boundaries, RA wrap-around and face edges (869,117
+  points inside, half within a part per billion of an edge), and 2 × 30,000 cones
+  with 200 points each. It also prints ranges, cells examined, false-positive
+  fraction and µs per covering. Current run: **0 false negatives**.
+
+**SQL regression** — `make installcheck` in `ext/`, against a running server:
+
+- `skycell`: every indexed query must return exactly what the exact predicate
+  returns on a sequential scan — no false negatives, no false positives — on a
+  clustered catalogue with clusters at both poles and across RA = 0: cones,
+  polygons, the Q3C-shaped spellings, cross-matches, MOC-stored regions and the
+  GiST region operator classes.
+- `adql`: the ADQL surface — the standard's spelling, the indexable operator
+  form, and the IVOA UDF astronomy functions.
+- `cone_scan`: the custom scan. Every query returns the same rows with
+  `skycell.custom_scan` on and off, in both of its modes (a heap in cell order
+  and one that is not), rescanned in a nested loop, under a generic plan and
+  through a scrollable cursor; each placement of a cone (under `OR`, in a view,
+  a `JOIN ON`, a sub-select, a target list) gets the plan it should; cross-matches
+  (join, per-row radius, `WHERE` join, `LEFT JOIN`, `EXISTS`, expression index,
+  correlated nearest-neighbour, `skycell_join`), with a NULL centre, a cone round
+  the pole and one across RA = 0, match the rewrite; an invalid centre errors as
+  the rewrite does; and the cross-match row estimate is within 3× of the truth.
+
+All three pass on PostgreSQL 16 and 18. The benchmark harness records each
+method's row count in every trial too; the phase-grid (`bench/report.py`),
+cross-match and crossover reports compare them across methods.
+
 ## Limitations
 
 - Polygons must be convex, and there is no `REGION`, union of regions or
   non-convex support.
-- No KNN ordering yet (`ORDER BY pos <-> point(…) LIMIT k` is not indexed).
+- No KNN ordering yet (`ORDER BY pos <-> point(…) LIMIT k` is not indexed); a
+  correlated sub-select with `ORDER BY skycell_dist(…) LIMIT 1` over a cone is
+  indexed (the custom scan covers the cone per rescan) and is the way to do it.
+- **The custom scan's own limits.** It answers cones only (polygons and stored
+  regions use the rewrite), and only a cone that is a top-level `AND` term of a
+  `WHERE` or `JOIN ON` — one under an `OR` is rewritten, which a `BitmapOr` can
+  still serve. It reads heap tables only (other table access methods keep the
+  rewrite), and on a partitioned table each partition keeps the rewrite, because
+  PostgreSQL re-simplifies each partition's copy of the condition. It is not
+  parallel-aware, and before PostgreSQL 18 its bitmap mode does not prefetch.
+- **Where it has been measured.** The custom scan's numbers come from one
+  4-vCPU cloud host at 10M rows, on the synthetic and the resampled-Gaia corpora.
+  It has not been run on real DR3 positions — where the older rewrite loses
+  small warm cones to pgSphere, a deficit in planning that the custom scan
+  shrinks but has not been shown to remove — nor at 50M rows.
+- Planning still costs: a covering is computed at plan time (0.036 ms at 1″,
+  against 0.029 ms for pgSphere's whole plan) and the warm win at small radii
+  comes from execution. With the rewrite (`skycell.custom_scan = off`) planning
+  also pays ~10 µs per range and grows with source density: 3% slower than
+  pgSphere at 6′ on 10M rows, 13% at 50M.
+- **Plan-time sampling for cross-matches.** To estimate a cross-match's rows the
+  planner reads up to 32 probe rows and up to 4000 catalogue rows through the
+  index (as PostgreSQL itself reads index endpoints for range estimates): about
+  2–5 ms of planning, more on a cold cache. It applies when the probe position
+  is a plain column of one table and the cones are small; otherwise the
+  estimate falls back to the density model, which ignores that probes sit on
+  sources and can be orders of magnitude low.
 - The density model reads the histogram of a plain column or expression
   index; it is a coarse synopsis, and a dense cluster split by the
   space-filling curve can be underestimated — `max_area_ratio` bounds the
-  damage rather than fixing it. A custom `typanalyze` storing a multi-order
-  density map would.
-- Planning a covering costs 0.01–0.12 ms, which is the reason small relations
-  favour pgSphere. Removing it means not planning ranges at all: an SP-GiST
-  operator class over the cell hierarchy, where one index qual is planned and
-  the covering happens during the descent.
-- Planning is the one cost that *grows* with source density, so the method's
-  disadvantage on small cones gets worse, not better, as a catalogue grows:
-  3% at 10M rows, 13% at 50M. An SP-GiST opclass is the fix.
-- Tested to 50M rows on one machine, warm and with caches dropped. The Gaia
-  corpus uses the real DR3 density field but not real positions, and has no
-  structure below its 0.11° map cells.
-- Cross-match plans are not robust on wide relations: the range join
-  `cell BETWEEN r.lo AND r.hi` has no selectivity estimator, so the planner can
-  pick a sequential scan that is orders of magnitude slower than the index path
-  it rejects (measured: >90 s against 145 ms). Narrow catalogues are unaffected.
+  damage rather than fixing it.
+- The Gaia corpus uses the real DR3 density field but not real positions, and
+  has no structure below its 0.11° map cells.
+- With the rewrite only: the range join `cell BETWEEN r.lo AND r.hi` of the
+  `LATERAL` form has no selectivity estimator without `skycell_cell_ops`, so on
+  wide relations the planner can pick a sequential scan orders of magnitude
+  slower than the index path (>90 s against 145 ms measured). The custom scan's
+  join supplies its own estimate.
 - The memory-residency advantage needs two things the index-size arithmetic
   does not mention: a query stream that sweeps enough sky to touch most of the
   index, and a heap small enough that it does not take the buffer pool by
