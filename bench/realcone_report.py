@@ -40,7 +40,7 @@ def fmt(xs):
     return f'{statistics.median(xs):.2f} [{lo:.2f}, {hi:.2f}]'
 
 
-def report(title, rows, label_of, extra):
+def report(title, rows, label_of, extra, a='skycell', b='pgsphere'):
     # per (method, qid): medians over measurements
     per = defaultdict(list)
     for r in rows:
@@ -51,8 +51,8 @@ def report(title, rows, label_of, extra):
         med[k] = {'tot': statistics.median(float(x['plan_ms']) + float(x['exec_ms']) for x in rs),
                   'plan': f('plan_ms'), 'exec': f('exec_ms'),
                   'n': {x['n'] for x in rs}, 'rows': rs}
-    print(f'\n## {title}\n')
-    print('| radius | n | total, skycell/pgSphere | execution only | planning, skycell - pgSphere (ms) | '
+    print(f'\n## {title}: {a} / {b}\n')
+    print(f'| radius | n | total, {a}/{b} | execution only | planning, {a} - {b} (ms) | '
           + ' | '.join(h for h, _ in extra) + ' |')
     print('|' + '---|' * (5 + len(extra)))
     mism = 0
@@ -60,7 +60,7 @@ def report(title, rows, label_of, extra):
     for lab in LABELS:
         tot, ex, dp, pairs = [], [], [], []
         for q in qids:
-            s, p = med.get(('skycell', q)), med.get(('pgsphere', q))
+            s, p = med.get((a, q)), med.get((b, q))
             if not s or not p or label_of(q) != lab:
                 continue
             if s['n'] != p['n']:
@@ -99,8 +99,13 @@ def main():
     cold = load(os.path.join(d, 'bench_realcone_cold.csv'))
     wc = {int(r['qid']): r['label'] for r in load(os.path.join(d, 'realcone_centers.csv'))}
     if warm:
-        report('Real corpus, warm (gaia_realc, per-method blocks, both orders)', warm,
-               lambda q: wc.get(q), [('buffers, skycell / pgSphere', mean_of('buffers'))])
+        methods = {r['method'] for r in warm}
+        pairs = [('skycell', 'pgsphere')]
+        if 'skycell-rw' in methods:
+            pairs += [('skycell-rw', 'pgsphere'), ('skycell', 'skycell-rw')]
+        for a, b in pairs:
+            report('Real corpus, warm (gaia_realc, per-method blocks, two orders)', warm,
+                   lambda q: wc.get(q), [('buffers, a / b', mean_of('buffers'))], a, b)
     if cold:
         lab = {int(r['qid']): r['label'] for r in cold}
         report('Real corpus, cold (gaia_real_cell / gaia_real_sphere, restart before each pass)', cold,

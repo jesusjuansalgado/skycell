@@ -30,12 +30,15 @@ cold_restart() { eval "$RESTART"; eval "$DROP_CACHES"; wait_up; }
 q -v scale="$SCALE" -f 30_real_cones.sql
 
 if [[ " $STAGES " == *" warm "* ]]; then
-  # each method's block runs alone; both orders, so neither method always goes first
-  for order in "A skycell pgsphere" "B pgsphere skycell"; do
-    set -- $order
-    for m in "$2" "$3"; do
-      echo "warm block $1: $m"
-      q -c "SELECT realcone_block('$m', '$1')" >/dev/null
+  # each method's block runs alone; two orders, so no method always goes first.
+  # skycell-rw (the range rewrite) only where the build has a custom scan.
+  WARM_METHODS=${WARM_METHODS:-"skycell skycell-rw pgsphere"}
+  rev=$(echo $WARM_METHODS | tr ' ' '\n' | tac | tr '\n' ' ')
+  for order in "A $WARM_METHODS" "B $rev"; do
+    set -- $order; blk=$1; shift
+    for m in "$@"; do
+      echo "warm block $blk: $m"
+      q -c "SELECT realcone_block('$m', '$blk')" >/dev/null
     done
   done
 fi

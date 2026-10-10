@@ -5,8 +5,11 @@
 -- The referee asks whether the ordering survives elsewhere, and separates the
 -- indexing method from the query formulation.  Both are varied here:
 --
---   formulation  q3c_join | skycell LATERAL (ranges then index) | skycell_join
---                (the fixed-slot predicate form) | pgSphere
+--   formulation  q3c_join | skycell_cone join through the custom scan
+--                (skycell_cs) or the range rewrite's fixed slots
+--                (skycell_slots) | skycell_join, Q3C's spelling, through the
+--                custom scan | pgSphere   (skycell_lateral, the ranges-then-
+--                index form, remains available but is not run by default)
 --   outer size   1k, 10k, 100k probes
 --   radius       0.2", 1", 5", 30"
 --   targets      drawn from the catalogue (clustered) or uniform on the sphere
@@ -41,15 +44,29 @@ LANGUAGE sql IMMUTABLE AS $$
       'SELECT count(*) FROM xp p CROSS JOIN LATERAL skycell_cone_ranges(p.ra, p.dec, %s) r
        JOIN gaia_realc o ON skycell_ang2cell(o.ra, o.dec) BETWEEN r.lo AND r.hi
        WHERE skycell_in_cone(o.ra, o.dec, p.ra, p.dec, %s)', r_deg, r_deg)
+    -- the Q3C-shaped spelling; with skycell.custom_scan on it is the custom
+    -- scan's per-probe covering through gaia_realc's expression index
     WHEN 'skycell_join' THEN format(
       'SELECT count(*) FROM xp p, gaia_realc o WHERE skycell_join(o.ra, o.dec, p.ra, p.dec, %s)', r_deg)
+    -- skycell_slots and skycell_cs are the same query, the join written with
+    -- skycell_cone: the range rewrite's fixed slots (custom_scan off) and the
+    -- custom scan's covering per probe (on); xms_run sets the GUC per method
+    WHEN 'skycell_slots' THEN format(
+      'SELECT count(*) FROM xp p, gaia_realc o
+       WHERE skycell_cone(skycell_ang2cell(o.ra, o.dec), o.ra, o.dec, p.ra, p.dec, %s)', r_deg)
+    WHEN 'skycell_cs' THEN format(
+      'SELECT count(*) FROM xp p, gaia_realc o
+       WHERE skycell_cone(skycell_ang2cell(o.ra, o.dec), o.ra, o.dec, p.ra, p.dec, %s)', r_deg)
     WHEN 'pgsphere' THEN format(
       'SELECT count(*) FROM xp p, gaia_realc o
        WHERE o.pos <@ scircle(spoint(radians(p.ra), radians(p.dec)), radians(%s))', r_deg)
   END $$;
 
+DROP FUNCTION IF EXISTS xms_run(int[], float8[], text[], int, int);
 CREATE OR REPLACE FUNCTION xms_run(sizes int[], radii float8[], kinds text[],
-                                   timeout_ms int DEFAULT 120000, reps int DEFAULT 3)
+                                   timeout_ms int DEFAULT 120000, reps int DEFAULT 3,
+                                   methods text[] DEFAULT
+                                     ARRAY['q3c_join','skycell_cs','skycell_join','skycell_slots','pgsphere'])
 RETURNS void LANGUAGE plpgsql AS $$
 DECLARE k text; n int; ra float8; m text; q text; t0 timestamptz; nn bigint;
         shape text; plan text; ms float8; to_ bool; rep int;
@@ -65,9 +82,10 @@ BEGIN
      -- answer the same cones from the same pages.  A first version of this
      -- script ran them in a fixed order and made the method that happened to
      -- run third look 6-45x faster than it is.
-     FOR m IN SELECT unnest FROM unnest(ARRAY['q3c_join','skycell_lateral','skycell_join','pgsphere'])
-              ORDER BY random() LOOP
+     FOR m IN SELECT unnest FROM unnest(methods) ORDER BY random() LOOP
       q := xms_sql(m, ra / 3600.0);
+      PERFORM set_config('skycell.custom_scan',
+                         CASE WHEN m = 'skycell_slots' THEN 'off' ELSE 'on' END, true);
       -- record what the planner decided, before timing it
       shape := 'unknown';
       BEGIN
