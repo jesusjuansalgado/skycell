@@ -469,35 +469,59 @@ which of 20\,000 stored circles contain each probe.
 
 \subsection{Reproducibility}
 
-Table~\ref{tab:repro} records the configuration in enough detail to repeat or contest
-the measurement.
+Table~\ref{tab:repro} records the two configurations in enough detail to repeat or
+contest the measurements.
 
 \begin{table}
-  \caption{The measured configuration.}
+  \caption{The measured configurations. The second host ran the custom-scan
+    measurements, with the range rewrite alongside in the same trials; everything else
+    is from the first. Rows spanning both columns are common to the two.}
   \label{tab:repro}
   \centering
-  \small
-  \begin{tabular}{l p{5.3cm}}
+  \footnotesize
+  \setlength{\tabcolsep}{3pt}
+  \begin{tabular}{@{}l p{2.95cm} p{2.95cm}@{}}
     \hline\hline
-    Item & Value \\
+    Item & First host & Second host \tabularnewline
     \hline
-    Host & Apple silicon laptop, 11 cores, Docker Desktop Linux VM, 8\,GB, NVMe SSD \\
-    PostgreSQL & 18.6; \texttt{shared\_buffers} 2\,GB, JIT off, parallelism off \\
-    Extensions & Q3C 2.0.5, pgSphere 1.5.2, skycell 0.4; \texttt{range\_cost} derived
-      per relation (Eq.~\ref{eq:crange}), 116 here \\
-    Rows & $10^7$ per corpus ($5\times10^7$ for the Gaia corpus's scale test) \\
-    Schema & each extension's own B-tree/GiST on its own key (\texttt{q3c\_ang2ipix},
-      \texttt{spoint}, \texttt{cell int8}), heap ordered by its own key;
-      \texttt{VACUUM (FREEZE)} and \texttt{ANALYZE} (stats target 1000) before measuring \\
-    Repetitions & 5 (warm), 1 (cold); 1456 queries per repetition \\
-    Uncertainty & percentile bootstrap, 4000 resamples, over queries \\
+    Machine & \raggedright Apple M3 Pro laptop (aarch64), 11 cores; Docker Desktop Linux VM, 8\,GB
+      shared with other containers; NVMe SSD
+      & \raggedright cloud micro-VM (KVM, x86-64), 4 vCPU Intel Xeon 2.8\,GHz, 15\,GB; one
+      virtual disk, its backing storage not visible \tabularnewline
+    PostgreSQL & \raggedright 18.6, PGDG package & \raggedright 18.6, built from source (gcc 13.3, \texttt{-O2}, no
+      LLVM) \tabularnewline
+    Settings & \multicolumn{2}{p{6.0cm}@{}}{\raggedright \texttt{shared\_buffers} 2\,GB,
+      \texttt{effective\_cache\_size} 5\,GB, \texttt{random\_page\_cost} 1.1,
+      \texttt{work\_mem} 64\,MB, JIT off, parallelism off} \tabularnewline
+    Extensions & \raggedright Q3C 2.0.5, pgSphere 1.5.2, skycell 0.4 (range rewrite)
+      & \raggedright the same Q3C and pgSphere built from source; skycell 0.26 (custom scan and
+      range rewrite) \tabularnewline
+    Range price & \raggedright Eq.~(\ref{eq:crange}), derived per relation, 116 here
+      & \raggedright Eq.~(\ref{eq:crange-cs}) for the custom scan, 34 on the Gaia catalogue;
+      Eq.~(\ref{eq:crange}) for the rewrite, 110 \tabularnewline
+    Used for & \raggedright every table and figure not listed opposite
+      & \raggedright synthetic columns of Table~\ref{tab:cones}, \emph{custom} columns of
+      Table~\ref{tab:scale}, Table~\ref{tab:crossover}, Fig.~\ref{fig:benchmark}a,b \tabularnewline
+    Rows & \multicolumn{2}{p{6.0cm}@{}}{\raggedright $10^7$ per corpus ($5\times10^7$ for the Gaia
+      corpus's scale test, first host only)} \tabularnewline
+    Schema & \multicolumn{2}{p{6.0cm}@{}}{\raggedright each extension's own B-tree/GiST on its own
+      key (\texttt{q3c\_ang2ipix}, \texttt{spoint}, \texttt{cell int8}), heap ordered by
+      its own key; \texttt{VACUUM (FREEZE)} and \texttt{ANALYZE} (stats target 1000)
+      before measuring} \tabularnewline
+    Repetitions & \multicolumn{2}{p{6.0cm}@{}}{\raggedright 5 (warm), 1 (cold); 1456 queries per
+      repetition} \tabularnewline
+    Uncertainty & \multicolumn{2}{p{6.0cm}@{}}{\raggedright percentile bootstrap, 4000 resamples,
+      over queries} \tabularnewline
     \hline
   \end{tabular}
 \end{table}
 
-\paragraph{What this protocol still does not control.} One machine, one storage device,
-one configuration -- absolute times are properties of that machine, only the comparisons
-travel -- and the three extensions are compared as configured here: a different Q3C
+\paragraph{What this protocol still does not control.} Two machines, each with one
+storage device, sharing one configuration -- absolute times are properties of a machine,
+only the comparisons travel. The custom scan was measured only on the second, so
+comparing it with the range rewrite across tables also compares hosts and CPU
+architectures; where the two ran in the same trials (the rewrite's ratios in
+Sect.~\ref{sec:cones}, its columns in Table~\ref{tab:crossover}) they do not. The three extensions are compared as configured here: a different Q3C
 formulation or pgSphere index configuration could move their numbers (Sect.~\ref{sec:cones}
 reports one such effect dominating Q3C's small-cone results).
 

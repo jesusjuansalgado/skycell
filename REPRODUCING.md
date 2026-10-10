@@ -22,6 +22,21 @@ attributed rather than guessed at.
 Extension build options: PGXS defaults, `PG_CPPFLAGS = -DSKYCELL_PG`, no
 `-march` or LTO flags, `with_llvm=no` in the container image.
 
+The custom-scan measurements (the synthetic columns of `tab:cones`, the
+*custom* columns of `tab:scale`, `tab:crossover` and Fig. 1a,b) come from a
+second host, with the same server settings (§2):
+
+| | |
+|---|---|
+| Host | cloud micro-VM (Firecracker/KVM), x86-64, 4 vCPU Intel Xeon @ 2.80 GHz, 15 GiB |
+| Kernel | Linux 6.18 |
+| Storage | one virtio disk; the storage behind it is not visible from the guest |
+| PostgreSQL | 18.6 built from source, `--without-llvm`, gcc 13.3.0, `-O2` |
+| Q3C, pgSphere | 2.0.5, 1.5.2, built from source against it |
+| skycell | 0.26 (this repository), `skycell.custom_scan = on` |
+
+Its driver and raw results are in `bench/results-pg18/`.
+
 ## 2. Server settings
 
 Set on the command line; everything else is a PostgreSQL 18 default.
