@@ -44,7 +44,13 @@ LANGUAGE sql IMMUTABLE AS $$
     WHEN 'pgsphere' THEN format(
       'SELECT count(*), sum(c.id) FROM probe p JOIN cat_sphere c '
       'ON c.pos <@ scircle(p.pos, radians(%s)) WHERE p.blk = %s', r, blk)
+    -- skycell_slots and skycell_cs are the same query: the rewrite's fixed
+    -- range slots (skycell.custom_scan off) and the custom scan's covering
+    -- per probe (on, the default); bench_xm_ab_run sets the GUC per method
     WHEN 'skycell_slots' THEN format(
+      'SELECT count(*), sum(c.id) FROM probe p JOIN cat_cell c '
+      'ON skycell_cone(c.cell, c.ra, c.dec, p.ra, p.dec, %s) WHERE p.blk = %s', r, blk)
+    WHEN 'skycell_cs' THEN format(
       'SELECT count(*), sum(c.id) FROM probe p JOIN cat_cell c '
       'ON skycell_cone(c.cell, c.ra, c.dec, p.ra, p.dec, %s) WHERE p.blk = %s', r, blk)
     WHEN 'skycell_lateral' THEN format(
@@ -58,7 +64,7 @@ $$;
 CREATE OR REPLACE FUNCTION bench_xm_ab_run(rows_m float8, radii float8[],
                                            reps int DEFAULT 2,
                                            methods text[] DEFAULT
-                                             ARRAY['q3c', 'pgsphere', 'skycell_slots', 'skycell_lateral'],
+                                             ARRAY['q3c', 'pgsphere', 'skycell_slots', 'skycell_lateral', 'skycell_cs'],
                                            seed float8 DEFAULT 0.53) RETURNS void
 LANGUAGE plpgsql AS $$
 DECLARE r float8; b int; i int; rep int; ms text[]; n bigint; s numeric;
@@ -75,6 +81,8 @@ BEGIN
         FOR i IN 1 .. array_length(ms, 1) LOOP
           -- memoize keyed on (lo, hi) never hits for distinct probes
           PERFORM set_config('enable_memoize', 'off', true);
+          PERFORM set_config('skycell.custom_scan',
+                             CASE WHEN ms[i] = 'skycell_slots' THEN 'off' ELSE 'on' END, true);
           -- warm this method on this block, then time the same query
           EXECUTE xm_block_sql(ms[i], r / 3600, b) INTO n, s;
           t0 := clock_timestamp();
