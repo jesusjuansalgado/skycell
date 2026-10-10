@@ -14,8 +14,9 @@ rewrite (`skycell.custom_scan = off`).  The cold pass runs q3c, pgsphere and
 skycell only: skycell-rw shares `cat_cell`, so whichever ran second would find
 it warm.
 
-Not rerun: the real-DR3 columns (the Gaia archive is not reachable from this
-container) and the 50M column of tab:scale (needs about 30 GB of disk).
+The real-DR3 columns and the 50M column of tab:scale were run later, on the
+same container type: `realcone/` (tab:cones' real columns), `xmreal/`
+(tab:xmreal), `estimator/` (tab:estimator) and `scale50/` (tab:scale).
 
 ## Files
 

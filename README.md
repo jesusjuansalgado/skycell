@@ -21,10 +21,11 @@ SELECT * FROM cat WHERE point('ICRS', ra, dec) <@ circle('ICRS', 266.4, -28.9, 0
 
 It **beats each established PostgreSQL sky index at its own speciality**:
 
-- **Cone searches, pgSphere's speciality:** 17–33% faster than pgSphere at
-  every radius from 1″ to 3° warm, and up to 2× faster cold.
-- **Cross-matching, Q3C's speciality:** 25–33% faster than `q3c_join`, and
-  3.2–3.8× faster than pgSphere.
+- **Cone searches, pgSphere's speciality:** faster than pgSphere at every
+  radius from 1″ to 3° warm, on every corpus: 17–33% on synthetic catalogues,
+  4–31% on real Gaia DR3 positions. Cold it is up to 2.7× faster.
+- **Cross-matching, Q3C's speciality:** 20–33% faster than `q3c_join` on both
+  resampled and real positions, and 2.9–3.8× faster than pgSphere.
 
 It also answers convex polygons 2.7–4.4× faster than pgSphere. Its index is a
 third the size of pgSphere's and builds 30× faster, and its row estimates are
@@ -35,9 +36,9 @@ The interface follows ADQL. The functions carry ADQL's own names (`CONTAINS`,
 one-to-one translation of `1 = CONTAINS(…)`. Stored regions read and write as
 IVOA STC-S, and one column can hold circles and polygons together.
 
-These numbers come from randomized paired trials on PostgreSQL 18.6, on 10M-row
-catalogues: one synthetic, one resampled from the real Gaia DR3 density field.
-The details, and what is still being measured, are in
+These numbers come from randomized paired trials on PostgreSQL 18.6. The
+corpora are 10M-row catalogues (synthetic, resampled from the Gaia DR3 density
+field, and real DR3 positions) and a 50M-row one. The details are in
 [Comparison](#comparison-with-q3c-and-pgsphere).
 
 ---
@@ -621,11 +622,16 @@ server is restarted and the page cache dropped before each timed pass. Cache
 residency has to be controlled: an uncontrolled run of ours once reported
 skycell at 2× Q3C on a cross-match, an artefact of which method ran first.
 
-**Corpora.** There are two 10M-row catalogues. The first is synthetic, with
-Gaia-like crowding. The second is resampled from the **real Gaia DR3 density
-field** (source counts in all 3,145,728 order-9 cells), so the crowding
-structure is not one we invented. The ObsCore-shaped relation comes in three
-sizes.
+**Corpora.** There are three 10M-row catalogues:
+
+- **designed:** synthetic, with Gaia-like crowding;
+- **Gaia:** resampled from the real Gaia DR3 density field (source counts in
+  all 3,145,728 order-9 cells), so the crowding structure is not one we
+  invented;
+- **real:** 10M real Gaia DR3 positions, with every scale of clustering.
+
+There is also a 50M-row resampled catalogue, and an ObsCore-shaped relation in
+three sizes.
 
 **Host.** A 4-vCPU x86-64 cloud VM running PostgreSQL 18.6, Q3C 2.0.5 and
 pgSphere 1.5.2, all built from source, with the server settings of
@@ -633,27 +639,33 @@ pgSphere 1.5.2, all built from source, with the server settings of
 [`bench/results-pg18/`](bench/results-pg18/). Rows marked *first host* come
 from an Apple M3 Pro under Docker
 ([`bench/results-ab/`](bench/results-ab/)), measured before the custom scan
-existed. They cover polygons, regions, index sizes and the 50M-row runs.
+existed. They cover polygons, regions and index sizes.
 
 ### Cone searches — pgSphere's speciality
 
 skycell ÷ pgSphere (below 1 = skycell faster; **bold** = 95% interval excludes 1):
 
-| radius | designed, warm | designed, cold | Gaia, warm | Gaia, cold |
-|---|---|---|---|---|
-| 1″ | **0.75** | **0.85** | **0.70** | **0.79** |
-| 10″ | **0.76** | **0.88** | **0.71** | **0.88** |
-| 1′ | **0.80** | 0.99 | **0.74** | 0.96 |
-| 6′ | **0.83** | **0.86** | **0.80** | **0.86** |
-| 30′ | **0.79** | **0.75** | **0.75** | **0.69** |
-| 1° | **0.75** | **0.61** | **0.71** | **0.51** |
-| 3° | **0.73** | **0.61** | **0.67** | **0.51** |
+| radius | designed, warm | designed, cold | Gaia, warm | Gaia, cold | real, warm | real, cold |
+|---|---|---|---|---|---|---|
+| 1″ | **0.75** | **0.85** | **0.70** | **0.79** | **0.83** | **0.87** |
+| 10″ | **0.76** | **0.88** | **0.71** | **0.88** | **0.85** | 1.01 |
+| 1′ | **0.80** | 0.99 | **0.74** | 0.96 | **0.90** | 0.98 |
+| 6′ | **0.83** | **0.86** | **0.80** | **0.86** | **0.96** | **0.61** |
+| 30′ | **0.79** | **0.75** | **0.75** | **0.69** | **0.81** | **0.67** |
+| 1° | **0.75** | **0.61** | **0.71** | **0.51** | **0.80** | **0.53** |
+| 3° | **0.73** | **0.61** | **0.67** | **0.51** | **0.69** | **0.48** |
 
-**skycell is faster at every radius, on both corpora, warm and cold.** The two
-cold 1′ cells are level, and the rest are wins. At 1″ skycell plans in 0.036 ms
-(pgSphere: 0.029 ms) and executes in 0.022 ms against pgSphere's 0.040 ms. At
-1° and above it reads a fraction of pgSphere's pages, so the cold advantage
-reaches 2×.
+**Warm, skycell is faster at every radius on all three corpora.** Cold, it is
+faster or level everywhere: the level cells are 1′ on all three corpora and
+10″ on real positions. At 1″ skycell plans in 0.036 ms (pgSphere: 0.029 ms)
+and executes in 0.022 ms against pgSphere's 0.040 ms. At 1° and above it reads
+a fraction of pgSphere's pages, so the cold advantage reaches 2×.
+
+On real positions the custom scan plans in at most 0.004 ms more than pgSphere
+and executes in 0.52–0.82 of its time. The older range rewrite, run in the
+same trials, lost there (1.25–1.56 of pgSphere below 3°) because it planned one
+index path per range. Removing that planning cost is what the custom scan is
+for.
 
 Against Q3C 2.0.5 skycell is 4–50× faster at cone searches. Most of that gap
 is because Q3C 2.0.5 expands *every* `q3c_radial_query` into about 100 bitmap
@@ -673,7 +685,22 @@ exactly `q3c_join`'s rows:
 | `skycell_join` ÷ pgSphere | **0.26** | **0.31** |
 
 **skycell beats `q3c_join` by 25–33% at Q3C's own workload, and pgSphere by
-3.2–3.8×.** For each probe, the scan node walks that probe's own covering:
+3.2–3.8×.**
+
+On **real Gaia DR3 positions** the sweep covers three upload sizes (10³–10⁵
+probes), clustered and uniform targets, and the radii cross-matching is
+actually done at. Each figure below is the geometric mean of per-cell ratios
+(`bench/18_xmatch_sweep.sql`):
+
+| radius | `skycell_cone` ÷ `q3c_join` | `skycell_join` ÷ `q3c_join` | `skycell_join` ÷ pgSphere |
+|---|---|---|---|
+| 0.5″ | 0.81 | 0.77 | 0.30 |
+| 1″ | 0.77 | 0.76 | 0.30 |
+| 1.5″ | 0.77 | 0.78 | 0.34 |
+| 5″ | 0.84 | 0.83 | 0.35 |
+| **all** | **0.80** | **0.79** | **0.32** |
+
+skycell is faster than both rivals in all 24 cells. For each probe, the scan node walks that probe's own covering:
 1.2 ranges and 4.3 buffer pages on average at 1″. The planner's row estimate
 for the join is measured rather than modelled. At plan time skycell samples 32
 probes, covers each one, and counts the catalogue rows its cone really holds:
@@ -747,19 +774,27 @@ cones and stored regions and `q3c_join` for cross-matching, so it carries both
 indexes. skycell beats each of them at its own workload from one index, which
 needs **4× less memory**.
 
-The scale advantage grows for large regions. At 50M rows, pgSphere's index
-(3442 MB) no longer fits in `shared_buffers` (2 GB), while skycell's (1072 MB)
-still does. Measured on the first host before the custom scan:
+**The advantage survives scale.** At 50M rows, pgSphere's index (3439 MB) no
+longer fits in `shared_buffers` (2 GB), while skycell's (1071 MB, built in
+17 s against pgSphere's 387 s) still does:
 
-- For regions of 30′ and above, skycell's lead roughly doubles. At 1° the warm
-  ratio goes from 0.85 to 0.60 and the cold ratio from 0.53 to 0.31; skycell
-  touches 387 pages against pgSphere's 1848.
-- Cones of 1′ and below stay where they were, because both methods touch 5–8
-  pages at any table size.
+| radius | warm 10M → 50M | cold 10M → 50M |
+|---|---|---|
+| 1″ | **0.70** → **0.78** | **0.79** → **0.82** |
+| 10″ | **0.71** → **0.78** | **0.88** → **0.86** |
+| 1′ | **0.74** → **0.86** | 0.96 → 0.98 |
+| 6′ | **0.80** → **0.86** | **0.86** → **0.81** |
+| 30′ | **0.75** → **0.75** | **0.69** → **0.53** |
+| 1° | **0.71** → **0.69** | **0.51** → **0.37** |
+| 3° | **0.67** → **0.73** | **0.51** → **0.42** |
+
+- **Warm**, skycell stays 14–31% faster at every radius.
+- **Cold**, its lead for regions of 30′ and above widens to 2.7× at 1°. At 1°
+  skycell touches 188 buffer pages against pgSphere's 642.
 
 On a machine sized between the two (holding skycell's index but not the pair),
-skycell runs warm while pgSphere runs cold: 0.05–0.08 of pgSphere's time at
-50M rows. That is an upper bound. In the measured in-between regime, a 3 GiB
+skycell runs warm while pgSphere runs cold. On the first host, at 50M rows,
+that is 0.05–0.08 of pgSphere's time. That is an upper bound. In the measured in-between regime, a 3 GiB
 container with 768 MB of `shared_buffers` and a 20.5M-row ObsCore relation,
 skycell is **4.2–4.8× faster** (`bench/13_pressure.sql`,
 [`bench/results-pressure/`](bench/results-pressure/)). Two conditions matter
@@ -850,9 +885,9 @@ inner-scan estimate from 2,276,921 rows to 1, the plan from a sequential scan
 (>120 s) to an index scan with Memoize, and the runtime to **50 ms**.
 
 **Measurements of the range rewrite alone** (`skycell.custom_scan = off`) are
-in [`bench/results-ab/`](bench/results-ab/) and in the paper. They cover cones
-and cross-matches on the first host and the real-DR3 runs, which are being
-redone with the custom scan.
+in [`bench/results-ab/`](bench/results-ab/) (first host). Every
+`bench/results-pg18/` run also measures the rewrite in the same trials, which
+isolates the custom scan's contribution.
 
 ---
 
@@ -915,10 +950,10 @@ cross-match and crossover reports compare them across methods.
   keeps the rewrite, because PostgreSQL re-simplifies each partition's copy of
   the condition. It is not parallel-aware, and before PostgreSQL 18 its bitmap
   mode does not prefetch.
-- **Still being measured.** The custom scan has been run on one 4-vCPU cloud
-  host at 10M rows. Runs on real DR3 positions and at 50M rows are in
-  progress. The earlier range-rewrite runs there lost small warm cones to
-  pgSphere, a planning cost the custom scan was built to remove.
+- **One host type.** Every custom-scan number comes from one 4-vCPU cloud
+  host type. A cold read there costs about 0.1 ms, because a cache beneath the
+  VM serves it rather than a disk, so the cold margins are probably
+  conservative. On real positions, small cold cones are level rather than won.
 - **Small tables.** On a 0.5M-row field-clustered table, pgSphere still wins
   the small cone (skycell takes 1.14× its time). Inside a TAP service whose own
   code dominates each request, the index choice is immaterial: in our
