@@ -11,19 +11,8 @@ __pycache__/
 paper/*.aux
 paper/*.log
 paper/*.out
-paper/preview.pdf
-paper/paper.pdf
-paper/ac/*.aux
-paper/ac/*.log
-paper/ac/*.out
-paper/ac/*.spl
-paper/ac/submission/*.aux
-paper/ac/submission/*.log
-paper/ac/submission/*.out
-paper/ac/submission/*.spl
-
-# journal class files -- EDP Sciences, not ours to redistribute.
-# Fetch from https://www.aanda.org/for-authors/latex-issues/latex-tools
-paper/aa.cls
-paper/aa.bst
-paper/linenoaa.sty
+paper/*.spl
+paper/submission/*.aux
+paper/submission/*.log
+paper/submission/*.out
+paper/submission/*.spl

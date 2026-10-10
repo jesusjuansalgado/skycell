@@ -719,26 +719,17 @@ each method's row count in every trial and checks they agree.
 ## Paper
 
 [`paper/`](paper/) holds the paper describing skycell and its comparison with
-Q3C and pgSphere, in two versions built from one shared text
-([`paper/content.tex`](paper/content.tex)):
-
-- **Astronomy and Computing** (Elsevier), the version prepared for submission:
-  [`paper/ac/`](paper/ac/), with the self-contained files to upload — the
-  manuscript, its figure and the highlights — in
-  [`paper/ac/submission/`](paper/ac/submission/)
-  ([PDF](paper/ac/submission/skycell-ac.pdf)).
-- **Astronomy & Astrophysics**: [`paper/body.tex`](paper/body.tex), built with the
-  journal's `aa.cls` (not redistributed here) or, for reading, a stand-in class.
+Q3C and pgSphere, prepared for **Astronomy and Computing** on the journal's
+Elsevier template ([`paper/skycell.tex`](paper/skycell.tex), text in
+[`paper/content.tex`](paper/content.tex)). `make submission` also writes the
+self-contained files to upload — the manuscript, its figure and the highlights —
+to `paper/submission/`.
 
 ```bash
 cd paper
-make ac-submission   # Astronomy and Computing: ac/skycell-ac.pdf and ac/submission/
-make aa              # A&A: paper.pdf (needs aa.cls from aanda.org)
-make                 # A&A text with a stand-in class: skycell-preview.pdf
+make              # skycell.pdf
+make submission   # submission/
 ```
-
-Edit the shared text in `content.tex`; each journal's front and back matter
-lives in its own wrapper.
 
 ## License
 

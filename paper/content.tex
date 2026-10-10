@@ -1,9 +1,5 @@
-%% The paper's text, from the Introduction to the Conclusions, input by
-%% ac/skycell-ac.tex (Astronomy and Computing). The wrapper defines \Sect and may
-%% define widetable, the float for a table wider than a column (table* by default).
-\makeatletter
-\@ifundefined{widetable}{\newenvironment{widetable}{\begin{table*}}{\end{table*}}}{}
-\makeatother
+%% The paper's text, from the Introduction to the Conclusions, input by skycell.tex,
+%% which defines \Sect (the word used for section references).
 
 \section{Introduction}
 
@@ -275,20 +271,22 @@ rewrite.
 operators and index support, and works on existing tables. A catalogue with
 \texttt{ra} and \texttt{dec} columns needs no schema change, only an expression index
 and fresh statistics:
-{\small
+{\footnotesize
 \begin{verbatim}
 CREATE EXTENSION skycell;
-CREATE INDEX cat_cell ON cat (skycell_ang2cell(ra, dec));
+CREATE INDEX cat_cell
+  ON cat (skycell_ang2cell(ra, dec));
 ANALYZE cat;
 
 -- cone search
 SELECT * FROM cat
-WHERE point('ICRS', ra, dec) <@ circle('ICRS', 266.4, -28.9, 0.05);
+WHERE point('ICRS', ra, dec)
+   <@ circle('ICRS', 266.4, -28.9, 0.05);
 
--- cross-match against an uploaded target list
+-- cross-match against a target list
 SELECT * FROM targets t JOIN cat c
   ON point('ICRS', c.ra, c.dec)
-     <@ circle('ICRS', t.ra, t.dec, 1/3600.);
+  <@ circle('ICRS', t.ra, t.dec, 1/3600.);
 \end{verbatim}}
 \noindent Storing the cell key as a column and ordering the table by it is optional; it lets
 nearby sky share heap pages, which the benchmark tables use. Because the covering reads
@@ -422,7 +420,7 @@ call into about 100 bitmap index scans regardless of radius, and spends about 2.
 planning them. Q3C's cross-match, which does not have this overhead, is the fairer
 comparison (\Sect~\ref{sec:xmatch}).
 
-\begin{widetable}
+\begin{table*}
   \caption{Cone searches: paired ratio of \texttt{skycell} to pgSphere with its 95\%
     bootstrap interval. Below 1, \texttt{skycell} is faster. \textbf{Bold}: interval
     excludes 1. $n$: distinct queries at that radius. Real catalogue: its own centres at
@@ -447,7 +445,7 @@ comparison (\Sect~\ref{sec:xmatch}).
     3\degr    &  16 & \textbf{0.73} [0.66, 0.82] & \textbf{0.61} [0.50, 0.66] & \textbf{0.67} [0.63, 0.76] & \textbf{0.51} [0.41, 0.60] & \textbf{0.69} [0.64, 0.75] & \textbf{0.48} [0.43, 0.54] \\
     \hline
   \end{tabular}
-\end{widetable}
+\end{table*}
 
 \subsection{Catalogue size, index size and build time}
 \label{sec:scale}
