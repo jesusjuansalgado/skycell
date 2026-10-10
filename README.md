@@ -281,10 +281,12 @@ EXPLAIN (ANALYZE, BUFFERS)
 SELECT * FROM cat WHERE point('ICRS', ra, dec) <@ circle('ICRS', 266.4, -28.9, 0.05);
 ```
 
-If you get a sequential scan, the usual causes are a missing `ANALYZE`, a
-region that is not a constant (the rewrite needs constant geometry — use
-`skycell_cone_ranges()` in a `LATERAL` for per-row regions), or the index being
-on a different expression than the query's position argument.
+If you get a sequential scan, the usual causes are a missing `ANALYZE`, the
+index being on a different expression than the query's position argument, or —
+for `skycell_join` and `skycell_radial_query` — no index on
+`skycell_ang2cell(ra, dec)` at all. Per-row regions are indexed too: a per-row
+cone (a cross-match) by the custom scan, one covering per outer row, and a
+per-row polygon or stored region by the rewrite's run-time range slots.
 
 ## Operators and functions
 
@@ -726,12 +728,15 @@ directly, and it is **not monotonic in the radius** — measured on the
 
 The worst point is **sub-arcsecond**, where the cost model refuses to cut finer
 (the extra ranges would cost more than the area they save) and emits one or two
-very coarse cells. That is exactly the cross-match radius, and it explains a
-result further down that would otherwise look unmotivated: skycell only reaches
-*parity* with `q3c_join` at 1″ rather than beating it, despite the cheaper
-index — it is doing ~100× the area work and breaking even anyway. Above about
-1° the covering is tight (within 7% of the region) and the advantage is
-straightforward.
+very coarse cells. That is exactly the cross-match radius, and it explains why
+the range rewrite only reached *parity* with `q3c_join` at 1″ despite the
+cheaper index: it was doing ~100× the area work and breaking even. The custom
+scan does not tighten the covering — it removes the rewrite's per-probe cost
+(four `BitmapOr` slots each descending the index, filled or not) — and beats
+`q3c_join` by 25–33% doing the same area work (see
+[With the custom scan](#with-the-custom-scan-postgresql-186-second-host)).
+Above about 1° the covering is tight (within 7% of the region) and the advantage
+is straightforward.
 
 **Elongated regions — where the gap is widest.** A space-filling curve is
 supposed to cover long thin shapes badly, and it does: a 1 deg² strip wastes 8×
@@ -753,11 +758,13 @@ Note also that cones at the pole are *not* a problem — the covering stays at
 3–7 ranges at every declination from 0° to 89.9°, which is the point of an
 equal-area scheme.
 
-**So: on a Gaia-sized catalogue this index improves degree-scale selections,
-polygons and cross-matches — not small cone searches.** Removing the plan-time
-cost (an SP-GiST opclass, or the `= ANY` single-scan form) is what would change
-that; making the sub-arcsecond covering tighter is a separate, independent
-improvement.
+**So, with the range rewrite: on a Gaia-sized catalogue this index improved
+degree-scale selections and polygons, and matched `q3c_join` on cross-matches —
+not small cone searches.** Removing the per-range plan-time cost was what would
+change that, and the custom scan did: on the 10M corpora it wins at every cone
+radius and beats `q3c_join` on cross-matches (see above). Making the
+sub-arcsecond covering tighter is a separate, independent improvement, still
+open.
 
 **Everything else:**
 
@@ -767,7 +774,8 @@ improvement.
 | index size / build, 50M | 1072 MB / 22 s | 3442 MB / 269 s | **1072 MB / 23 s** |
 | buffers touched, 1° / 3° | 329 / 649 | 154 / 617 | **55 / 343** |
 | convex polygons, median | 1.86 ms | 0.77 ms | **0.28 ms** |
-| cross-match 200k probes, 1″ (steady state, 50M rows) | **1.23 s** | 2.95 s | **1.08 s** |
+| cross-match 200k probes, 1″, 50M rows, first host (`LATERAL` form, rewrite era) | **1.23 s** | 2.95 s | **1.08 s** |
+| cross-match, 1″, 10M rows, second host, median per 25k-probe block (`skycell_join`, custom scan) | 226 ms | 595 ms | **153 ms** |
 | 200k points in 20k footprints | not supported | 0.97 s, 1.1 MB | **0.76 s**, 9.5 MB |
 | planner row-estimate error, 1° | 1.9× | 2.8× | **1.22×** |
 
@@ -850,8 +858,8 @@ method warmed on its own block before timing, paired over 16 block-repetitions
 | skycell, join form | 1.50 s | 1.85 s | 1.07 | **0.44** |
 | skycell, `LATERAL` | **1.08 s** | **1.43 s** | 0.78 [0.62, 1.00] | **0.30** |
 
-skycell is **level with `q3c_join`** (not faster — the intervals reach 1) and
-2.5–3.3× faster than pgSphere. So one index is competitive with each of the two
+Through the rewrite, skycell was **level with `q3c_join`** (not faster — the
+intervals reach 1) and 2.5–3.3× faster than pgSphere. So one index is competitive with each of the two
 established ones on the workload each was built for.
 
 **At the radii cross-matching is actually done at.** Optical matching uses
