@@ -27,6 +27,10 @@ round sixty-eight: 1.12-1.45 below 1 deg), and its cause: extra planning
 (+0.014 to +0.17 ms over pgSphere). The custom scan plans in +0.004 ms over
 pgSphere at every radius and executes faster too (0.52-0.82 of pgSphere's
 execution time), so the warm real-corpus result now goes skycell's way at
-every radius. Cold reads cost about 0.1 ms per page here (pages read and I/O
-time are in `report.md`): a cache below the VM, not disk latency, as in round
-sixty-nine.
+every radius. Cold reads cost about 0.06-0.1 ms per page here. Writing and reading back an 18 GB
+direct-I/O filler file did not change that (0.067 and 0.060 ms per read before and
+after), so it is this container's own storage, most likely local NVMe, not a cache
+that could be dropped: cold here means cold for PostgreSQL and the VM on fast flash.
+The paper's first host (Docker Desktop on a laptop) measured about 16 ms per
+first-touch read (GIST_REGION_DESIGN.md round forty-four); that regime needs
+vm/run_paper.sh on a VM with its own disk.

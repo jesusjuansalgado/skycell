@@ -32,6 +32,10 @@ small radii (0.81-0.85 below 30', from planning: 0.042 ms against the rewrite's
 larger covering cost), and nil from 30' up, where the scan's pages decide and
 both read the same ones (EXPLAIN: 188 buffers against pgSphere's 642 at 1 deg).
 Cold, the custom scan is 0.37-0.53 of pgSphere from 30' up and 0.81-0.98 below.
-The cold pass drops the guest page cache only; on this container type reads
-were measured at about 0.1 ms (results-pg18/realcone), a host-level cache, so
-"cold" means cold for PostgreSQL and the VM, as for `../`'s own cold columns.
+The cold pass drops the guest page cache. cold reads cost about 0.06-0.1 ms per page here. Writing and reading back an 18 GB
+direct-I/O filler file did not change that (0.067 and 0.060 ms per read before and
+after), so it is this container's own storage, most likely local NVMe, not a cache
+that could be dropped: cold here means cold for PostgreSQL and the VM on fast flash.
+The paper's first host (Docker Desktop on a laptop) measured about 16 ms per
+first-touch read (GIST_REGION_DESIGN.md round forty-four); that regime needs
+vm/run_paper.sh on a VM with its own disk.
