@@ -36,10 +36,12 @@ def psql(db, sql):
 
 
 RESAB = os.path.join(HERE, "..", "bench", "results-ab")
+# the cone trials of Table cones' synthetic columns: the custom scan, PostgreSQL 18.6
+RESPG18 = os.path.join(HERE, "..", "bench", "results-pg18")
 
 
-def load_ab(name):
-    with open(os.path.join(RESAB, name + ".csv")) as f:
+def load_ab(name, where=RESAB):
+    with open(os.path.join(where, name + ".csv")) as f:
         return list(csv.DictReader(f))
 
 
@@ -80,8 +82,8 @@ def paired_ratios(rows, corpus, cache, rival="pgsphere"):
 
 def fig_benchmark():
     """The controlled result: paired ratios with intervals, and what drives them."""
-    ab = load_ab("bench_ab")
-    abx = load_ab("bench_ab_x")
+    ab = load_ab("bench_ab", RESPG18)
+    abx = load_ab("bench_ab_x", RESPG18)
 
     fig, axes = plt.subplots(1, 3, figsize=(10.5, 3.3))
     styles = [("designed", "warm", "#1b7f3b", "o", "-", "designed, warm"),
