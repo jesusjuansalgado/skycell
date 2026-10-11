@@ -46,8 +46,7 @@ column can hold circles and polygons together.
 
 The numbers come from randomized paired trials on PostgreSQL 18.6, on 10M-row
 catalogues (synthetic, resampled from the Gaia DR3 density field, and real DR3
-positions) and a 50M-row one; see
-[Comparison](#comparison-with-q3c-and-pgsphere).
+positions) and a 50M-row one; see [Performance](#performance).
 
 ---
 
@@ -165,7 +164,7 @@ separate step on purpose — `make install` may run with no server up, and
 issuing DDL against live databases as a side effect of copying files is not
 something an install should do.
 
-With Docker, including Q3C and pgSphere for comparison:
+With Docker:
 
 ```bash
 docker build -t skycell-pg:18 docker/
@@ -225,7 +224,7 @@ ANALYZE cat;
 
 **2. A catalogue you can reorganise.** Storing the key and sorting the heap by
 it is worth it for a large table: neighbouring sky lands on neighbouring pages,
-so a cone reads fewer of them. This is what the benchmark tables use:
+so a cone reads fewer of them:
 
 ```sql
 CREATE TABLE cat AS
@@ -346,7 +345,7 @@ run-time range slots.
 **Region opclasses.** `CREATE INDEX ON t USING gist (region)` picks
 `skyregion_box4_gist_ops`: an axis-aligned 3D box rounded outward to `float4`
 (24 bytes, pgSphere's own representation). It beats pgSphere's native GiST on
-every region operator (see [Stored regions](#stored-regions)). Two others can be
+every region operator (see [Performance](#performance)). Two others can be
 named explicitly:
 
 ```sql
@@ -494,172 +493,30 @@ WHERE point('ICRS', ra, dec) <@ circle('ICRS', 269.45, 4.69, 0.05 + 0.006)
 
 ---
 
-## Comparison with Q3C and pgSphere
+## Performance
 
-Every number below is skycell with its defaults: cones and cross-matches
-through the `SkycellCone` custom scan, polygons and boxes through the range
-rewrite, stored regions through the box GiST.
+Against Q3C 2.0.5 and pgSphere 1.5.2 on PostgreSQL 18.6, with skycell's
+defaults throughout (ratio below 1 = skycell faster):
 
-**Setup.** Three 10M-row catalogues: *designed* (synthetic, with Gaia-like
-crowding), *Gaia* (positions placed in proportion to the Gaia DR3 source counts
-of all 3,145,728 order-9 cells) and *real* (10M real Gaia DR3 positions), plus a
-50M-row Gaia-density catalogue and an ObsCore-shaped relation at three sizes.
-Every query is a trial: the methods answer it back to back in random order,
-five times, and the ratio is formed per query (paired) with a 95% bootstrap
-interval. *Warm* follows an untimed pass; *cold* is the first touch after a
-server restart and page-cache drop. PostgreSQL 18.6, Q3C 2.0.5, pgSphere 1.5.2,
-2 GB `shared_buffers`. Cones, scale, cross-matches, the ObsCore relation and
-the density estimate ran on a 4-vCPU cloud VM with local flash storage;
-polygons, stored regions and the memory test on an Apple M3 Pro laptop. Raw
-results are in [`bench/results-pg18/`](bench/results-pg18/).
-
-### Cone searches
-
-skycell ÷ pgSphere (below 1 = skycell faster; **bold** = 95% interval excludes 1):
-
-| radius | designed, warm | designed, cold | Gaia, warm | Gaia, cold | real, warm | real, cold |
-|---|---|---|---|---|---|---|
-| 1″ | **0.75** | **0.85** | **0.70** | **0.79** | **0.83** | **0.87** |
-| 10″ | **0.76** | **0.88** | **0.71** | **0.88** | **0.85** | 1.01 |
-| 1′ | **0.80** | 0.99 | **0.74** | 0.96 | **0.90** | 0.98 |
-| 6′ | **0.83** | **0.86** | **0.80** | **0.86** | **0.96** | **0.61** |
-| 30′ | **0.79** | **0.75** | **0.75** | **0.69** | **0.81** | **0.67** |
-| 1° | **0.75** | **0.61** | **0.71** | **0.51** | **0.80** | **0.53** |
-| 3° | **0.73** | **0.61** | **0.67** | **0.51** | **0.69** | **0.48** |
-
-**Warm, skycell is faster at every radius on all three corpora; cold, it is
-faster or level everywhere.** At 1″ it plans in 0.036 ms (pgSphere: 0.029 ms)
-and executes in 0.022 ms against pgSphere's 0.040 ms. At 1° and above it reads
-a third of pgSphere's pages, so the cold advantage reaches 2×. Against Q3C
-2.0.5 it takes 0.02–0.58 of the time, mostly because Q3C 2.0.5 expands every
-`q3c_radial_query` into about 100 bitmap index scans whatever the radius.
-
-### Scale and index size
-
-At 50M rows pgSphere's index (3439 MB) no longer fits in `shared_buffers`,
-while skycell's (1071 MB) still does:
-
-| radius | warm 10M → 50M | cold 10M → 50M |
+| workload | skycell ÷ pgSphere | skycell ÷ Q3C |
 |---|---|---|
-| 1″ | **0.70** → **0.78** | **0.79** → **0.82** |
-| 10″ | **0.71** → **0.78** | **0.88** → **0.86** |
-| 1′ | **0.74** → **0.86** | 0.96 → 0.98 |
-| 6′ | **0.80** → **0.86** | **0.86** → **0.81** |
-| 30′ | **0.75** → **0.75** | **0.69** → **0.53** |
-| 1° | **0.71** → **0.69** | **0.51** → **0.37** |
-| 3° | **0.67** → **0.73** | **0.51** → **0.42** |
+| cone searches, 1″–3°, warm | 0.67–0.96 | 0.02–0.58 |
+| cone searches, 1″–3°, cold | 0.48–1.01 | |
+| cross-matching, 0.5″–5″, real Gaia DR3 positions | 0.30–0.35 | 0.76–0.84 |
+| convex polygons, 0.05°–2° | 0.23–0.37 | |
+| stored regions, `&&` / `<@` / `@>` | 0.12–0.93 | |
 
-Warm, skycell stays 14–31% faster at every radius; cold, its lead from 30′ up
-widens to 2.7× at 1° (188 buffer pages against pgSphere's 642). Its row
-estimates stay within 1.3× of the truth, where pgSphere's are off by up to 8.7×
-and Q3C's by up to 2.4×.
+Its index is a third the size of pgSphere's (214 MB against 685 MB at 10M
+rows, about the size of Q3C's) and builds 11–23× faster, and its row estimates
+stay within 1.3× of the truth where pgSphere's are off by up to 8.7×. At Gaia
+DR3 scale that is one 38 GiB index where an archive running pgSphere for cones
+and Q3C for cross-matching keeps 160 GiB.
 
-Index size and build time, measured at 10M rows and extrapolated linearly from
-50M to Gaia DR3's 1.81×10⁹ sources:
-
-| index | 10M rows | build | at DR3 scale | build | server RAM to keep it warm |
-|---|---|---|---|---|---|
-| **skycell** | **214 MB** | 6.0 s | **38 GiB** | 10 min | **64 GiB** |
-| Q3C | 214 MB | 5.6 s | 38 GiB | 15 min | 64 GiB |
-| pgSphere | 685 MB | 68.6 s | 122 GiB | 3.9 h | 192 GiB |
-| pgSphere + Q3C | | | 160 GiB | 4.1 h | 256 GiB |
-
-The last row is what an archive runs today: pgSphere for cones and stored
-regions, `q3c_join` for cross-matching. skycell beats each at its own workload
-from one index, with **4× less memory**. Where the buffer pool cannot hold every
-index, the smaller one wins: in a 3 GiB container (768 MB `shared_buffers`)
-with a 22 GB, 20.5M-row ObsCore relation, skycell answered a stream of 2° cones
-sweeping the sky **4.2–4.8× faster**.
-
-### Cross-matching
-
-On **real Gaia DR3 positions**, at the radii cross-matching uses, with uploads
-of 10³–10⁵ targets, clustered or uniform (geometric mean of per-cell ratios):
-
-| radius | `skycell_cone` ÷ `q3c_join` | `skycell_join` ÷ `q3c_join` | `skycell_join` ÷ pgSphere |
-|---|---|---|---|
-| 0.5″ | 0.81 | 0.77 | 0.30 |
-| 1″ | 0.77 | 0.76 | 0.30 |
-| 1.5″ | 0.77 | 0.78 | 0.34 |
-| 5″ | 0.84 | 0.83 | 0.35 |
-| **all** | **0.80** | **0.79** | **0.32** |
-
-skycell is faster than both in all 24 cells. On the resampled catalogue, with
-200,000 probes at 1″ and 10″, it is 0.67–0.75 of `q3c_join` and 0.26–0.31 of
-pgSphere, with identical rows. Each probe's cone is covered with the ranges it
-needs, 1.2 on average at 1″ (4.3 pages per probe). `skycell_cone`,
-`skycell_join` and ADQL's `point <@ circle` give the same plan.
-
-### Polygons and elongated regions
-
-Convex polygons of 0.05°–2° take a median 0.28 ms against pgSphere's 0.77 ms
-and Q3C's 1.86 ms (2.7–4.4× on both synthetic catalogues). Long thin regions
-are skycell's best case: pgSphere's bounding structure for a strip is looser
-than a cell covering. Boxes of 1 deg² at the Galactic centre, 20.5M-row ObsCore
-relation:
-
-| aspect ratio | pgSphere | skycell | ratio |
-|---|---|---|---|
-| 1 | 3.5 ms | **0.7 ms** | 0.20 |
-| 16 | 11.8 ms | **1.5 ms** | 0.12 |
-| 100 | 47.2 ms | **4.5 ms** | 0.10 |
-| 901 | 769 ms | **19.6 ms** | 0.03 |
-| 3593 | 3439 ms | **21.4 ms** | **0.01** |
-
-### An archive's observation table
-
-ObsCore-shaped relation, observations in groups of 128 per field, clustered by
-collection and field; total time, skycell ÷ pgSphere, 30 stored query centres:
-
-| class | 0.5M | 2M | 10M |
-|---|---|---|---|
-| 0.15° cone | 1.14 | 1.07 | 0.97 |
-| 2° cone | 0.92 | 0.93 | 0.75 |
-| 0.5° cone + catalogue cuts | 0.94 | 0.99 | 0.80 |
-| empty 0.7″ cone | 0.71 | 0.68 | 0.47 |
-
-skycell's lead grows with the table. The one cell pgSphere wins is the small
-cone on the smallest table, and there the database hardly matters: inside a TAP
-service on a 500k-row ObsCore corpus the two indexes tie on throughput, since
-the service's own code costs ~10 ms a request.
-
-### The density estimate
-
-The covering reads source density from the `ANALYZE` histogram. On real Gaia
-DR3 positions, estimate ÷ truth (median over radii 0.01°–1° and ten `ANALYZE`
-samples):
-
-| field | ratio | across samples |
-|---|---|---|
-| ω Cen | 0.08 | 0.06–0.09 |
-| 47 Tuc | 0.02 | 0.01–0.11 |
-| LMC | 0.80 | 0.46–0.92 |
-| Baade's Window | 0.96 | 0.92–0.98 |
-| Galactic pole | 1.27 | 1.18–1.49 |
-| Galactic centre | 3.71 | 3.41–3.80 |
-
-The error costs little: the cost curve is flat, so the covering chosen in a
-cluster core is within 1.05–1.53 of the best fixed order (0.98–1.31 elsewhere),
-against 243–830× for a fixed order chosen badly.
-
-### Stored regions
-
-The default `float4` box GiST against pgSphere's native GiST, real 50,000-row
-`fpr` footprint catalogue, 500 probes per operator:
-
-| operator | skycell ÷ pgSphere |
-|---|---|
-| `&&` (overlap) | **0.12–0.17** |
-| `@>` (region, point) | **0.75–0.93** |
-| `@>` (region, region) | **0.55–0.70** |
-| `<@` (region, region) | **0.26–0.27** |
-
-MOC cells in a B-tree answer 200,474 point-in-region pairs in 0.76 s against
-pgSphere's 0.97 s.
-
-The measurements that led to these defaults, including the range rewrite's own
-numbers, are kept in [`bench/`](bench/) and
-[`GIST_REGION_DESIGN.md`](GIST_REGION_DESIGN.md).
+The paper describing skycell, the benchmark harness, the raw results of every
+measurement and how to reproduce them are in
+[skycell-paper](https://github.com/jesusjuansalgado/skycell-paper), together
+with the design notebook (`GIST_REGION_DESIGN.md`) that the "Round …"
+references in the source comments point to.
 
 ---
 
@@ -702,8 +559,7 @@ Two layers, both in [`ext/test/`](ext/test/).
   the pole and one across RA = 0, match the rewrite; an invalid centre errors as
   the rewrite does; and the cross-match row estimate is within 3× of the truth.
 
-All three pass on PostgreSQL 16 and 18. The benchmark harness also records
-each method's row count in every trial and checks they agree.
+All three pass on PostgreSQL 16 and 18.
 
 ## Limitations
 
@@ -732,21 +588,6 @@ each method's row count in every trial and checks they agree.
 - **The density estimate is coarse.** An equi-depth histogram cannot see a
   cluster smaller than one of its buckets; `max_area_ratio` bounds the damage
   rather than fixing it.
-
-## Paper
-
-[`paper/`](paper/) holds the paper describing skycell and its comparison with
-Q3C and pgSphere, prepared for **Astronomy and Computing** on the journal's
-Elsevier template ([`paper/skycell.tex`](paper/skycell.tex), text in
-[`paper/content.tex`](paper/content.tex)). `make submission` also writes the
-self-contained files to upload — the manuscript, its figure and the highlights —
-to `paper/submission/`.
-
-```bash
-cd paper
-make              # skycell.pdf
-make submission   # submission/
-```
 
 ## License
 
