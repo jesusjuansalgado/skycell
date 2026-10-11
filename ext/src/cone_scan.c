@@ -767,19 +767,20 @@ static uint64 distances_gen = 0;
 
 /*
  * A query level's first relation is looked up after its quals are simplified
- * and before they are distributed: the moment to add the cones that make
- * distance comparisons indexable (skycell_index_distances() in adql.c).
+ * and before they are distributed: the moment to make ADQL's integer
+ * predicates and distance comparisons indexable
+ * (skycell_index_adql_predicates() in adql.c).
  */
 static void
 cone_get_relation_info(PlannerInfo *root, Oid relid, bool inhparent, RelOptInfo *rel)
 {
 	if (prev_get_relation_info_hook)
 		prev_get_relation_info_hook(root, relid, inhparent, rel);
-	if (skycell_custom_scan && (root != distances_root || plan_generation != distances_gen))
+	if (root != distances_root || plan_generation != distances_gen)
 	{
 		distances_root = root;
 		distances_gen = plan_generation;
-		skycell_index_distances(root);
+		skycell_index_adql_predicates(root);
 	}
 }
 

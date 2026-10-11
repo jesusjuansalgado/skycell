@@ -401,8 +401,8 @@ about a second. Table~\ref{tab:workloads} summarises which index serves which wo
 The functions carry ADQL's own names (\texttt{point}, \texttt{circle},
 \texttt{polygon}, \texttt{contains}, \texttt{distance} and the rest), so a TAP service
 can translate ADQL almost word for word (Table~\ref{tab:ops}), where pgSphere needs its
-own types and Q3C a separate function per shape. The operator
-\texttt{point <@ circle} is the indexable form of \texttt{CONTAINS}, and it uses the
+own types and Q3C a separate function per shape. \texttt{CONTAINS(...) = 1} is planned
+as its operator, \texttt{point <@ circle}, which uses the
 custom scan whether the circle is a constant or comes from another table, so an ADQL
 cross-match is as fast as the native one. ADQL's other spelling of the same search, a
 \texttt{DISTANCE(p1, p2) < r} comparison, is planned as the same cone: the planner adds

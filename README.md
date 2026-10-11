@@ -33,9 +33,10 @@ third the size of pgSphere's and builds 11–23× faster, and its row estimates
 stay within 1.3× of the truth where pgSphere's are off by up to 8.7×.
 
 The interface is ADQL's. The functions carry ADQL's own names (`CONTAINS`,
-`POINT`, `CIRCLE`, `POLYGON`, …), and `point <@ circle`, the indexable form of
-`1 = CONTAINS(…)`, runs through the same scan as skycell's native functions,
-cross-matches included, and so does a `DISTANCE(p1, p2) < r` comparison. It
+`POINT`, `CIRCLE`, `POLYGON`, …), and `1 = CONTAINS(…)` is indexed as written:
+the planner turns it into its operator, `point <@ circle`, which runs through
+the same scan as skycell's native functions, cross-matches included, and so
+does a `DISTANCE(p1, p2) < r` comparison. It
 works whichever way round the query is written: a constant point inside a
 circle around each row is planned as the cone around that point, and a
 cross-match probes the larger indexed table whichever side is the point and
@@ -298,8 +299,8 @@ for ADQL compatibility and must be `'ICRS'`; convert other frames first with
 | `circle(ra, dec, radius)`<br>`circle(coordsys, ra, dec, radius)` | `skyregion` | radius in degrees. ADQL `CIRCLE` |
 | `box(ra, dec, width, height)`<br>`box(coordsys, …)` | `skyregion` | centre and extent, as ADQL defines it. Errors if it reaches a pole — use a polygon there. ADQL `BOX` |
 | `polygon(ra1, dec1, ra2, dec2, …)`<br>`polygon(coordsys, …)` | `skyregion` | ≥ 3 vertices, **convex**, smaller than a hemisphere. ADQL `POLYGON` |
-| `contains(p skypos, r skyregion)`<br>`contains(a skyregion, b skyregion)` | `integer` (1/0) | ADQL `CONTAINS`. For an *indexable* test use the `<@` operator below |
-| `intersects(p skypos, r skyregion)`<br>`intersects(a skyregion, b skyregion)` | `integer` (1/0) | ADQL `INTERSECTS`. For an *indexable* test use `<@` (point-region) or `&&` (region-region) below |
+| `contains(p skypos, r skyregion)`<br>`contains(a skyregion, b skyregion)` | `integer` (1/0) | ADQL `CONTAINS`. Compared with 1 (`contains(…) = 1`, or `1 = …`) in a `WHERE` or `JOIN ON` it is planned as the `<@` operator below, so it is indexed |
+| `intersects(p skypos, r skyregion)`<br>`intersects(a skyregion, b skyregion)` | `integer` (1/0) | ADQL `INTERSECTS`. Compared with 1 it is planned as `<@` (point-region) or `&&` (region-region) below, so it is indexed |
 | `distance(a skypos, b skypos)`<br>`distance(ra1, dec1, ra2, dec2)` | `float8` | degrees. ADQL `DISTANCE`, both forms. `distance(…) < r` (or `<=`) in a `WHERE` or `JOIN ON` is planned as the cone, like `<@` below |
 | `area(r skyregion)` | `float8` | square degrees. ADQL `AREA` |
 | `coord1(p)` / `coord2(p)` | `float8` | right ascension / declination, degrees |
@@ -488,7 +489,7 @@ WHERE point('ICRS', ra, dec) <@ circle('ICRS', 269.45, 4.69, 0.05 + 0.006)
 | `skycell.split_cost`, `skycell.max_steps` | 1, 4000 | refinement guards for polygons and very large cones |
 | `skycell.probe_orders` | 0 (off) | experimental: try this many orders past the closed-form choice and keep whichever scores lowest |
 | `skycell.probe_split_cost` | 1.0 | experimental: cost per cell the order probe charges itself |
-| `skycell.rewrite_max_waste` | 100 | decline the range rewrite for a constant region when the covering expects more than this many false-positive rows, scaled by how cache-resident the relation is |
+| `skycell.rewrite_max_waste` | 100 | decline the range rewrite for a constant region when the covering expects more than this many false-positive rows, scaled by how cache-resident the relation is — only when the relation also has a GiST or SP-GiST index on the position for the planner to use instead (without one, declining would leave a sequential scan) |
 | `skycell.rewrite_waste_scale_cap` | 10 | upper bound, as a multiple of `rewrite_max_waste`, on how far that scaling may go for a relation far bigger than `shared_buffers` |
 
 ---

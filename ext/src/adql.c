@@ -23,9 +23,13 @@
 #include <math.h>
 
 #include "access/stratnum.h"
+#include "access/table.h"
+#include "catalog/namespace.h"
+#include "catalog/pg_am_d.h"
+#include "catalog/pg_class.h"
 #include "catalog/pg_language_d.h"
-#include "catalog/pg_proc.h"
 #include "catalog/pg_opfamily_d.h"
+#include "catalog/pg_proc.h"
 #include "catalog/pg_type_d.h"
 #include "fmgr.h"
 #include "libpq/pqformat.h"
@@ -35,6 +39,7 @@
 #include "optimizer/optimizer.h"
 #include "parser/parse_coerce.h"
 #include "parser/parse_func.h"
+#include "parser/parsetree.h"
 #include "rewrite/rewriteManip.h"
 #include "utils/array.h"
 #include "utils/builtins.h"
@@ -42,6 +47,8 @@
 #include "utils/fmgroids.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
+#include "utils/rel.h"
+#include "utils/relcache.h"
 #include "utils/syscache.h"
 
 #include "cover.h"
@@ -1153,7 +1160,7 @@ static Node *region_simplify_oriented(SupportRequestSimplify *req, Oid funcid,
 
 /*
  * The parse location that marks a point or circle built by
- * skycell_index_distances() below rather than written by the user.
+ * skycell_index_adql_predicates() below rather than written by the user.
  * PostgreSQL copies a node's location through every rewrite of it, and
  * real locations are offsets into the query text (or -1).
  */
@@ -1302,6 +1309,49 @@ region_support_simplify(SupportRequestSimplify *req, Oid funcid, Node *pt, Node 
 	return res;
 }
 
+/*
+ * Whether pt's relation has an index of another kind (GiST, SP-GiST) over
+ * pt's type -- the alternative the waste gate below declines the rewrite in
+ * favour of.  Without one, declining leaves the planner a sequential scan
+ * and nothing else, which no amount of exact-test waste is worse than, so
+ * the gate only applies when there is something to decline it for.
+ */
+static bool
+has_position_index(PlannerInfo *root, Node *pt)
+{
+	int			varno = single_varno(pt);
+	RangeTblEntry *rte;
+	Relation	rel;
+	List	   *indexes;
+	ListCell   *lc;
+	bool		found = false;
+
+	if (varno <= 0 || varno > list_length(root->parse->rtable))
+		return false;
+	rte = rt_fetch(varno, root->parse->rtable);
+	if (rte->rtekind != RTE_RELATION)
+		return false;
+	rel = table_open(rte->relid, NoLock);	/* locked by the parser */
+	indexes = RelationGetIndexList(rel);
+	table_close(rel, NoLock);
+	foreach(lc, indexes)
+	{
+		Oid			ix = lfirst_oid(lc);
+		HeapTuple	tup = SearchSysCache1(RELOID, ObjectIdGetDatum(ix));
+
+		if (!HeapTupleIsValid(tup))
+			continue;
+		if (((Form_pg_class) GETSTRUCT(tup))->relam != BTREE_AM_OID &&
+			get_atttype(ix, 1) == exprType(pt))
+			found = true;
+		ReleaseSysCache(tup);
+		if (found)
+			break;
+	}
+	list_free(indexes);
+	return found;
+}
+
 static Node *
 region_simplify_oriented(SupportRequestSimplify *req, Oid funcid, Node *pt, Node *rg)
 {
@@ -1402,7 +1452,8 @@ region_simplify_oriented(SupportRequestSimplify *req, Oid funcid, Node *pt, Node
 		 * several unrelated queries later, in whatever next allocation hit
 		 * the corrupted free list -- see GIST_REGION_DESIGN.md).
 		 */
-		if (cov.exp_rows * (1.0 - sel) > rewrite_waste_threshold(&dens))
+		if (cov.exp_rows * (1.0 - sel) > rewrite_waste_threshold(&dens) &&
+			has_position_index(req->root, pt))
 		{
 			sc_region_free(&reg);
 			return NULL;
@@ -1896,7 +1947,7 @@ skycell_region_covered_by_sel(PG_FUNCTION_ARGS)
  * ADQL's other spelling of a cone or a cross-match, DISTANCE(p1, p2) < r, is
  * a comparison of two float8s: the support function PostgreSQL consults is
  * the float type's, so none of skycell's ever sees it.  So before a query
- * level's quals become RestrictInfos, skycell_index_distances() adds next to
+ * level's quals become RestrictInfos, skycell_index_adql_predicates() adds next to
  * every top-level `distance(p1, p2) < r` of a WHERE or JOIN ON (also <=,
  * r > distance(...), the four-coordinate form and skycell_dist) the cone
  * `p1 <@ circle(p2, r')`, with r' a hair larger than r, which
@@ -1906,33 +1957,96 @@ skycell_region_covered_by_sel(PG_FUNCTION_ARGS)
  * angle may round apart at the edge, and `<` is not `<=`.  The cone is
  * marked (INJECTED_LOCATION) so that it is kept only as the custom scan's.
  */
-static bool
-is_distance_func(Oid fn)
+/* the C symbol behind fn when it is one of skycell's, else NULL */
+static char *
+skycell_c_src(Oid fn)
 {
 	HeapTuple	tup = SearchSysCache1(PROCOID, ObjectIdGetDatum(fn));
-	Form_pg_proc p;
-	bool		res = false;
+	char	   *res = NULL;
 
 	if (!HeapTupleIsValid(tup))
-		return false;
-	p = (Form_pg_proc) GETSTRUCT(tup);
-	if (p->prolang == ClanguageId && p->prorettype == FLOAT8OID)
+		return NULL;
+	if (((Form_pg_proc) GETSTRUCT(tup))->prolang == ClanguageId)
 	{
-		bool		isnull;
-		Datum		src = SysCacheGetAttr(PROCOID, tup, Anum_pg_proc_prosrc, &isnull);
-		Datum		bin;
-		bool		binnull;
+		bool		srcnull,
+					binnull;
+		Datum		src = SysCacheGetAttr(PROCOID, tup, Anum_pg_proc_prosrc, &srcnull);
+		Datum		bin = SysCacheGetAttr(PROCOID, tup, Anum_pg_proc_probin, &binnull);
 
-		bin = SysCacheGetAttr(PROCOID, tup, Anum_pg_proc_probin, &binnull);
-		if (!isnull && !binnull && strstr(TextDatumGetCString(bin), "skycell") != NULL)
-		{
-			char	   *s = TextDatumGetCString(src);
-
-			res = strcmp(s, "skycell_distance") == 0 || strcmp(s, "skycell_dist") == 0;
-		}
+		if (!srcnull && !binnull && strstr(TextDatumGetCString(bin), "skycell") != NULL)
+			res = TextDatumGetCString(src);
 	}
 	ReleaseSysCache(tup);
 	return res;
+}
+
+static bool
+is_distance_func(Oid fn)
+{
+	char	   *s = skycell_c_src(fn);
+
+	return s != NULL && get_func_rettype(fn) == FLOAT8OID &&
+		(strcmp(s, "skycell_distance") == 0 || strcmp(s, "skycell_dist") == 0);
+}
+
+/*
+ * ADQL's CONTAINS and INTERSECTS return an integer, so a query compares them
+ * with 1, and that comparison is the integer type's: nothing of skycell's
+ * sees the geometry.  Each runs exactly an operator's test -- the same C
+ * code -- so `contains(p, r) = 1` (or `1 = ...`) is replaced by the operator
+ * itself, which the support function, the custom scan and the GiST
+ * opclasses all index:
+ *   contains(skypos, skyregion), intersects(skypos, skyregion)  ->  <@
+ *   contains(skyregion, skyregion)                              ->  <@
+ *   intersects(skyregion, skyregion)                            ->  &&
+ * NULL when qual is not one of these.
+ */
+static Node *
+adql_predicate_operator(Node *qual)
+{
+	OpExpr	   *op = (OpExpr *) qual;
+	Node	   *one,
+			   *fn;
+	FuncExpr   *f;
+	char	   *src;
+	const char *opname;
+	Oid			opno;
+	OpExpr	   *res;
+
+	if (!IsA(qual, OpExpr) || list_length(op->args) != 2 ||
+		(OidIsValid(op->opfuncid) ? op->opfuncid : get_opcode(op->opno)) != F_INT4EQ)
+		return NULL;
+	one = linitial(op->args);
+	fn = lsecond(op->args);
+	if (!IsA(one, Const))
+	{
+		one = lsecond(op->args);
+		fn = linitial(op->args);
+	}
+	if (!IsA(one, Const) || ((Const *) one)->constisnull || ((Const *) one)->consttype != INT4OID ||
+		DatumGetInt32(((Const *) one)->constvalue) != 1 ||
+		!IsA(fn, FuncExpr) || list_length(((FuncExpr *) fn)->args) != 2)
+		return NULL;
+	f = (FuncExpr *) fn;
+	if ((src = skycell_c_src(f->funcid)) == NULL)
+		return NULL;
+	if (strcmp(src, "skycell_contains") == 0 || strcmp(src, "skycell_intersects_pos") == 0 ||
+		strcmp(src, "skycell_contains_region") == 0)
+		opname = "<@";
+	else if (strcmp(src, "skycell_intersects") == 0)
+		opname = "&&";
+	else
+		return NULL;
+	opno = OpernameGetOprid(list_make2(makeString(get_namespace_name(get_func_namespace(f->funcid))),
+									   makeString(pstrdup(opname))),
+							exprType(linitial(f->args)), exprType(lsecond(f->args)));
+	if (!OidIsValid(opno))
+		return NULL;
+	res = (OpExpr *) make_opclause(opno, BOOLOID, false,
+								   copyObject(linitial(f->args)), copyObject(lsecond(f->args)),
+								   InvalidOid, InvalidOid);
+	res->opfuncid = get_opcode(opno);
+	return (Node *) res;
 }
 
 /* a position the cone machinery reads: a column, a constant or point(...) */
@@ -2103,8 +2217,10 @@ distance_cone(Node *qual, Node **below)
 }
 
 /*
- * Add the cones to one WHERE or JOIN ON.  By now its quals are an implicit-AND
- * list that preprocess_expression() has simplified, so each added cone is
+ * Index the ADQL predicates of one WHERE or JOIN ON: contains()/intersects()
+ * compared with 1 become their operator (adql_predicate_operator()), and
+ * distance comparisons get a cone.  By now its quals are an implicit-AND
+ * list that preprocess_expression() has simplified, so each new term is
  * simplified here, with the quals in place for the support function to find
  * it as a top-level term (cone_scan_keep_as()).  One that does not become the
  * custom scan's comes back as true and is left out; one that does carries the
@@ -2118,7 +2234,8 @@ add_distance_cones(PlannerInfo *root, Node **quals)
 	List	   *conj,
 			   *kept = NIL,
 			   *belows = NIL,
-			   *origs = NIL;
+			   *origs = NIL,
+			   *replaced = NIL;
 	ListCell   *lc;
 	int			norig;
 	bool		was_list;
@@ -2131,18 +2248,30 @@ add_distance_cones(PlannerInfo *root, Node **quals)
 	for (int i = 0; i < norig; i++)
 	{
 		Node	   *below;
-		Node	   *cone = distance_cone(list_nth(conj, i), &below);
+		Node	   *opx = adql_predicate_operator(list_nth(conj, i));
+		Node	   *cone;
 
-		if (cone != NULL)
+		if (opx != NULL)
+		{
+			lfirst(list_nth_cell(conj, i)) = opx;
+			replaced = lappend_int(replaced, i);
+		}
+		else if ((cone = distance_cone(list_nth(conj, i), &below)) != NULL)
 		{
 			conj = lappend(conj, cone);
 			belows = lappend(belows, below);
 			origs = lappend_int(origs, i);
 		}
 	}
-	if (list_length(conj) == norig)
+	if (list_length(conj) == norig && replaced == NIL)
 		return;
 	*quals = was_list ? (Node *) conj : (Node *) make_ands_explicit(conj);
+	foreach(lc, replaced)
+	{
+		ListCell   *cell = list_nth_cell(conj, lfirst_int(lc));
+
+		lfirst(cell) = eval_const_expressions(root, lfirst(cell));
+	}
 	for (int i = norig; i < list_length(conj); i++)
 	{
 		ListCell   *cell = list_nth_cell(conj, i);
@@ -2159,7 +2288,12 @@ add_distance_cones(PlannerInfo *root, Node **quals)
 		if (foreach_current_index(lc) >= norig && IsA(q, Const) &&
 			!((Const *) q)->constisnull && DatumGetBool(((Const *) q)->constvalue))
 			continue;
-		kept = lappend(kept, q);
+		/* a rewrite's ranges AND exact test: its arms are separate quals, so
+		 * that the OR of ranges reaches the index as a BitmapOr */
+		if (is_andclause(q))
+			kept = list_concat(kept, make_ands_implicit((Expr *) q));
+		else
+			kept = lappend(kept, q);
 	}
 	*quals = was_list ? (Node *) kept : (Node *) make_ands_explicit(kept);
 }
@@ -2196,15 +2330,16 @@ distance_jointree(PlannerInfo *root, Node *jt)
  * are simplified, before they are split into RestrictInfos.
  */
 void
-skycell_index_distances(PlannerInfo *root)
+skycell_index_adql_predicates(PlannerInfo *root)
 {
 	distance_jointree(root, (Node *) root->parse->jointree);
 }
 
 /*
- * The support function of distance() and skycell_dist(): nothing to
- * simplify, but being called while the query is planned loads the library,
- * so its hooks are in place by the time skycell_index_distances() runs.
+ * The support function of distance(), skycell_dist(), contains() and
+ * intersects(): nothing to simplify, but being called while the query is
+ * planned loads the library, so its hooks are in place by the time
+ * skycell_index_adql_predicates() runs.
  */
 PG_FUNCTION_INFO_V1(skycell_distance_support);
 Datum
