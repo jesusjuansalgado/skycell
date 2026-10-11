@@ -34,6 +34,7 @@
 #include "nodes/supportnodes.h"
 #include "optimizer/optimizer.h"
 #include "parser/parse_coerce.h"
+#include "parser/parse_func.h"
 #include "rewrite/rewriteManip.h"
 #include "utils/array.h"
 #include "utils/builtins.h"
@@ -1965,9 +1966,14 @@ valid_const_pos(Node *ra, Node *dec)
 	return true;
 }
 
-/* the cone to add next to a distance comparison, else NULL */
+/*
+ * The cone to add next to a distance comparison, else NULL.  *below is the
+ * comparison as skycell_distance_below(d, r, strict) -- the same test, but
+ * estimated as always true, since the cone carries the estimate -- or NULL
+ * when the extension's SQL predates that function (before 0.28).
+ */
 static Node *
-distance_cone(Node *qual)
+distance_cone(Node *qual, Node **below)
 {
 	Oid			ff[2] = {FLOAT8OID, FLOAT8OID};
 	Oid			fff[3] = {FLOAT8OID, FLOAT8OID, FLOAT8OID};
@@ -1985,7 +1991,9 @@ distance_cone(Node *qual)
 				circle_oid;
 	int			v1,
 				v2;
+	bool		strict;
 
+	*below = NULL;
 	if (!IsA(qual, OpExpr) || list_length(op->args) != 2)
 		return NULL;
 	opfn = OidIsValid(op->opfuncid) ? op->opfuncid : get_opcode(op->opno);
@@ -1997,6 +2005,7 @@ distance_cone(Node *qual)
 		case F_FLOAT84LE:
 			d = linitial(op->args);
 			r = lsecond(op->args);
+			strict = (opfn == F_FLOAT8LT || opfn == F_FLOAT84LT);
 			break;
 		case F_FLOAT8GT:
 		case F_FLOAT8GE:
@@ -2004,6 +2013,7 @@ distance_cone(Node *qual)
 		case F_FLOAT48GE:
 			d = lsecond(op->args);
 			r = linitial(op->args);
+			strict = (opfn == F_FLOAT8GT || opfn == F_FLOAT48GT);
 			break;
 		default:
 			return NULL;
@@ -2052,6 +2062,19 @@ distance_cone(Node *qual)
 		if (r == NULL)
 			return NULL;
 	}
+	{
+		Oid			bt[3] = {FLOAT8OID, FLOAT8OID, BOOLOID};
+		char	   *nsp = get_namespace_name(get_func_namespace(f->funcid));
+		Oid			below_oid = LookupFuncName(list_make2(makeString(nsp),
+														  makeString("skycell_distance_below")),
+											   3, bt, true);
+
+		if (OidIsValid(below_oid))
+			*below = (Node *) makeFuncExpr(below_oid, BOOLOID,
+										   list_make3(copyObject(d), copyObject(r),
+													  makeBoolConst(strict, false)),
+										   InvalidOid, InvalidOid, COERCE_EXPLICIT_CALL);
+	}
 	r = (Node *) makeFuncExpr(F_FLOAT8MUL, FLOAT8OID, list_make2(r, float8_const(1.0 + 1e-9)),
 							  InvalidOid, InvalidOid, COERCE_EXPLICIT_CALL);
 	r = (Node *) makeFuncExpr(F_FLOAT8PL, FLOAT8OID, list_make2(r, float8_const(1e-12)),
@@ -2083,14 +2106,19 @@ distance_cone(Node *qual)
  * Add the cones to one WHERE or JOIN ON.  By now its quals are an implicit-AND
  * list that preprocess_expression() has simplified, so each added cone is
  * simplified here, with the quals in place for the support function to find
- * it as a top-level term (cone_scan_keep_as()); one that does not become the
- * custom scan's comes back as true and is left out.
+ * it as a top-level term (cone_scan_keep_as()).  One that does not become the
+ * custom scan's comes back as true and is left out; one that does carries the
+ * estimate, so its comparison becomes skycell_distance_below(), estimated as
+ * always true, instead of the 1/3 PostgreSQL guesses for an inequality on an
+ * expression.
  */
 static void
 add_distance_cones(PlannerInfo *root, Node **quals)
 {
 	List	   *conj,
-			   *kept = NIL;
+			   *kept = NIL,
+			   *belows = NIL,
+			   *origs = NIL;
 	ListCell   *lc;
 	int			norig;
 	bool		was_list;
@@ -2100,12 +2128,17 @@ add_distance_cones(PlannerInfo *root, Node **quals)
 	was_list = IsA(*quals, List);
 	conj = was_list ? list_copy((List *) *quals) : make_ands_implicit((Expr *) *quals);
 	norig = list_length(conj);
-	foreach(lc, list_copy(conj))
+	for (int i = 0; i < norig; i++)
 	{
-		Node	   *cone = distance_cone(lfirst(lc));
+		Node	   *below;
+		Node	   *cone = distance_cone(list_nth(conj, i), &below);
 
 		if (cone != NULL)
+		{
 			conj = lappend(conj, cone);
+			belows = lappend(belows, below);
+			origs = lappend_int(origs, i);
+		}
 	}
 	if (list_length(conj) == norig)
 		return;
@@ -2113,8 +2146,11 @@ add_distance_cones(PlannerInfo *root, Node **quals)
 	for (int i = norig; i < list_length(conj); i++)
 	{
 		ListCell   *cell = list_nth_cell(conj, i);
+		Node	   *below = list_nth(belows, i - norig);
 
 		lfirst(cell) = eval_const_expressions(root, lfirst(cell));
+		if (below != NULL && !(IsA(lfirst(cell), Const)))
+			lfirst(list_nth_cell(conj, list_nth_int(origs, i - norig))) = below;
 	}
 	foreach(lc, conj)
 	{
@@ -2174,5 +2210,36 @@ PG_FUNCTION_INFO_V1(skycell_distance_support);
 Datum
 skycell_distance_support(PG_FUNCTION_ARGS)
 {
+	PG_RETURN_POINTER(NULL);
+}
+
+/*
+ * skycell_distance_below(d, r, strict): d < r (strict) or d <= r, with the
+ * float type's own ordering (NaN above everything).  It stands in for a
+ * distance comparison once a cone has been added next to it
+ * (add_distance_cones()), and is estimated as always true, because the cone
+ * already carries the estimate.
+ */
+PG_FUNCTION_INFO_V1(skycell_distance_below);
+Datum
+skycell_distance_below(PG_FUNCTION_ARGS)
+{
+	float8		d = PG_GETARG_FLOAT8(0),
+				r = PG_GETARG_FLOAT8(1);
+
+	PG_RETURN_BOOL(PG_GETARG_BOOL(2) ? float8_lt(d, r) : float8_le(d, r));
+}
+
+PG_FUNCTION_INFO_V1(skycell_distance_below_support);
+Datum
+skycell_distance_below_support(PG_FUNCTION_ARGS)
+{
+	Node	   *rawreq = (Node *) PG_GETARG_POINTER(0);
+
+	if (IsA(rawreq, SupportRequestSelectivity))
+	{
+		((SupportRequestSelectivity *) rawreq)->selectivity = 1.0;
+		PG_RETURN_POINTER(rawreq);
+	}
 	PG_RETURN_POINTER(NULL);
 }

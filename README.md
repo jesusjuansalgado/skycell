@@ -330,7 +330,8 @@ circle('ICRS', ra, dec, r)`), is planned as the cone around that point, and a
 cross-match probes whichever table has the index (the larger one if both do).
 `distance(p1, p2) < r` (also `<=`, `r > distance(…)`, the four-coordinate form
 and `skycell_dist`) gets the same plan: the planner adds the cone next to the
-comparison, which still decides, so the answer is exactly the comparison's.
+comparison, which still decides, so the answer is exactly the comparison's,
+and the row estimate is the cone's (as of 0.28).
 Against a constant polygon or box they go through the B-tree cell rewrite
 described above. A `skyregion` column with its
 own GiST index additionally indexes `&&` and both region-region containment

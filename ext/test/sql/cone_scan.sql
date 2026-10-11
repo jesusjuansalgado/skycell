@@ -284,6 +284,18 @@ SELECT t.name, (cs_join(t.q)).* FROM (VALUES
   ('distance cone 4', 'SELECT count(*) || '':'' || sum(id) FROM cs_cat WHERE distance(ra, dec, 10, 20) < 1'),
   ('distance, pole',  'SELECT count(*) || '':'' || sum(id) FROM cs_cat WHERE distance(ra, dec, 0, 89.99) < 1')
 ) t(name, q);
+-- and is estimated as the cone: the comparison next to it counts as always true
+CREATE FUNCTION cs_rows(q text) RETURNS float8 LANGUAGE plpgsql AS $$
+DECLARE j json;
+BEGIN
+  EXECUTE 'EXPLAIN (FORMAT JSON) ' || q INTO j;
+  RETURN (j -> 0 -> 'Plan' ->> 'Plan Rows')::float8;
+END $$;
+SELECT cs_rows('SELECT c.id FROM cs_dprobe p JOIN cs_cat c ON distance(p.ra, p.dec, c.ra, c.dec) < 0.3')
+     = cs_rows('SELECT c.id FROM cs_dprobe p JOIN cs_cat c ON point(''ICRS'', c.ra, c.dec) <@ circle(''ICRS'', p.ra, p.dec, 0.3)') AS join_rows_same,
+       cs_rows('SELECT id FROM cs_cat WHERE distance(point(''ICRS'', 10, 20), point(''ICRS'', ra, dec)) < 1')
+     = cs_rows('SELECT id FROM cs_cat WHERE point(''ICRS'', ra, dec) <@ circle(''ICRS'', 10, 20, 1)') AS cone_rows_same;
+DROP FUNCTION cs_rows(text);
 -- a centre off the sphere is the direction distance() takes it as, and a
 -- non-finite one matches nothing, as its NaN distance does: neither is an error
 CREATE TABLE cs_bad AS SELECT * FROM (VALUES
