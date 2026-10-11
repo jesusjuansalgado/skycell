@@ -325,7 +325,9 @@ can translate ADQL almost word for word (Table~\ref{tab:ops}), where pgSphere ne
 own types and Q3C a separate function per shape. The operator
 \texttt{point <@ circle} is the indexable form of \texttt{CONTAINS}, and it uses the
 custom scan whether the circle is a constant or comes from another table, so an ADQL
-cross-match is as fast as the native one. It also does not matter which way round the
+cross-match is as fast as the native one. ADQL's other spelling of the same search, a
+\texttt{DISTANCE(p1, p2) < r} comparison, is planned as the same cone: the planner adds
+the cone next to the comparison, which still decides. It also does not matter which way round the
 query is written. A constant point inside a circle around each row, as the Gaia
 archive's own examples write cone searches, is planned as the cone around that point,
 and a cross-match always probes the indexed table, the larger one if both are indexed,

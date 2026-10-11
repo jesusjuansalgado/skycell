@@ -199,7 +199,9 @@ SELECT (SELECT count(*) FROM cs_cat WHERE point('ICRS', 10, 20) <@ circle('ICRS'
      = (SELECT count(*) FROM cs_probe p JOIN cs_cat c ON skycell_in_cone(c.ra, c.dec, p.ra, p.dec, 0.3)) AS rev_join_same;
 SELECT t.name, (cs_join(t.q)).* FROM (VALUES
   ('stored skypos', 'SELECT count(*) || '':'' || sum(id) FROM cs_spos WHERE pos <@ circle(''ICRS'', 10, 20, 1)'),
-  ('stored, join',  'SELECT count(*) || '':'' || sum(s.id) FROM cs_probe p JOIN cs_spos s ON s.pos <@ circle(''ICRS'', p.ra, p.dec, 0.3)')
+  ('stored, join',  'SELECT count(*) || '':'' || sum(s.id) FROM cs_probe p JOIN cs_spos s ON s.pos <@ circle(''ICRS'', p.ra, p.dec, 0.3)'),
+  ('stored, dist',  'SELECT count(*) || '':'' || sum(s.id) FROM (SELECT * FROM cs_probe WHERE pid % 5 = 0) p JOIN cs_spos s ON distance(s.pos, point(''ICRS'', p.ra, p.dec)) < 0.3'),
+  ('stored, dist rev', 'SELECT count(*) || '':'' || sum(s.id) FROM (SELECT * FROM cs_probe WHERE pid % 5 = 0) p JOIN cs_spos s ON distance(point(''ICRS'', p.ra, p.dec), s.pos) < 0.3')
 ) t(name, q);
 EXPLAIN (COSTS OFF)
 SELECT count(*) FROM cs_probe p JOIN cs_cat c ON point('ICRS', c.ra, c.dec) <@ circle('ICRS', p.ra, p.dec, 0.3);
@@ -223,7 +225,9 @@ SELECT t.name, (cs_probed(t.q)).* FROM (VALUES
   ('p(cat) <@ c(probe)', 'SELECT count(*) || '':'' || sum(c.id) FROM cs_probe p JOIN cs_cat c ON point(''ICRS'', c.ra, c.dec) <@ circle(''ICRS'', p.ra, p.dec, 0.3)'),
   ('p(probe) <@ c(cat)', 'SELECT count(*) || '':'' || sum(c.id) FROM cs_probe p JOIN cs_cat c ON point(''ICRS'', p.ra, p.dec) <@ circle(''ICRS'', c.ra, c.dec, 0.3)'),
   ('c(probe) @> p(cat)', 'SELECT count(*) || '':'' || sum(c.id) FROM cs_cat c, cs_probe p WHERE circle(''ICRS'', p.ra, p.dec, 0.3) @> point(''ICRS'', c.ra, c.dec)'),
-  ('c(cat) @> p(probe)', 'SELECT count(*) || '':'' || sum(c.id) FROM cs_cat c, cs_probe p WHERE circle(''ICRS'', c.ra, c.dec, 0.3) @> point(''ICRS'', p.ra, p.dec)')
+  ('c(cat) @> p(probe)', 'SELECT count(*) || '':'' || sum(c.id) FROM cs_cat c, cs_probe p WHERE circle(''ICRS'', c.ra, c.dec, 0.3) @> point(''ICRS'', p.ra, p.dec)'),
+  ('dist(probe, cat)',   'SELECT count(*) || '':'' || sum(c.id) FROM cs_probe p JOIN cs_cat c ON distance(p.ra, p.dec, c.ra, c.dec) < 0.3'),
+  ('dist(cat, probe)',   'SELECT count(*) || '':'' || sum(c.id) FROM cs_cat c, cs_probe p WHERE distance(point(''ICRS'', c.ra, c.dec), point(''ICRS'', p.ra, p.dec)) < 0.3')
 ) t(name, q);
 DROP FUNCTION cs_probed(text);
 DROP INDEX cs_probe_expr;
@@ -262,6 +266,41 @@ PREPARE cs_xm_rw(float8) AS
 EXECUTE cs_xm_rw(0.3);
 SET skycell.custom_scan = on;
 RESET plan_cache_mode;
+
+-- distance(p1, p2) < r, ADQL's other spelling of a cone or a cross-match, is
+-- planned as the same cone, whatever the spelling and whichever way round,
+-- and returns exactly what the comparison alone returns (custom scan off,
+-- every pair compared: a fifth of the probes, and the odd ones, keep it short)
+CREATE TABLE cs_dprobe AS SELECT * FROM cs_probe WHERE pid % 5 = 0 OR pid >= 200000;
+ANALYZE cs_dprobe;
+SELECT t.name, (cs_join(t.q)).* FROM (VALUES
+  ('distance join',   'SELECT count(*) || '':'' || sum(c.id) FROM cs_dprobe p JOIN cs_cat c ON distance(point(''ICRS'', c.ra, c.dec), point(''ICRS'', p.ra, p.dec)) < 0.3'),
+  ('distance rev',    'SELECT count(*) || '':'' || sum(c.id) FROM cs_dprobe p JOIN cs_cat c ON distance(point(''ICRS'', p.ra, p.dec), point(''ICRS'', c.ra, c.dec)) < 0.3'),
+  ('distance 4 <=',   'SELECT count(*) || '':'' || sum(c.id) FROM cs_dprobe p, cs_cat c WHERE distance(p.ra, p.dec, c.ra, c.dec) <= 0.3'),
+  ('skycell_dist >',  'SELECT count(*) || '':'' || sum(c.id) FROM cs_dprobe p, cs_cat c WHERE 0.3 > skycell_dist(c.ra, c.dec, p.ra, p.dec)'),
+  ('distance radius', 'SELECT count(*) || '':'' || sum(c.id) FROM cs_dprobe p JOIN cs_cat c ON distance(c.ra, c.dec, p.ra, p.dec) < p.r'),
+  ('distance left',   'SELECT count(*) || '':'' || count(c.id) FROM cs_dprobe p LEFT JOIN cs_cat c ON distance(p.ra, p.dec, c.ra, c.dec) < 0.3'),
+  ('distance cone',   'SELECT count(*) || '':'' || sum(id) FROM cs_cat WHERE distance(point(''ICRS'', 10, 20), point(''ICRS'', ra, dec)) < 1'),
+  ('distance cone 4', 'SELECT count(*) || '':'' || sum(id) FROM cs_cat WHERE distance(ra, dec, 10, 20) < 1'),
+  ('distance, pole',  'SELECT count(*) || '':'' || sum(id) FROM cs_cat WHERE distance(ra, dec, 0, 89.99) < 1')
+) t(name, q);
+-- a centre off the sphere is the direction distance() takes it as, and a
+-- non-finite one matches nothing, as its NaN distance does: neither is an error
+CREATE TABLE cs_bad AS SELECT * FROM (VALUES
+  (1, 10.0::float8, 95.0::float8), (2, 'NaN', 20), (3, 'Infinity', 20), (4, 10, -100),
+  (5, 10, 'NaN'), (6, 10, 20), (7, 190, -85)) v(pid, ra, dec);
+ANALYZE cs_bad;
+SELECT (cs_join('SELECT string_agg(pid || ''='' || n, '','' ORDER BY pid) FROM (SELECT p.pid, count(c.id) n FROM cs_bad p LEFT JOIN cs_cat c ON distance(p.ra, p.dec, c.ra, c.dec) < 3 GROUP BY p.pid) s')).*;
+SELECT string_agg(pid || '=' || n, ',' ORDER BY pid) FROM (SELECT p.pid, count(c.id) n
+  FROM cs_bad p LEFT JOIN cs_cat c ON distance(p.ra, p.dec, c.ra, c.dec) < 3 GROUP BY p.pid) s;
+DROP TABLE cs_bad, cs_dprobe;
+-- the first query of a session: distance()'s support function loads the
+-- library while the comparison is planned, in time for the cone
+\c
+SET max_parallel_workers_per_gather = 0;
+EXPLAIN (COSTS OFF)
+SELECT count(*) FROM cs_probe p JOIN cs_cat c ON distance(p.ra, p.dec, c.ra, c.dec) < 0.3;
+SET extra_float_digits = 0;
 
 RESET skycell.custom_scan;
 DROP TABLE cs_probe;

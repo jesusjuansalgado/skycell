@@ -37,7 +37,9 @@ than handing it the whole statement.
 What it handles: `POINT`, `CIRCLE`, `BOX`, `POLYGON`, `CONTAINS`, `INTERSECTS`,
 `DISTANCE` (both the two-point and the ADQL 2.1 four-scalar form), `AREA`,
 `COORD1`, `COORD2`, `CENTROID`, the `= 1` / `= 0` / `1 = …` predicate forms, and
-nesting. Case-insensitive; string literals are left alone.
+nesting. Case-insensitive; string literals are left alone. `DISTANCE(p1, p2) < r`
+stays a `distance(…) < r` comparison: the skycell extension (0.27 and later) plans
+it as the cone itself.
 
 **Versions.** ADQL 2.0 requires a coordinate-system argument on the geometry
 constructors; 2.1 makes it optional. Pass `version="2.0"` to require it.

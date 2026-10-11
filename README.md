@@ -35,11 +35,12 @@ stay within 1.3× of the truth where pgSphere's are off by up to 8.7×.
 The interface is ADQL's. The functions carry ADQL's own names (`CONTAINS`,
 `POINT`, `CIRCLE`, `POLYGON`, …), and `point <@ circle`, the indexable form of
 `1 = CONTAINS(…)`, runs through the same scan as skycell's native functions,
-cross-matches included. It works whichever way round the query is written: a
-constant point inside a circle around each row is planned as the cone around
-that point, and a cross-match probes the larger indexed table whichever side is
-the point and whichever the circle. With pgSphere and Q3C the reversed form is a
-full table scan, or a cross-match that probes the wrong table. Stored regions read and write as IVOA STC-S, and one
+cross-matches included, and so does a `DISTANCE(p1, p2) < r` comparison. It
+works whichever way round the query is written: a constant point inside a
+circle around each row is planned as the cone around that point, and a
+cross-match probes the larger indexed table whichever side is the point and
+whichever the circle. With pgSphere and Q3C the reversed form is a full table
+scan, or a cross-match that probes the wrong table. Stored regions read and write as IVOA STC-S, and one
 column can hold circles and polygons together.
 
 The numbers come from randomized paired trials on PostgreSQL 18.6, on 10M-row
@@ -299,7 +300,7 @@ for ADQL compatibility and must be `'ICRS'`; convert other frames first with
 | `polygon(ra1, dec1, ra2, dec2, …)`<br>`polygon(coordsys, …)` | `skyregion` | ≥ 3 vertices, **convex**, smaller than a hemisphere. ADQL `POLYGON` |
 | `contains(p skypos, r skyregion)`<br>`contains(a skyregion, b skyregion)` | `integer` (1/0) | ADQL `CONTAINS`. For an *indexable* test use the `<@` operator below |
 | `intersects(p skypos, r skyregion)`<br>`intersects(a skyregion, b skyregion)` | `integer` (1/0) | ADQL `INTERSECTS`. For an *indexable* test use `<@` (point-region) or `&&` (region-region) below |
-| `distance(a skypos, b skypos)`<br>`distance(ra1, dec1, ra2, dec2)` | `float8` | degrees. ADQL `DISTANCE`, both forms |
+| `distance(a skypos, b skypos)`<br>`distance(ra1, dec1, ra2, dec2)` | `float8` | degrees. ADQL `DISTANCE`, both forms. `distance(…) < r` (or `<=`) in a `WHERE` or `JOIN ON` is planned as the cone, like `<@` below |
 | `area(r skyregion)` | `float8` | square degrees. ADQL `AREA` |
 | `coord1(p)` / `coord2(p)` | `float8` | right ascension / declination, degrees |
 | `centroid(r skyregion)` | `skypos` | ADQL `CENTROID` |
@@ -327,6 +328,9 @@ indexed: a constant point inside a circle drawn around each row, as the Gaia
 archive's examples write cone searches (`point('ICRS', 81.28, -69.78) <@
 circle('ICRS', ra, dec, r)`), is planned as the cone around that point, and a
 cross-match probes whichever table has the index (the larger one if both do).
+`distance(p1, p2) < r` (also `<=`, `r > distance(…)`, the four-coordinate form
+and `skycell_dist`) gets the same plan: the planner adds the cone next to the
+comparison, which still decides, so the answer is exactly the comparison's.
 Against a constant polygon or box they go through the B-tree cell rewrite
 described above. A `skyregion` column with its
 own GiST index additionally indexes `&&` and both region-region containment
