@@ -30,6 +30,7 @@
 #include "nodes/makefuncs.h"
 #include "nodes/nodeFuncs.h"
 #include "nodes/supportnodes.h"
+#include "optimizer/optimizer.h"
 #include "utils/array.h"
 #include "utils/builtins.h"
 #include "utils/lsyscache.h"
@@ -902,6 +903,9 @@ gin_region_rewrite(Oid funcid, Node *pt, Node *rg, Node *cell,
 	return (Node *) makeBoolExpr(AND_EXPR, list_make2(overlap, (Expr *) exact), -1);
 }
 
+static bool pos_ra_dec(Oid funcid, Node *pt, Node **ra, Node **dec);
+static List *circle_args(Oid funcid, Node *rg);
+
 /*
  * The ADQL circle as the custom scan's cone.  `point(...) <@ circle(...)` (or
  * `@>`, either order) whose circle is a constant or is built per row by
@@ -925,36 +929,7 @@ circle_as_cone(SupportRequestSimplify *req, Oid funcid, Node *pt, Node *rg, Node
 	FuncExpr   *cone6;
 
 	/* the position: point([coordsys,] ra, dec), or a stored skypos */
-	if (IsA(pt, FuncExpr))
-	{
-		List	   *a = ((FuncExpr *) pt)->args;
-
-		if (list_length(a) == 3)
-		{
-			Node	   *cs = linitial(a);
-
-			if (!IsA(cs, Const) || ((Const *) cs)->constisnull)
-				return NULL;
-			check_coordsys(DatumGetTextPP(((Const *) cs)->constvalue));
-			a = list_delete_first(list_copy(a));
-		}
-		if (list_length(a) != 2)
-			return NULL;
-		ra = copyObject(linitial(a));
-		dec = copyObject(lsecond(a));
-	}
-	else if (IsA(pt, Var))
-	{
-		Oid			one[1] = {exprType(pt)};
-
-		ra = (Node *) makeFuncExpr(lookup_sibling_func(funcid, "coord1", 1, one), FLOAT8OID,
-								   list_make1(copyObject(pt)), InvalidOid, InvalidOid,
-								   COERCE_EXPLICIT_CALL);
-		dec = (Node *) makeFuncExpr(lookup_sibling_func(funcid, "coord2", 1, one), FLOAT8OID,
-									list_make1(copyObject(pt)), InvalidOid, InvalidOid,
-									COERCE_EXPLICIT_CALL);
-	}
-	else
+	if (IsA(pt, Const) || !pos_ra_dec(funcid, pt, &ra, &dec))
 		return NULL;
 
 	/* the circle: a constant, or circle([coordsys,] ra0, dec0, radius) */
@@ -969,28 +944,8 @@ circle_as_cone(SupportRequestSimplify *req, Oid funcid, Node *pt, Node *rg, Node
 			return NULL;
 		c = list_make3(float8_const(r->v[0]), float8_const(r->v[1]), float8_const(r->v[2]));
 	}
-	else if (IsA(rg, FuncExpr))
-	{
-		FuncExpr   *f = (FuncExpr *) rg;
-		char	   *name = get_func_name(f->funcid);
-
-		if (name == NULL || (strcmp(name, "circle") != 0 && strcmp(name, "skycell_circle") != 0) ||
-			get_func_namespace(f->funcid) != get_func_namespace(funcid))
-			return NULL;
-		c = f->args;
-		if (list_length(c) == 4)
-		{
-			Node	   *cs = linitial(c);
-
-			if (!IsA(cs, Const) || ((Const *) cs)->constisnull)
-				return NULL;
-			check_coordsys(DatumGetTextPP(((Const *) cs)->constvalue));
-			c = list_delete_first(list_copy(c));
-		}
-		if (list_length(c) != 3)
-			return NULL;
+	else if ((c = circle_args(funcid, rg)) != NIL)
 		c = copyObject(c);
-	}
 	else
 		return NULL;
 
@@ -1002,8 +957,188 @@ circle_as_cone(SupportRequestSimplify *req, Oid funcid, Node *pt, Node *rg, Node
 	return NULL;
 }
 
+/*
+ * The relation all Vars of a node belong to: 0 for none, -1 for several.
+ * Only this query level's Vars count; outer references are parameters.
+ */
+static int
+single_varno(Node *node)
+{
+	List	   *vars = pull_var_clause(node, PVC_RECURSE_AGGREGATES |
+									   PVC_RECURSE_WINDOWFUNCS |
+									   PVC_RECURSE_PLACEHOLDERS);
+	ListCell   *lc;
+	int			varno = 0;
+
+	foreach(lc, vars)
+	{
+		Var		   *v = (Var *) lfirst(lc);
+
+		if (v->varlevelsup != 0)
+			continue;
+		if (varno != 0 && varno != (int) v->varno)
+			return -1;
+		varno = v->varno;
+	}
+	return varno;
+}
+
+/* ra and dec of a position: point([coordsys,] ra, dec), a constant or a column */
+static bool
+pos_ra_dec(Oid funcid, Node *pt, Node **ra, Node **dec)
+{
+	if (IsA(pt, FuncExpr))
+	{
+		List	   *a = ((FuncExpr *) pt)->args;
+
+		if (list_length(a) == 3)
+		{
+			Node	   *cs = linitial(a);
+
+			if (!IsA(cs, Const) || ((Const *) cs)->constisnull)
+				return false;
+			check_coordsys(DatumGetTextPP(((Const *) cs)->constvalue));
+			a = list_delete_first(list_copy(a));
+		}
+		if (list_length(a) != 2)
+			return false;
+		*ra = copyObject(linitial(a));
+		*dec = copyObject(lsecond(a));
+		return true;
+	}
+	if (IsA(pt, Const))
+	{
+		SkyPos	   *p;
+
+		if (((Const *) pt)->constisnull)
+			return false;
+		p = DatumGetSkyPos(((Const *) pt)->constvalue);
+		*ra = (Node *) float8_const(p->ra);
+		*dec = (Node *) float8_const(p->dec);
+		return true;
+	}
+	if (IsA(pt, Var))
+	{
+		Oid			one[1] = {exprType(pt)};
+
+		*ra = (Node *) makeFuncExpr(lookup_sibling_func(funcid, "coord1", 1, one), FLOAT8OID,
+									list_make1(copyObject(pt)), InvalidOid, InvalidOid,
+									COERCE_EXPLICIT_CALL);
+		*dec = (Node *) makeFuncExpr(lookup_sibling_func(funcid, "coord2", 1, one), FLOAT8OID,
+									 list_make1(copyObject(pt)), InvalidOid, InvalidOid,
+									 COERCE_EXPLICIT_CALL);
+		return true;
+	}
+	return false;
+}
+
+/* centre and radius of circle([coordsys,] ra0, dec0, radius), else NIL */
+static List *
+circle_args(Oid funcid, Node *rg)
+{
+	FuncExpr   *f;
+	char	   *name;
+	List	   *c;
+
+	if (!IsA(rg, FuncExpr))
+		return NIL;
+	f = (FuncExpr *) rg;
+	name = get_func_name(f->funcid);
+	if (name == NULL || (strcmp(name, "circle") != 0 && strcmp(name, "skycell_circle") != 0) ||
+		get_func_namespace(f->funcid) != get_func_namespace(funcid))
+		return NIL;
+	c = f->args;
+	if (list_length(c) == 4)
+	{
+		Node	   *cs = linitial(c);
+
+		if (!IsA(cs, Const) || ((Const *) cs)->constisnull)
+			return NIL;
+		check_coordsys(DatumGetTextPP(((Const *) cs)->constvalue));
+		c = list_delete_first(list_copy(c));
+	}
+	return list_length(c) == 3 ? c : NIL;
+}
+
+/*
+ * "Point A lies in a circle of radius r around B" is the same condition as
+ * "B lies in a circle of radius r around A": it is a distance below r. ADQL
+ * users write it both ways -- the Gaia archive's own examples put a constant
+ * point inside CIRCLE(ra, dec, r) -- but only the side written as the point is
+ * looked up in an index. When the circle's centre is the indexable side, swap
+ * the two: *pt2 becomes point(centre) and *rg2 a circle around the old point.
+ * For a cross-match where both sides are indexed, the larger relation is the
+ * one worth probing. False when the written orientation should stay.
+ */
+static bool
+want_swap(SupportRequestSimplify *req, Oid funcid, Node *pt, Node *rg,
+		  Node **pt2, Node **rg2)
+{
+	Oid			ff[2] = {FLOAT8OID, FLOAT8OID};
+	Oid			fff[3] = {FLOAT8OID, FLOAT8OID, FLOAT8OID};
+	List	   *c = circle_args(funcid, rg);
+	Node	   *ra,
+			   *dec,
+			   *cell1,
+			   *cell2;
+	FuncExpr   *newpt;
+	sc_density	d1,
+				d2;
+	Oid			statrel;
+	bool		cell_ops;
+	int			cv;
+
+	if (c == NIL)
+		return false;
+	/* the circle's centre must be one relation's columns, the radius not */
+	cv = single_varno((Node *) list_make2(linitial(c), lsecond(c)));
+	if (cv <= 0 || single_varno((Node *) lthird(c)) == cv)
+		return false;
+	if (single_varno(pt) == cv || !pos_ra_dec(funcid, pt, &ra, &dec))
+		return false;
+
+	newpt = makeFuncExpr(lookup_sibling_func(funcid, "point", 2, ff), exprType(pt),
+						 list_make2(copyObject(linitial(c)), copyObject(lsecond(c))),
+						 InvalidOid, InvalidOid, COERCE_EXPLICIT_CALL);
+	cell2 = cell_expr_for_point(funcid, (Node *) newpt);
+	if (cell2 == NULL || !density_for_expr(req->root, cell2, &d2, &statrel, &cell_ops))
+		return false;
+	cell1 = cell_expr_for_point(funcid, pt);
+	if (cell1 != NULL && density_for_expr(req->root, cell1, &d1, &statrel, &cell_ops) &&
+		d1.ntotal >= d2.ntotal)
+		return false;
+
+	*pt2 = (Node *) newpt;
+	*rg2 = eval_const_expressions(req->root,
+								  (Node *) makeFuncExpr(lookup_sibling_func(funcid, "circle", 3, fff),
+														exprType(rg),
+														list_make3(ra, dec, copyObject(lthird(c))),
+														InvalidOid, InvalidOid,
+														COERCE_EXPLICIT_CALL));
+	return true;
+}
+
+static Node *region_simplify_oriented(SupportRequestSimplify *req, Oid funcid,
+									  Node *pt, Node *rg);
+
 static Node *
 region_support_simplify(SupportRequestSimplify *req, Oid funcid, Node *pt, Node *rg)
+{
+	Node	   *pt2,
+			   *rg2;
+
+	if (req->root != NULL && want_swap(req, funcid, pt, rg, &pt2, &rg2))
+	{
+		Node	   *res = region_simplify_oriented(req, funcid, pt2, rg2);
+
+		if (res != NULL)
+			return res;
+	}
+	return region_simplify_oriented(req, funcid, pt, rg);
+}
+
+static Node *
+region_simplify_oriented(SupportRequestSimplify *req, Oid funcid, Node *pt, Node *rg)
 {
 	Node	   *cell;
 	sc_density	dens;

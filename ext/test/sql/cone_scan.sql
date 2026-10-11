@@ -184,9 +184,19 @@ FROM unnest(ARRAY['cs_cat', 'cs_sorted']) tbl, (VALUES
   ('adql radius',   'SELECT count(*) || '':'' || sum(c.id) FROM cs_probe p JOIN cs_cat c ON circle(''ICRS'', p.ra, p.dec, p.r) @> point(''ICRS'', c.ra, c.dec)'),
   ('adql left',     'SELECT count(*) || '':'' || count(c.id) FROM cs_probe p LEFT JOIN cs_cat c ON point(''ICRS'', c.ra, c.dec) <@ circle(''ICRS'', p.ra, p.dec, 0.3)'),
   ('adql or',       'SELECT count(*) || '':'' || sum(id) FROM cs_cat WHERE point(''ICRS'', ra, dec) <@ circle(''ICRS'', 10, 20, 1) OR id = 7'),
-  ('adql polygon',  'SELECT count(*) || '':'' || sum(id) FROM cs_cat WHERE point(''ICRS'', ra, dec) <@ polygon(''ICRS'', 10, 20, 12, 20, 11, 22)')
+  ('adql polygon',  'SELECT count(*) || '':'' || sum(id) FROM cs_cat WHERE point(''ICRS'', ra, dec) <@ polygon(''ICRS'', 10, 20, 12, 20, 11, 22)'),
+  -- written the other way round, as the Gaia archive's examples do: a constant
+  -- point inside a circle drawn around each row is the same cone
+  ('adql reversed', 'SELECT count(*) || '':'' || sum(id) FROM cs_cat WHERE point(''ICRS'', 10, 20) <@ circle(''ICRS'', ra, dec, 1)'),
+  ('adql rev @>',   'SELECT count(*) || '':'' || sum(id) FROM cs_cat WHERE circle(''ICRS'', ra, dec, 1) @> point(''ICRS'', 10, 20)'),
+  ('adql rev join', 'SELECT count(*) || '':'' || sum(c.id) FROM cs_probe p JOIN cs_cat c ON point(''ICRS'', p.ra, p.dec) <@ circle(''ICRS'', c.ra, c.dec, 0.3)')
 ) t(name, q)
 ORDER BY tbl, t.name;
+-- the reversed cone returns exactly the rows of the cone it stands for
+SELECT (SELECT count(*) FROM cs_cat WHERE point('ICRS', 10, 20) <@ circle('ICRS', ra, dec, 1))
+     = (SELECT count(*) FROM cs_cat WHERE skycell_in_cone(ra, dec, 10, 20, 1)) AS reversed_same,
+       (SELECT count(*) FROM cs_probe p JOIN cs_cat c ON point('ICRS', p.ra, p.dec) <@ circle('ICRS', c.ra, c.dec, 0.3))
+     = (SELECT count(*) FROM cs_probe p JOIN cs_cat c ON skycell_in_cone(c.ra, c.dec, p.ra, p.dec, 0.3)) AS rev_join_same;
 SELECT t.name, (cs_join(t.q)).* FROM (VALUES
   ('stored skypos', 'SELECT count(*) || '':'' || sum(id) FROM cs_spos WHERE pos <@ circle(''ICRS'', 10, 20, 1)'),
   ('stored, join',  'SELECT count(*) || '':'' || sum(s.id) FROM cs_probe p JOIN cs_spos s ON s.pos <@ circle(''ICRS'', p.ra, p.dec, 0.3)')

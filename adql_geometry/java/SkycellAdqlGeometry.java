@@ -1,4 +1,4 @@
-package skycell.adql;
+package skycell.adqlgeometry;
 
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -24,13 +24,13 @@ import java.util.regex.Pattern;
  * anything else is refused rather than silently mis-translated.
  *
  * <pre>
- *   SkycellAdql t = new SkycellAdql(Dialect.SKYCELL, "2.1");
+ *   SkycellAdqlGeometry t = new SkycellAdqlGeometry(Dialect.SKYCELL, "2.1");
  *   t.translate("SELECT * FROM t WHERE "
  *             + "CONTAINS(POINT('ICRS', ra, dec), CIRCLE('ICRS', 10, 20, 0.5)) = 1");
  *   // SELECT * FROM t WHERE (point('ICRS', ra, dec) &lt;@ circle('ICRS', 10, 20, 0.5))
  * </pre>
  */
-public final class SkycellAdql {
+public final class SkycellAdqlGeometry {
 
     /** Target SQL. PGSPHERE also emits Q3C where Q3C is the faster path. */
     public enum Dialect { SKYCELL, PGSPHERE }
@@ -50,7 +50,7 @@ public final class SkycellAdql {
     private final Dialect dialect;
     private final String version;
 
-    public SkycellAdql(Dialect dialect, String version) {
+    public SkycellAdqlGeometry(Dialect dialect, String version) {
         if (!"2.0".equals(version) && !"2.1".equals(version)) {
             throw new TranslationException("unknown ADQL version " + version);
         }
@@ -205,6 +205,11 @@ public final class SkycellAdql {
             case "CONTAINS": {
                 need(raw, 2, "CONTAINS takes two geometries");
                 String inner = raw.get(0), outer = raw.get(1);
+                String[] rev = reverseCone(inner, outer);
+                if (rev != null) {
+                    inner = rev[0];
+                    outer = rev[1];
+                }
                 if (dialect == Dialect.SKYCELL) {
                     return containsSkycell(inner, outer);
                 }
@@ -215,11 +220,11 @@ public final class SkycellAdql {
                     List<String> a = splitArgs(m.group(2));
                     if (!a.isEmpty() && a.get(0).startsWith("'")) a = a.subList(1, a.size());
                     if (m.group(1).equalsIgnoreCase("CIRCLE")) {
-                        return "q3c_radial_query(" + cols[0] + ", " + cols[1] + ", "
-                                + a.get(0) + ", " + a.get(1) + ", " + a.get(2) + ")";
+                        return "(q3c_radial_query(" + cols[0] + ", " + cols[1] + ", "
+                                + a.get(0) + ", " + a.get(1) + ", " + a.get(2) + "))";
                     }
-                    return "q3c_poly_query(" + cols[0] + ", " + cols[1] + ", ARRAY["
-                            + String.join(", ", a) + "]::float8[])";
+                    return "(q3c_poly_query(" + cols[0] + ", " + cols[1] + ", ARRAY["
+                            + String.join(", ", a) + "]::float8[]))";
                 }
                 return "(" + translateExpression(inner) + " <@ " + translateExpression(outer) + ")";
             }
@@ -306,38 +311,12 @@ public final class SkycellAdql {
     }
 
     /**
-     * skycell_radial_query(...) for a cross-match shape: {@code cols} a point
-     * over a pair of plain columns and {@code region} a CIRCLE whose centre or
-     * radius is not a literal constant -- it comes from another table's row.
-     * {@code <@}'s rewrite (skycell_region_support) gives up outright when the
-     * region isn't a compile-time constant, so this would otherwise reach no
-     * index at all. skycell_radial_query (Q3C's own argument order) reaches
-     * simplify_cone's non-constant branch instead, which still covers with an
-     * index, if capped to skycell.join_slots ranges. Null if the shape doesn't
-     * match -- a literal circle is left alone, since {@code <@}/{@code
-     * intersects} already reach the same, uncapped covering for that case.
-     */
-    private String crossmatchRadial(String[] cols, String region) {
-        if (cols == null) return null;
-        Matcher cm = Pattern.compile("\\s*CIRCLE\\s*\\((.*)\\)\\s*",
-                Pattern.CASE_INSENSITIVE | Pattern.DOTALL).matcher(region);
-        if (!cm.matches()) return null;
-        List<String> a = stripFrame(splitArgs(cm.group(1)), "CIRCLE");
-        if (a.size() == 3 && !allConst(a)) {
-            return "skycell_radial_query(" + cols[0] + ", " + cols[1] + ", "
-                    + a.get(0) + ", " + a.get(1) + ", " + a.get(2) + ")";
-        }
-        return null;
-    }
-
-    /**
      * skycell_poly_join(...) for a cross-match shape: {@code cols} a point
      * over a pair of plain columns and {@code region} a POLYGON whose
      * vertices are not all literal constants -- they come from another
-     * table's row. The polygon analogue of crossmatchRadial: {@code <@}'s
-     * rewrite gives up outright on a non-constant region regardless of
-     * shape, and skycell_poly_join reaches simplify_poly's non-constant
-     * branch instead, capped to skycell.join_slots ranges. Null if the shape
+     * table's row. The counterpart of the circle case, which needs no
+     * redirect: skycell_poly_join reaches simplify_poly's non-constant
+     * branch, capped to skycell.join_slots ranges. Null if the shape
      * doesn't match -- a literal polygon is left alone, since {@code <@}/
      * {@code intersects} already reach the same, uncapped covering.
      */
@@ -381,13 +360,38 @@ public final class SkycellAdql {
         return null;
     }
 
-    /** skycell_radial_query/skycell_poly_join/&lt;@ for whichever cross-match
-     * shape {@code region} is, else null. */
+    /** skycell_poly_join/&lt;@ for a per-row POLYGON or BOX, else null. A
+     * per-row CIRCLE needs no redirect: skycell plans {@code point <@ circle}
+     * through its custom scan whichever side the columns are on, so it is
+     * emitted as written. */
     private String crossmatch(String[] cols, String region) {
-        String xm = crossmatchRadial(cols, region);
-        if (xm != null) return xm;
-        xm = crossmatchPoly(cols, region);
+        String xm = crossmatchPoly(cols, region);
         return xm != null ? xm : crossmatchBox(cols, region);
+    }
+
+    /**
+     * CONTAINS(POINT(constant), CIRCLE(ra, dec, r)) -- a fixed point inside a
+     * circle around each row, as the Gaia archive's examples write cone
+     * searches -- is the cone CONTAINS(POINT(ra, dec), CIRCLE(constant, r)):
+     * both say the two positions are less than r apart. Rewritten that way so
+     * that the indexed columns are the point, which is the side both dialects
+     * index. Null if the shape doesn't match.
+     */
+    private String[] reverseCone(String inner, String outer) {
+        Matcher pm = Pattern.compile("\\s*POINT\\s*\\((.*)\\)\\s*",
+                Pattern.CASE_INSENSITIVE | Pattern.DOTALL).matcher(inner);
+        Matcher cm = Pattern.compile("\\s*CIRCLE\\s*\\((.*)\\)\\s*",
+                Pattern.CASE_INSENSITIVE | Pattern.DOTALL).matcher(outer);
+        if (!pm.matches() || !cm.matches()) return null;
+        List<String> p = splitArgs(pm.group(1));
+        if (!p.isEmpty() && p.get(0).startsWith("'")) p = p.subList(1, p.size());
+        if (p.size() != 2 || !allConst(p)) return null;
+        List<String> a = stripFrame(splitArgs(cm.group(1)), "CIRCLE");
+        if (a.size() != 3 || allConst(a.subList(0, 2))) return null;
+        return new String[] {
+            "POINT('ICRS', " + a.get(0) + ", " + a.get(1) + ")",
+            "CIRCLE('ICRS', " + p.get(0) + ", " + p.get(1) + ", " + a.get(2) + ")"
+        };
     }
 
     /**
@@ -399,8 +403,13 @@ public final class SkycellAdql {
      * comment), whether the region is literal or per-row.
      */
     private String containsSkycell(String inner, String outer) {
+        String[] rev = reverseCone(inner, outer);
+        if (rev != null) {
+            inner = rev[0];
+            outer = rev[1];
+        }
         String xm = crossmatch(pointOfColumns(inner), outer);
-        if (xm != null) return xm;
+        if (xm != null) return xm.startsWith("(") ? xm : "(" + xm + ")";
         return "(" + translateExpression(inner) + " <@ " + translateExpression(outer) + ")";
     }
 
@@ -458,6 +467,6 @@ public final class SkycellAdql {
     public static void main(String[] args) {
         Dialect d = args.length > 1 && args[1].equalsIgnoreCase("pgsphere")
                 ? Dialect.PGSPHERE : Dialect.SKYCELL;
-        System.out.println(new SkycellAdql(d, "2.1").translate(args[0]));
+        System.out.println(new SkycellAdqlGeometry(d, "2.1").translate(args[0]));
     }
 }

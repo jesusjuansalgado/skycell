@@ -324,8 +324,10 @@ The functions carry ADQL's own names (\texttt{point}, \texttt{circle},
 can translate ADQL almost word for word (Table~\ref{tab:ops}), where pgSphere needs its
 own types and Q3C a separate function per shape. The operator
 \texttt{point <@ circle} is the indexable form of \texttt{CONTAINS}, and it uses the
-custom scan whether the circle is a constant or comes from another table, so an ADQL
-cross-match is as fast as the native one. Regions are written and read as IVOA STC-S
+custom scan whether the circle is a constant or comes from another table, and whichever
+way round the query is written (a constant point inside a circle around each row is
+planned as the cone around that point), so an ADQL cross-match is as fast as the
+native one. Regions are written and read as IVOA STC-S
 text \citep{stc}, the format \texttt{s\_region} columns already use. Code written for
 Q3C can move by renaming: \texttt{skycell\_radial\_query} and \texttt{skycell\_join}
 take Q3C's arguments unchanged. The IVOA UDF registry's epoch-propagation functions are also

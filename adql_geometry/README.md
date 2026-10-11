@@ -1,32 +1,35 @@
-# ADQL → PostgreSQL translation
+# ADQL geometry → PostgreSQL
 
-Reference translators that turn ADQL geometry into SQL, for **skycell** or for
+Reference translators that turn the **geometry** in ADQL into SQL, for **skycell** or for
 the **pgSphere + Q3C** pair an archive uses today. Two implementations, kept
 byte-for-byte identical in output, so a service in either language gets the
 same SQL:
 
 | | |
 |---|---|
-| [`python/skycell_adql.py`](python/skycell_adql.py) | no dependencies, Python 3.9+ |
-| [`java/SkycellAdql.java`](java/SkycellAdql.java) | no dependencies, Java 11+ |
+| [`python/skycell_adql_geometry.py`](python/skycell_adql_geometry.py) | no dependencies, Python 3.9+ |
+| [`java/SkycellAdqlGeometry.java`](java/SkycellAdqlGeometry.java) | no dependencies, Java 11+ |
 
 ```bash
-python3 python/skycell_adql.py "SELECT * FROM t WHERE CONTAINS(POINT('ICRS', ra, dec), CIRCLE('ICRS', 10, 20, 0.5)) = 1"
+python3 python/skycell_adql_geometry.py "SELECT * FROM t WHERE CONTAINS(POINT('ICRS', ra, dec), CIRCLE('ICRS', 10, 20, 0.5)) = 1"
 # SELECT * FROM t WHERE (point('ICRS', ra, dec) <@ circle('ICRS', 10, 20, 0.5))
 
-python3 python/skycell_adql.py "...same query..." pgsphere
-# SELECT * FROM t WHERE q3c_radial_query(ra, dec, 10, 20, 0.5)
+python3 python/skycell_adql_geometry.py "...same query..." pgsphere
+# SELECT * FROM t WHERE (q3c_radial_query(ra, dec, 10, 20, 0.5))
 ```
 
 ```java
-new SkycellAdql(Dialect.SKYCELL, "2.1").translate(adql);
+new SkycellAdqlGeometry(Dialect.SKYCELL, "2.1").translate(adql);
 ```
 
 ## What it is, and is not
 
 It is **not an ADQL parser**. It tokenises the statement, rewrites the geometry
-constructs, and passes everything else through untouched — enough for a TAP
-layer whose SQL is otherwise already PostgreSQL. If your service already parses
+constructs, and passes everything else through untouched. Everything that is not
+geometry belongs to the TAP service's own ADQL-to-SQL translation: `TOP n` →
+`LIMIT n`, schema and table names, quoting, reserved words, `ORDER BY` on
+select-list aliases and the like. Run these translators inside that step, or
+after it on SQL that is otherwise already PostgreSQL. If your service already parses
 ADQL properly (the [CDS ADQL library](https://github.com/gmantele/taplib) in
 Java, for instance), call `translateExpression()` on the geometry nodes rather
 than handing it the whole statement.
@@ -186,6 +189,6 @@ python3 -m pytest tests -q          # 15 cases, both dialects, both versions
 produce identical output:
 
 ```bash
-javac -d /tmp/jb java/SkycellAdql.java
+javac -d /tmp/jb java/SkycellAdqlGeometry.java
 python3 tests/cross_check.py
 ```
