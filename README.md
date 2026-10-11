@@ -168,14 +168,16 @@ docker run -d --name skycell-pg -e POSTGRES_PASSWORD=skycell -e POSTGRES_DB=skyc
 docker exec -w /work/ext skycell-pg make with_llvm=no install
 ```
 
-### Translating ADQL
+### Translating ADQL geometry
 
-[`adql_parser/`](adql_parser/) holds reference translators in Python and Java
-that turn ADQL geometry into SQL — for skycell, or for the pgSphere+Q3C pair, so
-you can compare the two on your own queries:
+[`adql_geometry/`](adql_geometry/) holds reference translators in Python and Java
+that turn the geometry in ADQL into SQL — for skycell, or for the pgSphere+Q3C
+pair, so you can compare the two on your own queries. They rewrite only the
+geometry (`CONTAINS`, `POINT`, `CIRCLE`, `DISTANCE`, …); the rest of ADQL, such
+as `TOP n` → `LIMIT n`, is the job of the TAP service's own ADQL parser:
 
 ```bash
-python3 adql_parser/python/skycell_adql.py \
+python3 adql_geometry/python/skycell_adql_geometry.py \
   "SELECT * FROM t WHERE CONTAINS(POINT('ICRS', ra, dec), CIRCLE('ICRS', 10, 20, 0.5)) = 1"
 # SELECT * FROM t WHERE (point('ICRS', ra, dec) <@ circle('ICRS', 10, 20, 0.5))
 ```

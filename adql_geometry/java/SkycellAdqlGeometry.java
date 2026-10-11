@@ -1,4 +1,4 @@
-package skycell.adql;
+package skycell.adqlgeometry;
 
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -24,13 +24,13 @@ import java.util.regex.Pattern;
  * anything else is refused rather than silently mis-translated.
  *
  * <pre>
- *   SkycellAdql t = new SkycellAdql(Dialect.SKYCELL, "2.1");
+ *   SkycellAdqlGeometry t = new SkycellAdqlGeometry(Dialect.SKYCELL, "2.1");
  *   t.translate("SELECT * FROM t WHERE "
  *             + "CONTAINS(POINT('ICRS', ra, dec), CIRCLE('ICRS', 10, 20, 0.5)) = 1");
  *   // SELECT * FROM t WHERE (point('ICRS', ra, dec) &lt;@ circle('ICRS', 10, 20, 0.5))
  * </pre>
  */
-public final class SkycellAdql {
+public final class SkycellAdqlGeometry {
 
     /** Target SQL. PGSPHERE also emits Q3C where Q3C is the faster path. */
     public enum Dialect { SKYCELL, PGSPHERE }
@@ -50,7 +50,7 @@ public final class SkycellAdql {
     private final Dialect dialect;
     private final String version;
 
-    public SkycellAdql(Dialect dialect, String version) {
+    public SkycellAdqlGeometry(Dialect dialect, String version) {
         if (!"2.0".equals(version) && !"2.1".equals(version)) {
             throw new TranslationException("unknown ADQL version " + version);
         }
@@ -467,6 +467,6 @@ public final class SkycellAdql {
     public static void main(String[] args) {
         Dialect d = args.length > 1 && args[1].equalsIgnoreCase("pgsphere")
                 ? Dialect.PGSPHERE : Dialect.SKYCELL;
-        System.out.println(new SkycellAdql(d, "2.1").translate(args[0]));
+        System.out.println(new SkycellAdqlGeometry(d, "2.1").translate(args[0]));
     }
 }

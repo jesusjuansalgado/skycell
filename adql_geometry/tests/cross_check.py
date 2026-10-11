@@ -5,7 +5,7 @@ import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(HERE, "..", "python"))
-from skycell_adql import translate  # noqa: E402
+from skycell_adql_geometry import translate  # noqa: E402
 
 CLASSES = os.environ.get("SKYCELL_JAVA_CLASSES", "/tmp/jb")
 
@@ -20,7 +20,7 @@ def main() -> int:
             for dialect in ("skycell", "pgsphere"):
                 py = translate(q, dialect)
                 java = subprocess.run(
-                    ["java", "-cp", CLASSES, "skycell.adql.SkycellAdql", q, dialect],
+                    ["java", "-cp", CLASSES, "skycell.adqlgeometry.SkycellAdqlGeometry", q, dialect],
                     capture_output=True, text=True, check=True).stdout.strip()
                 if py != java:
                     bad += 1

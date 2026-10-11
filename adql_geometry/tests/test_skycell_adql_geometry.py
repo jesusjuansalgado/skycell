@@ -5,7 +5,7 @@ import sys
 import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "python"))
-from skycell_adql import TranslationError, translate  # noqa: E402
+from skycell_adql_geometry import TranslationError, translate  # noqa: E402
 
 CONE = "SELECT * FROM t WHERE CONTAINS(POINT('ICRS', ra, dec), CIRCLE('ICRS', 10, 20, 0.5)) = 1"
 
