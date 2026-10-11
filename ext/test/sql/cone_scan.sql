@@ -305,7 +305,53 @@ ANALYZE cs_bad;
 SELECT (cs_join('SELECT string_agg(pid || ''='' || n, '','' ORDER BY pid) FROM (SELECT p.pid, count(c.id) n FROM cs_bad p LEFT JOIN cs_cat c ON distance(p.ra, p.dec, c.ra, c.dec) < 3 GROUP BY p.pid) s')).*;
 SELECT string_agg(pid || '=' || n, ',' ORDER BY pid) FROM (SELECT p.pid, count(c.id) n
   FROM cs_bad p LEFT JOIN cs_cat c ON distance(p.ra, p.dec, c.ra, c.dec) < 3 GROUP BY p.pid) s;
-DROP TABLE cs_bad, cs_dprobe;
+DROP TABLE cs_bad;
+-- ADQL's CONTAINS and INTERSECTS compared with 1 are their operator: the
+-- same rows as the comparison evaluated as written (`+ 0` hides it), through
+-- an index
+CREATE FUNCTION cs_adql(q text, OUT same bool, OUT plan text)
+LANGUAGE plpgsql AS $$
+DECLARE a text; b text; l text;
+BEGIN
+  EXECUTE 'SELECT (' || replace(replace(q, ') = 1', ') + 0 = 1'), '1 = contains(', '1 = 0 + contains(') || ')::text' INTO a;
+  EXECUTE 'SELECT (' || q || ')::text' INTO b;
+  same := a IS NOT DISTINCT FROM b;
+  plan := 'seq';
+  FOR l IN EXECUTE 'EXPLAIN (COSTS OFF) ' || q LOOP
+    IF l ~ 'Custom Scan \(SkycellCone\)' THEN plan := 'custom';
+    ELSIF l ~ 'Index Scan' AND plan = 'seq' THEN plan := 'index'; END IF;
+  END LOOP;
+END $$;
+CREATE TABLE cs_reg AS SELECT id, circle('ICRS', ra, dec, 0.5) AS r FROM cs_cat WHERE id % 20 = 0;
+CREATE INDEX cs_reg_r ON cs_reg USING gist (r);
+ANALYZE cs_reg;
+SET enable_seqscan = off;
+SELECT t.name, (cs_adql(t.q)).* FROM (VALUES
+  ('contains cone',     'SELECT count(*) || '':'' || sum(id) FROM cs_cat WHERE contains(point(''ICRS'', ra, dec), circle(''ICRS'', 10, 20, 1)) = 1'),
+  ('contains reversed', 'SELECT count(*) || '':'' || sum(id) FROM cs_cat WHERE 1 = contains(point(''ICRS'', 10, 20), circle(''ICRS'', ra, dec, 1))'),
+  ('intersects cone',   'SELECT count(*) || '':'' || sum(id) FROM cs_cat WHERE intersects(point(''ICRS'', ra, dec), circle(''ICRS'', 10, 20, 1)) = 1'),
+  ('contains polygon',  'SELECT count(*) || '':'' || sum(id) FROM cs_cat WHERE contains(point(''ICRS'', ra, dec), polygon(''ICRS'', 10, 20, 12, 20, 12, 22, 10, 22)) = 1'),
+  ('intersects box',    'SELECT count(*) || '':'' || sum(id) FROM cs_cat WHERE intersects(point(''ICRS'', ra, dec), box(''ICRS'', 11, 21, 2, 2)) = 1'),
+  ('contains join',     'SELECT count(*) || '':'' || sum(c.id) FROM cs_dprobe p JOIN cs_cat c ON contains(point(''ICRS'', c.ra, c.dec), circle(''ICRS'', p.ra, p.dec, 0.3)) = 1'),
+  ('contains join rev', 'SELECT count(*) || '':'' || sum(c.id) FROM cs_dprobe p JOIN cs_cat c ON contains(point(''ICRS'', p.ra, p.dec), circle(''ICRS'', c.ra, c.dec, 0.3)) = 1'),
+  ('region in region',  'SELECT count(*) || '':'' || sum(id) FROM cs_reg WHERE contains(circle(''ICRS'', 10, 20, 0.1), r) = 1'),
+  ('regions intersect', 'SELECT count(*) || '':'' || sum(id) FROM cs_reg WHERE intersects(r, circle(''ICRS'', 10, 20, 3)) = 1')
+) t(name, q);
+RESET enable_seqscan;
+DROP TABLE cs_reg;
+DROP FUNCTION cs_adql(text);
+-- the range rewrite's waste gate declines in favour of a GiST-family index on
+-- the position; with none there is nothing to decline for, and the rewrite
+-- stays (here the gate is forced to trigger)
+SET skycell.rewrite_max_waste = 0;
+EXPLAIN (COSTS OFF)
+SELECT count(*) FROM cs_cat WHERE point('ICRS', ra, dec) <@ polygon('ICRS', 10, 20, 12, 20, 12, 22, 10, 22);
+CREATE INDEX cs_cat_spg ON cs_cat USING spgist (point('ICRS', ra, dec) skypos_spgist_ops);
+EXPLAIN (COSTS OFF)
+SELECT count(*) FROM cs_cat WHERE point('ICRS', ra, dec) <@ polygon('ICRS', 10, 20, 12, 20, 12, 22, 10, 22);
+DROP INDEX cs_cat_spg;
+RESET skycell.rewrite_max_waste;
+DROP TABLE cs_dprobe;
 -- the first query of a session: distance()'s support function loads the
 -- library while the comparison is planned, in time for the cone
 \c
