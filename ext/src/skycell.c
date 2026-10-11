@@ -125,39 +125,20 @@ _PG_init(void)
 							NULL, &skycell_join_slots, 4, 1, MAX_SLOTS,
 							PGC_USERSET, 0, NULL, NULL, NULL);
 	DefineCustomRealVariable("skycell.rewrite_max_waste",
-							 "Decline the B-tree range rewrite for a constant region when the "
-							 "covering's own cost model expects more than this many rows to be "
-							 "fetched and then rejected by the exact test (cov.exp_rows * "
-							 "(1 - sel)), scaled by how much of the relation is expected to be "
-							 "cache-resident (see rewrite_waste_threshold(): this value applies "
-							 "as-is when the whole relation fits in the shared buffer pool "
-							 "(NBuffers), and scales up as it doesn't, since that same wasted "
-							 "CPU work is cheap once I/O, not CPU, is the bottleneck -- measured "
-							 "directly in GIST_REGION_DESIGN.md's 'Round forty-four', not "
-							 "assumed). A covering's overshoot is cheap in absolute rows at small "
-							 "radii and expensive at large ones when cache-resident; past this "
-							 "many wasted rows, leaving the original <@/@> clause unrewritten lets "
-							 "the planner cost a GiST-family index (skypos_spgist_ops, or an "
-							 "experimental opclass) against it instead, if one exists -- see "
-							 "GIST_REGION_DESIGN.md's 'Round forty-three' for the warm-cache "
-							 "crossover this value was tuned from. Set this very high to recover "
-							 "the always-rewrite behaviour every version before this one had.",
-							 NULL, &skycell_rewrite_max_waste, 100.0, 0.0, 1e12,
+							 "Decline the B-tree range rewrite of a constant region when the "
+							 "covering is expected to fetch more than this many rows that the "
+							 "exact test then rejects, if a GiST or SP-GiST index on the "
+							 "position can answer the query instead.",
+							 "The threshold is scaled up for a relation larger than "
+							 "shared_buffers, where wasted rows cost less relative to I/O "
+							 "(bounded by skycell.rewrite_waste_scale_cap). Without such an "
+							 "index the rewrite is always kept.",
+							 &skycell_rewrite_max_waste, 100.0, 0.0, 1e12,
 							 PGC_USERSET, 0, NULL, NULL, NULL);
 	DefineCustomRealVariable("skycell.rewrite_waste_scale_cap",
-							 "Upper bound, as a multiple of skycell.rewrite_max_waste, on how far "
-							 "rewrite_waste_threshold() may scale the gate up for a relation far "
-							 "bigger than the shared buffer pool. The scaling itself only prices "
-							 "in the exact-test's wasted CPU rows getting cheaper as I/O comes to "
-							 "dominate -- it has no term for the rewrite's own page count, which "
-							 "GIST_REGION_DESIGN.md's 'Round forty-five' measured growing faster "
-							 "than a GiST-family alternative's at the largest radii on a table "
-							 "whose rows are not physically ordered by cell, even cold. Left "
-							 "unbounded, a deployment with a small enough buffer pool relative to "
-							 "the table could scale past that radius's own waste estimate and force "
-							 "the rewrite exactly where this was measured to lose. This caps the "
-							 "scaling before that point without touching small-to-mid radii, where "
-							 "scaling up was measured correct even cold.",
+							 "Upper bound, as a multiple of skycell.rewrite_max_waste, on how "
+							 "far that threshold is scaled up for a relation larger than "
+							 "shared_buffers.",
 							 NULL, &skycell_rewrite_waste_scale_cap, 10.0, 1.0, 1e12,
 							 PGC_USERSET, 0, NULL, NULL, NULL);
 	DefineCustomBoolVariable("skycell.use_stats",
@@ -174,28 +155,17 @@ _PG_init(void)
 							 NULL, &skycell_exact_cells, true,
 							 PGC_USERSET, 0, NULL, NULL, NULL);
 	DefineCustomIntVariable("skycell.probe_orders",
-							"Orders past the closed-form choice to score on the covering "
-							"they actually produce (0, the default, disables: see the "
-							"comment in cover.c -- this helps execution time but its own "
-							"enumeration cost is paid at plan time on every distinct query, "
-							"which GIST_REGION_DESIGN.md's probe-loop decoupling round found "
-							"erases or reverses the gain, radius-dependently, once total "
-							"plan+exec time is measured honestly rather than execution time "
-							"alone).",
-							NULL, &skycell_probe_orders, 0, 0, 8,
+							"Experimental: also score this many HEALPix orders past the cost "
+							"model's choice on the covering each produces, and keep the "
+							"cheapest (0 = off).",
+							"It can lower execution time, but the extra coverings are "
+							"computed at plan time for every query, which usually costs more "
+							"than it saves.",
+							&skycell_probe_orders, 0, 0, 8,
 							PGC_USERSET, 0, NULL, NULL, NULL);
 	DefineCustomRealVariable("skycell.probe_split_cost",
-							 "Cost charged per cell examined by the order-probe loop "
-							 "(skycell.probe_orders), in rows. Separate from "
-							 "skycell.split_cost, which prices the unrelated descent's own "
-							 "split/keep decision: sharing one field between them meant "
-							 "calibrating it for the probe loop also detuned the descent's "
-							 "SC_PROBE_MIN early-exit guard (see GIST_REGION_DESIGN.md's "
-							 "probe-loop decoupling round). Default 1.0, matching "
-							 "skycell.split_cost's own default -- inert while "
-							 "skycell.probe_orders = 0, and not yet separately calibrated "
-							 "for when it isn't: the decoupling is this GUC's point, not a "
-							 "measured tuning recommendation.",
+							 "Cost, in rows, charged per cell examined by the order probe "
+							 "(skycell.probe_orders); no effect while that is 0.",
 							 NULL, &skycell_probe_split_cost, 1.0, 0.0, 1e9,
 							 PGC_USERSET, 0, NULL, NULL, NULL);
 	DefineCustomIntVariable("skycell.force_order",

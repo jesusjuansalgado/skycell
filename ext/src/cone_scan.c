@@ -1586,12 +1586,12 @@ void
 cone_scan_init(void)
 {
 	DefineCustomBoolVariable("skycell.custom_scan",
-							 "Answer constant cones with skycell's own scan node instead of "
-							 "rewriting them into B-tree range conditions.",
+							 "Answer cones and cross-matches with skycell's own scan node "
+							 "instead of rewriting them into B-tree range conditions.",
 							 "The planner sees one clause and one path, instead of building "
 							 "and estimating a path per range; the scan walks the ranges in "
 							 "cell order, or through a TID bitmap when the heap is not "
-							 "ordered by cell.",
+							 "ordered by cell. Off restores the rewrite.",
 							 &skycell_custom_scan, true,
 							 PGC_USERSET, 0, NULL, NULL, NULL);
 	RegisterCustomScanMethods(&cone_scan_methods);
