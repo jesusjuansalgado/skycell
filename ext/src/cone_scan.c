@@ -59,6 +59,7 @@
 #include "nodes/nodeFuncs.h"
 #include "nodes/tidbitmap.h"
 #include "optimizer/cost.h"
+#include "optimizer/plancat.h"
 #include "optimizer/planner.h"
 #include "optimizer/optimizer.h"
 #include "optimizer/pathnode.h"
@@ -510,6 +511,21 @@ plain_column(Node *n)
 		t == INT2OID || t == INT4OID || t == INT8OID;
 }
 
+/*
+ * A centre coordinate the sample can read: a plain column, or one inside the
+ * CASE that guards the centre of a cone added for distance() (guard_centre()
+ * in adql.c), whose first branch is the column itself. The sample evaluates
+ * the expression as written, so a row the guard turns to NULL is skipped.
+ */
+static bool
+centre_column(Node *n)
+{
+	if (IsA(n, CaseExpr) && ((CaseExpr *) n)->arg == NULL &&
+		list_length(((CaseExpr *) n)->args) >= 1)
+		n = (Node *) ((CaseWhen *) linitial(((CaseExpr *) n)->args))->result;
+	return plain_column(n);
+}
+
 static bool
 sampleable_rel(PlannerInfo *root, int varno, RangeTblEntry **rte)
 {
@@ -575,7 +591,7 @@ join_cone_sample(PlannerInfo *root, List *args, const sc_density *dens, join_est
 	bool		ok = true;
 
 	/* centre and radius: plain columns of one table; cell, ra, dec: of another */
-	if (!plain_column(list_nth(args, 3)) || !plain_column(list_nth(args, 4)) ||
+	if (!centre_column(list_nth(args, 3)) || !centre_column(list_nth(args, 4)) ||
 		!(rconst ? !((Const *) rarg)->constisnull : plain_column(rarg)) ||
 		!plain_column(lsecond(args)) || !plain_column(lthird(args)))
 		return false;
@@ -744,6 +760,28 @@ static struct
 }			est_cache[EST_CACHE];
 static int	est_next = 0;
 static planner_hook_type prev_planner_hook = NULL;
+
+static get_relation_info_hook_type prev_get_relation_info_hook = NULL;
+static PlannerInfo *distances_root = NULL;
+static uint64 distances_gen = 0;
+
+/*
+ * A query level's first relation is looked up after its quals are simplified
+ * and before they are distributed: the moment to add the cones that make
+ * distance comparisons indexable (skycell_index_distances() in adql.c).
+ */
+static void
+cone_get_relation_info(PlannerInfo *root, Oid relid, bool inhparent, RelOptInfo *rel)
+{
+	if (prev_get_relation_info_hook)
+		prev_get_relation_info_hook(root, relid, inhparent, rel);
+	if (skycell_custom_scan && (root != distances_root || plan_generation != distances_gen))
+	{
+		distances_root = root;
+		distances_gen = plan_generation;
+		skycell_index_distances(root);
+	}
+}
 
 static PlannedStmt *
 cone_planner(Query *parse, const char *query_string, int cursorOptions, ParamListInfo boundParams)
@@ -1560,4 +1598,6 @@ cone_scan_init(void)
 	planner_hook = cone_planner;
 	prev_set_rel_pathlist_hook = set_rel_pathlist_hook;
 	set_rel_pathlist_hook = cone_set_rel_pathlist;
+	prev_get_relation_info_hook = get_relation_info_hook;
+	get_relation_info_hook = cone_get_relation_info;
 }

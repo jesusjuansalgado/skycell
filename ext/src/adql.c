@@ -23,6 +23,8 @@
 #include <math.h>
 
 #include "access/stratnum.h"
+#include "catalog/pg_language_d.h"
+#include "catalog/pg_proc.h"
 #include "catalog/pg_opfamily_d.h"
 #include "catalog/pg_type_d.h"
 #include "fmgr.h"
@@ -31,10 +33,15 @@
 #include "nodes/nodeFuncs.h"
 #include "nodes/supportnodes.h"
 #include "optimizer/optimizer.h"
+#include "parser/parse_coerce.h"
+#include "rewrite/rewriteManip.h"
 #include "utils/array.h"
 #include "utils/builtins.h"
+#include "utils/float.h"
+#include "utils/fmgroids.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
+#include "utils/syscache.h"
 
 #include "cover.h"
 #include "skycell_internal.h"
@@ -1060,6 +1067,26 @@ circle_args(Oid funcid, Node *rg)
 	return list_length(c) == 3 ? c : NIL;
 }
 
+/* V for coord1(V), coord2(V) of one stored skypos column, else NULL */
+static Var *
+stored_pos(Node *ra, Node *dec)
+{
+	FuncExpr   *f1 = (FuncExpr *) ra,
+			   *f2 = (FuncExpr *) dec;
+	char	   *n1,
+			   *n2;
+
+	if (!IsA(ra, FuncExpr) || !IsA(dec, FuncExpr) ||
+		list_length(f1->args) != 1 || list_length(f2->args) != 1 ||
+		!IsA(linitial(f1->args), Var) || !equal(linitial(f1->args), linitial(f2->args)))
+		return NULL;
+	n1 = get_func_name(f1->funcid);
+	n2 = get_func_name(f2->funcid);
+	if (n1 == NULL || n2 == NULL || strcmp(n1, "coord1") != 0 || strcmp(n2, "coord2") != 0)
+		return NULL;
+	return (Var *) copyObject(linitial(f1->args));
+}
+
 /*
  * "Point A lies in a circle of radius r around B" is the same condition as
  * "B lies in a circle of radius r around A": it is a distance below r. ADQL
@@ -1080,8 +1107,8 @@ want_swap(SupportRequestSimplify *req, Oid funcid, Node *pt, Node *rg,
 	Node	   *ra,
 			   *dec,
 			   *cell1,
-			   *cell2;
-	FuncExpr   *newpt;
+			   *cell2,
+			   *newpt;
 	sc_density	d1,
 				d2;
 	Oid			statrel;
@@ -1097,10 +1124,12 @@ want_swap(SupportRequestSimplify *req, Oid funcid, Node *pt, Node *rg,
 	if (single_varno(pt) == cv || !pos_ra_dec(funcid, pt, &ra, &dec))
 		return false;
 
-	newpt = makeFuncExpr(lookup_sibling_func(funcid, "point", 2, ff), exprType(pt),
-						 list_make2(copyObject(linitial(c)), copyObject(lsecond(c))),
-						 InvalidOid, InvalidOid, COERCE_EXPLICIT_CALL);
-	cell2 = cell_expr_for_point(funcid, (Node *) newpt);
+	newpt = (Node *) stored_pos(linitial(c), lsecond(c));
+	if (newpt == NULL)
+		newpt = (Node *) makeFuncExpr(lookup_sibling_func(funcid, "point", 2, ff), exprType(pt),
+									  list_make2(copyObject(linitial(c)), copyObject(lsecond(c))),
+									  InvalidOid, InvalidOid, COERCE_EXPLICIT_CALL);
+	cell2 = cell_expr_for_point(funcid, newpt);
 	if (cell2 == NULL || !density_for_expr(req->root, cell2, &d2, &statrel, &cell_ops))
 		return false;
 	cell1 = cell_expr_for_point(funcid, pt);
@@ -1108,7 +1137,7 @@ want_swap(SupportRequestSimplify *req, Oid funcid, Node *pt, Node *rg,
 		d1.ntotal >= d2.ntotal)
 		return false;
 
-	*pt2 = (Node *) newpt;
+	*pt2 = newpt;
 	*rg2 = eval_const_expressions(req->root,
 								  (Node *) makeFuncExpr(lookup_sibling_func(funcid, "circle", 3, fff),
 														exprType(rg),
@@ -1121,20 +1150,155 @@ want_swap(SupportRequestSimplify *req, Oid funcid, Node *pt, Node *rg,
 static Node *region_simplify_oriented(SupportRequestSimplify *req, Oid funcid,
 									  Node *pt, Node *rg);
 
+/*
+ * The parse location that marks a point or circle built by
+ * skycell_index_distances() below rather than written by the user.
+ * PostgreSQL copies a node's location through every rewrite of it, and
+ * real locations are offsets into the query text (or -1).
+ */
+#define INJECTED_LOCATION (-0x5c11)	/* from distance(skypos, skypos) */
+#define INJECTED_RAW_LOCATION (-0x5c12) /* from distance(ra1, dec1, ra2, dec2) */
+
+static int
+node_location(Node *n)
+{
+	if (IsA(n, FuncExpr))
+		return ((FuncExpr *) n)->location;
+	if (IsA(n, Var))
+		return ((Var *) n)->location;
+	if (IsA(n, Const))
+		return ((Const *) n)->location;
+	return -1;
+}
+
+static bool
+injected(Node *n)
+{
+	int			loc = node_location(n);
+
+	return loc == INJECTED_LOCATION || loc == INJECTED_RAW_LOCATION;
+}
+
+static void
+mark_injected(Node *n, bool raw)
+{
+	int			loc = raw ? INJECTED_RAW_LOCATION : INJECTED_LOCATION;
+
+	if (IsA(n, FuncExpr))
+		((FuncExpr *) n)->location = loc;
+	else if (IsA(n, Var))
+		((Var *) n)->location = loc;
+	else if (IsA(n, Const))
+		((Const *) n)->location = loc;
+}
+
+static Node *
+f8call(Oid fn, Oid rettype, List *args)
+{
+	return (Node *) makeFuncExpr(fn, rettype, args, InvalidOid, InvalidOid, COERCE_EXPLICIT_CALL);
+}
+
+static Node *
+case_f8(Node *when1, Node *then1, Node *when2, Node *then2)
+{
+	CaseExpr   *c = makeNode(CaseExpr);
+	CaseWhen   *w1 = makeNode(CaseWhen),
+			   *w2 = makeNode(CaseWhen);
+
+	w1->expr = (Expr *) when1;
+	w1->result = (Expr *) then1;
+	w1->location = -1;
+	w2->expr = (Expr *) when2;
+	w2->result = (Expr *) then2;
+	w2->location = -1;
+	c->casetype = FLOAT8OID;
+	c->casecollid = InvalidOid;
+	c->args = list_make2(w1, w2);
+	c->defresult = (Expr *) makeNullConst(FLOAT8OID, -1, InvalidOid);
+	c->location = -1;
+	return (Node *) c;
+}
+
+/*
+ * The centre of a cone added for distance(ra1, dec1, ra2, dec2) comes from
+ * raw columns, which the cone would reject where distance() does not: a
+ * declination past a pole is still a direction to distance()'s vectors, and a
+ * NaN or an infinity is a NaN distance, which nothing is below. So the
+ * centre passes through when it is on the sphere, a finite one off it becomes
+ * the direction distance() takes it as, and a non-finite one becomes NULL,
+ * a cone that matches nothing.
+ */
+static void
+guard_centre(List *cone_args)
+{
+	ListCell   *lra = list_nth_cell(cone_args, 3),
+			   *ldec = list_nth_cell(cone_args, 4);
+	Node	   *ra = lfirst(lra),
+			   *dec = lfirst(ldec),
+			   *inf = (Node *) float8_const(get_float8_infinity()),
+			   *ninf = (Node *) float8_const(-get_float8_infinity()),
+			   *finite,
+			   *onsky,
+			   *cosdec;
+
+	if (IsA(ra, Const) && IsA(dec, Const))
+		return;
+	finite = (Node *) makeBoolExpr(AND_EXPR,
+								   list_make4(f8call(F_FLOAT8GT, BOOLOID, list_make2(copyObject(ra), copyObject(ninf))),
+											  f8call(F_FLOAT8LT, BOOLOID, list_make2(copyObject(ra), copyObject(inf))),
+											  f8call(F_FLOAT8GT, BOOLOID, list_make2(copyObject(dec), copyObject(ninf))),
+											  f8call(F_FLOAT8LT, BOOLOID, list_make2(copyObject(dec), copyObject(inf)))), -1);
+	onsky = (Node *) makeBoolExpr(AND_EXPR,
+								  list_make4(f8call(F_FLOAT8GT, BOOLOID, list_make2(copyObject(ra), copyObject(ninf))),
+											 f8call(F_FLOAT8LT, BOOLOID, list_make2(copyObject(ra), copyObject(inf))),
+											 f8call(F_FLOAT8GE, BOOLOID, list_make2(copyObject(dec), float8_const(-90.0))),
+											 f8call(F_FLOAT8LE, BOOLOID, list_make2(copyObject(dec), float8_const(90.0)))), -1);
+	cosdec = f8call(F_COSD, FLOAT8OID, list_make1(copyObject(dec)));
+	lfirst(ldec) = case_f8(onsky, copyObject(dec), finite,
+						   f8call(F_ATAN2D, FLOAT8OID,
+								  list_make2(f8call(F_SIND, FLOAT8OID, list_make1(copyObject(dec))),
+											 f8call(F_FLOAT8ABS, FLOAT8OID, list_make1(cosdec)))));
+	lfirst(lra) = case_f8(copyObject(onsky), copyObject(ra), copyObject(finite),
+						  f8call(F_ATAN2D, FLOAT8OID,
+								 list_make2(f8call(F_FLOAT8MUL, FLOAT8OID,
+												   list_make2(copyObject(cosdec),
+															  f8call(F_SIND, FLOAT8OID, list_make1(copyObject(ra))))),
+											f8call(F_FLOAT8MUL, FLOAT8OID,
+												   list_make2(copyObject(cosdec),
+															  f8call(F_COSD, FLOAT8OID, list_make1(copyObject(ra))))))));
+}
+
 static Node *
 region_support_simplify(SupportRequestSimplify *req, Oid funcid, Node *pt, Node *rg)
 {
 	Node	   *pt2,
-			   *rg2;
+			   *rg2,
+			   *res = NULL;
 
 	if (req->root != NULL && want_swap(req, funcid, pt, rg, &pt2, &rg2))
-	{
-		Node	   *res = region_simplify_oriented(req, funcid, pt2, rg2);
+		res = region_simplify_oriented(req, funcid, pt2, rg2);
+	if (res == NULL)
+		res = region_simplify_oriented(req, funcid, pt, rg);
 
-		if (res != NULL)
-			return res;
+	/*
+	 * A cone added for a distance comparison is only there to reach an index:
+	 * the comparison itself stays in the query and decides. So it is kept
+	 * only as the custom scan's skycell_cone, and dropped otherwise rather
+	 * than evaluated per row, where its point() and circle() would reject
+	 * coordinates that distance() accepts.
+	 */
+	if (req->root != NULL && (injected(pt) || injected(rg)))
+	{
+		char	   *name = (res != NULL && IsA(res, FuncExpr)) ?
+			get_func_name(((FuncExpr *) res)->funcid) : NULL;
+
+		if (name == NULL || strcmp(name, "skycell_cone") != 0)
+			res = (Node *) makeBoolConst(true, false);
+		else if (node_location(pt) == INJECTED_RAW_LOCATION ||
+				 node_location(rg) == INJECTED_RAW_LOCATION)
+			guard_centre(((FuncExpr *) res)->args);
 	}
-	return region_simplify_oriented(req, funcid, pt, rg);
+	return res;
 }
 
 static Node *
@@ -1725,4 +1889,290 @@ skycell_region_covered_by_sel(PG_FUNCTION_ARGS)
 		PG_RETURN_FLOAT8(1e-4);
 	(void) node_angles(fcinfo->flinfo->fn_oid, root, (Node *) linitial(args), &contained, &ncontained);
 	PG_RETURN_FLOAT8(combine_angles_avg(container, ncontainer, contained, ncontained, true));
+}
+
+/*
+ * ADQL's other spelling of a cone or a cross-match, DISTANCE(p1, p2) < r, is
+ * a comparison of two float8s: the support function PostgreSQL consults is
+ * the float type's, so none of skycell's ever sees it.  So before a query
+ * level's quals become RestrictInfos, skycell_index_distances() adds next to
+ * every top-level `distance(p1, p2) < r` of a WHERE or JOIN ON (also <=,
+ * r > distance(...), the four-coordinate form and skycell_dist) the cone
+ * `p1 <@ circle(p2, r')`, with r' a hair larger than r, which
+ * region_support_simplify() plans as the
+ * cone, either way round, exactly as a written one.  The comparison stays
+ * and decides: the haversine of the cone's test and distance()'s vector
+ * angle may round apart at the edge, and `<` is not `<=`.  The cone is
+ * marked (INJECTED_LOCATION) so that it is kept only as the custom scan's.
+ */
+static bool
+is_distance_func(Oid fn)
+{
+	HeapTuple	tup = SearchSysCache1(PROCOID, ObjectIdGetDatum(fn));
+	Form_pg_proc p;
+	bool		res = false;
+
+	if (!HeapTupleIsValid(tup))
+		return false;
+	p = (Form_pg_proc) GETSTRUCT(tup);
+	if (p->prolang == ClanguageId && p->prorettype == FLOAT8OID)
+	{
+		bool		isnull;
+		Datum		src = SysCacheGetAttr(PROCOID, tup, Anum_pg_proc_prosrc, &isnull);
+		Datum		bin;
+		bool		binnull;
+
+		bin = SysCacheGetAttr(PROCOID, tup, Anum_pg_proc_probin, &binnull);
+		if (!isnull && !binnull && strstr(TextDatumGetCString(bin), "skycell") != NULL)
+		{
+			char	   *s = TextDatumGetCString(src);
+
+			res = strcmp(s, "skycell_distance") == 0 || strcmp(s, "skycell_dist") == 0;
+		}
+	}
+	ReleaseSysCache(tup);
+	return res;
+}
+
+/* a position the cone machinery reads: a column, a constant or point(...) */
+static bool
+plain_pos(Oid funcid, Node *p)
+{
+	char	   *name;
+
+	if (IsA(p, Var) || IsA(p, Const))
+		return true;
+	if (!IsA(p, FuncExpr) || get_func_namespace(((FuncExpr *) p)->funcid) != get_func_namespace(funcid))
+		return false;
+	name = get_func_name(((FuncExpr *) p)->funcid);
+	return name != NULL && (strcmp(name, "point") == 0 || strcmp(name, "skycell_point") == 0);
+}
+
+/* false for constant coordinates point() would reject at plan time */
+static bool
+valid_const_pos(Node *ra, Node *dec)
+{
+	if (IsA(ra, Const) && !((Const *) ra)->constisnull &&
+		!isfinite(DatumGetFloat8(((Const *) ra)->constvalue)))
+		return false;
+	if (IsA(dec, Const) && !((Const *) dec)->constisnull)
+	{
+		double		d = DatumGetFloat8(((Const *) dec)->constvalue);
+
+		if (!(d >= -90.0 && d <= 90.0))
+			return false;
+	}
+	return true;
+}
+
+/* the cone to add next to a distance comparison, else NULL */
+static Node *
+distance_cone(Node *qual)
+{
+	Oid			ff[2] = {FLOAT8OID, FLOAT8OID};
+	Oid			fff[3] = {FLOAT8OID, FLOAT8OID, FLOAT8OID};
+	Oid			types[2];
+	OpExpr	   *op = (OpExpr *) qual;
+	FuncExpr   *f;
+	Node	   *d,
+			   *r,
+			   *pt,
+			   *ra2,
+			   *dec2,
+			   *radius;
+	FuncExpr   *circ;
+	Oid			opfn,
+				circle_oid;
+	int			v1,
+				v2;
+
+	if (!IsA(qual, OpExpr) || list_length(op->args) != 2)
+		return NULL;
+	opfn = OidIsValid(op->opfuncid) ? op->opfuncid : get_opcode(op->opno);
+	switch (opfn)
+	{
+		case F_FLOAT8LT:
+		case F_FLOAT8LE:
+		case F_FLOAT84LT:
+		case F_FLOAT84LE:
+			d = linitial(op->args);
+			r = lsecond(op->args);
+			break;
+		case F_FLOAT8GT:
+		case F_FLOAT8GE:
+		case F_FLOAT48GT:
+		case F_FLOAT48GE:
+			d = lsecond(op->args);
+			r = linitial(op->args);
+			break;
+		default:
+			return NULL;
+	}
+	if (!IsA(d, FuncExpr) || !is_distance_func(((FuncExpr *) d)->funcid) ||
+		contain_volatile_functions(qual) || checkExprHasSubLink(qual))
+		return NULL;
+	f = (FuncExpr *) d;
+
+	if (list_length(f->args) == 4)
+	{
+		Node	   *ra1 = linitial(f->args),
+				   *dec1 = lsecond(f->args);
+		Oid			point_oid = lookup_sibling_func(f->funcid, "point", 2, ff);
+
+		ra2 = lthird(f->args);
+		dec2 = lfourth(f->args);
+		if (!valid_const_pos(ra1, dec1) || !valid_const_pos(ra2, dec2))
+			return NULL;
+		pt = (Node *) makeFuncExpr(point_oid, get_func_rettype(point_oid),
+								   list_make2(copyObject(ra1), copyObject(dec1)),
+								   InvalidOid, InvalidOid, COERCE_EXPLICIT_CALL);
+	}
+	else if (list_length(f->args) == 2)
+	{
+		if (!plain_pos(f->funcid, linitial(f->args)) || !plain_pos(f->funcid, lsecond(f->args)) ||
+			!pos_ra_dec(f->funcid, lsecond(f->args), &ra2, &dec2))
+			return NULL;
+		pt = copyObject(linitial(f->args));
+	}
+	else
+		return NULL;
+
+	/* one side a relation's row, the other a constant or another relation's */
+	v1 = single_varno(pt);
+	v2 = single_varno((Node *) list_make2(ra2, dec2));
+	if (v1 < 0 || v2 < 0 || v1 == v2)
+		return NULL;
+
+	/* r' = least(r * (1 + 1e-9) + 1e-12, 180): NULL and NaN become the sky */
+	r = copyObject(r);
+	if (exprType(r) != FLOAT8OID)
+	{
+		r = coerce_to_target_type(NULL, r, exprType(r), FLOAT8OID, -1,
+								  COERCION_IMPLICIT, COERCE_IMPLICIT_CAST, -1);
+		if (r == NULL)
+			return NULL;
+	}
+	r = (Node *) makeFuncExpr(F_FLOAT8MUL, FLOAT8OID, list_make2(r, float8_const(1.0 + 1e-9)),
+							  InvalidOid, InvalidOid, COERCE_EXPLICIT_CALL);
+	r = (Node *) makeFuncExpr(F_FLOAT8PL, FLOAT8OID, list_make2(r, float8_const(1e-12)),
+							  InvalidOid, InvalidOid, COERCE_EXPLICIT_CALL);
+	{
+		MinMaxExpr *least = makeNode(MinMaxExpr);
+
+		least->minmaxtype = FLOAT8OID;
+		least->op = IS_LEAST;
+		least->args = list_make2(r, float8_const(180.0));
+		least->location = -1;
+		radius = (Node *) least;
+	}
+
+	circle_oid = lookup_sibling_func(f->funcid, "circle", 3, fff);
+	circ = makeFuncExpr(circle_oid, get_func_rettype(circle_oid),
+						list_make3(copyObject(ra2), copyObject(dec2), radius),
+						InvalidOid, InvalidOid, COERCE_EXPLICIT_CALL);
+	mark_injected(pt, list_length(f->args) == 4);
+	mark_injected((Node *) circ, list_length(f->args) == 4);
+	types[0] = exprType(pt);
+	types[1] = exprType((Node *) circ);
+	return (Node *) makeFuncExpr(lookup_sibling_func(f->funcid, "skycell_pos_in_region", 2, types),
+								 BOOLOID, list_make2(pt, circ),
+								 InvalidOid, InvalidOid, COERCE_EXPLICIT_CALL);
+}
+
+/*
+ * Add the cones to one WHERE or JOIN ON.  By now its quals are an implicit-AND
+ * list that preprocess_expression() has simplified, so each added cone is
+ * simplified here, with the quals in place for the support function to find
+ * it as a top-level term (cone_scan_keep_as()); one that does not become the
+ * custom scan's comes back as true and is left out.
+ */
+static void
+add_distance_cones(PlannerInfo *root, Node **quals)
+{
+	List	   *conj,
+			   *kept = NIL;
+	ListCell   *lc;
+	int			norig;
+	bool		was_list;
+
+	if (*quals == NULL)
+		return;
+	was_list = IsA(*quals, List);
+	conj = was_list ? list_copy((List *) *quals) : make_ands_implicit((Expr *) *quals);
+	norig = list_length(conj);
+	foreach(lc, list_copy(conj))
+	{
+		Node	   *cone = distance_cone(lfirst(lc));
+
+		if (cone != NULL)
+			conj = lappend(conj, cone);
+	}
+	if (list_length(conj) == norig)
+		return;
+	*quals = was_list ? (Node *) conj : (Node *) make_ands_explicit(conj);
+	for (int i = norig; i < list_length(conj); i++)
+	{
+		ListCell   *cell = list_nth_cell(conj, i);
+
+		lfirst(cell) = eval_const_expressions(root, lfirst(cell));
+	}
+	foreach(lc, conj)
+	{
+		Node	   *q = lfirst(lc);
+
+		if (foreach_current_index(lc) >= norig && IsA(q, Const) &&
+			!((Const *) q)->constisnull && DatumGetBool(((Const *) q)->constvalue))
+			continue;
+		kept = lappend(kept, q);
+	}
+	*quals = was_list ? (Node *) kept : (Node *) make_ands_explicit(kept);
+}
+
+static void
+distance_jointree(PlannerInfo *root, Node *jt)
+{
+	ListCell   *lc;
+
+	if (jt == NULL)
+		return;
+	if (IsA(jt, FromExpr))
+	{
+		FromExpr   *f = (FromExpr *) jt;
+
+		add_distance_cones(root, &f->quals);
+		foreach(lc, f->fromlist)
+			distance_jointree(root, lfirst(lc));
+	}
+	else if (IsA(jt, JoinExpr))
+	{
+		JoinExpr   *j = (JoinExpr *) jt;
+
+		/* a FULL JOIN's ON must stay merge- or hash-joinable */
+		if (j->jointype != JOIN_FULL)
+			add_distance_cones(root, &j->quals);
+		distance_jointree(root, j->larg);
+		distance_jointree(root, j->rarg);
+	}
+}
+
+/*
+ * Called once per query level from get_relation_info_hook: after the quals
+ * are simplified, before they are split into RestrictInfos.
+ */
+void
+skycell_index_distances(PlannerInfo *root)
+{
+	distance_jointree(root, (Node *) root->parse->jointree);
+}
+
+/*
+ * The support function of distance() and skycell_dist(): nothing to
+ * simplify, but being called while the query is planned loads the library,
+ * so its hooks are in place by the time skycell_index_distances() runs.
+ */
+PG_FUNCTION_INFO_V1(skycell_distance_support);
+Datum
+skycell_distance_support(PG_FUNCTION_ARGS)
+{
+	PG_RETURN_POINTER(NULL);
 }
