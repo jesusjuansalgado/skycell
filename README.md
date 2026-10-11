@@ -35,7 +35,11 @@ stay within 1.3× of the truth where pgSphere's are off by up to 8.7×.
 The interface is ADQL's. The functions carry ADQL's own names (`CONTAINS`,
 `POINT`, `CIRCLE`, `POLYGON`, …), and `point <@ circle`, the indexable form of
 `1 = CONTAINS(…)`, runs through the same scan as skycell's native functions,
-cross-matches included. Stored regions read and write as IVOA STC-S, and one
+cross-matches included. It works whichever way round the query is written: a
+constant point inside a circle around each row is planned as the cone around
+that point, and a cross-match probes the larger indexed table whichever side is
+the point and whichever the circle. With pgSphere and Q3C the reversed form is a
+full table scan, or a cross-match that probes the wrong table. Stored regions read and write as IVOA STC-S, and one
 column can hold circles and polygons together.
 
 The numbers come from randomized paired trials on PostgreSQL 18.6, on 10M-row

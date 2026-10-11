@@ -206,6 +206,28 @@ SELECT count(*) FROM cs_probe p JOIN cs_cat c ON point('ICRS', c.ra, c.dec) <@ c
 -- the coordinate system is still checked, at plan time
 SELECT count(*) FROM cs_cat WHERE point('ICRS', ra, dec) <@ circle('GALACTIC', 10, 20, 1);
 SELECT count(*) FROM cs_probe p JOIN cs_cat c ON point('FK4', c.ra, c.dec) <@ circle('ICRS', p.ra, p.dec, 0.3);
+-- with both sides indexed, a cross-match probes the larger relation (cs_cat)
+-- whichever side is written as the point and whichever as the circle
+CREATE INDEX cs_probe_expr ON cs_probe (skycell_ang2cell(ra, dec));
+ANALYZE cs_probe;
+CREATE FUNCTION cs_probed(q text, OUT probed text, OUT result text)
+LANGUAGE plpgsql AS $$
+DECLARE l text;
+BEGIN
+  FOR l IN EXECUTE 'EXPLAIN (COSTS OFF) ' || q LOOP
+    probed := coalesce(probed, substring(l from 'SkycellCone\) on (\w+)'));
+  END LOOP;
+  EXECUTE 'SELECT (' || q || ')::text' INTO result;
+END $$;
+SELECT t.name, (cs_probed(t.q)).* FROM (VALUES
+  ('p(cat) <@ c(probe)', 'SELECT count(*) || '':'' || sum(c.id) FROM cs_probe p JOIN cs_cat c ON point(''ICRS'', c.ra, c.dec) <@ circle(''ICRS'', p.ra, p.dec, 0.3)'),
+  ('p(probe) <@ c(cat)', 'SELECT count(*) || '':'' || sum(c.id) FROM cs_probe p JOIN cs_cat c ON point(''ICRS'', p.ra, p.dec) <@ circle(''ICRS'', c.ra, c.dec, 0.3)'),
+  ('c(probe) @> p(cat)', 'SELECT count(*) || '':'' || sum(c.id) FROM cs_cat c, cs_probe p WHERE circle(''ICRS'', p.ra, p.dec, 0.3) @> point(''ICRS'', c.ra, c.dec)'),
+  ('c(cat) @> p(probe)', 'SELECT count(*) || '':'' || sum(c.id) FROM cs_cat c, cs_probe p WHERE circle(''ICRS'', c.ra, c.dec, 0.3) @> point(''ICRS'', p.ra, p.dec)')
+) t(name, q);
+DROP FUNCTION cs_probed(text);
+DROP INDEX cs_probe_expr;
+ANALYZE cs_probe;
 DROP TABLE cs_spos;
 
 -- the join's row estimate: half the probes sit on catalogue sources, which a
