@@ -215,36 +215,12 @@ def _split_args(s: str) -> list[str]:
     return out
 
 
-def _crossmatch_radial(cols: tuple[str, str] | None, region: str, version: str) -> str | None:
-    """skycell_radial_query(...) for a cross-match shape: `cols` a point over a
-    pair of plain columns and `region` a CIRCLE whose centre or radius is not a
-    literal constant -- it comes from another table's row. `<@`'s rewrite
-    (skycell_region_support) gives up outright when the region isn't a
-    compile-time constant, so this would otherwise reach no index at all.
-    skycell_radial_query (Q3C's own argument order) reaches simplify_cone's
-    non-constant branch instead, which still covers with an index, if capped
-    to skycell.join_slots ranges. None if the shape doesn't match -- a literal
-    circle is left alone, since `<@`/`intersects` already reach the same,
-    uncapped covering for that case.
-    """
-    if not cols:
-        return None
-    m = re.fullmatch(r"\s*CIRCLE\s*\((.*)\)\s*", region, re.I | re.S)
-    if not m:
-        return None
-    a = _frame([p.strip() for p in _split_args(m.group(1))], version, "CIRCLE")
-    if len(a) == 3 and not _all_const(a):
-        return f"skycell_radial_query({cols[0]}, {cols[1]}, {a[0]}, {a[1]}, {a[2]})"
-    return None
-
-
 def _crossmatch_poly(cols: tuple[str, str] | None, region: str, version: str) -> str | None:
     """skycell_poly_join(...) for a cross-match shape: `cols` a point over a
     pair of plain columns and `region` a POLYGON whose vertices are not all
     literal constants -- they come from another table's row. The polygon
-    analogue of _crossmatch_radial: `<@`'s rewrite gives up outright on a
-    non-constant region regardless of shape, and skycell_poly_join reaches
-    simplify_poly's non-constant branch instead, capped to skycell.join_slots
+    counterpart of the circle case, which needs no redirect: skycell_poly_join
+    reaches simplify_poly's non-constant branch, capped to skycell.join_slots
     ranges. None if the shape doesn't match -- a literal polygon is left
     alone, since `<@`/`intersects` already reach the same, uncapped covering.
     """
@@ -284,22 +260,53 @@ def _crossmatch_box(cols: tuple[str, str] | None, region: str, version: str) -> 
 
 
 def _crossmatch(cols: tuple[str, str] | None, region: str, version: str) -> str | None:
-    """skycell_radial_query/skycell_poly_join/<@ for whichever cross-match
-    shape `region` is, else None."""
-    return (_crossmatch_radial(cols, region, version)
-            or _crossmatch_poly(cols, region, version)
+    """skycell_poly_join/<@ for a per-row POLYGON or BOX, else None. A per-row
+    CIRCLE needs no redirect: skycell plans `point <@ circle` through its custom
+    scan whichever side the columns are on, so it is emitted as written."""
+    return (_crossmatch_poly(cols, region, version)
             or _crossmatch_box(cols, region, version))
+
+
+def _const_point(inner: str) -> tuple[str, str] | None:
+    """POINT('ICRS', 81.28, -69.78) with literal coordinates -> the pair."""
+    m = re.fullmatch(r"\s*POINT\s*\((.*)\)\s*", inner, re.I | re.S)
+    if not m:
+        return None
+    parts = [p.strip() for p in _split_args(m.group(1))]
+    if parts and parts[0].startswith("'"):
+        parts = parts[1:]
+    return (parts[0], parts[1]) if len(parts) == 2 and _all_const(parts) else None
+
+
+def _reverse_cone(inner: str, outer: str, version: str) -> tuple[str, str] | None:
+    """CONTAINS(POINT(constant), CIRCLE(ra, dec, r)) -- a fixed point inside a
+    circle around each row, as the Gaia archive's examples write cone searches
+    -- is the cone CONTAINS(POINT(ra, dec), CIRCLE(constant, r)): both say the
+    two positions are less than r apart. Rewritten that way so that the indexed
+    columns are the point, which is the side both dialects index. None if the
+    shape doesn't match."""
+    p = _const_point(inner)
+    m = re.fullmatch(r"\s*CIRCLE\s*\((.*)\)\s*", outer, re.I | re.S)
+    if p is None or not m:
+        return None
+    a = _frame([x.strip() for x in _split_args(m.group(1))], version, "CIRCLE")
+    if len(a) != 3 or _all_const(a[:2]):
+        return None
+    return (f"POINT('ICRS', {a[0]}, {a[1]})", f"CIRCLE('ICRS', {p[0]}, {p[1]}, {a[2]})")
 
 
 def _contains(args: list[str], d: Dialect, version: str) -> str:
     if len(args) != 2:
         raise TranslationError("CONTAINS takes two geometries")
     inner, outer = args
+    rev = _reverse_cone(inner, outer, version)
+    if rev is not None:
+        inner, outer = rev
     cols = _is_point_of_columns(inner)
     if d is SKYCELL:
         xm = _crossmatch(cols, outer, version)
         if xm is not None:
-            return xm
+            return xm if xm.startswith("(") else f"({xm})"
         return f"({translate_expr(inner, d, version)} <@ {translate_expr(outer, d, version)})"
     # pgSphere+Q3C: use Q3C when the position is a pair of columns and the region
     # is a circle or polygon, because that is the fast path; otherwise pgSphere.
@@ -310,9 +317,9 @@ def _contains(args: list[str], d: Dialect, version: str) -> str:
         if a and a[0].startswith("'"):
             a = a[1:]
         if kind == "CIRCLE":
-            return f"q3c_radial_query({cols[0]}, {cols[1]}, {a[0]}, {a[1]}, {a[2]})"
-        return (f"q3c_poly_query({cols[0]}, {cols[1]}, "
-                f"ARRAY[{', '.join(a)}]::float8[])")
+            return f"(q3c_radial_query({cols[0]}, {cols[1]}, {a[0]}, {a[1]}, {a[2]}))"
+        return (f"(q3c_poly_query({cols[0]}, {cols[1]}, "
+                f"ARRAY[{', '.join(a)}]::float8[]))")
     return f"({translate_expr(inner, d, version)} <@ {translate_expr(outer, d, version)})"
 
 

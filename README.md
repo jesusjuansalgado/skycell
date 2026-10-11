@@ -316,8 +316,13 @@ all exist there), either install into a schema that precedes it in
 `<@`/`@>` against a circle and a plain `ra`/`dec` (or `skypos`) catalogue go
 through the custom scan, like `skycell_cone`, whether the circle is a constant or
 comes from another table's row (`JOIN cat c ON point('ICRS', c.ra, c.dec) <@
-circle('ICRS', p.ra, p.dec, r)` is a cross-match); against a constant polygon or
-box they go through the B-tree cell rewrite described above. A `skyregion` column with its
+circle('ICRS', p.ra, p.dec, r)` is a cross-match). Either side can be the one
+indexed: a constant point inside a circle drawn around each row, as the Gaia
+archive's examples write cone searches (`point('ICRS', 81.28, -69.78) <@
+circle('ICRS', ra, dec, r)`), is planned as the cone around that point, and a
+cross-match probes whichever table has the index (the larger one if both do).
+Against a constant polygon or box they go through the B-tree cell rewrite
+described above. A `skyregion` column with its
 own GiST index additionally indexes `&&` and both region-region containment
 operators (`@>`/`<@`, in either argument order — they're commutators of each
 other) directly against it, region side non-constant included — what a stored
