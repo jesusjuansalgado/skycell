@@ -367,3 +367,60 @@ DROP VIEW cs_view;
 DROP FUNCTION cs_both(text);
 DROP FUNCTION cs_plan(text);
 DROP TABLE cs_cat, cs_sorted;
+
+-- the index filter: with the position in the cell index (INCLUDE), the scan
+-- tests the cone on each index entry and fetches only the rows inside it.
+-- The rows are the same with the filter on and off, in both modes and for a
+-- cross-match, NULL positions and an updated position included.
+CREATE TABLE cs_fcat AS
+SELECT i AS id,
+       mod(i * 137.50776405003785, 360.0)::float8 AS ra,
+       degrees(asin(1 - 2 * (i + 0.5) / 20000.0)) AS dec
+FROM generate_series(0, 19999) i;
+UPDATE cs_fcat SET ra = NULL WHERE id % 1000 = 7;
+CREATE TABLE cs_fsorted AS SELECT * FROM cs_fcat ORDER BY skycell_ang2cell(ra, dec);
+CREATE INDEX cs_fcat_cov ON cs_fcat ((skycell_ang2cell(ra, dec))) INCLUDE (ra, dec);
+CREATE INDEX cs_fsorted_cov ON cs_fsorted ((skycell_ang2cell(ra, dec))) INCLUDE (ra, dec);
+UPDATE cs_fcat SET ra = ra + 0.5 WHERE id % 50 = 3;
+VACUUM ANALYZE cs_fcat;
+VACUUM ANALYZE cs_fsorted;
+CREATE TABLE cs_fprobe AS
+SELECT id AS pid, ra + 0.0003 AS ra, dec FROM cs_fcat WHERE id % 97 = 0 AND ra IS NOT NULL;
+ANALYZE cs_fprobe;
+CREATE FUNCTION cs_filter(q text, OUT same bool, OUT filtered bool, OUT mode text)
+LANGUAGE plpgsql AS $$
+DECLARE a text; b text; j json;
+BEGIN
+  PERFORM set_config('max_parallel_workers_per_gather', '0', true);
+  PERFORM set_config('skycell.index_filter', 'off', true);
+  EXECUTE 'SELECT (' || q || ')::text' INTO a;
+  PERFORM set_config('skycell.index_filter', 'on', true);
+  EXECUTE 'SELECT (' || q || ')::text' INTO b;
+  EXECUTE 'EXPLAIN (FORMAT JSON) ' || q INTO j;
+  same := a IS NOT DISTINCT FROM b;
+  filtered := j::text ~ '"Index Filter": "ra, dec"';
+  mode := substring(j::text from '"Mode": "([a-z]+)"');
+END $$;
+SELECT * FROM cs_filter($q$SELECT row(count(*), sum(id)) FROM cs_fcat
+  WHERE skycell_cone(skycell_ang2cell(ra, dec), ra, dec, 10, 20, 3)$q$);
+SELECT * FROM cs_filter($q$SELECT row(count(*), sum(id)) FROM cs_fsorted
+  WHERE skycell_cone(skycell_ang2cell(ra, dec), ra, dec, 10, 20, 3)$q$);
+SELECT * FROM cs_filter($q$SELECT row(count(*), sum(id)) FROM cs_fcat
+  WHERE contains(skycell_point(ra, dec), skycell_circle(359.9, 0, 4)) = 1$q$);
+SELECT * FROM cs_filter($q$SELECT row(count(*), sum(id)) FROM cs_fsorted
+  WHERE contains(skycell_point(ra, dec), skycell_circle(0, 89.9, 5)) = 1$q$);
+SELECT * FROM cs_filter($q$SELECT row(count(*), sum(p.pid::int8 * 100000 + c.id)) FROM cs_fprobe p
+  JOIN cs_fcat c ON contains(skycell_point(c.ra, c.dec), skycell_circle(p.ra, p.dec, 0.4)) = 1$q$);
+SELECT * FROM cs_filter($q$SELECT row(count(*), sum(p.pid::int8 * 100000 + c.id)) FROM cs_fprobe p
+  JOIN cs_fsorted c ON contains(skycell_point(c.ra, c.dec), skycell_circle(p.ra, p.dec, 0.4)) = 1$q$);
+-- and against a sequential scan
+SET skycell.custom_scan = off;
+SET enable_indexscan = off;
+SET enable_bitmapscan = off;
+SELECT count(*), sum(id) FROM cs_fcat WHERE skycell_in_cone(ra, dec, 10, 20, 3, -1);
+RESET enable_indexscan;
+RESET enable_bitmapscan;
+RESET skycell.custom_scan;
+SELECT count(*), sum(id) FROM cs_fcat WHERE skycell_cone(skycell_ang2cell(ra, dec), ra, dec, 10, 20, 3);
+DROP FUNCTION cs_filter(text);
+DROP TABLE cs_fprobe, cs_fcat, cs_fsorted;
