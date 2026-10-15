@@ -79,6 +79,7 @@
 #include "skycell_internal.h"
 
 static bool skycell_custom_scan = true;
+static bool skycell_index_filter = true;
 
 /* the six-argument skycell_cone, as last seen by cone_scan_keep() */
 static Oid	cone_funcid = InvalidOid;
@@ -149,6 +150,21 @@ typedef struct ConeScanState
 	int			rt_cap;
 	double		ncoverings,		/* for EXPLAIN ANALYZE */
 				nranges_total;
+
+	/*
+	 * The index filter: when the index also holds the cone's ra and dec
+	 * columns (INCLUDE), the cone is tested on each index entry and only the
+	 * entries inside it are fetched from the heap.  ira/idec are their index
+	 * attribute numbers, 0 when the index holds neither.
+	 */
+	AttrNumber	ira,
+				idec;
+	bool		have_centre;
+	double		cra,
+				cosdec0,
+				cdec,
+				thr;
+	double		nfiltered;		/* entries the filter skipped, for EXPLAIN ANALYZE */
 } ConeScanState;
 
 /* ------------------------------------------------------------------ */
@@ -1177,14 +1193,54 @@ in_cone_oid(void)
  * expression need not be computed per row.  Any other cone qual on the same
  * relation is kept as written.
  */
+
+/*
+ * The index attribute holding column arg of relation rel (a plain float8
+ * column, as skycell_in_cone reads it), or 0.  Any column past the cell key
+ * will do -- an INCLUDE column or a further key -- as long as the index can
+ * return it.
+ */
+static AttrNumber
+index_column_of(RelOptInfo *rel, Oid indexoid, Node *arg)
+{
+	Var		   *v = (Var *) arg;
+	ListCell   *lc;
+
+	if (!IsA(arg, Var) || v->varno != rel->relid || v->varlevelsup != 0 ||
+		v->varattno <= 0 || v->vartype != FLOAT8OID)
+		return 0;
+	foreach(lc, rel->indexlist)
+	{
+		IndexOptInfo *ix = (IndexOptInfo *) lfirst(lc);
+
+		if (ix->indexoid != indexoid)
+			continue;
+		for (int k = 1; k < ix->ncolumns; k++)
+			if (ix->indexkeys[k] == v->varattno && ix->canreturn[k])
+				return (AttrNumber) (k + 1);
+	}
+	return 0;
+}
+
 static Plan *
 cone_plan(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
 		  List *tlist, List *clauses, List *custom_plans)
 {
 	CustomScan *cs = makeNode(CustomScan);
 	FuncExpr   *driving = (FuncExpr *) lfourth(best_path->custom_private);
+	Oid			indexoid = DatumGetObjectId(linitial_node(Const, best_path->custom_private)->constvalue);
+	AttrNumber	ira = 0,
+				idec = 0;
 	List	   *quals = NIL;
 	ListCell   *lc;
+
+	if (skycell_index_filter)
+	{
+		ira = index_column_of(rel, indexoid, lsecond(driving->args));
+		idec = index_column_of(rel, indexoid, lthird(driving->args));
+		if (ira == 0 || idec == 0)
+			ira = idec = 0;
+	}
 
 	foreach(lc, clauses)
 	{
@@ -1211,9 +1267,16 @@ cone_plan(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
 	cs->flags = best_path->flags;
 	cs->custom_plans = NIL;
 	cs->custom_exprs = NIL;
-	cs->custom_private = list_make3(linitial(best_path->custom_private),
+	cs->custom_private = list_make5(linitial(best_path->custom_private),
 									lsecond(best_path->custom_private),
-									lthird(best_path->custom_private));
+									lthird(best_path->custom_private),
+									makeConst(INT2OID, -1, InvalidOid, sizeof(int16),
+											  Int16GetDatum(ira), false, true),
+									makeConst(INT2OID, -1, InvalidOid, sizeof(int16),
+											  Int16GetDatum(idec), false, true));
+	/* a constant cone's centre and radius, for the index filter */
+	if (ira != 0)
+		cs->custom_exprs = list_copy_tail(copyObject(driving->args), 3);
 	if (list_length(best_path->custom_private) > 4)
 	{
 		/*
@@ -1265,11 +1328,10 @@ cone_begin(CustomScanState *node, EState *estate, int eflags)
 		st->need_cover = true;
 		st->nranges = 0;
 		st->bounds = NULL;
-		st->relid = DatumGetObjectId(list_nth_node(Const, cscan->custom_private, 3)->constvalue);
-		st->statrel = DatumGetObjectId(list_nth_node(Const, cscan->custom_private, 4)->constvalue);
-		st->attnum = DatumGetInt16(list_nth_node(Const, cscan->custom_private, 5)->constvalue);
-		st->joined = DatumGetBool(list_nth_node(Const, cscan->custom_private, 6)->constvalue);
-		st->args = ExecInitExprList(cscan->custom_exprs, &node->ss.ps);
+		st->relid = DatumGetObjectId(list_nth_node(Const, cscan->custom_private, 5)->constvalue);
+		st->statrel = DatumGetObjectId(list_nth_node(Const, cscan->custom_private, 6)->constvalue);
+		st->attnum = DatumGetInt16(list_nth_node(Const, cscan->custom_private, 7)->constvalue);
+		st->joined = DatumGetBool(list_nth_node(Const, cscan->custom_private, 8)->constvalue);
 	}
 	else
 	{
@@ -1278,6 +1340,9 @@ cone_begin(CustomScanState *node, EState *estate, int eflags)
 		st->nranges = ArrayGetNItems(ARR_NDIM(arr), ARR_DIMS(arr)) / 2;
 		st->bounds = (const int64 *) ARR_DATA_PTR(arr);
 	}
+	st->args = ExecInitExprList(cscan->custom_exprs, &node->ss.ps);
+	st->ira = DatumGetInt16(list_nth_node(Const, cscan->custom_private, 3)->constvalue);
+	st->idec = DatumGetInt16(list_nth_node(Const, cscan->custom_private, 4)->constvalue);
 	st->bitmap = DatumGetBool(modec->constvalue);
 	st->cur = -1;
 	st->index = index_open(st->indexoid, lockmode);
@@ -1301,20 +1366,87 @@ cone_begin(CustomScanState *node, EState *estate, int eflags)
 	 * bitmap itself, so its heap scan is begun with the first bitmap, as
 	 * BitmapHeapScan does.
 	 */
+	/*
+	 * With the index filter the entries are read one by one, with their
+	 * included columns, in either mode: the bitmap mode then collects only
+	 * the TIDs that pass, instead of every TID of every range.
+	 */
 #if PG_VERSION_NUM >= 180000
-	if (st->bitmap)
+	if (st->bitmap && st->ira == 0)
 		st->iscan = index_beginscan_bitmap(st->index, estate->es_snapshot, NULL, 2);
 	else
 		st->iscan = index_beginscan(heap, st->index, estate->es_snapshot, NULL, 2, 0);
 #else
-	if (st->bitmap)
-	{
+	if (st->bitmap && st->ira == 0)
 		st->iscan = index_beginscan_bitmap(st->index, estate->es_snapshot, 2);
-		st->hscan = table_beginscan_bm(heap, estate->es_snapshot, 0, NULL);
-	}
 	else
 		st->iscan = index_beginscan(heap, st->index, estate->es_snapshot, 2, 0);
+	if (st->bitmap)
+		st->hscan = table_beginscan_bm(heap, estate->es_snapshot, 0, NULL);
 #endif
+	if (st->ira != 0)
+		st->iscan->xs_want_itup = true;
+}
+
+/* the cone the index filter tests, from its centre and radius in degrees */
+static void
+cone_set_centre(ConeScanState *st, double ra0, double dec0, double radius)
+{
+	double		thr = radius < 0 ? -1.0
+		: (radius >= 180.0 ? 2.0 : pow(sin(radius * M_PI / 360.0), 2));
+
+	st->cra = ra0;
+	st->cdec = dec0;
+	st->cosdec0 = cos(dec0 * M_PI / 180.0);
+
+	/*
+	 * A hair wider than skycell_in_cone's threshold, so that rounding can
+	 * only let a borderline entry through, never hold one back: the plan's
+	 * qual still applies the exact test to every row the filter passes.
+	 */
+	st->thr = thr < 0 ? thr : thr * (1.0 + 1e-9) + 1e-300;
+	st->have_centre = true;
+}
+
+/*
+ * The index filter's test of the current index entry: skycell_in_cone's
+ * haversine on the included ra and dec.  A NULL coordinate fails, as the
+ * strict exact test would.
+ */
+static bool
+cone_entry_passes(ConeScanState *st)
+{
+	IndexScanDesc s = st->iscan;
+	bool		n1,
+				n2;
+	double		ra,
+				dec,
+				sdd,
+				sda;
+
+	ra = DatumGetFloat8(index_getattr(s->xs_itup, st->ira, s->xs_itupdesc, &n1));
+	dec = DatumGetFloat8(index_getattr(s->xs_itup, st->idec, s->xs_itupdesc, &n2));
+	if (!n1 && !n2)
+	{
+		sdd = sin((dec - st->cdec) * M_PI / 360.0);
+		sda = sin((ra - st->cra) * M_PI / 360.0);
+		if (sdd * sdd + cos(dec * M_PI / 180.0) * st->cosdec0 * sda * sda <= st->thr)
+			return true;
+	}
+	st->nfiltered += 1;
+	return false;
+}
+
+/* the next TID of the current range whose entry passes the index filter */
+static ItemPointer
+cone_next_tid(ConeScanState *st)
+{
+	ItemPointer tid;
+
+	while ((tid = index_getnext_tid(st->iscan, ForwardScanDirection)) != NULL)
+		if (cone_entry_passes(st))
+			return tid;
+	return NULL;
 }
 
 /*
@@ -1357,6 +1489,8 @@ cone_cover_row(ConeScanState *st)
 		MemoryContextSwitchTo(old);
 		st->have_dens = true;
 	}
+	if (st->ira != 0)
+		cone_set_centre(st, v[0], v[1], v[2]);
 	old = MemoryContextSwitchTo(econtext->ecxt_per_tuple_memory);
 	check_err(sc_region_cone(&reg, v[0], v[1], v[2], true));
 	skycell_scan_params(&p, &st->dens);
@@ -1390,6 +1524,23 @@ cone_range(ConeScanState *st, int i)
 	index_rescan(st->iscan, st->keys, 2, NULL, 0);
 }
 
+/*
+ * The next visible row of the current range whose entry passes the index
+ * filter: index_getnext_slot() with the filter between the entry and the
+ * heap, following a HOT chain as it does.
+ */
+static bool
+cone_next_filtered(ConeScanState *st, TupleTableSlot *slot)
+{
+	for (;;)
+	{
+		if (!st->iscan->xs_heap_continue && cone_next_tid(st) == NULL)
+			return false;
+		if (index_fetch_heap(st->iscan, slot))
+			return true;
+	}
+}
+
 /* ordered: the next row of the current range, moving on when it runs out */
 static TupleTableSlot *
 cone_next_ordered(ConeScanState *st, TupleTableSlot *slot)
@@ -1398,7 +1549,9 @@ cone_next_ordered(ConeScanState *st, TupleTableSlot *slot)
 	{
 		if (st->cur >= st->nranges)
 			return ExecClearTuple(slot);
-		if (st->cur >= 0 && index_getnext_slot(st->iscan, ForwardScanDirection, slot))
+		if (st->cur >= 0 &&
+			(st->ira != 0 ? cone_next_filtered(st, slot)
+			 : index_getnext_slot(st->iscan, ForwardScanDirection, slot)))
 			return slot;
 		if (++st->cur >= st->nranges)
 			return ExecClearTuple(slot);
@@ -1419,7 +1572,15 @@ cone_build_bitmap(ConeScanState *st)
 	for (int i = 0; i < st->nranges; i++)
 	{
 		cone_range(st, i);
-		index_getbitmap(st->iscan, st->tbm);
+		if (st->ira == 0)
+			index_getbitmap(st->iscan, st->tbm);
+		else
+		{
+			ItemPointer tid;
+
+			while ((tid = cone_next_tid(st)) != NULL)
+				tbm_add_tuples(st->tbm, tid, 1, false);
+		}
 	}
 }
 
@@ -1483,6 +1644,24 @@ cone_next(ScanState *ss)
 
 	if (st->need_cover)
 		cone_cover_row(st);
+	else if (st->ira != 0 && !st->have_centre)
+	{
+		/* a constant cone: its centre and radius are evaluated once */
+		ExprContext *econtext = st->css.ss.ps.ps_ExprContext;
+		double		v[3];
+		int			i = 0;
+		ListCell   *lc;
+
+		foreach(lc, st->args)
+		{
+			bool		isnull;
+
+			v[i++] = DatumGetFloat8(ExecEvalExpr((ExprState *) lfirst(lc), econtext, &isnull));
+			if (isnull)
+				v[2] = -1.0;	/* matches nothing, as the strict test does */
+		}
+		cone_set_centre(st, v[0], v[1], v[2]);
+	}
 	return st->bitmap ? cone_next_bitmap(st, ss->ss_ScanTupleSlot)
 		: cone_next_ordered(st, ss->ss_ScanTupleSlot);
 }
@@ -1578,6 +1757,17 @@ cone_explain(CustomScanState *node, List *ancestors, ExplainState *es)
 	else
 		ExplainPropertyText("Ranges", st->joined ? "per outer row" : "per rescan", es);
 	ExplainPropertyText("Mode", st->bitmap ? "bitmap" : "ordered", es);
+	if (st->ira != 0)
+	{
+		TupleDesc	itd = RelationGetDescr(st->index);
+		char	   *cols = psprintf("%s, %s",
+									NameStr(TupleDescAttr(itd, st->ira - 1)->attname),
+									NameStr(TupleDescAttr(itd, st->idec - 1)->attname));
+
+		ExplainPropertyText("Index Filter", cols, es);
+		if (es->analyze)
+			ExplainPropertyFloat("Rows Removed by Index Filter", NULL, st->nfiltered, 0, es);
+	}
 }
 
 /* ------------------------------------------------------------------ */
@@ -1593,6 +1783,15 @@ cone_scan_init(void)
 							 "cell order, or through a TID bitmap when the heap is not "
 							 "ordered by cell. Off restores the rewrite.",
 							 &skycell_custom_scan, true,
+							 PGC_USERSET, 0, NULL, NULL, NULL);
+	DefineCustomBoolVariable("skycell.index_filter",
+							 "Test cones on the index entries when the cell index also "
+							 "holds the position columns.",
+							 "With an index such as (skycell_ang2cell(ra, dec)) INCLUDE "
+							 "(ra, dec), the custom scan reads ra and dec from each index "
+							 "entry and fetches from the table only the rows inside the "
+							 "cone. Off fetches every row of the covering cells.",
+							 &skycell_index_filter, true,
 							 PGC_USERSET, 0, NULL, NULL, NULL);
 	RegisterCustomScanMethods(&cone_scan_methods);
 	prev_planner_hook = planner_hook;
