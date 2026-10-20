@@ -439,17 +439,27 @@ sequential scan. With it they take the custom scan, the same plan as `skycell_co
 | `skycell_ancestors(cell [, min_order, max_order])` | `int8[]` | a position's containing cells — join against stored MOC cells |
 | `skycell_nuniq_order/lo/hi(nuniq)` | `int`/`int8` | decode a `NUNIQ` cell |
 
-### Astrometry — IVOA UDF registry names
+### Astrometry — IVOA user-defined function names
 
-| Function | Returns | Notes |
-|---|---|---|
-| `ivo_epoch_prop(ra, dec, parallax, pmra, pmdec, rv, ref_epoch, out_epoch)` | `float8[6]` | all six parameters propagated, rigorously (ESA SP-1200 §1.5.5): parallax and radial velocity evolve too |
-| `ivo_epoch_prop_pos(…8 args…)` | `skypos` | position only |
-| `ivo_epoch_prop_pos(ra, dec, pmra, pmdec, ref_epoch, out_epoch)` | `skypos` | without parallax or radial velocity |
-| `ivo_apply_pm(ra, dec, pmra, pmdec, epdiff)` | `skypos` | proper motion alone |
-| `ivo_healpix_index(order, ra, dec)`<br>`ivo_healpix_index(order, p)` | `int8` | HEALPix cell |
-| `ivo_healpix_center(order, hpxindex)` | `skypos` | and back |
-| `icrs2gal` / `gal2icrs` / `icrs2ecl` / `ecl2icrs` | `skypos` | frame conversion |
+The names are those of the IVOA [catalogue of ADQL user-defined
+functions](https://github.com/ivoa-std/udf-catalogue) (Endorsed Note 1.2) or,
+where it has none, of GAVO DaCHS, so ADQL written for DaCHS or the Gaia
+archives runs unchanged.
+
+| Function | Returns | Source | Notes |
+|---|---|---|---|
+| `ivo_epoch_prop_pos(ra, dec, parallax, pmra, pmdec, rv, ref_epoch, out_epoch)` | `skypos` | catalogue | the position, propagated rigorously (ESA SP-1200 §1.5.5, the catalogue's recommended formalism) |
+| `ivo_epoch_prop_pos(ra, dec, pmra, pmdec, ref_epoch, out_epoch)` | `skypos` | DaCHS | as if parallax and radial velocity were NULL |
+| `ivo_epoch_prop(…the same 8…)` | `float8[6]` | DaCHS | all six parameters: parallax and radial velocity evolve too; NULL there without a parallax |
+| `ivo_apply_pm(ra, dec, pmra, pmdec, epdiff)` | `skypos` | skycell | proper motion alone, in mas/yr. Neither the catalogue (which dropped its `ivo_apply_pm`) nor DaCHS (`gavo_apply_pm`, in degrees/yr) has this one |
+| `ivo_healpix_index(hpxOrder, ra, dec)`<br>`ivo_healpix_index(hpxOrder, p)` | `int8` | catalogue | NESTED HEALPix cell |
+| `ivo_healpix_center(hpxOrder, hpxIndex)` | `skypos` | catalogue | and back |
+| `icrs2gal` / `gal2icrs` / `icrs2ecl` / `ecl2icrs` | `skypos` | skycell | frame conversion |
+
+NULL arguments to the epoch functions are taken as the catalogue says (since
+0.32): a missing parallax means infinitely remote, a missing proper motion or
+radial velocity is 0, and a missing position or epoch is an error — not a NULL
+result, which would drop every star without a measured radial velocity.
 
 Proper motions are in mas/yr, parallax in mas, radial velocity in km/s, epochs
 in years. An index cannot know where a star has moved to, so write a

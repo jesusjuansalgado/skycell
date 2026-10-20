@@ -115,6 +115,33 @@ SELECT ivo_epoch_prop_pos(10, 20, 0, 0, 0, 0, 2000, 2050) AS no_motion,
        ivo_apply_pm(10, 20, 3600, 0, 10)::text = ivo_epoch_prop_pos(10, 20, 3600, 0, 2000, 2010)::text AS apply_pm_matches,
        round(skycell_pm_margin(-802.80, 10362.54, 16)::numeric, 6) AS margin_deg;
 
+-- the IVOA catalogue's examples (ADQL UDF catalogue EN 1.2,
+-- ivo_epoch_prop_pos), as separations from its answers in micro-arcseconds:
+-- a NULL radial velocity, proper motion or parallax enters as 0 (the last
+-- answer the catalogue itself calls approximate)
+SELECT n, round((3.6e9 * distance(ivo_epoch_prop_pos(ra, de, plx, pmra, pmde, rv, e0, e1),
+                                  point('ICRS', want_ra, want_de)))::numeric, 1) AS off_uas
+FROM (VALUES
+  (1, 7.606083572::float8, 11.79044105::float8, 125::float8, 300::float8, -428.8::float8, 52.51::float8,
+      2016.0::float8, 1992.25::float8, 7.604061404627978::float8, 11.7932703828279::float8),
+  (2, 7.606083572, 11.79044105, 125, 300, -428.8, 52.51, 2016.0, 1875.0, 7.594068213694308, 11.807251375203935),
+  (3, 7.606083572, 11.79044105, 125, 300, -428.8, NULL, 2016.0, 1875.0, 7.594079587029898, 11.807235464326332),
+  (4, 7.606083572, 11.79044105, 125, 300, NULL, NULL, 2016.0, 1875.0, 7.594080321498365, 11.790440798509207),
+  (5, 7.606083572, 11.79044105, NULL, 300, -428.8, 52.51, 2016.0, 1875.0, 7.594079587020846, 11.807235464339055)
+) AS ex(n, ra, de, plx, pmra, pmde, rv, e0, e1, want_ra, want_de)
+ORDER BY n;
+-- a missing position or epoch is an error, not a NULL
+SELECT ivo_epoch_prop_pos(NULL, 11.79044105, 125, 300, NULL, NULL, 2016.0, 1875.0);
+SELECT ivo_epoch_prop_pos(7.606083572, 11.79044105, 125, 300, -428.8, 52.51, NULL, 1875.0);
+-- the six-argument form takes NULL motions as 0 too; the six-vector, without
+-- a parallax, has no distance to give a parallax or radial velocity for
+SELECT ivo_epoch_prop_pos(10, 20, NULL, NULL, 2000, 2050)::text
+         = ivo_epoch_prop_pos(10, 20, 0, 0, 2000, 2050)::text AS null_motion_is_none,
+       s[3] IS NULL AND s[6] IS NULL AS no_parallax_no_distance,
+       round((3.6e9 * distance(point('ICRS', s[1], s[2]),
+                               point('ICRS', 7.594079587020846, 11.807235464339055)))::numeric, 1) AS off_uas
+FROM (SELECT ivo_epoch_prop(7.606083572, 11.79044105, NULL, 300, -428.8, 52.51, 2016, 1875) AS s) AS t;
+
 -- frames ------------------------------------------------------------
 SELECT round(coord1(icrs2gal(point('ICRS', 266.404988, -28.936178)))::numeric, 3) AS gal_l,
        round(coord2(icrs2gal(point('ICRS', 266.404988, -28.936178)))::numeric, 3) AS gal_b,
@@ -128,3 +155,9 @@ SELECT ivo_healpix_index(12, 10.0, 20.0) = skycell_ang2pix(12, 10.0, 20.0) AS sa
        ivo_healpix_index(5, ivo_healpix_center(5, 1234::int8)) = 1234 AS center_roundtrip,
        skycell_cell(point('ICRS', 10, 20)) = skycell_ang2cell(10, 20) AS cell_of_position;
 SELECT ivo_healpix_index(30, 10.0, 20.0);   -- error: order out of range
+-- the catalogue's examples (EN 1.2): NESTED numbering
+SELECT ivo_healpix_index(0, 1, 1) AS i0, ivo_healpix_index(17, 1, 1) AS i17,
+       ivo_healpix_index(17, 359, -1) AS i17_wrap, ivo_healpix_index(0, point('ICRS', 1, 1)) AS i0_point,
+       coord1(ivo_healpix_center(0, 6)) AS c0_ra, coord2(ivo_healpix_center(0, 6)) AS c0_dec,
+       round((3.6e9 * distance(ivo_healpix_center(17, ivo_healpix_index(17, 23.4, 56.7)),
+                               point('ICRS', 23.399843462947466, 56.70016214363192)))::numeric, 1) AS c17_off_uas;
