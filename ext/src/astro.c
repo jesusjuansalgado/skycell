@@ -3,9 +3,13 @@
  * geometry: epoch propagation, proper motion, coordinate frames, and the
  * HEALPix helpers of the IVOA UDF registry.
  *
- * Names follow the registry (ivo_epoch_prop, ivo_epoch_prop_pos,
- * ivo_apply_pm, ivo_healpix_index, ivo_healpix_center) so that ADQL written
- * for GAVO DaCHS or the Gaia archives runs here unchanged.
+ * ivo_epoch_prop_pos, ivo_healpix_index and ivo_healpix_center are those of
+ * the IVOA catalogue of ADQL user-defined functions (EN 1.2), NULL handling
+ * included; ivo_epoch_prop and the six-argument ivo_epoch_prop_pos are GAVO
+ * DaCHS's, under the same names, so ADQL written for DaCHS or the Gaia
+ * archives runs here unchanged.  ivo_apply_pm is skycell's own, in mas/yr:
+ * the catalogue dropped its ivo_apply_pm before 1.0, and DaCHS's equivalent,
+ * gavo_apply_pm, takes degrees/yr.
  */
 #include "postgres.h"
 
@@ -146,19 +150,66 @@ epoch_prop(double ra, double dec, double plx, double pmra, double pmdec,
 	out[5] = (plx1 != 0.0) ? mu_r1 * RAD2MAS * AU_KMYS / plx1 : rv;
 }
 
+/*
+ * NULL arguments, as the IVOA catalogue of ADQL user-defined functions (EN
+ * 1.2, ivo_epoch_prop_pos) has them: a missing position or epoch is an
+ * error; a missing parallax is "infinitely remote" (0 here, which is how
+ * epoch_prop() takes it: the radial velocity then has no effect), and a
+ * missing proper motion or radial velocity is 0.  So the functions are not
+ * STRICT, which would answer NULL instead -- for most of a Gaia catalogue,
+ * whose radial velocities are mostly unmeasured.
+ */
+static double
+arg_required(FunctionCallInfo fcinfo, int n, const char *function, const char *name)
+{
+	if (PG_ARGISNULL(n))
+		ereport(ERROR, (errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
+						errmsg("%s: %s must not be NULL", function, name)));
+	return PG_GETARG_FLOAT8(n);
+}
+
+static double
+arg_or_zero(FunctionCallInfo fcinfo, int n)
+{
+	return PG_ARGISNULL(n) ? 0.0 : PG_GETARG_FLOAT8(n);
+}
+
+/* the eight-argument form: ra, dec, parallax, pmra, pmdec, rv, ref_epoch, out_epoch */
+static void
+epoch_prop_args(FunctionCallInfo fcinfo, const char *function, double out[6])
+{
+	double		ra = arg_required(fcinfo, 0, function, "ra"),
+				dec = arg_required(fcinfo, 1, function, "dec"),
+				ref_epoch = arg_required(fcinfo, 6, function, "ref_epoch"),
+				out_epoch = arg_required(fcinfo, 7, function, "out_epoch");
+
+	epoch_prop(ra, dec, arg_or_zero(fcinfo, 2), arg_or_zero(fcinfo, 3),
+			   arg_or_zero(fcinfo, 4), arg_or_zero(fcinfo, 5),
+			   out_epoch - ref_epoch, out);
+}
+
+/*
+ * The six parameters at out_epoch.  Without a parallax (NULL or 0) the
+ * distance is unknown, and so are the parallax and radial velocity at
+ * out_epoch: those two come back NULL, as GAVO DaCHS's ivo_epoch_prop has it.
+ */
 PG_FUNCTION_INFO_V1(ivo_epoch_prop);
 Datum
 ivo_epoch_prop(PG_FUNCTION_ARGS)
 {
 	double		out[6];
 	Datum		d[6];
+	bool		nulls[6] = {false, false, false, false, false, false};
+	int			dims[1] = {6};
+	int			lbs[1] = {1};
 
-	epoch_prop(PG_GETARG_FLOAT8(0), PG_GETARG_FLOAT8(1), PG_GETARG_FLOAT8(2),
-			   PG_GETARG_FLOAT8(3), PG_GETARG_FLOAT8(4), PG_GETARG_FLOAT8(5),
-			   PG_GETARG_FLOAT8(7) - PG_GETARG_FLOAT8(6), out);
+	epoch_prop_args(fcinfo, "ivo_epoch_prop", out);
+	if (arg_or_zero(fcinfo, 2) == 0.0)
+		nulls[2] = nulls[5] = true;
 	for (int i = 0; i < 6; i++)
 		d[i] = Float8GetDatum(out[i]);
-	PG_RETURN_ARRAYTYPE_P(construct_array(d, 6, FLOAT8OID, sizeof(float8), true, TYPALIGN_DOUBLE));
+	PG_RETURN_ARRAYTYPE_P(construct_md_array(d, nulls, 1, dims, lbs, FLOAT8OID,
+											 sizeof(float8), true, TYPALIGN_DOUBLE));
 }
 
 PG_FUNCTION_INFO_V1(ivo_epoch_prop_pos);
@@ -167,22 +218,27 @@ ivo_epoch_prop_pos(PG_FUNCTION_ARGS)
 {
 	double		out[6];
 
-	epoch_prop(PG_GETARG_FLOAT8(0), PG_GETARG_FLOAT8(1), PG_GETARG_FLOAT8(2),
-			   PG_GETARG_FLOAT8(3), PG_GETARG_FLOAT8(4), PG_GETARG_FLOAT8(5),
-			   PG_GETARG_FLOAT8(7) - PG_GETARG_FLOAT8(6), out);
+	epoch_prop_args(fcinfo, "ivo_epoch_prop_pos", out);
 	PG_RETURN_POINTER(pos_make(out[0], out[1]));
 }
 
-/* the same without a parallax or radial velocity: ra, dec, pmra, pmdec, epochs */
+/*
+ * The same without a parallax or radial velocity: ra, dec, pmra, pmdec,
+ * epochs (GAVO DaCHS's variant, "as if parallax and radial_velocity were both
+ * passed as NULL").
+ */
 PG_FUNCTION_INFO_V1(ivo_epoch_prop_pos_pm);
 Datum
 ivo_epoch_prop_pos_pm(PG_FUNCTION_ARGS)
 {
 	double		out[6];
+	double		ra = arg_required(fcinfo, 0, "ivo_epoch_prop_pos", "ra"),
+				dec = arg_required(fcinfo, 1, "ivo_epoch_prop_pos", "dec"),
+				ref_epoch = arg_required(fcinfo, 4, "ivo_epoch_prop_pos", "ref_epoch"),
+				out_epoch = arg_required(fcinfo, 5, "ivo_epoch_prop_pos", "out_epoch");
 
-	epoch_prop(PG_GETARG_FLOAT8(0), PG_GETARG_FLOAT8(1), 0.0,
-			   PG_GETARG_FLOAT8(2), PG_GETARG_FLOAT8(3), 0.0,
-			   PG_GETARG_FLOAT8(5) - PG_GETARG_FLOAT8(4), out);
+	epoch_prop(ra, dec, 0.0, arg_or_zero(fcinfo, 2), arg_or_zero(fcinfo, 3), 0.0,
+			   out_epoch - ref_epoch, out);
 	PG_RETURN_POINTER(pos_make(out[0], out[1]));
 }
 
