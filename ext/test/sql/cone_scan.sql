@@ -347,8 +347,12 @@ SET skycell.rewrite_max_waste = 0;
 EXPLAIN (COSTS OFF)
 SELECT count(*) FROM cs_cat WHERE point('ICRS', ra, dec) <@ polygon('ICRS', 10, 20, 12, 20, 12, 22, 10, 22);
 CREATE INDEX cs_cat_spg ON cs_cat USING spgist (point('ICRS', ra, dec) skypos_spgist_ops);
+-- the index is what matters, not how it is read: PostgreSQL 16 reads it
+-- through a bitmap where 18 scans it, so the plain index scan is pinned
+SET enable_bitmapscan = off;
 EXPLAIN (COSTS OFF)
 SELECT count(*) FROM cs_cat WHERE point('ICRS', ra, dec) <@ polygon('ICRS', 10, 20, 12, 20, 12, 22, 10, 22);
+RESET enable_bitmapscan;
 DROP INDEX cs_cat_spg;
 RESET skycell.rewrite_max_waste;
 DROP TABLE cs_dprobe;

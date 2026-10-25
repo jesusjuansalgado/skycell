@@ -1381,8 +1381,13 @@ cone_begin(CustomScanState *node, EState *estate, int eflags)
 		st->iscan = index_beginscan_bitmap(st->index, estate->es_snapshot, 2);
 	else
 		st->iscan = index_beginscan(heap, st->index, estate->es_snapshot, 2, 0);
+	/* PostgreSQL 17 alone asks whether the scan returns tuples: it does */
 	if (st->bitmap)
+#if PG_VERSION_NUM >= 170000
+		st->hscan = table_beginscan_bm(heap, estate->es_snapshot, 0, NULL, true);
+#else
 		st->hscan = table_beginscan_bm(heap, estate->es_snapshot, 0, NULL);
+#endif
 #endif
 	if (st->ira != 0)
 		st->iscan->xs_want_itup = true;
