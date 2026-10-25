@@ -376,7 +376,7 @@ SELECT count(*) FROM cs_probe p JOIN cs_cat c ON point('ICRS', c.ra, c.dec) <@ c
                Filter: skycell_in_cone((ra)::double precision, "dec", (p.ra)::double precision, p."dec", '0.3'::double precision, '-1'::double precision)
                Index: cs_cat_expr
                Ranges: per outer row
-               Mode: bitmap
+               Mode: ordered
 (8 rows)
 
 -- the coordinate system is still checked, at plan time
@@ -482,7 +482,7 @@ EXPLAIN (COSTS OFF) EXECUTE cs_xm(0.3);
                Filter: skycell_in_cone((ra)::double precision, "dec", (p.ra)::double precision, p."dec", $1, '-1'::double precision)
                Index: cs_cat_cell
                Ranges: per outer row
-               Mode: bitmap
+               Mode: ordered
 (8 rows)
 
 SET skycell.custom_scan = off;
@@ -656,7 +656,7 @@ SELECT count(*) FROM cs_probe p JOIN cs_cat c ON distance(p.ra, p.dec, c.ra, c.d
                Filter: (skycell_distance_below(distance((p.ra)::double precision, p."dec", (ra)::double precision, "dec"), '0.3'::double precision, true) AND skycell_in_cone((ra)::double precision, "dec", CASE WHEN (float8gt((p.ra)::double precision, '-Infinity'::double precision) AND float8lt((p.ra)::double precision, 'Infinity'::double precision) AND float8ge(p."dec", '-90'::double precision) AND float8le(p."dec", '90'::double precision)) THEN (p.ra)::double precision WHEN (float8gt((p.ra)::double precision, '-Infinity'::double precision) AND float8lt((p.ra)::double precision, 'Infinity'::double precision) AND float8gt(p."dec", '-Infinity'::double precision) AND float8lt(p."dec", 'Infinity'::double precision)) THEN atan2d(float8mul(cosd(p."dec"), sind((p.ra)::double precision)), float8mul(cosd(p."dec"), cosd((p.ra)::double precision))) ELSE NULL::double precision END, CASE WHEN (float8gt((p.ra)::double precision, '-Infinity'::double precision) AND float8lt((p.ra)::double precision, 'Infinity'::double precision) AND float8ge(p."dec", '-90'::double precision) AND float8le(p."dec", '90'::double precision)) THEN p."dec" WHEN (float8gt((p.ra)::double precision, '-Infinity'::double precision) AND float8lt((p.ra)::double precision, 'Infinity'::double precision) AND float8gt(p."dec", '-Infinity'::double precision) AND float8lt(p."dec", 'Infinity'::double precision)) THEN atan2d(sind(p."dec"), float8abs(cosd(p."dec"))) ELSE NULL::double precision END, '0.300000000301'::double precision, '-1'::double precision))
                Index: cs_cat_expr
                Ranges: per outer row
-               Mode: bitmap
+               Mode: ordered
 (8 rows)
 
 SET extra_float_digits = 0;
@@ -730,9 +730,9 @@ SELECT * FROM cs_filter($q$SELECT row(count(*), sum(id)) FROM cs_fsorted
 
 SELECT * FROM cs_filter($q$SELECT row(count(*), sum(p.pid::int8 * 100000 + c.id)) FROM cs_fprobe p
   JOIN cs_fcat c ON contains(skycell_point(c.ra, c.dec), skycell_circle(p.ra, p.dec, 0.4)) = 1$q$);
- same | filtered |  mode  
-------+----------+--------
- t    | t        | bitmap
+ same | filtered |  mode   
+------+----------+---------
+ t    | t        | ordered
 (1 row)
 
 SELECT * FROM cs_filter($q$SELECT row(count(*), sum(p.pid::int8 * 100000 + c.id)) FROM cs_fprobe p
@@ -740,6 +740,16 @@ SELECT * FROM cs_filter($q$SELECT row(count(*), sum(p.pid::int8 * 100000 + c.id)
  same | filtered |  mode   
 ------+----------+---------
  t    | t        | ordered
+(1 row)
+
+-- a few probes share few pages, so the bitmap mode answers them: the filter
+-- in it too, rescanned (the 206 probes above share theirs and run ordered)
+SELECT * FROM cs_filter($q$SELECT row(count(*), sum(p.pid::int8 * 100000 + c.id))
+  FROM (SELECT * FROM cs_fprobe WHERE pid < 3000) p
+  JOIN cs_fcat c ON contains(skycell_point(c.ra, c.dec), skycell_circle(p.ra, p.dec, 0.4)) = 1$q$);
+ same | filtered |  mode  
+------+----------+--------
+ t    | t        | bitmap
 (1 row)
 
 -- and against a sequential scan
