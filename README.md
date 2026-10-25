@@ -570,7 +570,15 @@ Two layers, both in [`ext/test/`](ext/test/).
   the pole and one across RA = 0, match the rewrite; an invalid centre errors as
   the rewrite does; and the cross-match row estimate is within 3× of the truth.
 
-All three pass on PostgreSQL 16 and 18.
+**Reference translators** — [`adql_geometry/tests/`](adql_geometry/tests/): the
+Python translator's tests (pytest), and `cross_check.py`, which requires the
+Python and Java translators to produce identical SQL for every case.
+
+[CI](.github/workflows/ci.yml) runs all of it on every push to `main` and every
+pull request: the SQL regression on PostgreSQL 16, 17 and 18 (packages from
+apt.postgresql.org, a fresh cluster with default settings; the steps are
+[`.github/ci/pg-regress.sh`](.github/ci/pg-regress.sh), which runs as well
+locally), the standalone selftests, and the reference translators.
 
 ## Limitations
 

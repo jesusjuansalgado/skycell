@@ -1,0 +1,74 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  regress:
+    # the extension against each PostgreSQL major version it supports: the
+    # custom scan carries version guards for 16, 17 and 18
+    name: Regression (PostgreSQL ${{ matrix.pg }})
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        pg: ["16", "17", "18"]
+    env:
+      PG: ${{ matrix.pg }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install PostgreSQL from apt.postgresql.org
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq postgresql-common
+          sudo /usr/share/postgresql-common/pgdg/apt.postgresql.org.sh -y
+          sudo apt-get install -y -qq "postgresql-$PG" "postgresql-server-dev-$PG"
+      - name: Build, install and run the regression suite
+        run: .github/ci/pg-regress.sh "$PG"
+      - name: Keep the regression output
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: regression-pg${{ matrix.pg }}
+          path: |
+            ext/test/regression.diffs
+            ext/test/regression.out
+            ext/test/results/
+          if-no-files-found: ignore
+
+  selftest:
+    # the HEALPix and covering code on its own: no PostgreSQL needed
+    name: Geometry selftests
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: make -C ext selftest
+
+  adql-geometry:
+    # the reference translators: their tests, and Python and Java agreeing
+    # byte for byte on every case
+    name: adql_geometry (Python and Java)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Python tests
+        run: |
+          python3 -m venv "$RUNNER_TEMP/venv"
+          "$RUNNER_TEMP/venv/bin/pip" install -q pytest
+          "$RUNNER_TEMP/venv/bin/python" -m pytest -q adql_geometry/tests
+      - name: Python and Java agree
+        run: |
+          javac -d "$RUNNER_TEMP/classes" adql_geometry/java/SkycellAdqlGeometry.java
+          SKYCELL_JAVA_CLASSES="$RUNNER_TEMP/classes" python3 adql_geometry/tests/cross_check.py
