@@ -16,9 +16,9 @@ jobs:
     name: Regression (PostgreSQL ${{ matrix.pg }})
     runs-on: ubuntu-24.04
     # a run takes 2-3 minutes once PostgreSQL is installed, and the install
-    # has taken 20 s to 16 min; without a limit a stalled one holds the job
-    # for GitHub's default of 6 hours
-    timeout-minutes: 45
+    # has taken 20 s to over 30 min; without a limit a stalled one holds the
+    # job for GitHub's default of 6 hours
+    timeout-minutes: 50
     strategy:
       fail-fast: false
       matrix:
@@ -30,16 +30,23 @@ jobs:
         with:
           persist-credentials: false
       - name: Install PostgreSQL from apt.postgresql.org
-        timeout-minutes: 35
+        timeout-minutes: 40
         run: |
-          # The mirror is sometimes slow and sometimes stalls. apt gives up on
-          # a connection silent for 60 s and retries it itself; a whole step
-          # still stuck after 10 minutes is killed and run again, up to three
-          # times. Downloaded packages are kept, so a retry resumes.
+          # The mirror is sometimes slow (50 kB/s has been seen) and sometimes
+          # stalls. A stall is apt's to catch: it gives up on a connection
+          # silent for 60 s and retries it, 5 times. A slow download is left to
+          # finish, within the step's limit: cutting it off, as an earlier
+          # version of this step did after 10 minutes, only started it again
+          # at the same speed. A command that still fails is run again, up to
+          # three times, keeping what it had downloaded.
+          #
+          # The server packages are downloaded first, with a line per package
+          # in the log, so a slow mirror shows; installing them then needs no
+          # network.
           apt_opts=(-o Acquire::Retries=5 -o Acquire::http::Timeout=60 -o Acquire::https::Timeout=60)
           retry() {
             for attempt in 1 2 3; do
-              sudo timeout 600 "$@" && return 0
+              sudo "$@" && return 0
               echo "::warning::attempt $attempt of 3 failed: $*"
               sudo dpkg --configure -a || true
               sleep 15
@@ -49,6 +56,7 @@ jobs:
           retry apt-get "${apt_opts[@]}" update -qq
           retry apt-get "${apt_opts[@]}" install -y -qq postgresql-common
           retry /usr/share/postgresql-common/pgdg/apt.postgresql.org.sh -y
+          retry apt-get "${apt_opts[@]}" install -y -q --download-only "postgresql-$PG" "postgresql-server-dev-$PG"
           retry apt-get "${apt_opts[@]}" install -y -qq "postgresql-$PG" "postgresql-server-dev-$PG"
       - name: Build, install and run the regression suite
         run: .github/ci/pg-regress.sh "$PG"
