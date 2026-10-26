@@ -529,6 +529,30 @@ stay within 1.3× of the truth where pgSphere's are off by up to 8.7×. At Gaia
 DR3 scale that is one 38 GiB index where an archive running pgSphere for cones
 and Q3C for cross-matching keeps 160 GiB.
 
+**Parallel cross-matching.** The comparisons above, like the paper's, are
+serial. They run with `max_parallel_workers_per_gather = 0` for every method.
+With parallelism on, a cross-match with enough probes runs in parallel
+workers. The setup:
+
+- PostgreSQL 18.6 with its default settings, 4 cores.
+- 5M catalogue rows, the heap stored once in cell order and once at random.
+- 200k and 1M probes on sources.
+- Median of 3 warm runs, against v0.35, which cannot run a cross-match in
+  parallel. Every result is identical to the serial one.
+
+| probes | cone | serial | default workers | 3 workers |
+|---|---|---|---|---|
+| 200k (10 MB) | 1″–30″ | 1.4–18.2 s | 1 worker: 1.8–2.2× faster | — |
+| 1M (50 MB) | 1″, cell order | 8.4 s | 2 workers: 2.9× | 3.7× |
+| 1M | 30″, cell order | 20.9 s | 3.3× | 3.9× |
+| 1M | 1″, random order | 6.9 s | 2.7× | 3.6× |
+| 1M | 30″, random order | 92.0 s | 3.4× | 4.6× |
+
+"3 workers" sets the probe table's `parallel_workers`, so the leader and three
+workers use the four cores. Q3C's and pgSphere's cross-matches can run under a
+parallel nested loop too. They were not measured that way, so these figures
+compare skycell with itself only.
+
 The paper describing skycell, the benchmark harness, the raw results of every
 measurement and how to reproduce them are in
 [skycell-paper](https://github.com/jesusjuansalgado/skycell-paper), together

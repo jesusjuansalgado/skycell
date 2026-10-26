@@ -4,6 +4,7 @@
 -- debug_parallel_query a whole cone search runs in a worker. Every answer
 -- must be the serial one.
 CREATE EXTENSION IF NOT EXISTS skycell;
+NOTICE:  extension "skycell" already exists, skipping
 SET extra_float_digits = 0;
 SELECT setseed(0.31);
  setseed 
