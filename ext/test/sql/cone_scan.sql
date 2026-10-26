@@ -417,6 +417,11 @@ SELECT * FROM cs_filter($q$SELECT row(count(*), sum(p.pid::int8 * 100000 + c.id)
   JOIN cs_fcat c ON contains(skycell_point(c.ra, c.dec), skycell_circle(p.ra, p.dec, 0.4)) = 1$q$);
 SELECT * FROM cs_filter($q$SELECT row(count(*), sum(p.pid::int8 * 100000 + c.id)) FROM cs_fprobe p
   JOIN cs_fsorted c ON contains(skycell_point(c.ra, c.dec), skycell_circle(p.ra, p.dec, 0.4)) = 1$q$);
+-- a few probes share few pages, so the bitmap mode answers them: the filter
+-- in it too, rescanned (the 206 probes above share theirs and run ordered)
+SELECT * FROM cs_filter($q$SELECT row(count(*), sum(p.pid::int8 * 100000 + c.id))
+  FROM (SELECT * FROM cs_fprobe WHERE pid < 3000) p
+  JOIN cs_fcat c ON contains(skycell_point(c.ra, c.dec), skycell_circle(p.ra, p.dec, 0.4)) = 1$q$);
 -- so many probes share cs_fcat's few pages that each rescan reads about one,
 -- and the ordered scan is the cheaper; fewer and wider cones read several
 -- pages each, through a bitmap
