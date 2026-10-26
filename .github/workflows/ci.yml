@@ -15,6 +15,10 @@ jobs:
     # custom scan carries version guards for 16, 17 and 18
     name: Regression (PostgreSQL ${{ matrix.pg }})
     runs-on: ubuntu-24.04
+    # a run takes 2-3 minutes once PostgreSQL is installed, and the install
+    # has taken 20 s to 16 min; without a limit a stalled one holds the job
+    # for GitHub's default of 6 hours
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
@@ -26,11 +30,26 @@ jobs:
         with:
           persist-credentials: false
       - name: Install PostgreSQL from apt.postgresql.org
+        timeout-minutes: 35
         run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq postgresql-common
-          sudo /usr/share/postgresql-common/pgdg/apt.postgresql.org.sh -y
-          sudo apt-get install -y -qq "postgresql-$PG" "postgresql-server-dev-$PG"
+          # The mirror is sometimes slow and sometimes stalls. apt gives up on
+          # a connection silent for 60 s and retries it itself; a whole step
+          # still stuck after 10 minutes is killed and run again, up to three
+          # times. Downloaded packages are kept, so a retry resumes.
+          apt_opts=(-o Acquire::Retries=5 -o Acquire::http::Timeout=60 -o Acquire::https::Timeout=60)
+          retry() {
+            for attempt in 1 2 3; do
+              sudo timeout 600 "$@" && return 0
+              echo "::warning::attempt $attempt of 3 failed: $*"
+              sudo dpkg --configure -a || true
+              sleep 15
+            done
+            return 1
+          }
+          retry apt-get "${apt_opts[@]}" update -qq
+          retry apt-get "${apt_opts[@]}" install -y -qq postgresql-common
+          retry /usr/share/postgresql-common/pgdg/apt.postgresql.org.sh -y
+          retry apt-get "${apt_opts[@]}" install -y -qq "postgresql-$PG" "postgresql-server-dev-$PG"
       - name: Build, install and run the regression suite
         run: .github/ci/pg-regress.sh "$PG"
       - name: Keep the regression output
@@ -48,6 +67,7 @@ jobs:
     # the HEALPix and covering code on its own: no PostgreSQL needed
     name: Geometry selftests
     runs-on: ubuntu-24.04
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -59,6 +79,7 @@ jobs:
     # byte for byte on every case
     name: adql_geometry (Python and Java)
     runs-on: ubuntu-24.04
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:

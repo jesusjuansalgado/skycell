@@ -5,7 +5,7 @@ EXTENSION = skycell
 # adding a file and nothing else.
 DATA = $(wildcard sql/skycell--*.sql)
 PG_CPPFLAGS = -DSKYCELL_PG
-REGRESS = skycell adql cone_scan
+REGRESS = skycell adql cone_scan polygon
 REGRESS_OPTS = --inputdir=test --outputdir=test
 PG_CONFIG ?= pg_config
 PGXS := $(shell $(PG_CONFIG) --pgxs)
