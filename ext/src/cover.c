@@ -127,13 +127,448 @@ poly_setup(sc_region *r)
 {
 	for (int i = 0; i < r->nv; i++)
 	{
-		sc_vec3		c = sc_cross(r->v[i], r->v[(i + 1) % r->nv]);
+		/*
+		 * a x (b - a), not a x b: the same vector, but for a short edge the
+		 * difference is exact and a x b is not -- its rounding, ~1e-16 in
+		 * each component, is relative to the edge length once normalised,
+		 * and tilts the edge plane by ~1e-16 / length rad.
+		 */
+		sc_vec3		a = r->v[i],
+					b = r->v[(i + 1) % r->nv];
+		sc_vec3		c = sc_cross(a, (sc_vec3) {b.x - a.x, b.y - a.y, b.z - a.z});
 
 		if (sqrt(sc_dot(c, c)) < 1e-15)
 			return "polygon has a zero-length edge (repeated vertex?)";
 		r->n[i] = vnormalize(c);
 	}
 	return NULL;
+}
+
+/* ------------------------------------------------------------------ */
+/* non-convex polygons                                                */
+/* ------------------------------------------------------------------ */
+
+/*
+ * A polygon whose vertices all lie in the open hemisphere around a point g
+ * maps, under the gnomonic projection tangent at g, to a plane polygon whose
+ * edges are straight: the projection sends great circles to lines.  So a
+ * non-convex polygon is cut into convex pieces in that plane -- ear clipping
+ * into triangles, then Hertel-Mehlhorn merging, which drops every diagonal
+ * whose removal leaves both sides convex (at most 4x the minimum number of
+ * pieces) -- and each piece is an ordinary convex polygon on the sphere,
+ * with the polygon's own vertices.  Containment is "in some piece"; the
+ * boundary ring is kept whole for everything else (distances, edge
+ * crossings, cell classification), so the diagonals never show.
+ */
+typedef struct
+{
+	double		x,
+				y;
+} pt2;
+
+static inline pt2
+gnomonic(const sc_vec3 *f, sc_vec3 v)
+{
+	double		w = sc_dot(v, f[0]);
+
+	return (pt2) {sc_dot(v, f[1]) / w, sc_dot(v, f[2]) / w};
+}
+
+static inline sc_vec3
+gnomonic_inv(const sc_vec3 *f, pt2 p)
+{
+	return vnormalize((sc_vec3) {f[0].x + p.x * f[1].x + p.y * f[2].x,
+								 f[0].y + p.x * f[1].y + p.y * f[2].y,
+								 f[0].z + p.x * f[1].z + p.y * f[2].z});
+}
+
+/* twice the signed area of (a, b, c): > 0 counter-clockwise */
+static inline double
+orient2(pt2 a, pt2 b, pt2 c)
+{
+	return (b.x - a.x) * (c.y - a.y) - (b.y - a.y) * (c.x - a.x);
+}
+
+/*
+ * Positions in the plane are good to about this, in tangent-plane units
+ * (radians near g): a vertex given in degrees rounds to ~5e-16 rad, and
+ * the projection adds a few ulp.  Turns and gaps below it are noise.
+ */
+#define SC_PLANE_EPS 1e-14
+
+/* is the turn a -> b -> c straight (to rounding), forward or back? */
+static inline int
+straight2(pt2 a, pt2 b, pt2 c)
+{
+	/* b within SC_PLANE_EPS of the line through a and c, or of a or c */
+	double		lac = Max(hypot(c.x - a.x, c.y - a.y),
+						  Max(hypot(b.x - a.x, b.y - a.y), hypot(c.x - b.x, c.y - b.y)));
+
+	return fabs(orient2(a, b, c)) <= SC_PLANE_EPS * lac;
+}
+
+/* do the closed segments a-b and c-d meet? */
+static int
+segments_meet(pt2 a, pt2 b, pt2 c, pt2 d)
+{
+	double		o1 = orient2(a, b, c),
+				o2 = orient2(a, b, d),
+				o3 = orient2(c, d, a),
+				o4 = orient2(c, d, b),
+				lab = hypot(b.x - a.x, b.y - a.y);
+
+	/*
+	 * Collinear to rounding -- two edges along one great circle, like the
+	 * tops of a U's arms -- and the signs below are noise: do their extents
+	 * along a-b overlap?
+	 */
+	if (fabs(o1) <= SC_PLANE_EPS * lab && fabs(o2) <= SC_PLANE_EPS * lab)
+	{
+		double		ux = b.x - a.x,
+					uy = b.y - a.y,
+					tc = (c.x - a.x) * ux + (c.y - a.y) * uy,
+					td = (d.x - a.x) * ux + (d.y - a.y) * uy,
+					tb = ux * ux + uy * uy;
+
+		return Max(tc, td) >= 0 && Min(tc, td) <= tb;
+	}
+	return ((o1 <= 0 && o2 >= 0) || (o1 >= 0 && o2 <= 0)) &&
+		((o3 <= 0 && o4 >= 0) || (o3 >= 0 && o4 <= 0));
+}
+
+/* spherical area of the triangle (a, b, c), Van Oosterom & Strackee */
+static double
+tri_area(sc_vec3 a, sc_vec3 b, sc_vec3 c)
+{
+	double		num = fabs(sc_dot(a, sc_cross(b, c)));
+	double		den = 1.0 + sc_dot(a, b) + sc_dot(b, c) + sc_dot(c, a);
+
+	return 2.0 * atan2(num, den);
+}
+
+static const char *poly_setup(sc_region *r);
+
+/* reverse the ring in place (v[] and its projection), and redo the normals */
+static const char *
+poly_reverse(sc_region *r, pt2 *pt)
+{
+	for (int i = 0; i < r->nv / 2; i++)
+	{
+		sc_vec3		t = r->v[i];
+		pt2			q = pt[i];
+
+		r->v[i] = r->v[r->nv - 1 - i];
+		r->v[r->nv - 1 - i] = t;
+		pt[i] = pt[r->nv - 1 - i];
+		pt[r->nv - 1 - i] = q;
+	}
+	return poly_setup(r);
+}
+
+/* one diagonal of the triangulation: triangle ta has edge a->b, tb has b->a */
+typedef struct
+{
+	int			a,
+				b,
+				ta,
+				tb;
+} diag_t;
+
+static int
+uf_find(int *parent, int i)
+{
+	while (parent[i] != i)
+		i = parent[i] = parent[parent[i]];
+	return i;
+}
+
+/* position of vertex index x in the part list p[0..n) */
+static int
+part_pos(const int *p, int n, int x)
+{
+	for (int i = 0; i < n; i++)
+		if (p[i] == x)
+			return i;
+	return -1;
+}
+
+/*
+ * Set up r (ring in r->v[]/r->n[], vertex mean g) as a non-convex polygon.
+ * Returns NULL or an error message.
+ */
+static const char *
+poly_nonconvex(sc_region *r, sc_vec3 g)
+{
+	int			nv = r->nv;
+	sc_vec3	   *f = r->frame;
+	pt2		   *pt;
+	int		   *prev,
+			   *next,
+			   *owner,
+			   *tri,
+			   *parent,
+			  **part,
+			   *plen;
+	diag_t	   *diag;
+	int			ntri = 0,
+				ndiag = 0,
+				left = nv,
+				i,
+				stall = 0;
+	double		area2 = 0;
+	sc_vec3		cen = {0, 0, 0};
+	const char *err = NULL;
+
+	/* the tangent plane at g, with (e1, e2, g) right-handed */
+	f[0] = g;
+	f[1] = vnormalize(sc_cross(g, fabs(g.z) < 0.9 ? (sc_vec3) {0, 0, 1} : (sc_vec3) {1, 0, 0}));
+	f[2] = sc_cross(g, f[1]);
+
+	pt = SC_MALLOC(sizeof(pt2) * nv);
+	prev = SC_MALLOC(sizeof(int) * nv);
+	next = SC_MALLOC(sizeof(int) * nv);
+	owner = SC_MALLOC(sizeof(int) * nv);
+	tri = SC_MALLOC(sizeof(int) * 3 * nv);
+	parent = SC_MALLOC(sizeof(int) * nv);
+	plen = SC_MALLOC(sizeof(int) * nv);
+	part = SC_MALLOC(sizeof(int *) * nv);
+	diag = SC_MALLOC(sizeof(diag_t) * 3 * nv);
+	memset(part, 0, sizeof(int *) * nv);
+
+	/* every vertex strictly inside g's hemisphere, else the plane cannot hold it */
+	for (i = 0; i < nv; i++)
+	{
+		if (sc_dot(r->v[i], g) <= 1e-9)
+		{
+			err = "polygon must be smaller than a hemisphere";
+			goto done;
+		}
+		pt[i] = gnomonic(f, r->v[i]);
+	}
+
+	/* counter-clockwise in the plane is interior-on-the-left on the sphere */
+	for (i = 0; i < nv; i++)
+		area2 += pt[i].x * pt[(i + 1) % nv].y - pt[(i + 1) % nv].x * pt[i].y;
+	if (area2 == 0)
+	{
+		err = "polygon has zero area";
+		goto done;
+	}
+	if (area2 < 0 && (err = poly_reverse(r, pt)) != NULL)
+		goto done;
+
+	/*
+	 * Simple: no two edges meet except adjacent ones at their shared vertex,
+	 * and no edge doubles back along the one before it.
+	 */
+	for (i = 0; i < nv; i++)
+	{
+		pt2			a = pt[i],
+					b = pt[(i + 1) % nv],
+					c = pt[(i + 2) % nv];
+
+		if (straight2(a, b, c) &&
+			(b.x - a.x) * (c.x - b.x) + (b.y - a.y) * (c.y - b.y) < 0)
+		{
+			err = "polygon edges must not cross (the polygon must be simple)";
+			goto done;
+		}
+		for (int j = i + 2; j < nv; j++)
+		{
+			if (i == 0 && j == nv - 1)
+				continue;		/* adjacent across the wrap */
+			if (segments_meet(a, b, pt[j], pt[(j + 1) % nv]))
+			{
+				err = "polygon edges must not cross (the polygon must be simple)";
+				goto done;
+			}
+		}
+	}
+
+	/*
+	 * Ear clipping.  owner[i] is the triangle on the far side of the
+	 * remaining ring's edge i -> next[i], or -1 for an edge of the polygon
+	 * itself; each ear clipped across an owned edge records that diagonal.
+	 */
+	for (i = 0; i < nv; i++)
+	{
+		prev[i] = (i + nv - 1) % nv;
+		next[i] = (i + 1) % nv;
+		owner[i] = -1;
+	}
+	i = 0;
+	while (left >= 3)
+	{
+		int			p = prev[i],
+					q = next[i],
+					ear;
+
+		if (straight2(pt[p], pt[i], pt[q]))
+		{
+			/* a vertex on a straight run: drop it, no triangle */
+			next[p] = q;
+			prev[q] = p;
+			owner[p] = -1;
+			left--;
+			stall = 0;
+			i = p;
+			continue;
+		}
+		ear = orient2(pt[p], pt[i], pt[q]) > 0;
+		for (int k = next[q]; ear && k != p; k = next[k])
+			if (orient2(pt[p], pt[i], pt[k]) >= 0 && orient2(pt[i], pt[q], pt[k]) >= 0 &&
+				orient2(pt[q], pt[p], pt[k]) >= 0)
+				ear = 0;		/* another vertex inside or on the triangle */
+		if (!ear)
+		{
+			i = q;
+			if (++stall > left)
+			{
+				/*
+				 * No ear left.  For a simple polygon that only happens when
+				 * what remains is a sliver thinner than SC_PLANE_EPS -- the
+				 * rounding of the cuts so far -- and then the triangles are
+				 * already the polygon.
+				 */
+				double		a2 = 0,
+							per = 0;
+				int			k = i;
+
+				do
+				{
+					a2 += pt[k].x * pt[next[k]].y - pt[next[k]].x * pt[k].y;
+					per += hypot(pt[next[k]].x - pt[k].x, pt[next[k]].y - pt[k].y);
+					k = next[k];
+				} while (k != i);
+				if (fabs(a2) <= SC_PLANE_EPS * per)
+					break;
+				err = "polygon is degenerate (no triangulation)";
+				goto done;
+			}
+			continue;
+		}
+
+		tri[3 * ntri] = p;
+		tri[3 * ntri + 1] = i;
+		tri[3 * ntri + 2] = q;
+		if (owner[p] >= 0)
+			diag[ndiag++] = (diag_t) {p, i, ntri, owner[p]};
+		if (owner[i] >= 0)
+			diag[ndiag++] = (diag_t) {i, q, ntri, owner[i]};
+		if (left == 3)
+		{
+			if (owner[q] >= 0)
+				diag[ndiag++] = (diag_t) {q, p, ntri, owner[q]};
+			ntri++;
+			break;
+		}
+		next[p] = q;
+		prev[q] = p;
+		owner[p] = ntri;		/* the ring's new edge p -> q is the triangle's q -> p */
+		ntri++;
+		left--;
+		stall = 0;
+		i = q;
+	}
+	if (ntri == 0)
+	{
+		err = "polygon has zero area";
+		goto done;
+	}
+
+	for (int t = 0; t < ntri; t++)
+		r->area += tri_area(r->v[tri[3 * t]], r->v[tri[3 * t + 1]], r->v[tri[3 * t + 2]]);
+
+	/*
+	 * The centroid, exactly: by Stokes, the integral of the position vector
+	 * over a spherical polygon is half the sum over its edges of arc length
+	 * times unit edge normal.
+	 */
+	for (i = 0; i < nv; i++)
+	{
+		double		len = sc_angle(r->v[i], r->v[(i + 1) % nv]);
+
+		cen.x += len * r->n[i].x;
+		cen.y += len * r->n[i].y;
+		cen.z += len * r->n[i].z;
+	}
+	r->center = vnormalize(cen);
+
+	/* Hertel-Mehlhorn: drop each diagonal that leaves both corners convex */
+	for (int t = 0; t < ntri; t++)
+	{
+		parent[t] = t;
+		plen[t] = 3;
+		part[t] = SC_MALLOC(sizeof(int) * 3);
+		memcpy(part[t], &tri[3 * t], sizeof(int) * 3);
+	}
+	for (int d = 0; d < ndiag; d++)
+	{
+		int			A = uf_find(parent, diag[d].ta),
+					B = uf_find(parent, diag[d].tb),
+					na = plen[A],
+					nb = plen[B],
+					pa = part_pos(part[A], na, diag[d].a),	/* A: ... a, b ... */
+					pb = part_pos(part[B], nb, diag[d].b),	/* B: ... b, a ... */
+				   *m;
+		int			a_prev = part[A][(pa + na - 1) % na],
+					b_next = part[A][(pa + 2) % na],
+					a_next = part[B][(pb + 2) % nb],
+					b_prev = part[B][(pb + nb - 1) % nb];
+		int			k = 0;
+
+		if (orient2(pt[a_prev], pt[diag[d].a], pt[a_next]) < 0 ||
+			orient2(pt[b_prev], pt[diag[d].b], pt[b_next]) < 0)
+			continue;			/* the merged piece would be reflex at a or b */
+
+		/* A from b round to a, then B after a round to before b */
+		m = SC_MALLOC(sizeof(int) * (na + nb - 2));
+		for (int j = 0; j < na; j++)
+			m[k++] = part[A][(pa + 1 + j) % na];
+		for (int j = 0; j < nb - 2; j++)
+			m[k++] = part[B][(pb + 2 + j) % nb];
+		SC_FREE(part[A]);
+		SC_FREE(part[B]);
+		part[B] = NULL;
+		part[A] = m;
+		plen[A] = k;
+		parent[B] = A;
+	}
+
+	/* the pieces, as convex polygons on the sphere */
+	r->parts = SC_MALLOC(sizeof(sc_region) * ntri);
+	for (int t = 0; t < ntri; t++)
+	{
+		sc_region  *q;
+
+		if (parent[t] != t)
+			continue;
+		q = &r->parts[r->nparts++];
+		memset(q, 0, sizeof(*q));
+		q->kind = SC_REGION_POLY;
+		q->nv = plen[t];
+		q->v = SC_MALLOC(sizeof(sc_vec3) * q->nv);
+		q->n = SC_MALLOC(sizeof(sc_vec3) * q->nv);
+		for (int j = 0; j < q->nv; j++)
+			q->v[j] = r->v[part[t][j]];
+		if ((err = poly_setup(q)) != NULL)
+			goto done;
+	}
+
+done:
+	for (int t = 0; t < ntri; t++)
+		if (part[t])
+			SC_FREE(part[t]);
+	SC_FREE(pt);
+	SC_FREE(prev);
+	SC_FREE(next);
+	SC_FREE(owner);
+	SC_FREE(tri);
+	SC_FREE(parent);
+	SC_FREE(plen);
+	SC_FREE(part);
+	SC_FREE(diag);
+	return err;
 }
 
 const char *
@@ -143,6 +578,7 @@ sc_region_poly(sc_region *r, int nv, const double *ra_deg, const double *dec_deg
 	sc_vec3		g = {0, 0, 0};
 	double		orient = 0;
 	const char *err;
+	int			convex = 1;
 
 	memset(r, 0, sizeof(*r));
 	if (nv < 3)
@@ -185,29 +621,29 @@ sc_region_poly(sc_region *r, int nv, const double *ra_deg, const double *dec_deg
 	}
 
 	/* convex: every vertex on the inner side of every edge */
-	for (int i = 0; i < nv; i++)
+	for (int i = 0; i < nv && convex; i++)
 	{
 		if (sc_dot(r->n[i], g) <= 0)
-			return "polygon must be convex and smaller than a hemisphere";
-		for (int j = 0; j < nv; j++)
+			convex = 0;
+		for (int j = 0; j < nv && convex; j++)
 		{
 			if (j == i || j == (i + 1) % nv)
 				continue;
 			if (sc_dot(r->n[i], r->v[j]) < -1e-12)
-				return "polygon must be convex (non-convex polygons are not supported by this prototype)";
+				convex = 0;
 		}
 	}
 
-	/* area: fan of triangles (g, v_i, v_i+1), Van Oosterom & Strackee */
-	for (int i = 0; i < nv; i++)
+	if (!convex)
 	{
-		sc_vec3		a = g,
-					b = r->v[i],
-					c = r->v[(i + 1) % nv];
-		double		num = fabs(sc_dot(a, sc_cross(b, c)));
-		double		den = 1.0 + sc_dot(a, b) + sc_dot(b, c) + sc_dot(c, a);
-
-		r->area += 2.0 * atan2(num, den);
+		if ((err = poly_nonconvex(r, g)) != NULL)
+			return err;
+	}
+	else
+	{
+		/* area: fan of triangles (g, v_i, v_i+1) */
+		for (int i = 0; i < nv; i++)
+			r->area += tri_area(g, r->v[i], r->v[(i + 1) % nv]);
 	}
 
 	if (!need_covering)
@@ -226,6 +662,14 @@ sc_region_free(sc_region *r)
 	if (r->n)
 		SC_FREE(r->n);
 	r->v = r->n = NULL;
+	if (r->parts)
+	{
+		for (int i = 0; i < r->nparts; i++)
+			sc_region_free(&r->parts[i]);
+		SC_FREE(r->parts);
+	}
+	r->parts = NULL;
+	r->nparts = 0;
 }
 
 int
@@ -245,6 +689,14 @@ sc_region_contains(const sc_region *r, sc_vec3 p)
 	 * vertices -- see poly_setup's identical tolerance on the same kind of
 	 * dot product, a few lines up in this file.
 	 */
+	if (r->nparts > 0)
+	{
+		/* non-convex: in some convex piece (shared diagonals overlap in the slack) */
+		for (int k = 0; k < r->nparts; k++)
+			if (sc_region_contains(&r->parts[k], p))
+				return 1;
+		return 0;
+	}
 	for (int i = 0; i < r->nv; i++)
 		if (sc_dot(r->n[i], p) < -1e-12)
 			return 0;
@@ -385,6 +837,30 @@ sc_region_classify_cap(const sc_region *r, int order, int64_t pix, double *f_out
 		*f_out = clamp01(0.5 + (d - r->radius) / (2.0 * rho));
 		return SC_PARTIAL;
 	}
+	else if (r->nparts > 0)
+	{
+		/*
+		 * Non-convex: a cap that does not reach the boundary ring is wholly
+		 * inside or wholly outside, as its centre is.  Only edges whose great
+		 * circle passes within the cap (|n.c| <= sin(rho + eps)) can reach it;
+		 * the pieces' diagonals are not boundary and play no part.
+		 */
+		double		s = r->sin_rho[order];
+		double		dist = M_PI;
+		int			inside;
+
+		for (int i = 0; i < r->nv; i++)
+			if (fabs(sc_dot(r->n[i], c)) <= s)
+				dist = fmin(dist, arc_dist(c, r->v[i], r->v[(i + 1) % r->nv], r->n[i]));
+		inside = sc_region_contains(r, c);
+		if (dist > rho + SC_ANG_EPS)
+		{
+			*f_out = inside ? 0.0 : 1.0;
+			return inside ? SC_IN : SC_OUT;
+		}
+		*f_out = clamp01(0.5 - (inside ? dist : -dist) / (2.0 * rho));
+		return SC_PARTIAL;
+	}
 	else
 	{
 		double		s = r->sin_rho[order];
@@ -497,8 +973,8 @@ sc_region_centroid(const sc_region *r)
 {
 	sc_vec3		g = {0, 0, 0};
 
-	if (r->kind == SC_REGION_CONE)
-		return r->center;
+	if (r->kind == SC_REGION_CONE || r->nparts > 0)
+		return r->center;		/* a non-convex polygon's: its centre of mass */
 	for (int i = 0; i < r->nv; i++)
 	{
 		g.x += r->v[i].x;
@@ -514,11 +990,33 @@ region_farthest(const sc_region *r, sc_vec3 p)
 {
 	double		d = 0;
 
+	sc_vec3		q = {-p.x, -p.y, -p.z};
+
 	if (r->kind == SC_REGION_CONE)
 		return sc_angle(p, r->center) + r->radius;
-	/* convex polygon: the farthest point from an external point is a vertex */
+
+	/*
+	 * A polygon: the farthest point is on the boundary unless the polygon
+	 * holds p's antipode.  Along one edge the distance from p peaks at a
+	 * vertex, or inside the edge where it passes the point of its great
+	 * circle farthest from p (p's antipode projected onto the circle) -- the
+	 * second only for edges more than 90 degrees from p, so for most
+	 * polygons this is the vertex maximum, computed as such.
+	 */
+	if (sc_region_contains(r, q))
+		return M_PI;
 	for (int i = 0; i < r->nv; i++)
-		d = fmax(d, sc_angle(p, r->v[i]));
+	{
+		sc_vec3		a = r->v[i],
+					b = r->v[(i + 1) % r->nv],
+					n = r->n[i];
+		double		s = sc_dot(n, q);
+		sc_vec3		f = {q.x - s * n.x, q.y - s * n.y, q.z - s * n.z};
+
+		d = fmax(d, sc_angle(p, a));
+		if (sc_dot(sc_cross(a, f), n) > 0 && sc_dot(sc_cross(f, b), n) > 0)
+			d = fmax(d, M_PI - asin(fmin(1.0, fabs(s))));
+	}
 	return d;
 }
 
@@ -561,6 +1059,102 @@ arcs_cross(sc_vec3 a1, sc_vec3 a2, sc_vec3 na, sc_vec3 b1, sc_vec3 b2, sc_vec3 n
 	return 0;
 }
 
+/*
+ * a inside b, b a non-convex polygon.  A cone is inside when its centre is
+ * and no boundary edge of b comes nearer the centre than the radius.  A
+ * polygon is inside when its vertices are and none of its edges leaves b:
+ * all of a then lies in b's hemisphere, so each edge of a is a straight
+ * segment in b's gnomonic plane.  Cut it wherever it meets b's boundary
+ * (crossing, touching or running along it); between two cuts the edge is
+ * wholly in or wholly out, as the midpoint shows.  Extra cuts are harmless,
+ * so near-misses count as meetings.
+ */
+static int
+contained_in_nonconvex(const sc_region *a, const sc_region *b)
+{
+	const sc_vec3 *f = b->frame;
+	double	   *t;
+	int			ok = 1;
+
+	if (a->kind == SC_REGION_CONE)
+	{
+		if (!sc_region_contains(b, a->center))
+			return 0;
+		for (int j = 0; j < b->nv; j++)
+			if (arc_dist(a->center, b->v[j], b->v[(j + 1) % b->nv], b->n[j]) < a->radius)
+				return 0;
+		return 1;
+	}
+	for (int i = 0; i < a->nv; i++)
+		if (!sc_region_contains(b, a->v[i]) || sc_dot(a->v[i], f[0]) <= 0)
+			return 0;
+
+	t = SC_MALLOC(sizeof(double) * (2 * b->nv + 2));
+	for (int i = 0; i < a->nv && ok; i++)
+	{
+		pt2			P = gnomonic(f, a->v[i]),
+					Q = gnomonic(f, a->v[(i + 1) % a->nv]),
+					u = {Q.x - P.x, Q.y - P.y};
+		double		uu = u.x * u.x + u.y * u.y;
+		int			nt = 0;
+		const double slack = 1e-9;
+
+		t[nt++] = 0.0;
+		t[nt++] = 1.0;
+		for (int j = 0; j < b->nv; j++)
+		{
+			pt2			C = gnomonic(f, b->v[j]),
+						D = gnomonic(f, b->v[(j + 1) % b->nv]),
+						w = {D.x - C.x, D.y - C.y},
+						cp = {C.x - P.x, C.y - P.y};
+			double		den = u.x * w.y - u.y * w.x,
+						scale = sqrt(uu * (w.x * w.x + w.y * w.y));
+
+			if (fabs(den) > 1e-12 * scale)
+			{
+				double		tt = (cp.x * w.y - cp.y * w.x) / den,
+							ss = (cp.x * u.y - cp.y * u.x) / den;
+
+				if (tt > -slack && tt < 1 + slack && ss > -slack && ss < 1 + slack)
+					t[nt++] = fmin(1.0, fmax(0.0, tt));
+			}
+			else
+			{
+				/* parallel, perhaps collinear: cut at b's endpoints along a's edge */
+				double		tc = (cp.x * u.x + cp.y * u.y) / uu,
+							td = ((D.x - P.x) * u.x + (D.y - P.y) * u.y) / uu;
+
+				if (tc > 0 && tc < 1)
+					t[nt++] = tc;
+				if (td > 0 && td < 1)
+					t[nt++] = td;
+			}
+		}
+
+		/* insertion sort: nt is small */
+		for (int k = 1; k < nt; k++)
+		{
+			double		x = t[k];
+			int			m = k - 1;
+
+			for (; m >= 0 && t[m] > x; m--)
+				t[m + 1] = t[m];
+			t[m + 1] = x;
+		}
+		for (int k = 0; k + 1 < nt && ok; k++)
+		{
+			double		mid = 0.5 * (t[k] + t[k + 1]);
+
+			if (t[k + 1] - t[k] <= 1e-15)
+				continue;
+			if (!sc_region_contains(b, gnomonic_inv(f, (pt2) {P.x + mid * u.x, P.y + mid * u.y})))
+				ok = 0;
+		}
+	}
+	SC_FREE(t);
+	return ok;
+}
+
 /* ADQL CONTAINS: is every point of a also in b? */
 int
 sc_region_contains_region(const sc_region *a, const sc_region *b)
@@ -569,8 +1163,10 @@ sc_region_contains_region(const sc_region *a, const sc_region *b)
 		return 1;				/* the empty region is inside anything */
 	if (b->kind == SC_REGION_CONE)
 		return region_farthest(a, b->center) <= b->radius;
+	if (b->nparts > 0)
+		return contained_in_nonconvex(a, b);
 
-	/* b is a convex polygon */
+	/* b is a convex polygon (a may be non-convex: its edges join its vertices) */
 	if (a->kind == SC_REGION_CONE)
 	{
 		if (!sc_region_contains(b, a->center))
@@ -583,7 +1179,7 @@ sc_region_contains_region(const sc_region *a, const sc_region *b)
 	for (int i = 0; i < a->nv; i++)
 		if (!sc_region_contains(b, a->v[i]))
 			return 0;
-	return 1;					/* both convex: vertices inside is enough */
+	return 1;					/* b convex: a's vertices inside is enough */
 }
 
 /* ADQL INTERSECTS: do a and b share any point? */
@@ -600,7 +1196,7 @@ sc_region_overlaps(const sc_region *a, const sc_region *b)
 	if (b->kind == SC_REGION_CONE)
 		return sc_region_distance(a, b->center) <= b->radius;
 
-	/* two convex polygons: a vertex inside the other, or crossing edges */
+	/* two simple polygons: a vertex inside the other, or crossing edges */
 	for (int i = 0; i < a->nv; i++)
 		if (sc_region_contains(b, a->v[i]))
 			return 1;

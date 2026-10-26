@@ -70,7 +70,7 @@ sources sit per square degree of sky. It is also the numbering Gaia's
 than private to the extension.
 
 **2. A region becomes a set of ranges, chosen by cost.** Any query region —
-cone, box, convex polygon — is covered by cells, and each run of cells becomes
+cone, box, polygon — is covered by cells, and each run of cells becomes
 a key range. How finely to cut is a cost question, not a fixed depth:
 
 ```
@@ -286,7 +286,7 @@ per-row polygon or stored region by the rewrite's run-time range slots.
 ## Operators and functions
 
 Every function skycell installs, one by one. Types are `skypos` (a position) and
-`skyregion` (a cone, box or convex polygon). The `coordsys` argument is accepted
+`skyregion` (a cone, box or polygon). The `coordsys` argument is accepted
 for ADQL compatibility and must be `'ICRS'`; convert other frames first with
 `gal2icrs()` / `ecl2icrs()`.
 
@@ -297,13 +297,13 @@ for ADQL compatibility and must be `'ICRS'`; convert other frames first with
 | `point(ra, dec)`<br>`point(coordsys, ra, dec)` | `skypos` | degrees. ADQL `POINT` |
 | `circle(ra, dec, radius)`<br>`circle(coordsys, ra, dec, radius)` | `skyregion` | radius in degrees. ADQL `CIRCLE` |
 | `box(ra, dec, width, height)`<br>`box(coordsys, …)` | `skyregion` | centre and extent, as ADQL defines it. Errors if it reaches a pole — use a polygon there. ADQL `BOX` |
-| `polygon(ra1, dec1, ra2, dec2, …)`<br>`polygon(coordsys, …)` | `skyregion` | ≥ 3 vertices, **convex**, smaller than a hemisphere. ADQL `POLYGON` |
+| `polygon(ra1, dec1, ra2, dec2, …)`<br>`polygon(coordsys, …)` | `skyregion` | ≥ 3 vertices, convex or not, but simple: no two edges may cross or touch. Every vertex must lie within 90° of the vertices' mean. ADQL `POLYGON` |
 | `contains(p skypos, r skyregion)`<br>`contains(a skyregion, b skyregion)` | `integer` (1/0) | ADQL `CONTAINS`. Compared with 1 (`contains(…) = 1`, or `1 = …`) in a `WHERE` or `JOIN ON` it is planned as the `<@` operator below, so it is indexed |
 | `intersects(p skypos, r skyregion)`<br>`intersects(a skyregion, b skyregion)` | `integer` (1/0) | ADQL `INTERSECTS`. Compared with 1 it is planned as `<@` (point-region) or `&&` (region-region) below, so it is indexed |
 | `distance(a skypos, b skypos)`<br>`distance(ra1, dec1, ra2, dec2)` | `float8` | degrees. ADQL `DISTANCE`, both forms. `distance(…) < r` (or `<=`) in a `WHERE` or `JOIN ON` is planned as the cone, like `<@` below |
 | `area(r skyregion)` | `float8` | square degrees. ADQL `AREA` |
 | `coord1(p)` / `coord2(p)` | `float8` | right ascension / declination, degrees |
-| `centroid(r skyregion)` | `skypos` | ADQL `CENTROID` |
+| `centroid(r skyregion)` | `skypos` | ADQL `CENTROID`. For a convex polygon, the mean of its vertices; for a non-convex one, its centre of mass (which may lie outside it, as a U's does) |
 
 If a bare name collides with `pg_catalog` (`point`, `circle`, `box`, `polygon`
 all exist there), either install into a schema that precedes it in
@@ -390,7 +390,7 @@ for comparison.
 | Function | Notes |
 |---|---|
 | `skycell_cone(cell, ra, dec, ra0, dec0, radius)` | cone test, answered by the custom scan: a constant cone covered at plan time; a per-row cone (a cross-match, `JOIN cat c ON skycell_cone(c.cell, c.ra, c.dec, p.ra, p.dec, r)`) covered per outer row; a generic plan or correlated sub-select covered per rescan |
-| `skycell_poly(cell, ra, dec, poly float8[])` | the same for a convex polygon |
+| `skycell_poly(cell, ra, dec, poly float8[])` | the same for a polygon |
 | `skycell_radial_query(ra, dec, ra0, dec0, radius)` | Q3C's spelling of the cone test — no cell argument, the planner synthesises `skycell_ang2cell(ra, dec)`; the custom scan answers it through an expression index on that |
 | `skycell_join(ra1, dec1, ra2, dec2, radius)` | Q3C's spelling of the cross-match — likewise; the first pair is the indexed side, as in `q3c_join` |
 | `skycell_in_cone(ra, dec, ra0, dec0, radius [, sel])` | the exact test alone, no index |
@@ -545,10 +545,16 @@ Two layers, both in [`ext/test/`](ext/test/).
 - `cover_selftest`: brute force on the covering itself. Two million catalogue
   points; for cones from 1″ to 120° and for convex polygons, under a uniform
   and a histogram density model, every point inside the region must have its
-  order-29 cell inside one of the ranges. Then the awkward places: 7,266
-  polygons at the poles, zone boundaries, RA wrap-around and face edges (869,117
+  order-29 cell inside one of the ranges. Then the awkward places: 7,552
+  polygons at the poles, zone boundaries, RA wrap-around and face edges (904,809
   points inside, half within a part per billion of an edge), and 2 × 30,000 cones
-  with 200 points each. It also prints ranges, cells examined, false-positive
+  with 200 points each. Then 1,200 non-convex polygons, from 0.2″ to 55°: L, U,
+  comb and random star shapes, in both orientations, at the same places. Each
+  is checked against a reference that shares none of its code: a crossing-number
+  test in a plane of the test's own choosing, plus a fan sum for the area. That
+  covers 444,683 points, half of them a hair either side of an edge, and each
+  point's membership and covering, the area, and CONTAINS and INTERSECTS for
+  14,400 small triangles around the notches. It also prints ranges, cells examined, false-positive
   fraction and µs per covering. Current run: **0 false negatives**.
 
 **SQL regression** — `make installcheck` in `ext/`, against a running server:
@@ -569,6 +575,16 @@ Two layers, both in [`ext/test/`](ext/test/).
   correlated nearest-neighbour, `skycell_join`), with a NULL centre, a cone round
   the pole and one across RA = 0, match the rewrite; an invalid centre errors as
   the rewrite does; and the cross-match row estimate is within 3× of the truth.
+- `polygon`: non-convex polygons, checked against things that do not share
+  their code: a U is written again as three convex pieces, and must hold
+  exactly the pieces' rows, with the pieces' total area. Points in the notch,
+  a cone in the notch and a bridge across it (every vertex inside, an edge
+  outside) are tested, along with self-crossing, self-touching and
+  doubled-back input. The exact test, the range rewrite and the indexed and
+  sequential operator must agree for a U, a comb across RA = 0, a pac-man
+  over the pole, a star at the zone boundary and an arcsecond-sized U. Every
+  GiST region operator class must give the sequential answer for regions
+  that are non-convex polygons.
 
 **Reference translators** — [`adql_geometry/tests/`](adql_geometry/tests/): the
 Python translator's tests (pytest), and `cross_check.py`, which requires the
@@ -582,8 +598,14 @@ locally), the standalone selftests, and the reference translators.
 
 ## Limitations
 
-- **Geometry.** Polygons must be convex. There is no `REGION`, no union of
-  regions and no non-convex support.
+- **Geometry.** A polygon must be simple, with no crossing or touching edges,
+  and every vertex must lie within 90° of the vertices' mean. There is no
+  `REGION` and no union of regions. A non-convex polygon costs more than a
+  convex one. Parsing a U or a comb takes 2–6 µs against 0.6 µs for a convex
+  quadrilateral, and each step of its covering is 2–3× dearer. The ranges it
+  yields are as few, so the rows read do not change. Setting one up is
+  quadratic in its vertices: 10 ms for 1,000 vertices, about 1 s for 10,000.
+  A constant polygon is set up once per query, a stored one once per row.
 - **No KNN ordering yet.** `ORDER BY pos <-> point(…) LIMIT k` is not indexed.
   A correlated sub-select with `ORDER BY skycell_dist(…) LIMIT 1` over a cone
   is indexed (the custom scan covers the cone per rescan), so use that instead.

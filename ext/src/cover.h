@@ -49,11 +49,21 @@ typedef struct sc_region
 								 * (sc_region_classify_cap() fills them lazily, on
 								 * first use at that order -- see cover.c) */
 
-	/* convex polygon: vertices CCW, unit edge normals, interior n.p >= 0 */
+	/*
+	 * polygon: vertices CCW, unit edge normals.  For a convex polygon the
+	 * interior is n.p >= 0 for every edge.  For a non-convex one (nparts > 0)
+	 * v[]/n[] are the boundary ring alone, and the interior is the union of
+	 * parts[], convex polygons cut from it in the gnomonic plane tangent at
+	 * frame[0] (axes frame[1], frame[2]); center then holds its centroid
+	 * (centre of mass).  See sc_region_poly() in cover.c.
+	 */
 	int			nv;
 	sc_vec3    *v;
 	sc_vec3    *n;
 	double		sin_rho[SC_MAX_ORDER + 1];
+	int			nparts;
+	struct sc_region *parts;
+	sc_vec3		frame[3];
 } sc_region;
 
 typedef struct sc_density

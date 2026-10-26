@@ -196,7 +196,7 @@ BEGIN
     poly := ARRAY[cra - s, cdec - s/2, cra + s, cdec - s/2, cra + s/2, least(cdec + s, 90), cra - s/2, least(cdec + s, 90)];
     BEGIN
       EXECUTE format('SELECT count(*) FROM cat WHERE skycell_poly(cell, ra, dec, %L::float8[])', poly) INTO a;
-    EXCEPTION WHEN invalid_parameter_value THEN CONTINUE;   -- degenerate/non-convex near the pole
+    EXCEPTION WHEN invalid_parameter_value THEN CONTINUE;   -- degenerate near the pole
     END;
     EXECUTE format('SELECT count(*) FROM cat WHERE skycell_in_poly(ra, dec, %L::float8[])', poly) INTO b;
     IF a <> b THEN bad := bad + 1; RAISE NOTICE 'poly %: % vs %', poly, a, b; END IF;
@@ -204,7 +204,7 @@ BEGIN
   RETURN bad;
 END $$;
 SELECT poly_mismatches() AS poly_mismatches;
-SELECT skycell_poly(1, 0, 0, ARRAY[0,0, 10,0, 1,1, 0,10]::float8[]);  -- non-convex: error
+SELECT skycell_poly(1, 0, 0, ARRAY[0,0, 10,10, 10,0, 0,10]::float8[]);  -- self-crossing: error
 
 -- sc_region_contains's polygon branch used a strict "< 0" test on a vertex's
 -- dot product against each edge's plane, so a vertex sitting exactly ON that
