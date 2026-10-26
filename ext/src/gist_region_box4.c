@@ -413,20 +413,25 @@ typedef struct
 	bytea	   *last_query;
 	Size		last_query_size;
 	GistBox3Df	qbox;
+	skycell_pos_cache qpos;		/* the point strategy's query */
 }			box4_query_cache;
+
+static box4_query_cache *
+box4_cache(FunctionCallInfo fcinfo)
+{
+	if (fcinfo->flinfo->fn_extra == NULL)
+		fcinfo->flinfo->fn_extra =
+			MemoryContextAllocZero(fcinfo->flinfo->fn_mcxt, sizeof(box4_query_cache));
+	return (box4_query_cache *) fcinfo->flinfo->fn_extra;
+}
 
 static const GistBox3Df *
 box4_cached_query(FunctionCallInfo fcinfo, Datum queryDatum)
 {
-	box4_query_cache *qcache = (box4_query_cache *) fcinfo->flinfo->fn_extra;
+	box4_query_cache *qcache = box4_cache(fcinfo);
 	bytea	   *qb = DatumGetByteaP(queryDatum);
 	Size		qsz = VARSIZE(qb);
 
-	if (qcache == NULL)
-	{
-		qcache = MemoryContextAllocZero(fcinfo->flinfo->fn_mcxt, sizeof(box4_query_cache));
-		fcinfo->flinfo->fn_extra = qcache;
-	}
 	if (qcache->last_query == NULL || qcache->last_query_size != qsz ||
 		memcmp(qcache->last_query, qb, qsz) != 0)
 	{
@@ -468,7 +473,8 @@ skyregion_box4_gist_consistent(PG_FUNCTION_ARGS)
 			*recheck = true;
 			break;
 		case GIST_REGION_BOX4_STRATEGY_CONTAINS_POINT:
-			result = box3df_contains_point(eb, skycell_pos_from_datum(queryDatum));
+			result = box3df_contains_point(eb,
+										   skycell_pos_from_datum_cached(queryDatum, &box4_cache(fcinfo)->qpos));
 			*recheck = true;
 			break;
 		default:

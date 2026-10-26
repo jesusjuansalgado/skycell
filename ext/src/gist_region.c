@@ -1033,6 +1033,7 @@ typedef struct
 	bytea	   *last_query;		/* palloc'd copy in fn_mcxt, or NULL */
 	Size		last_query_size;
 	GistMultiCap qmc;
+	skycell_pos_cache qpos;		/* STRATEGY_CONTAINS_POINT's query */
 }			region_gist_query_cache;
 
 PG_FUNCTION_INFO_V1(skyregion_gist_consistent);
@@ -1133,12 +1134,14 @@ skyregion_gist_consistent(PG_FUNCTION_ARGS)
 			}
 			break;
 		case GIST_REGION_STRATEGY_CONTAINS_POINT:
-			/* a skypos is a fixed-size by-reference Datum, not a region --
-			 * no fn_extra caching needed here (unlike the OVERLAP case
-			 * above): extracting its unit vector is two doubles and a bit
-			 * of trig, far cheaper than the region-parsing + MOC
-			 * decomposition that OVERLAP's cache exists to avoid repeating. */
-			result = multicap_contains_point(&em, skycell_pos_from_datum(queryDatum));
+			/* a skypos is a fixed-size by-reference Datum, not a region:
+			 * its unit vector is cached by its coordinates (skycell_pos_cache) */
+			if (qcache == NULL)
+			{
+				qcache = MemoryContextAllocZero(fcinfo->flinfo->fn_mcxt, sizeof(region_gist_query_cache));
+				fcinfo->flinfo->fn_extra = qcache;
+			}
+			result = multicap_contains_point(&em, skycell_pos_from_datum_cached(queryDatum, &qcache->qpos));
 			*recheck = true;	/* sub-caps cover the region; recheck confirms
 								 * the point is actually inside its true shape */
 			break;

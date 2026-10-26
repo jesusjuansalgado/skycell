@@ -167,6 +167,13 @@ SELECT i AS id,
                                                 ra+s/4, dec-s/2, ra-s/4, dec-s/2, ra-s/4, dec+s, ra-s, dec+s]) END AS r
 FROM (SELECT i, 176 + 8 * random() AS ra, 4 * (2 * random() - 1) AS dec, 0.05 + 0.5 * random() AS s
       FROM generate_series(1, 3000) i) t;
+-- points over the same patch, joined against the regions: each outer row's
+-- point is a new query for the index scan, so a point kept from the row
+-- before would show here
+CREATE TABLE ppts AS
+SELECT i AS pid, point('ICRS', 176 + 8 * random(), 4 * (2 * random() - 1)) AS pos
+FROM generate_series(1, 400) i;
+ANALYZE ppts;
 
 CREATE FUNCTION region_counts(OUT name text, OUT seq text, OUT idx text) RETURNS SETOF record
 LANGUAGE plpgsql AS $$
@@ -177,6 +184,7 @@ BEGIN
     ('in U',           'SELECT count(*) || '':'' || coalesce(sum(id), 0) FROM preg, shape WHERE r <@ u'),
     ('U holds',        'SELECT count(*) || '':'' || coalesce(sum(id), 0) FROM preg, shape WHERE u <@ r'),
     ('has notch pt',   'SELECT count(*) || '':'' || coalesce(sum(id), 0) FROM preg WHERE r @> point(''ICRS'', 180, 1)'),
+    ('hold points',    'SELECT count(*) || '':'' || coalesce(sum(id * 1000 + pid), 0) FROM ppts, preg WHERE r @> pos'),
     ('overlap circle', 'SELECT count(*) || '':'' || coalesce(sum(id), 0) FROM preg WHERE r && circle(''ICRS'', 180, 1, 0.4)')
   LOOP
     SET LOCAL enable_seqscan = on;
@@ -202,5 +210,5 @@ DROP INDEX preg_box;
 CREATE INDEX preg_box4 ON preg USING gist (r skyregion_box4_gist_ops);
 SELECT name, seq = idx AS agree FROM region_counts() ORDER BY name;
 
-DROP TABLE preg, polys, pcat, shape;
+DROP TABLE preg, ppts, polys, pcat, shape;
 DROP FUNCTION region_counts(), poly_counts(float8[]), poly_plan_uses_index(text);
