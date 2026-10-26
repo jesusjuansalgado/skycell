@@ -939,6 +939,31 @@ cone_join_selectivity(PlannerInfo *root, List *args)
 }
 
 /*
+ * How many times a scan parameterized by these outer relations runs: the
+ * smallest row estimate among them, as get_loop_count() (static in
+ * indxpath.c) has it, without its semijoin adjustment.
+ */
+static double
+cone_loop_count(PlannerInfo *root, Relids outer)
+{
+	double		result = 0.0;
+	int			relid = -1;
+
+	while ((relid = bms_next_member(outer, relid)) >= 0)
+	{
+		RelOptInfo *orel;
+
+		if (relid >= root->simple_rel_array_size ||
+			(orel = root->simple_rel_array[relid]) == NULL ||
+			IS_DUMMY_REL(orel) || orel->rows <= 0.0)
+			continue;
+		if (result == 0.0 || orel->rows < result)
+			result = orel->rows;
+	}
+	return result > 1.0 ? result : 1.0;
+}
+
+/*
  * Cost of walking the covering, in the planner's units, for both ways the
  * executor can do it, mirroring what PostgreSQL charges for the same work:
  * a descent per range (btcostestimate), the leaf pages and index tuples the
@@ -950,10 +975,19 @@ cone_join_selectivity(PlannerInfo *root, List *args)
  *            in physical order (cost_bitmap_heap_scan's page count).
  *
  * *bitmap reports which is cheaper; that is the mode the scan runs in.
+ *
+ * loops is how many times the scan runs: the outer rows of a cross-match
+ * (cone_loop_count()), 1 otherwise.  As cost_index(), compute_bitmap_pages()
+ * and genericcostestimate() have it, the pages the scans read together are
+ * then estimated across all of them (index_pages_fetched(), which knows
+ * effective_cache_size) and charged per scan: a page an earlier probe read is
+ * not a random read again.  Without this every probe of a cross-match paid
+ * for its pages cold, about ten times what the scan costs, and a parallel
+ * sequential scan that runs ten times slower was planned instead.
  */
 static void
 cone_cost(PlannerInfo *root, RelOptInfo *rel, IndexOptInfo *ix, double nr, double exp_rows,
-		  double rows, double corr, Cost *startup, Cost *total, bool *bitmap)
+		  double rows, double corr, double loops, Cost *startup, Cost *total, bool *bitmap)
 {
 	double		cand = fmax(exp_rows, rows);
 	double		ituples = fmax(ix->tuples, 1.0);
@@ -962,12 +996,20 @@ cone_cost(PlannerInfo *root, RelOptInfo *rel, IndexOptInfo *ix, double nr, doubl
 	double		rpp = (rel->tuples > 0 && rel->pages > 0) ? rel->tuples / rel->pages : 100.0;
 	double		descent = (ceil(log2(ituples)) + (Max(ix->tree_height, 0) + 1) * 50.0)
 		* cpu_operator_cost;
+	double		index_pages = nr + cand * ipages / ituples;
 	Cost		common,
+				index_io,
 				ordered,
 				bm;
 
+	/* a descent per range, then the leaf pages the ranges hold */
+	if (loops > 1.0)
+		index_io = index_pages_fetched(index_pages * loops, ix->pages, ipages, root)
+			* random_page_cost / loops;
+	else
+		index_io = index_pages * random_page_cost;
 	common = nr * descent
-		+ (nr + cand * ipages / ituples) * random_page_cost
+		+ index_io
 		+ cand * (cpu_index_tuple_cost + 2.0 * cpu_operator_cost)
 		+ cand * (cpu_tuple_cost + rel->baserestrictcost.per_tuple)
 		+ rows * rel->reltarget->cost.per_tuple;
@@ -983,14 +1025,32 @@ cone_cost(PlannerInfo *root, RelOptInfo *rel, IndexOptInfo *ix, double nr, doubl
 	 */
 	{
 		double		min_pages = fmin(T, nr + cand / rpp);
-		Cost		io_clustered = nr * random_page_cost + fmax(0.0, min_pages - nr) * seq_page_cost;
-		Cost		ordered_uncorr = index_pages_fetched(cand, rel->pages, ipages, root) * random_page_cost;
-		double		pages = fmin(T, (2.0 * T * cand) / (2.0 * T + cand));
-		double		per_page = (pages >= 2.0)
+		Cost		io_clustered,
+					ordered_uncorr,
+					bitmap_uncorr;
+		double		pages;
+		double		per_page;
+		double		c2 = corr * corr;
+
+		if (loops > 1.0)
+		{
+			/* the loops' pages together, charged per loop, at random cost */
+			io_clustered = index_pages_fetched(min_pages * loops, rel->pages, ipages, root)
+				* random_page_cost / loops;
+			ordered_uncorr = index_pages_fetched(cand * loops, rel->pages, ipages, root)
+				* random_page_cost / loops;
+			pages = index_pages_fetched(cand * loops, rel->pages, ipages, root) / loops;
+		}
+		else
+		{
+			io_clustered = nr * random_page_cost + fmax(0.0, min_pages - nr) * seq_page_cost;
+			ordered_uncorr = index_pages_fetched(cand, rel->pages, ipages, root) * random_page_cost;
+			pages = fmin(T, (2.0 * T * cand) / (2.0 * T + cand));
+		}
+		per_page = (pages >= 2.0)
 			? random_page_cost - (random_page_cost - seq_page_cost) * sqrt(pages / T)
 			: random_page_cost;
-		Cost		bitmap_uncorr = pages * per_page;
-		double		c2 = corr * corr;
+		bitmap_uncorr = pages * per_page;
 
 		ordered = ordered_uncorr + c2 * (io_clustered - ordered_uncorr);
 		bm = bitmap_uncorr + c2 * (io_clustered - bitmap_uncorr)
@@ -1033,6 +1093,7 @@ add_runtime_path(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte, FuncExp
 	cp->path.rows = rows;
 	cp->path.pathkeys = NIL;
 	cone_cost(root, rel, ix, e.nranges, e.cand, rows, cell_correlation(rte, ix, cell),
+			  ppi ? cone_loop_count(root, ppi->ppi_req_outer) : 1.0,
 			  &cp->path.startup_cost, &cp->path.total_cost, &bitmap);
 	/* the covering itself, each time: ten operator calls a classified cell */
 	cp->path.total_cost += e.steps * 10.0 * cpu_operator_cost;
@@ -1132,7 +1193,7 @@ cone_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, Index rti, RangeTblEnt
 		cp->path.rows = rel->rows;
 		cp->path.pathkeys = NIL;
 		cone_cost(root, rel, ix, cov.n, cov.exp_rows, rel->rows,
-				  cell_correlation(rte, ix, linitial(f->args)),
+				  cell_correlation(rte, ix, linitial(f->args)), 1.0,
 				  &cp->path.startup_cost, &cp->path.total_cost, &bitmap);
 		cp->flags = 0;
 		cp->custom_paths = NIL;

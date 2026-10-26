@@ -61,12 +61,8 @@ CREATE INDEX cat_a2c ON cat (skycell_ang2cell(ra, dec));
 ANALYZE cat;
 CREATE TABLE probe AS SELECT ra, dec FROM cat ORDER BY id LIMIT 20;
 ANALYZE probe;
--- that the cross-match can use the index, not how it is costed against a
--- parallel plan, which the custom scan is not: pinned serial, as in cone_scan
-SET max_parallel_workers_per_gather = 0;
 SELECT plan_uses_index('SELECT * FROM cat WHERE skycell_radial_query(ra, dec, 10, 20, 0.1)') AS radial_indexed,
        plan_uses_index('SELECT count(*) FROM probe p, cat c WHERE skycell_join(c.ra, c.dec, p.ra, p.dec, 0.05)') AS join_indexed;
-RESET max_parallel_workers_per_gather;
 SELECT (SELECT count(*) FROM cat WHERE skycell_radial_query(ra, dec, 10, 20, 0.5))
          = (SELECT count(*) FROM cat WHERE skycell_cone(cell, ra, dec, 10, 20, 0.5)) AS radial_matches_cone,
        (SELECT count(*) FROM cat WHERE skycell_radial_query(ra, dec, 10, 20, 0.5))
