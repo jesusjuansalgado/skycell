@@ -106,7 +106,10 @@ whose centre comes from another table's row, gets the same node parameterized
 by that row on the inner side of a nested loop, each probe covered with the
 ranges its own cone needs. Its row estimate is measured, not modelled: at plan
 time skycell covers 32 sampled probes and counts the catalogue rows their cones
-really hold (12,630 estimated against 12,390 actual).
+really hold (12,630 estimated against 12,390 actual). A probe's rescan is
+costed as PostgreSQL costs its own index scan on the inner side of a nested
+loop, the pages earlier probes have read counted as cached, so a cross-match
+is weighed fairly against a parallel sequential scan.
 
 ```
 Nested Loop

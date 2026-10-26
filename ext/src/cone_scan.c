@@ -560,9 +560,26 @@ sampleable_rel(PlannerInfo *root, int varno, RangeTblEntry **rte)
  * its pages, cover each probe as the scan will, and count the inner rows
  * the ranges hold and the cone keeps -- as get_actual_variable_range() reads
  * an index to estimate a range.  Anything else keeps the density estimate.
+ *
+ * The sample reads at most PROBE_MAX_CAND inner rows.  One the budget cuts
+ * short has still measured cones holding more than the model said -- the
+ * case of probes sitting on clusters, which the model, spreading each cell's
+ * rows evenly over it, misses most -- so it raises the estimate to what it
+ * read, and never lowers it.  The budget bounds what planning reads, cold on
+ * a heap out of cell order a random page a row: it is not raised to sample
+ * larger cones.
  */
 #define PROBE_SAMPLES	32
-#define PROBE_MAX_CAND	4000	/* inner rows read in all, before giving up */
+#define PROBE_SLOTS		(2 * PROBE_SAMPLES)	/* rows a block share rounds up to */
+#define PROBE_MAX_CAND	4000	/* inner rows read in all */
+
+typedef struct
+{
+	double		ra0,
+				dec0,
+				radius;
+	bool		null;
+} probe_centre;
 
 static bool
 join_cone_sample(PlannerInfo *root, List *args, const sc_density *dens, join_estimate *e)
@@ -597,14 +614,15 @@ join_cone_sample(PlannerInfo *root, List *args, const sc_density *dens, join_est
 	ScanKeyData keys[2];
 	Oid			opfamily;
 	sc_cover_params p;
+	probe_centre probes[PROBE_SLOTS];
+	int			nprobes = 0;
 	double		sum_n = 0,
 				sum_r = 0,
 				sum_c = 0,
-				sum_m = 0,
-				read = 0;
+				sum_m = 0;
 	int			nblk,
 				per_blk;
-	bool		ok = true;
+	bool		overrun = false;
 
 	/* centre and radius: plain columns of one table; cell, ra, dec: of another */
 	if (!centre_column(list_nth(args, 3)) || !centre_column(list_nth(args, 4)) ||
@@ -660,9 +678,10 @@ join_cone_sample(PlannerInfo *root, List *args, const sc_density *dens, join_est
 #endif
 	skycell_scan_params(&p, dens);
 
+	/* the probes first: cheap, a few outer pages */
 	nblk = (int) Min((BlockNumber) PROBE_SAMPLES, nblocks);
 	per_blk = (PROBE_SAMPLES + nblk - 1) / nblk;
-	for (int k = 0; k < nblk && ok; k++)
+	for (int k = 0; k < nblk; k++)
 	{
 		BlockNumber b = (BlockNumber) (((uint64) k * nblocks) / nblk);
 		ItemPointerData lo,
@@ -675,68 +694,83 @@ join_cone_sample(PlannerInfo *root, List *args, const sc_density *dens, join_est
 			tscan = table_beginscan_tidrange(orel, GetActiveSnapshot(), &lo, &hi);
 		else
 			table_rescan_tidrange(tscan, &lo, &hi);
-		while (got < per_blk && ok &&
+		while (got < per_blk &&
 			   table_scan_getnextslot_tidrange(tscan, ForwardScanDirection, oslot))
 		{
 			bool		n1,
 						n2,
 						n3 = false;
-			double		ra0,
-						dec0,
-						radius;
-			double		thr,
-						cosdec0;
-			sc_region	reg;
-			sc_cover	cov;
+			probe_centre *pc = &probes[nprobes++];
 
 			got++;
 			ResetExprContext(econtext);
 			econtext->ecxt_scantuple = oslot;
-			ra0 = DatumGetFloat8(ExecEvalExprSwitchContext(x_ra0, econtext, &n1));
-			dec0 = DatumGetFloat8(ExecEvalExprSwitchContext(x_dec0, econtext, &n2));
-			radius = rconst ? DatumGetFloat8(((Const *) rarg)->constvalue)
+			pc->ra0 = DatumGetFloat8(ExecEvalExprSwitchContext(x_ra0, econtext, &n1));
+			pc->dec0 = DatumGetFloat8(ExecEvalExprSwitchContext(x_dec0, econtext, &n2));
+			pc->radius = rconst ? DatumGetFloat8(((Const *) rarg)->constvalue)
 				: DatumGetFloat8(ExecEvalExprSwitchContext(x_r, econtext, &n3));
-			sum_n += 1;			/* a NULL probe is a probe that matches nothing */
-			if (n1 || n2 || n3 || sc_region_cone(&reg, ra0, dec0, radius, true) != NULL)
-				continue;
-			sc_cover_compute(&reg, dens, &p, &cov);
-			thr = radius < 0 ? -1.0 : (radius >= 180.0 ? 2.0 : pow(sin(radius * M_PI / 360.0), 2));
-			cosdec0 = cos(dec0 * M_PI / 180.0);
-			sum_r += cov.n;
-			for (int i = 0; i < cov.n && ok; i++)
-			{
-				keys[0].sk_argument = Int64GetDatum(cov.r[i].lo);
-				keys[1].sk_argument = Int64GetDatum(cov.r[i].hi);
-				index_rescan(iscan, keys, 2, NULL, 0);
-				while (index_getnext_slot(iscan, ForwardScanDirection, islot))
-				{
-					bool		m1,
-								m2;
-					double		ra,
-								dec,
-								sdd,
-								sda;
-
-					econtext->ecxt_scantuple = islot;
-					ra = DatumGetFloat8(ExecEvalExprSwitchContext(x_ra, econtext, &m1));
-					dec = DatumGetFloat8(ExecEvalExprSwitchContext(x_dec, econtext, &m2));
-					sum_c += 1;
-					if (++read > PROBE_MAX_CAND)
-					{
-						ok = false;
-						break;
-					}
-					if (m1 || m2)
-						continue;
-					/* skycell_in_cone's haversine */
-					sdd = sin((dec - dec0) * M_PI / 360.0);
-					sda = sin((ra - ra0) * M_PI / 360.0);
-					if (sdd * sdd + cos(dec * M_PI / 180.0) * cosdec0 * sda * sda <= thr)
-						sum_m += 1;
-				}
-			}
-			sc_cover_free(&cov);
+			pc->null = n1 || n2 || n3;
 		}
+	}
+
+	/*
+	 * Then their cones, in bit-reversed order, so that a sample the budget
+	 * cuts short is still spread over the outer table, not its first pages.
+	 */
+	for (int k = 0; k < PROBE_SLOTS && !overrun; k++)
+	{
+		int			j = 0;
+		const probe_centre *pc;
+		double		thr,
+					cosdec0;
+		sc_region	reg;
+		sc_cover	cov;
+
+		for (int bit = 1, rk = k; bit < PROBE_SLOTS; bit <<= 1, rk >>= 1)
+			j = (j << 1) | (rk & 1);
+		if (j >= nprobes)
+			continue;
+		pc = &probes[j];
+		sum_n += 1;				/* a NULL probe is a probe that matches nothing */
+		if (pc->null || sc_region_cone(&reg, pc->ra0, pc->dec0, pc->radius, true) != NULL)
+			continue;
+		sc_cover_compute(&reg, dens, &p, &cov);
+		thr = pc->radius < 0 ? -1.0
+			: (pc->radius >= 180.0 ? 2.0 : pow(sin(pc->radius * M_PI / 360.0), 2));
+		cosdec0 = cos(pc->dec0 * M_PI / 180.0);
+		sum_r += cov.n;
+		for (int i = 0; i < cov.n && !overrun; i++)
+		{
+			keys[0].sk_argument = Int64GetDatum(cov.r[i].lo);
+			keys[1].sk_argument = Int64GetDatum(cov.r[i].hi);
+			index_rescan(iscan, keys, 2, NULL, 0);
+			while (index_getnext_slot(iscan, ForwardScanDirection, islot))
+			{
+				bool		m1,
+							m2;
+				double		ra,
+							dec,
+							sdd,
+							sda;
+
+				econtext->ecxt_scantuple = islot;
+				ra = DatumGetFloat8(ExecEvalExprSwitchContext(x_ra, econtext, &m1));
+				dec = DatumGetFloat8(ExecEvalExprSwitchContext(x_dec, econtext, &m2));
+				if (++sum_c > PROBE_MAX_CAND)
+				{
+					overrun = true;
+					break;
+				}
+				if (m1 || m2)
+					continue;
+				/* skycell_in_cone's haversine */
+				sdd = sin((dec - pc->dec0) * M_PI / 360.0);
+				sda = sin((ra - pc->ra0) * M_PI / 360.0);
+				if (sdd * sdd + cos(dec * M_PI / 180.0) * cosdec0 * sda * sda <= thr)
+					sum_m += 1;
+			}
+		}
+		sc_cover_free(&cov);
 	}
 
 	index_endscan(iscan);
@@ -751,8 +785,19 @@ join_cone_sample(PlannerInfo *root, List *args, const sc_density *dens, join_est
 	MemoryContextSwitchTo(old);
 	MemoryContextDelete(cxt);
 
-	if (!ok || sum_n == 0)
+	if (sum_n == 0)
 		return false;
+	if (overrun)
+	{
+		/*
+		 * The cones held more than the model expected: what was read --
+		 * whole probes and the one the budget stopped -- is a lower bound
+		 * on the probes it reached, so it may only raise the estimate.
+		 */
+		e->cand = fmax(e->cand, sum_c / sum_n);
+		e->matches = fmax(e->matches, sum_m / sum_n);
+		return true;
+	}
 	e->nranges = sum_r / sum_n;
 	e->cand = sum_c / sum_n;
 	e->matches = sum_m / sum_n;
@@ -984,10 +1029,15 @@ cone_loop_count(PlannerInfo *root, Relids outer)
  * not a random read again.  Without this every probe of a cross-match paid
  * for its pages cold, about ten times what the scan costs, and a parallel
  * sequential scan that runs ten times slower was planned instead.
+ *
+ * recheck is the per-row cost of the cross-match's join clause, which the
+ * scan evaluates on every candidate, as cost_index() charges a path's join
+ * clauses; 0 for a cone with constant or run-time bounds.
  */
 static void
 cone_cost(PlannerInfo *root, RelOptInfo *rel, IndexOptInfo *ix, double nr, double exp_rows,
-		  double rows, double corr, double loops, Cost *startup, Cost *total, bool *bitmap)
+		  double rows, double corr, double loops, Cost recheck,
+		  Cost *startup, Cost *total, bool *bitmap)
 {
 	double		cand = fmax(exp_rows, rows);
 	double		ituples = fmax(ix->tuples, 1.0);
@@ -1011,7 +1061,7 @@ cone_cost(PlannerInfo *root, RelOptInfo *rel, IndexOptInfo *ix, double nr, doubl
 	common = nr * descent
 		+ index_io
 		+ cand * (cpu_index_tuple_cost + 2.0 * cpu_operator_cost)
-		+ cand * (cpu_tuple_cost + rel->baserestrictcost.per_tuple)
+		+ cand * (cpu_tuple_cost + rel->baserestrictcost.per_tuple + recheck)
 		+ rows * rel->reltarget->cost.per_tuple;
 
 	/*
@@ -1077,6 +1127,7 @@ add_runtime_path(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte, FuncExp
 	join_estimate e;
 	CustomPath *cp;
 	bool		bitmap;
+	QualCost	recheck = {0, 0};
 	double		rows = ppi ? ppi->ppi_rows : rel->rows;
 	AttrNumber	attnum = IsA(cell, Var) ? ((Var *) cell)->varattno : 1;
 
@@ -1092,9 +1143,14 @@ add_runtime_path(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte, FuncExp
 	cp->path.parallel_workers = 0;
 	cp->path.rows = rows;
 	cp->path.pathkeys = NIL;
+	/* the cone itself is rechecked on every candidate, as a join clause */
+	if (ppi)
+		cost_qual_eval(&recheck, ppi->ppi_clauses, root);
 	cone_cost(root, rel, ix, e.nranges, e.cand, rows, cell_correlation(rte, ix, cell),
-			  ppi ? cone_loop_count(root, ppi->ppi_req_outer) : 1.0,
+			  ppi ? cone_loop_count(root, ppi->ppi_req_outer) : 1.0, recheck.per_tuple,
 			  &cp->path.startup_cost, &cp->path.total_cost, &bitmap);
+	cp->path.startup_cost += recheck.startup;
+	cp->path.total_cost += recheck.startup;
 	/* the covering itself, each time: ten operator calls a classified cell */
 	cp->path.total_cost += e.steps * 10.0 * cpu_operator_cost;
 	cp->flags = 0;
@@ -1193,7 +1249,7 @@ cone_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, Index rti, RangeTblEnt
 		cp->path.rows = rel->rows;
 		cp->path.pathkeys = NIL;
 		cone_cost(root, rel, ix, cov.n, cov.exp_rows, rel->rows,
-				  cell_correlation(rte, ix, linitial(f->args)), 1.0,
+				  cell_correlation(rte, ix, linitial(f->args)), 1.0, 0,
 				  &cp->path.startup_cost, &cp->path.total_cost, &bitmap);
 		cp->flags = 0;
 		cp->custom_paths = NIL;
@@ -1860,6 +1916,13 @@ cone_scan_init(void)
 							 &skycell_index_filter, true,
 							 PGC_USERSET, 0, NULL, NULL, NULL);
 	RegisterCustomScanMethods(&cone_scan_methods);
+
+	/*
+	 * The library is usually loaded by the first skycell call a query makes,
+	 * which is while that query is being planned, before cone_planner() has
+	 * run for it: count that planning as a generation of its own.
+	 */
+	plan_generation = 1;
 	prev_planner_hook = planner_hook;
 	planner_hook = cone_planner;
 	prev_set_rel_pathlist_hook = set_rel_pathlist_hook;

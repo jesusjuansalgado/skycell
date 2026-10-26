@@ -422,6 +422,13 @@ SELECT * FROM cs_filter($q$SELECT row(count(*), sum(p.pid::int8 * 100000 + c.id)
 SELECT * FROM cs_filter($q$SELECT row(count(*), sum(p.pid::int8 * 100000 + c.id))
   FROM (SELECT * FROM cs_fprobe WHERE pid < 3000) p
   JOIN cs_fcat c ON contains(skycell_point(c.ra, c.dec), skycell_circle(p.ra, p.dec, 0.4)) = 1$q$);
+-- so many probes share cs_fcat's few pages that each rescan reads about one,
+-- and the ordered scan is the cheaper; fewer and wider cones read several
+-- pages each, through a bitmap
+CREATE TABLE cs_fwide AS SELECT * FROM cs_fprobe WHERE pid % 5 = 0;
+ANALYZE cs_fwide;
+SELECT * FROM cs_filter($q$SELECT row(count(*), sum(p.pid::int8 * 100000 + c.id)) FROM cs_fwide p
+  JOIN cs_fcat c ON contains(skycell_point(c.ra, c.dec), skycell_circle(p.ra, p.dec, 3)) = 1$q$);
 -- and against a sequential scan
 SET skycell.custom_scan = off;
 SET enable_indexscan = off;
@@ -432,4 +439,4 @@ RESET enable_bitmapscan;
 RESET skycell.custom_scan;
 SELECT count(*), sum(id) FROM cs_fcat WHERE skycell_cone(skycell_ang2cell(ra, dec), ra, dec, 10, 20, 3);
 DROP FUNCTION cs_filter(text);
-DROP TABLE cs_fprobe, cs_fcat, cs_fsorted;
+DROP TABLE cs_fwide, cs_fprobe, cs_fcat, cs_fsorted;
