@@ -521,7 +521,14 @@ defaults throughout (ratio below 1 = skycell faster):
 | cone searches, 1″–3°, cold | 0.48–1.01 | |
 | cross-matching, 0.5″–5″, real Gaia DR3 positions | 0.30–0.35 | 0.76–0.84 |
 | convex polygons, 0.05°–2° | 0.23–0.37 | |
-| stored regions, `&&` / `<@` / `@>` | 0.12–0.93 | |
+| stored regions: overlap and region-in-region (`&&`, `@>`, `<@` between regions) | 0.12–0.70 | |
+| stored regions: footprints that contain a position (`@>` a point) | 0.75–0.93 on an Apple M3; 0.97, level, on x86 | |
+
+The stored-region rows were re-measured on the x86 cloud host with skycell 0.34
+and 0.35. Overlap and containment between regions kept their margins there
+(0.12, 0.53, 0.24), and the v0.35 GiST key changed none of them. Point-in-footprint
+was level with pgSphere on that host: its gain is the laptop's
+([skycell-paper#2](https://github.com/jesusjuansalgado/skycell-paper/pull/2)).
 
 Its index is a third the size of pgSphere's (214 MB against 685 MB at 10M
 rows, about the size of Q3C's) and builds 11–23× faster, and its row estimates
