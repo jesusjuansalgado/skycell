@@ -109,7 +109,10 @@ time skycell covers 32 sampled probes and counts the catalogue rows their cones
 really hold (12,630 estimated against 12,390 actual). A probe's rescan is
 costed as PostgreSQL costs its own index scan on the inner side of a nested
 loop, the pages earlier probes have read counted as cached, so a cross-match
-is weighed fairly against a parallel sequential scan.
+is weighed fairly against a parallel sequential scan. The node is parallel
+safe: with enough probes the cross-match runs in parallel workers, as a Gather
+over the nested loop with a Parallel Seq Scan of the probes on its outer side,
+each worker covering and scanning the cones of its own probes.
 
 ```
 Nested Loop
@@ -518,13 +521,44 @@ defaults throughout (ratio below 1 = skycell faster):
 | cone searches, 1″–3°, cold | 0.48–1.01 | |
 | cross-matching, 0.5″–5″, real Gaia DR3 positions | 0.30–0.35 | 0.76–0.84 |
 | convex polygons, 0.05°–2° | 0.23–0.37 | |
-| stored regions, `&&` / `<@` / `@>` | 0.12–0.93 | |
+| stored regions: overlap and region-in-region (`&&`, `@>`, `<@` between regions) | 0.12–0.70 | |
+| stored regions: footprints that contain a position (`@>` a point) | 0.75–0.93 on an Apple M3; 0.97, level, on x86 | |
+
+The stored-region rows were re-measured on the x86 cloud host with skycell 0.34
+and 0.35. Overlap and containment between regions kept their margins there
+(0.12, 0.53, 0.24), and the v0.35 GiST key changed none of them. Point-in-footprint
+was level with pgSphere on that host: its gain is the laptop's
+([skycell-paper#2](https://github.com/jesusjuansalgado/skycell-paper/pull/2)).
 
 Its index is a third the size of pgSphere's (214 MB against 685 MB at 10M
 rows, about the size of Q3C's) and builds 11–23× faster, and its row estimates
 stay within 1.3× of the truth where pgSphere's are off by up to 8.7×. At Gaia
 DR3 scale that is one 38 GiB index where an archive running pgSphere for cones
 and Q3C for cross-matching keeps 160 GiB.
+
+**Parallel cross-matching.** The comparisons above, like the paper's, are
+serial. They run with `max_parallel_workers_per_gather = 0` for every method.
+With parallelism on, a cross-match with enough probes runs in parallel
+workers. The setup:
+
+- PostgreSQL 18.6 with its default settings, 4 cores.
+- 5M catalogue rows, the heap stored once in cell order and once at random.
+- 200k and 1M probes on sources.
+- Median of 3 warm runs, against v0.35, which cannot run a cross-match in
+  parallel. Every result is identical to the serial one.
+
+| probes | cone | serial | default workers | 3 workers |
+|---|---|---|---|---|
+| 200k (10 MB) | 1″–30″ | 1.4–18.2 s | 1 worker: 1.8–2.2× faster | — |
+| 1M (50 MB) | 1″, cell order | 8.4 s | 2 workers: 2.9× | 3.7× |
+| 1M | 30″, cell order | 20.9 s | 3.3× | 3.9× |
+| 1M | 1″, random order | 6.9 s | 2.7× | 3.6× |
+| 1M | 30″, random order | 92.0 s | 3.4× | 4.6× |
+
+"3 workers" sets the probe table's `parallel_workers`, so the leader and three
+workers use the four cores. Q3C's and pgSphere's cross-matches can run under a
+parallel nested loop too. They were not measured that way, so these figures
+compare skycell with itself only.
 
 The paper describing skycell, the benchmark harness, the raw results of every
 measurement and how to reproduce them are in
@@ -589,6 +623,17 @@ Two layers, both in [`ext/test/`](ext/test/).
   over the pole, a star at the zone boundary and an arcsecond-sized U. Every
   GiST region operator class must give the sequential answer for regions
   that are non-convex polygons.
+- `parallel`: parallel queries, with parallelism made free so that the
+  planner uses it wherever it can.
+  - A cross-match is planned as a Gather over a Parallel Seq Scan of the
+    probes, with the custom scan in ordered and bitmap mode and with the index
+    filter. It must give the serial answer as a join, with a radius column, as
+    a `LEFT JOIN`, an `EXISTS` and an ADQL `CONTAINS`.
+  - Workers are launched, and the rows the index filter removes in them add up
+    to the serial count.
+  - Under `debug_parallel_query` a whole cone search runs inside a worker, in
+    both modes, with the index filter, as a cross-match and as a generic plan's
+    run-time cone, and returns the serial answer.
 
 **Reference translators** — [`adql_geometry/tests/`](adql_geometry/tests/): the
 Python translator's tests (pytest), and `cross_check.py`, which requires the
@@ -617,9 +662,18 @@ locally), the standalone selftests, and the reference translators.
   and stored regions use the range rewrite and the region indexes. The cone must
   be a top-level `AND` term of a `WHERE` or `JOIN ON`: a cone under an `OR` is
   rewritten instead and stays indexable through a `BitmapOr`. It reads heap
-  tables only; on a partitioned table each partition keeps the rewrite. It is
-  not parallel-aware, and before PostgreSQL 18 its bitmap mode does not
-  prefetch.
+  tables only; on a partitioned table each partition keeps the rewrite. Before
+  PostgreSQL 18 its bitmap mode does not prefetch.
+- **Parallel queries.** The custom scan is parallel safe but not parallel
+  aware. A cross-match's probes are shared out among workers, but a single
+  cone search is not split among them. PostgreSQL gives the probe table workers
+  by its size: none below 8 MB (`min_parallel_table_scan_size`), one at 10 MB,
+  two at 50 MB. A smaller target list runs serially unless told otherwise:
+  `ALTER TABLE targets SET (parallel_workers = 3)`. In a parallel `EXPLAIN
+  ANALYZE` the average of ranges per covering is the leader's own, labelled
+  so, since a node that is not parallel aware gets no shared memory to collect
+  the workers' figures; the rows removed by the index filter are counted in
+  every process.
 - **Planning costs.** A covering is computed per query: 0.036 ms at 1″, against
   0.029 ms for pgSphere's whole plan, so on a small table (0.5M rows) a small
   cone can still favour pgSphere. skycell's win at small radii comes from

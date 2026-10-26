@@ -57,6 +57,24 @@ extern double cone_join_selectivity(PlannerInfo *root, List *args);
 
 /* adql.c: a skypos/skyregion datum, as cover.c understands it */
 extern sc_vec3 skycell_pos_from_datum(Datum d);
+
+/*
+ * A GiST consistent() function sees the same skypos query on every entry an
+ * index scan visits. Converting it to a unit vector is four trigonometric
+ * calls, which cost more than the box test they feed, so the point
+ * strategies keep the vector in their fn_extra cache, keyed by the
+ * coordinates: by value, not by pointer, as a join's outer rows can reuse
+ * one address for different points.
+ */
+typedef struct
+{
+	bool		valid;
+	double		ra,
+				dec;
+	sc_vec3		v;
+}			skycell_pos_cache;
+
+extern sc_vec3 skycell_pos_from_datum_cached(Datum d, skycell_pos_cache *c);
 extern void skycell_region_from_datum(Datum d, sc_region *r);
 extern void skycell_region_from_datum_lite(Datum d, sc_region *r);
 

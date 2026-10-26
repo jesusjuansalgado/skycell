@@ -23,9 +23,18 @@ pg_lsclusters --no-header | while read -r ver name _; do
 done
 sudo pg_createcluster "$PG" ci --port "$PORT" --start
 
+# Without the clang this PostgreSQL was built with, as in CI, which unpacks
+# postgresql-server-dev without its dependencies, skip the JIT bitcode
+make_opts=(PG_CONFIG="$PG_CONFIG")
+CLANG=$(sed -n 's/^CLANG *= *//p' "$(dirname "$("$PG_CONFIG" --pgxs)")/../Makefile.global")
+if [ -n "$CLANG" ] && ! command -v "$CLANG" >/dev/null; then
+  echo "no $CLANG: building without the JIT bitcode"
+  make_opts+=(with_llvm=no)
+fi
+
 cd "$ROOT/ext"
-make PG_CONFIG="$PG_CONFIG"
-sudo make install PG_CONFIG="$PG_CONFIG"
+make "${make_opts[@]}"
+sudo make install "${make_opts[@]}"
 
 # pg_regress connects over the Unix socket as this user (peer authentication)
 sudo -u postgres psql -p "$PORT" -qc "CREATE ROLE \"$(id -un)\" SUPERUSER LOGIN"

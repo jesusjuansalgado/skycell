@@ -159,6 +159,21 @@ skycell_pos_from_datum(Datum d)
 	return sc_radec2vec(p->ra, p->dec);
 }
 
+sc_vec3
+skycell_pos_from_datum_cached(Datum d, skycell_pos_cache *c)
+{
+	SkyPos	   *p = DatumGetSkyPos(d);
+
+	if (!c->valid || c->ra != p->ra || c->dec != p->dec)
+	{
+		c->v = sc_radec2vec(p->ra, p->dec);
+		c->ra = p->ra;
+		c->dec = p->dec;
+		c->valid = true;
+	}
+	return c->v;
+}
+
 /* a skyregion datum as the covering code understands it */
 static void
 region_from_datum_ex(Datum d, sc_region *out, bool need_covering)
