@@ -58,6 +58,7 @@
 #include "nodes/makefuncs.h"
 #include "nodes/nodeFuncs.h"
 #include "nodes/tidbitmap.h"
+#include "optimizer/clauses.h"
 #include "optimizer/cost.h"
 #include "optimizer/plancat.h"
 #include "optimizer/planner.h"
@@ -148,7 +149,7 @@ typedef struct ConeScanState
 	sc_density	dens;
 	int64	   *rt_bounds;		/* bounds' storage, rt_cap ranges */
 	int			rt_cap;
-	double		ncoverings,		/* for EXPLAIN ANALYZE */
+	double		ncoverings,		/* for EXPLAIN ANALYZE: this process's own */
 				nranges_total;
 
 	/*
@@ -164,7 +165,6 @@ typedef struct ConeScanState
 				cosdec0,
 				cdec,
 				thr;
-	double		nfiltered;		/* entries the filter skipped, for EXPLAIN ANALYZE */
 } ConeScanState;
 
 /* ------------------------------------------------------------------ */
@@ -1139,7 +1139,17 @@ add_runtime_path(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte, FuncExp
 	cp->path.pathtarget = rel->reltarget;
 	cp->path.param_info = ppi;
 	cp->path.parallel_aware = false;
-	cp->path.parallel_safe = false;
+
+	/*
+	 * Not parallel aware -- one scan does not split its cone among workers
+	 * -- but parallel safe: under a Parallel Seq Scan of the probes, each
+	 * worker covers and scans the cones of its own outer rows, as it would
+	 * an inner index scan.  The executor only reads: the index, the heap,
+	 * and the density from the catalogue and the density map.
+	 */
+	cp->path.parallel_safe = rel->consider_parallel &&
+		is_parallel_safe(root, (Node *) f) &&
+		(ppi == NULL || is_parallel_safe(root, (Node *) ppi->ppi_clauses));
 	cp->path.parallel_workers = 0;
 	cp->path.rows = rows;
 	cp->path.pathkeys = NIL;
@@ -1244,7 +1254,8 @@ cone_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, Index rti, RangeTblEnt
 		cp->path.pathtarget = rel->reltarget;
 		cp->path.param_info = NULL;
 		cp->path.parallel_aware = false;
-		cp->path.parallel_safe = false;
+		/* a constant cone is a restriction clause: consider_parallel judged it */
+		cp->path.parallel_safe = rel->consider_parallel;
 		cp->path.parallel_workers = 0;
 		cp->path.rows = rel->rows;
 		cp->path.pathkeys = NIL;
@@ -1555,7 +1566,12 @@ cone_entry_passes(ConeScanState *st)
 		if (sdd * sdd + cos(dec * M_PI / 180.0) * st->cosdec0 * sda * sda <= st->thr)
 			return true;
 	}
-	st->nfiltered += 1;
+	/*
+	 * Counted in the node's instrumentation, not the scan state: a parallel
+	 * query adds its workers' counts into the leader's (InstrAggNode), so
+	 * EXPLAIN ANALYZE reports them all however the probes were shared out.
+	 */
+	InstrCountFiltered2(&st->css.ss.ps, 1);
 	return false;
 }
 
@@ -1874,8 +1890,16 @@ cone_explain(CustomScanState *node, List *ancestors, ExplainState *es)
 	if (!st->runtime)
 		ExplainPropertyInteger("Ranges", NULL, st->nranges, es);
 	else if (es->analyze && st->ncoverings > 0)
-		ExplainPropertyFloat("Ranges per Covering", NULL,
+	{
+		/*
+		 * An average, from the coverings this process computed: in a parallel
+		 * query the workers' are not sent back (only a parallel-aware node
+		 * gets shared memory), so it is the leader's share of the probes.
+		 */
+		ExplainPropertyFloat(node->ss.ps.worker_instrument ? "Ranges per Covering (leader)"
+							 : "Ranges per Covering", NULL,
 							 st->nranges_total / st->ncoverings, 1, es);
+	}
 	else
 		ExplainPropertyText("Ranges", st->joined ? "per outer row" : "per rescan", es);
 	ExplainPropertyText("Mode", st->bitmap ? "bitmap" : "ordered", es);
@@ -1887,8 +1911,9 @@ cone_explain(CustomScanState *node, List *ancestors, ExplainState *es)
 									NameStr(TupleDescAttr(itd, st->idec - 1)->attname));
 
 		ExplainPropertyText("Index Filter", cols, es);
-		if (es->analyze)
-			ExplainPropertyFloat("Rows Removed by Index Filter", NULL, st->nfiltered, 0, es);
+		if (es->analyze && node->ss.ps.instrument)
+			ExplainPropertyFloat("Rows Removed by Index Filter", NULL,
+								 node->ss.ps.instrument->nfiltered2, 0, es);
 	}
 }
 
