@@ -43,6 +43,13 @@ jobs:
           # The server packages are downloaded first, with a line per package
           # in the log, so a slow mirror shows; installing them then needs no
           # network.
+          #
+          # postgresql-server-dev depends on clang and LLVM, 96 MB from the
+          # Ubuntu archive, which has been as slow as apt.postgresql.org. They
+          # only compile the JIT bitcode, which the regression suite does not
+          # use, so the package is unpacked rather than installed: its 1 MB
+          # of headers and PGXS, without its dependencies, and the build then
+          # skips the bitcode (pg-regress.sh).
           apt_opts=(-o Acquire::Retries=5 -o Acquire::http::Timeout=60 -o Acquire::https::Timeout=60)
           retry() {
             for attempt in 1 2 3; do
@@ -56,8 +63,11 @@ jobs:
           retry apt-get "${apt_opts[@]}" update -qq
           retry apt-get "${apt_opts[@]}" install -y -qq postgresql-common
           retry /usr/share/postgresql-common/pgdg/apt.postgresql.org.sh -y
-          retry apt-get "${apt_opts[@]}" install -y -q --download-only "postgresql-$PG" "postgresql-server-dev-$PG"
-          retry apt-get "${apt_opts[@]}" install -y -qq "postgresql-$PG" "postgresql-server-dev-$PG"
+          retry apt-get "${apt_opts[@]}" install -y -q --download-only "postgresql-$PG"
+          retry apt-get "${apt_opts[@]}" install -y -qq "postgresql-$PG"
+          cd "$RUNNER_TEMP"
+          retry apt-get "${apt_opts[@]}" download "postgresql-server-dev-$PG"
+          sudo dpkg-deb -x postgresql-server-dev-"$PG"_*.deb /
       - name: Build, install and run the regression suite
         run: .github/ci/pg-regress.sh "$PG"
       - name: Keep the regression output
