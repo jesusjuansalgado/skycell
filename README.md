@@ -297,13 +297,13 @@ for ADQL compatibility and must be `'ICRS'`; convert other frames first with
 | `point(ra, dec)`<br>`point(coordsys, ra, dec)` | `skypos` | degrees. ADQL `POINT` |
 | `circle(ra, dec, radius)`<br>`circle(coordsys, ra, dec, radius)` | `skyregion` | radius in degrees. ADQL `CIRCLE` |
 | `box(ra, dec, width, height)`<br>`box(coordsys, …)` | `skyregion` | centre and extent, as ADQL defines it. Errors if it reaches a pole — use a polygon there. ADQL `BOX` |
-| `polygon(ra1, dec1, ra2, dec2, …)`<br>`polygon(coordsys, …)` | `skyregion` | ≥ 3 vertices, convex or not, but simple: no two edges may cross or touch. Every vertex must lie within 90° of the vertices' mean. ADQL `POLYGON` |
+| `polygon(ra1, dec1, ra2, dec2, …)`<br>`polygon(coordsys, …)` | `skyregion` | ≥ 3 vertices, convex or not (non-convex since 0.35), but simple: no two edges may cross or touch. Every vertex must lie within 90° of the vertices' mean. ADQL `POLYGON` |
 | `contains(p skypos, r skyregion)`<br>`contains(a skyregion, b skyregion)` | `integer` (1/0) | ADQL `CONTAINS`. Compared with 1 (`contains(…) = 1`, or `1 = …`) in a `WHERE` or `JOIN ON` it is planned as the `<@` operator below, so it is indexed |
 | `intersects(p skypos, r skyregion)`<br>`intersects(a skyregion, b skyregion)` | `integer` (1/0) | ADQL `INTERSECTS`. Compared with 1 it is planned as `<@` (point-region) or `&&` (region-region) below, so it is indexed |
 | `distance(a skypos, b skypos)`<br>`distance(ra1, dec1, ra2, dec2)` | `float8` | degrees. ADQL `DISTANCE`, both forms. `distance(…) < r` (or `<=`) in a `WHERE` or `JOIN ON` is planned as the cone, like `<@` below |
 | `area(r skyregion)` | `float8` | square degrees. ADQL `AREA` |
 | `coord1(p)` / `coord2(p)` | `float8` | right ascension / declination, degrees |
-| `centroid(r skyregion)` | `skypos` | ADQL `CENTROID`. For a convex polygon, the mean of its vertices; for a non-convex one, its centre of mass (which may lie outside it, as a U's does) |
+| `centroid(r skyregion)` | `skypos` | ADQL `CENTROID`: a cone's centre, a polygon's centre of mass, which may lie outside a non-convex one, as a U's does. Before 0.35 a polygon's was the mean of its vertices |
 
 If a bare name collides with `pg_catalog` (`point`, `circle`, `box`, `polygon`
 all exist there), either install into a schema that precedes it in
@@ -553,7 +553,8 @@ Two layers, both in [`ext/test/`](ext/test/).
   is checked against a reference that shares none of its code: a crossing-number
   test in a plane of the test's own choosing, plus a fan sum for the area. That
   covers 444,683 points, half of them a hair either side of an edge, and each
-  point's membership and covering, the area, and CONTAINS and INTERSECTS for
+  point's membership and covering, the area, the centroid (against brute-force
+  quadrature, every quarter of the shapes) and CONTAINS and INTERSECTS for
   14,400 small triangles around the notches. It also prints ranges, cells examined, false-positive
   fraction and µs per covering. Current run: **0 false negatives**.
 

@@ -124,6 +124,36 @@ ref_inside(const xy *P, int n, xy q, double *dist)
 	return in;
 }
 
+/*
+ * Centre of mass, by brute force: the integral of (X e1 + Y e2 + c) /
+ * (1 + X^2 + Y^2)^2 over the polygon in the test's plane at c, on the fan
+ * from the origin, every triangle cut into m x m and each piece sampled at
+ * its centroid.  Slow and plain, but nothing like the library's code.
+ */
+static sc_vec3
+ref_centroid(const frame3 *f, const xy *P, int n, int m)
+{
+	double i0 = 0, ix = 0, iy = 0;
+	for (int i = 0; i < n; i++)
+	{
+		xy a = P[i], b = P[(i + 1) % n];
+		double area = 0.5 * (a.x * b.y - b.x * a.y) / ((double) m * m);
+		for (int u = 0; u < m; u++)
+			for (int v = 0; u + v < m; v++)
+				for (int up = 0; up < 2; up++)
+				{
+					/* barycentric centroid of the sub-triangle (u, v) pointing up or down */
+					double s1, s2, x, y, w;
+					if (up) { if (u + v + 1 >= m) continue; s1 = (u + 2.0 / 3) / m; s2 = (v + 2.0 / 3) / m; }
+					else { s1 = (u + 1.0 / 3) / m; s2 = (v + 1.0 / 3) / m; }
+					x = s1 * a.x + s2 * b.x; y = s1 * a.y + s2 * b.y;
+					w = 1 + x * x + y * y;
+					i0 += area / (w * w); ix += area * x / (w * w); iy += area * y / (w * w);
+				}
+	}
+	return from_plane(f, (xy) {ix / i0, iy / i0});
+}
+
 /* shape k in unit plane coordinates: L, U, comb, or a random star */
 static int
 make_shape(int k, xy *P)
@@ -388,7 +418,8 @@ main(void)
 	 * pairs the sampled reference cannot decide, are skipped, not scored.
 	 */
 	{
-		int npoly = 1200, bad_in = 0, bad_cov = 0, bad_area = 0, bad_cr = 0, bad_ov = 0, built = 0;
+		int npoly = 1200, bad_in = 0, bad_cov = 0, bad_area = 0, bad_cr = 0, bad_ov = 0, bad_cen = 0, built = 0;
+		double worst_cen = 0;
 		long pts = 0, ins = 0, pairs = 0;
 		double tot_parts = 0, tot_nv = 0, tot_true = 0, tot_cov = 0;
 		sc_cover_params p;
@@ -460,6 +491,26 @@ main(void)
 			{
 				bad_area++;
 				if (bad_area < 10) printf("NONCONVEX AREA: shape %d size=%g: %.17g vs %.17g\n", q % 4, size, r.area, fabs(ref_area));
+			}
+
+			/*
+			 * centroid: midpoint sampling converges as 1/m^2, so compare
+			 * m and 2m and take Richardson's (4 f(2m) - f(m)) / 3 as the
+			 * reference: good to ~2e-10 of the size at a radian, ~1e-12 below
+			 * a degree, against the library's ~1e-12 everywhere
+			 */
+			if (q % 4 == 0)
+			{
+				sc_vec3 a = ref_centroid(&f, P, n, 64), b = ref_centroid(&f, P, n, 128), got = sc_region_centroid(&r), ref;
+				double err;
+				ref = (sc_vec3) {(4 * b.x - a.x) / 3, (4 * b.y - a.y) / 3, (4 * b.z - a.z) / 3};
+				err = sc_angle(got, ref) / size;
+				worst_cen = fmax(worst_cen, err);
+				if (err > 1e-9 && sc_angle(got, ref) > 1e-15)
+				{
+					bad_cen++;
+					if (bad_cen < 10) printf("NONCONVEX CENTROID: shape %d size=%g off by %g of the size\n", q % 4, size, err);
+				}
 			}
 
 			sc_cover_compute(&r, &dens_hist, &p, &c);
@@ -587,10 +638,11 @@ main(void)
 			sc_region_free(&r);
 		}
 		printf("non-convex: %d polygons (%.1f vertices, %.1f convex pieces), %ld points (%ld inside), "
-			   "%ld region pairs; fp %.3f; misses: contains %d, covering %d, area %d, CONTAINS %d, INTERSECTS %d\n",
+			   "%ld region pairs; fp %.3f; centroid within %.1e of the size; misses: contains %d, covering %d, "
+			   "area %d, centroid %d, CONTAINS %d, INTERSECTS %d\n",
 			   built, tot_nv / built, tot_parts / built, pts, ins, pairs, tot_cov > 0 ? 1 - tot_true / tot_cov : 0,
-			   bad_in, bad_cov, bad_area, bad_cr, bad_ov);
-		failures += bad_in + bad_cov + bad_area + bad_cr + bad_ov;
+			   worst_cen, bad_in, bad_cov, bad_area, bad_cen, bad_cr, bad_ov);
+		failures += bad_in + bad_cov + bad_area + bad_cen + bad_cr + bad_ov;
 	}
 
 	/*

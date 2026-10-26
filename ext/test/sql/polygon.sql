@@ -41,6 +41,18 @@ SELECT abs(area(u) - (area(u1) + area(u2) + area(u3))) < 1e-9 * area(u) AS area_
        round(coord2(centroid(u))::numeric, 2) AS c2,
        contains(centroid(u), u) AS centroid_in_notch_is_outside
 FROM shape;
+-- a convex polygon's centroid is its centre of mass too (the mean of the
+-- vertices until 0.35): this lopsided quadrilateral is small enough to be
+-- flat to 1e-5, where the planar answer is (10.16667, 0.10833) and the
+-- vertex mean (10.2, 0.1).  The same polygon 0.4 arcsec and 4 microarcsec
+-- across: the centre of mass keeps its place in the shape.
+SELECT round(coord1(c)::numeric, 4) AS c1, round(coord2(c)::numeric, 4) AS c2
+FROM (SELECT centroid(polygon('ICRS', 10,0, 10.4,0, 10.4,0.1, 10,0.3)) AS c) t;
+SELECT s AS size_deg,
+       round(((coord1(c) - 10) / s)::numeric, 5) AS x_in_shape,
+       round(((coord2(c) - 0) / s)::numeric, 5) AS y_in_shape
+FROM (SELECT s, centroid(polygon('ICRS', 10,0, 10+4*s,0, 10+4*s,s, 10,3*s)) AS c
+      FROM (VALUES (1/36000.0::float8), (1/3.6e9::float8)) v(s)) t;
 -- from the middle of the notch the U is asin(cos 1 sin 1) = 0.99985 degrees
 -- away, across the meridian arc of either arm: a cone meets it just past that
 SELECT degrees(asin(cos(radians(1)) * sin(radians(1)))) AS d,

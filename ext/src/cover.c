@@ -182,6 +182,15 @@ gnomonic_inv(const sc_vec3 *f, pt2 p)
 								 f[0].z + p.x * f[1].z + p.y * f[2].z});
 }
 
+/* the tangent plane at unit g: f = {g, e1, e2}, with (e1, e2, g) right-handed */
+static void
+plane_frame(sc_vec3 g, sc_vec3 *f)
+{
+	f[0] = g;
+	f[1] = vnormalize(sc_cross(g, fabs(g.z) < 0.9 ? (sc_vec3) {0, 0, 1} : (sc_vec3) {1, 0, 0}));
+	f[2] = sc_cross(g, f[1]);
+}
+
 /* twice the signed area of (a, b, c): > 0 counter-clockwise */
 static inline double
 orient2(pt2 a, pt2 b, pt2 c)
@@ -316,13 +325,9 @@ poly_nonconvex(sc_region *r, sc_vec3 g)
 				i,
 				stall = 0;
 	double		area2 = 0;
-	sc_vec3		cen = {0, 0, 0};
 	const char *err = NULL;
 
-	/* the tangent plane at g, with (e1, e2, g) right-handed */
-	f[0] = g;
-	f[1] = vnormalize(sc_cross(g, fabs(g.z) < 0.9 ? (sc_vec3) {0, 0, 1} : (sc_vec3) {1, 0, 0}));
-	f[2] = sc_cross(g, f[1]);
+	plane_frame(g, f);
 
 	pt = SC_MALLOC(sizeof(pt2) * nv);
 	prev = SC_MALLOC(sizeof(int) * nv);
@@ -478,21 +483,6 @@ poly_nonconvex(sc_region *r, sc_vec3 g)
 
 	for (int t = 0; t < ntri; t++)
 		r->area += tri_area(r->v[tri[3 * t]], r->v[tri[3 * t + 1]], r->v[tri[3 * t + 2]]);
-
-	/*
-	 * The centroid, exactly: by Stokes, the integral of the position vector
-	 * over a spherical polygon is half the sum over its edges of arc length
-	 * times unit edge normal.
-	 */
-	for (i = 0; i < nv; i++)
-	{
-		double		len = sc_angle(r->v[i], r->v[(i + 1) % nv]);
-
-		cen.x += len * r->n[i].x;
-		cen.y += len * r->n[i].y;
-		cen.z += len * r->n[i].z;
-	}
-	r->center = vnormalize(cen);
 
 	/* Hertel-Mehlhorn: drop each diagonal that leaves both corners convex */
 	for (int t = 0; t < ntri; t++)
@@ -968,20 +958,95 @@ sc_region_distance(const sc_region *r, sc_vec3 p)
 	return d;
 }
 
-sc_vec3
-sc_region_centroid(const sc_region *r)
+/*
+ * A polygon's centre of mass: the direction of the integral of the position
+ * vector over it.  Two ways to the same integral, each where it is well
+ * conditioned:
+ *
+ * - By Stokes, half the sum over the edges of arc length times unit edge
+ *   normal.  Exact, but the terms are as long as the edges and cancel down
+ *   to the area, so the error relative to the polygon's size grows as
+ *   1e-16 / size^2: 1e-6 at a hundredth of a degree, worse than useless
+ *   below a milliarcsecond.  Used above 0.01 rad, where it is good to
+ *   ~1e-13 rad.
+ *
+ * - In the gnomonic plane at the vertex mean g, the integrand is
+ *   (X e1 + Y e2 + g) / (1 + X^2 + Y^2)^2 dX dY, smooth and nearly flat on
+ *   a small polygon.  A degree-5 rule (Dunavant, 7 points) on the signed fan
+ *   of triangles from g -- valid for a non-convex polygon too -- is exact to
+ *   ~size^6 relatively, and works in coordinates of the polygon's own size,
+ *   so its rounding is ~1e-16 rad absolute.  Used up to 0.01 rad.
+ */
+static sc_vec3
+poly_centroid(const sc_region *r)
 {
-	sc_vec3		g = {0, 0, 0};
+	static const double qw[7] = {0.225, 0.132394152788506, 0.132394152788506, 0.132394152788506,
+								 0.125939180544827, 0.125939180544827, 0.125939180544827};
+	static const double qa = 0.059715871789770, qb = 0.470142064105115,
+				qc = 0.797426985353087, qd = 0.101286507323456;
+	const double ql[7][3] = {{1.0 / 3, 1.0 / 3, 1.0 / 3},
+							 {qa, qb, qb}, {qb, qa, qb}, {qb, qb, qa},
+							 {qc, qd, qd}, {qd, qc, qd}, {qd, qd, qc}};
+	sc_vec3		g = {0, 0, 0},
+				f[3],
+				sum = {0, 0, 0};
+	double		size = 0,
+				i0 = 0,
+				ix = 0,
+				iy = 0;
+	int			nv = r->nv;
 
-	if (r->kind == SC_REGION_CONE || r->nparts > 0)
-		return r->center;		/* a non-convex polygon's: its centre of mass */
-	for (int i = 0; i < r->nv; i++)
+	for (int i = 0; i < nv; i++)
 	{
 		g.x += r->v[i].x;
 		g.y += r->v[i].y;
 		g.z += r->v[i].z;
 	}
-	return vnormalize(g);
+	g = vnormalize(g);
+	for (int i = 0; i < nv; i++)
+		size = fmax(size, sc_angle(g, r->v[i]));
+
+	if (size > 0.01)
+	{
+		for (int i = 0; i < nv; i++)
+		{
+			double		len = sc_angle(r->v[i], r->v[(i + 1) % nv]);
+
+			sum.x += len * r->n[i].x;
+			sum.y += len * r->n[i].y;
+			sum.z += len * r->n[i].z;
+		}
+		return vnormalize(sum);
+	}
+
+	plane_frame(g, f);
+	for (int i = 0; i < nv; i++)
+	{
+		pt2			p = gnomonic(f, r->v[i]),
+					q = gnomonic(f, r->v[(i + 1) % nv]);
+		double		a = 0.5 * (p.x * q.y - q.x * p.y);
+
+		for (int k = 0; k < 7; k++)
+		{
+			double		x = ql[k][1] * p.x + ql[k][2] * q.x,
+						y = ql[k][1] * p.y + ql[k][2] * q.y,
+						w = 1.0 + x * x + y * y,
+						d = a * qw[k] / (w * w);
+
+			i0 += d;
+			ix += d * x;
+			iy += d * y;
+		}
+	}
+	return gnomonic_inv(f, (pt2) {ix / i0, iy / i0});
+}
+
+sc_vec3
+sc_region_centroid(const sc_region *r)
+{
+	if (r->kind == SC_REGION_CONE)
+		return r->center;
+	return poly_centroid(r);
 }
 
 /* the farthest point of a region from p, as an angle (radians) */
