@@ -522,13 +522,16 @@ defaults throughout (ratio below 1 = skycell faster):
 | cross-matching, 0.5″–5″, real Gaia DR3 positions | 0.30–0.35 | 0.76–0.84 |
 | convex polygons, 0.05°–2° | 0.23–0.37 | |
 | stored regions: overlap and region-in-region (`&&`, `@>`, `<@` between regions) | 0.12–0.70 | |
-| stored regions: footprints that contain a position (`@>` a point) | 0.75–0.93 on an Apple M3; 0.97, level, on x86 | |
+| stored regions: footprints that contain a position (`@>` a point) | 0.57 on x86; 0.75–0.93 on an Apple M3 with 0.6 | |
 
-The stored-region rows were re-measured on the x86 cloud host with skycell 0.34
-and 0.35. Overlap and containment between regions kept their margins there
-(0.12, 0.53, 0.24), and the v0.35 GiST key changed none of them. Point-in-footprint
-was level with pgSphere on that host: its gain is the laptop's
-([skycell-paper#2](https://github.com/jesusjuansalgado/skycell-paper/pull/2)).
+The stored-region rows were re-measured on the x86 cloud host with skycell 0.34,
+0.35 and the version after 0.35, 8 runs each (skycell-paper's
+`bench/results-regions/`). Overlap and containment between regions kept their
+margins there (0.11, 0.55, 0.22), and the v0.35 GiST key changed none of them.
+Point-in-footprint was within 5% of pgSphere with 0.34 and 0.35 (0.98 and
+0.95): the index converted the query point to a unit vector at every entry it
+visited. Since the point is converted once per index scan, it takes 0.57
+(interval 0.55–0.60) of pgSphere's time.
 
 Its index is a third the size of pgSphere's (214 MB against 685 MB at 10M
 rows, about the size of Q3C's) and builds 11–23× faster, and its row estimates
