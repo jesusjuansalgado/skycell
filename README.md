@@ -109,8 +109,8 @@ time skycell covers 32 sampled probes and counts the catalogue rows their cones
 really hold (12,630 estimated against 12,390 actual). A probe's rescan is
 costed as PostgreSQL costs its own index scan on the inner side of a nested
 loop, the pages earlier probes have read counted as cached, so a cross-match
-is weighed fairly against a parallel sequential scan. The node is parallel
-safe: with enough probes the cross-match runs in parallel workers, as a Gather
+is weighed fairly against a parallel sequential scan. Since 0.36 the node is
+parallel safe: with enough probes the cross-match runs in parallel workers, as a Gather
 over the nested loop with a Parallel Seq Scan of the probes on its outer side,
 each worker covering and scanning the cones of its own probes.
 
@@ -525,13 +525,13 @@ defaults throughout (ratio below 1 = skycell faster):
 | stored regions: footprints that contain a position (`@>` a point) | 0.57 on x86; 0.75–0.93 on an Apple M3 with 0.6 | |
 
 The stored-region rows were re-measured on the x86 cloud host with skycell 0.34,
-0.35 and the version after 0.35, 8 runs each (skycell-paper's
-`bench/results-regions/`). Overlap and containment between regions kept their
+0.35 and 0.36, 8 runs each (skycell-paper's `bench/results-regions/`; 0.36 as
+`main` at b3bb7be, the same library code). Overlap and containment between regions kept their
 margins there (0.11, 0.55, 0.22), and the v0.35 GiST key changed none of them.
 Point-in-footprint was within 5% of pgSphere with 0.34 and 0.35 (0.98 and
 0.95): the index converted the query point to a unit vector at every entry it
-visited. Since the point is converted once per index scan, it takes 0.57
-(interval 0.55–0.60) of pgSphere's time.
+visited. Since 0.36 the point is converted once per index scan, and it takes
+0.57 (interval 0.55–0.60) of pgSphere's time.
 
 Its index is a third the size of pgSphere's (214 MB against 685 MB at 10M
 rows, about the size of Q3C's) and builds 11–23× faster, and its row estimates
