@@ -6,6 +6,7 @@ __pycache__/
 # build and test outputs
 ext/test/healpix_selftest
 ext/test/cover_selftest
+ext/test/equiv/
 ext/test/results/
 ext/test/regression.*
 ext/results/

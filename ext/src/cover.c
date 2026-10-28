@@ -790,6 +790,29 @@ classify_cone_exact(const sc_region *r, int order, int64_t pix, double *f_out)
 	return SC_PARTIAL;
 }
 
+/* the cap test of a cone, for a cell whose centre c is already known */
+static inline sc_class
+classify_cap_cone_at(const sc_region *r, int order, sc_vec3 c, double *f_out)
+{
+	double		c2 = sc_chord2(c, r->center);
+	double		d;
+
+	ensure_cone_bounds(r, order);
+	if (c2 > r->out_c2[order])
+	{
+		*f_out = 1.0;
+		return SC_OUT;
+	}
+	if (c2 <= r->in_c2[order])
+	{
+		*f_out = 0.0;
+		return SC_IN;
+	}
+	d = 2.0 * asin(fmin(1.0, sqrt(c2) / 2.0));
+	*f_out = clamp01(0.5 + (d - r->radius) / (2.0 * sc_pixrad(order)));
+	return SC_PARTIAL;
+}
+
 /*
  * Classify pixel (order, pix).  The pixel is approximated by the cap
  * (centre, sc_pixrad(order)) that contains it, so OUT and IN are always
@@ -808,25 +831,7 @@ sc_region_classify_cap(const sc_region *r, int order, int64_t pix, double *f_out
 	rho = sc_pixrad(order);
 
 	if (r->kind == SC_REGION_CONE)
-	{
-		double		c2 = sc_chord2(c, r->center);
-		double		d;
-
-		ensure_cone_bounds(r, order);
-		if (c2 > r->out_c2[order])
-		{
-			*f_out = 1.0;
-			return SC_OUT;
-		}
-		if (c2 <= r->in_c2[order])
-		{
-			*f_out = 0.0;
-			return SC_IN;
-		}
-		d = 2.0 * asin(fmin(1.0, sqrt(c2) / 2.0));
-		*f_out = clamp01(0.5 + (d - r->radius) / (2.0 * rho));
-		return SC_PARTIAL;
-	}
+		return classify_cap_cone_at(r, order, c, f_out);
 	else if (r->nparts > 0)
 	{
 		/*
@@ -910,31 +915,75 @@ sc_region_classify(const sc_region *r, int order, int64_t pix, double *f_out)
  * cells alike.  classify_cone_exact() answers OUT only when its OUT condition
  * dcentre - rcell > radius + SC_ANG_EPS holds and its IN test does not fire
  * first.  That condition needs the centre and corners alone, so evaluate it
- * first, with the same vectors, sc_angle() calls and fmax/fmin as that
- * function: when it fails the answer is "not OUT" without the edge midpoints
- * (most of the trig), and only a cell about to be dropped pays for the full
- * test.  The answer is identical, not close.
+ * here, with the same vectors, sc_angle() calls and fmax/fmin as that
+ * function, and its answer is the answer:
+ *
+ * - when it fails, the cell is not OUT, and the edge midpoints (most of the
+ *   trig) are never computed;
+ * - when it holds, the IN test cannot fire.  IN needs every corner within the
+ *   radius, but for any corner c_i, angle(centre, c_i) <= rcell + SC_ANG_EPS
+ *   (rcell is the largest of them, or sc_pixrad when that is smaller, which
+ *   bounds them all), so angle(cone, c_i) >= dcentre - rcell - SC_ANG_EPS >
+ *   radius.  So the full classification, which used to be run to confirm,
+ *   answers OUT too, and is skipped.
+ *
+ * rcell itself needs the four corners, and it is bounded on both sides
+ * without them: above by sc_pixrad(order), which it is clipped to, and below
+ * by cell_min_radius(order).  Where dcentre puts the answer beyond either
+ * bound the corners are not computed; most cells a covering's last level
+ * tests are decided that way.
+ *
+ * The answer is identical, not close: `make cover-equiv` (test/cover_equiv.c)
+ * compares coverings with and without these shortcuts range for range.
  */
+
+/*
+ * A lower bound on rcell for any cell of this order.  A cell lies within the
+ * cap of radius rcell around its centre (the bound classify_cone_exact()
+ * already rests on), so its area 4 pi / (12 4^order) is at most that cap's,
+ * 4 pi sin^2(rcell / 2): rcell >= 2 asin(2^-order / sqrt 12).  sc_pixrad,
+ * the clip, is far above it.  Shrunk by 1e-9 so that rounding in the corner
+ * angles, ~1e-16 relative, cannot bring them below it.
+ */
+static double
+cell_min_radius(int order)
+{
+	static double table[SC_MAX_ORDER + 1];
+	static int	ready = 0;
+
+	if (!ready)
+	{
+		for (int k = 0; k <= SC_MAX_ORDER; k++)
+			table[k] = 2.0 * asin(ldexp(1.0, -k) / sqrt(12.0)) * (1.0 - 1e-9);
+		ready = 1;
+	}
+	return table[order];
+}
+
 static int
-cell_is_out(const sc_region *r, int order, int64_t pix)
+cell_is_out_at(const sc_region *r, int order, int64_t pix, sc_vec3 centre)
 {
 	double		fo;
 
 	if (r->kind == SC_REGION_CONE && sc_exact_cells && r->radius >= 0)
 	{
-		sc_vec3		centre = sc_pix2vec(order, pix),
-					c[4];
+		sc_vec3		c[4];
 		double		dcentre = sc_angle(r->center, centre),
 					rcell = 0;
 
 		if (dcentre <= r->radius + SC_ANG_EPS)
 			return 0;			/* rcell >= 0: the OUT condition cannot hold */
+		/* rcell <= sc_pixrad: the condition holds whatever the corners say */
+		if (dcentre - sc_pixrad(order) > r->radius + SC_ANG_EPS)
+			return 1;
+		/* rcell >= cell_min_radius: it fails whatever the corners say */
+		if (dcentre - cell_min_radius(order) <= r->radius + SC_ANG_EPS)
+			return 0;
 		sc_pix_corners(order, pix, c);
 		for (int e = 0; e < 4; e++)
 			rcell = fmax(rcell, sc_angle(centre, c[e]));
 		rcell = fmin(rcell, sc_pixrad(order));
-		if (!(dcentre - rcell > r->radius + SC_ANG_EPS))
-			return 0;
+		return dcentre - rcell > r->radius + SC_ANG_EPS;
 	}
 	return sc_region_classify(r, order, pix, &fo) == SC_OUT;
 }
@@ -1751,6 +1800,18 @@ int			sc_order_probe = 0;
 /* rows a covering must hold, per cell examined, before probing one order finer */
 #define SC_PROBE_MIN 8.0
 
+static inline double
+max_d(double a, double b)
+{
+	return a > b ? a : b;
+}
+
+static inline double
+min_d(double a, double b)
+{
+	return a < b ? a : b;
+}
+
 static int
 choose_order(const sc_region *r, const sc_density *d, const sc_cover_params *p,
 			 double *rho_out)
@@ -1761,8 +1822,13 @@ choose_order(const sc_region *r, const sc_density *d, const sc_cover_params *p,
 	double		rows,
 				rho,
 				s,
+				sk,
 				s_max = INFINITY,
 				best_cost = INFINITY;
+
+	/* forced, and the density not asked for: nothing to compute */
+	if (p->force_order >= 0 && rho_out == NULL)
+		return Min(p->force_order, p->max_order);
 
 	/* local density: rows per steradian in a cell a few times the cone */
 	s = fmax(4.0 * fmax(r->radius, 1e-12), 1e-6);
@@ -1782,20 +1848,31 @@ choose_order(const sc_region *r, const sc_density *d, const sc_cover_params *p,
 	if (p->max_area_ratio > 0)
 		s_max = sqrt(p->max_area_ratio * fmax(r->area, order_area(SC_MAX_ORDER)));
 
+	/*
+	 * Every quantity here is finite and non-negative, so max_d()/min_d() give
+	 * what fmax()/fmin() would, without the library call (which the loop
+	 * otherwise makes ninety times); and halving is exact, so sk is the same
+	 * SC_ORDER0_SIZE / 2^k it was when divided out for each k.
+	 */
+	sk = SC_ORDER0_SIZE * 2.0;
 	for (int k = 0; k <= p->max_order; k++)
 	{
-		double		sk = SC_ORDER0_SIZE / (double) ((int64_t) 1 << k);
-		double		reach = r->radius + SC_COVER_BETA * sk;
-		double		covered = M_PI * reach * reach;
-		double		ncells = fmax(1.0, covered / (sk * sk));
-		double		nranges = fmax(1.0, fmin(ncells, SC_COVER_GAMMA * r->radius / sk + 1.0));
-		double		cost;
+		double		reach,
+					covered,
+					ncells,
+					nranges,
+					cost;
 
+		sk *= 0.5;
 		if (sk > s_max)
 			continue;
+		reach = r->radius + SC_COVER_BETA * sk;
+		covered = M_PI * reach * reach;
+		ncells = max_d(1.0, covered / (sk * sk));
+		nranges = max_d(1.0, min_d(ncells, SC_COVER_GAMMA * r->radius / sk + 1.0));
 		if (nranges > (double) p->max_ranges)
 			continue;
-		cost = nranges * p->range_cost + rho * fmax(0.0, covered - r->area);
+		cost = nranges * p->range_cost + rho * max_d(0.0, covered - r->area);
 		if (cost < best_cost)
 		{
 			best_cost = cost;
@@ -1831,6 +1908,17 @@ cover_cone_direct(const sc_region *r, const sc_density *d,
 	int64_t    *cur,
 			   *next;
 
+	/*
+	 * Each kept cell's centre and cap class, from the test that kept it: the
+	 * last level is tested again, with the exact geometry, from the same
+	 * centre, and a cell the cap already called IN needs no second test (IN
+	 * cannot be OUT, whichever test answers).
+	 */
+	sc_vec3    *curv,
+			   *nextv;
+	sc_class   *curc,
+			   *nextc;
+
 	for (k = target; k >= 0; k--)
 		if (seed_cone_at(r, k, &sd))
 			break;
@@ -1838,15 +1926,27 @@ cover_cone_direct(const sc_region *r, const sc_density *d,
 		return -1;				/* too many cells: fall back to the descent */
 
 	cap = Max(budget, sd.n) * 4 + 16;
-	cur = SC_MALLOC(sizeof(int64_t) * cap);
-	next = SC_MALLOC(sizeof(int64_t) * cap);
+	/* one block for the six arrays, the widest elements first */
+	curv = SC_MALLOC((2 * sizeof(sc_vec3) + 2 * sizeof(int64_t) + 2 * sizeof(sc_class)) * cap);
+	nextv = curv + cap;
+	cur = (int64_t *) (nextv + cap);
+	next = cur + cap;
+	curc = (sc_class *) (next + cap);
+	nextc = curc + cap;
 	for (int i = 0; i < sd.n; i++)
 	{
 		double		fo;
+		sc_vec3		c = sc_pix2vec(k, sd.pix[i]);
+		sc_class	cls;
 
 		(*steps)++;
-		if (sc_region_classify_cap(r, k, sd.pix[i], &fo) != SC_OUT)
+		cls = classify_cap_cone_at(r, k, c, &fo);
+		if (cls != SC_OUT)
+		{
+			curv[ncur] = c;
+			curc[ncur] = cls;
 			cur[ncur++] = sd.pix[i];
+		}
 	}
 
 	while (k < target && ncur > 0)
@@ -1859,20 +1959,27 @@ cover_cone_direct(const sc_region *r, const sc_density *d,
 			{
 				int64_t		child = 4 * cur[i] + c;
 				double		fo;
+				sc_vec3		v = sc_pix2vec(k + 1, child);
+				sc_class	cls;
 
 				(*steps)++;
-				if (sc_region_classify_cap(r, k + 1, child, &fo) == SC_OUT)
+				cls = classify_cap_cone_at(r, k + 1, v, &fo);
+				if (cls == SC_OUT)
 					continue;
 				if (nnext >= cap || nnext >= budget)
 				{
 					ok = 0;		/* this level is as fine as the budget allows */
 					break;
 				}
+				nextv[nnext] = v;
+				nextc[nnext] = cls;
 				next[nnext++] = child;
 			}
 		if (!ok)
 			break;
 		memcpy(cur, next, sizeof(int64_t) * nnext);
+		memcpy(curv, nextv, sizeof(sc_vec3) * nnext);
+		memcpy(curc, nextc, sizeof(sc_class) * nnext);
 		ncur = nnext;
 		k++;
 	}
@@ -1880,12 +1987,11 @@ cover_cone_direct(const sc_region *r, const sc_density *d,
 	for (int i = 0; i < ncur; i++)
 	{
 		(*steps)++;
-		if (cell_is_out(r, k, cur[i]))
+		if (curc[i] != SC_IN && cell_is_out_at(r, k, cur[i], curv[i]))
 			continue;
 		rlist_add(kept, sc_pix_lo(k, cur[i]), sc_pix_hi(k, cur[i]));
 	}
-	SC_FREE(cur);
-	SC_FREE(next);
+	SC_FREE(curv);
 	return k;
 }
 
