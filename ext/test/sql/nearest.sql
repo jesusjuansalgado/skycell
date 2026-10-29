@@ -134,6 +134,43 @@ SELECT nn_rings('SELECT id FROM nn_cat ORDER BY skycell_dist(ra, dec, 10, 20) LI
        nn_rings('SELECT id FROM nn_cat WHERE skycell_dist(ra, dec, 10, 20) > 40
                  ORDER BY skycell_dist(ra, dec, 10, 20) LIMIT 20') > 2 AS several_rings;
 
+-- a radius the conditions bound the answer to -- the distance below it, ADQL's
+-- CONTAINS, a cone round the same centre -- is as far as the rings go: fewer
+-- rows than the LIMIT inside it is the answer, not a reason to read on.
+-- Forced past the sort the planner prefers for these.
+CREATE FUNCTION nn_read(q text) RETURNS float8 LANGUAGE plpgsql AS $$
+DECLARE l text;
+BEGIN
+  FOR l IN EXECUTE 'EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF) ' || q LOOP
+    IF l ~ 'Rows Read by Rings: ' THEN
+      RETURN substring(l from 'Rows Read by Rings: ([0-9.]+)')::float8;
+    END IF;
+  END LOOP;
+  RETURN NULL;
+END $$;
+SET enable_sort = off;
+SELECT nn_read('SELECT id FROM nn_cat WHERE skycell_dist(ra, dec, 10, 20) < 0.5
+                ORDER BY skycell_dist(ra, dec, 10, 20) LIMIT 10') < 100 AS below,
+       nn_read($q$SELECT id FROM nn_cat WHERE contains(point('ICRS', ra, dec), circle('ICRS', 10, 20, 0.5)) = 1
+                ORDER BY distance(point('ICRS', ra, dec), point('ICRS', 10, 20)) LIMIT 10$q$) < 100 AS adql,
+       nn_read('SELECT id FROM nn_cat WHERE skycell_cone(skycell_ang2cell(ra, dec), ra, dec, 10, 20, 0.5)
+                ORDER BY skycell_dist(ra, dec, 10, 20) LIMIT 10') < 100 AS cone,
+       nn_rings('SELECT id FROM nn_cat WHERE skycell_dist(ra, dec, 10, 20) < 0.5
+                 ORDER BY skycell_dist(ra, dec, 10, 20) LIMIT 10') AS rings;
+SELECT count(*) AS queries, count(*) FILTER (WHERE nn_same(q)) AS same,
+       count(*) FILTER (WHERE nn_plan(q) ~ 'nearest') AS nearest
+FROM (SELECT format('SELECT id, skycell_dist(ra, dec, %s, %s) d FROM nn_cat WHERE skycell_dist(ra, dec, %s, %s) < %s ORDER BY 2 LIMIT %s',
+                    c.ra, c.dec, c.ra, c.dec, r, k) q FROM nn_centre c, unnest(ARRAY[0.5, 3, 30]) r, unnest(ARRAY[5, 500]) k
+      UNION ALL
+      SELECT format('SELECT id, skycell_dist(ra, dec, %s, %s) d FROM nn_cat WHERE skycell_cone(skycell_ang2cell(ra, dec), ra, dec, %s, %s, %s) ORDER BY 2 LIMIT 50',
+                    c.ra, c.dec, c.ra, c.dec, r) FROM nn_centre c, unnest(ARRAY[0.5, 10]) r
+      UNION ALL
+      -- a cone round another centre bounds nothing
+      SELECT format('SELECT id, skycell_dist(ra, dec, %s, %s) d FROM nn_cat WHERE skycell_cone(skycell_ang2cell(ra, dec), ra, dec, %s, %s, 5) ORDER BY 2 LIMIT 50',
+                    c.ra, c.dec, c.ra + 3, c.dec) FROM nn_centre c) t;
+SELECT nn_same('SELECT id, skycell_dist(ra, dec, 10, 20) d FROM nn_cat WHERE skycell_dist(ra, dec, 10, 20) < NULL::float8 ORDER BY 2 LIMIT 10') AS null_radius;
+RESET enable_sort;
+
 -- past the relation: every row, NULL distances last, through the final ring
 -- (forced: a sort is cheaper); OFFSET into the tail; a tiny work_mem, so that
 -- a ring outgrows memory and goes to a tuplesort
@@ -268,6 +305,7 @@ DROP FUNCTION nn_scan(text);
 DROP TABLE nn_gen, nn_chk, nn_nullable, nn_notvalid, nn_unenforced, nn_other;
 
 DROP FUNCTION nn_param(float8, float8, int);
+DROP FUNCTION nn_read(text);
 DROP FUNCTION nn_rings(text);
 DROP FUNCTION nn_same(text);
 DROP FUNCTION nn_plan(text);

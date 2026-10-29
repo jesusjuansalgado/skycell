@@ -71,6 +71,7 @@
 #include "utils/array.h"
 #include "utils/guc.h"
 #include "utils/datum.h"
+#include "utils/fmgroids.h"
 #include "utils/lsyscache.h"
 #include "storage/bufmgr.h"
 #include "utils/memutils.h"
@@ -1468,6 +1469,69 @@ nearest_ring_cost(PlannerInfo *root, RelOptInfo *rel, IndexOptInfo *ix, double c
 		+ c * (cpu_tuple_cost + 2.0 * cpu_operator_cost * log2(fmax(c, 2.0)));
 }
 
+/*
+ * The radius the relation's conditions confine the answer to, when they say
+ * the distance ordered by is below one: the comparison itself (as
+ * skycell_distance_below(), adql.c's spelling of it once a cone carries the
+ * estimate, or as written), or a cone round the same centre.  The radius
+ * expressions, each read once by the scan, which then never reads past the
+ * least of them: without that, the 10 nearest within 1 arcmin of a patch that
+ * holds fewer would have the rings widen to the whole relation.
+ */
+static double cap_area(double r);
+
+static bool
+radius_expr_ok(PlannerInfo *root, RelOptInfo *rel, Node *r)
+{
+	return exprType(r) == FLOAT8OID && !contain_volatile_functions(r) &&
+		!contain_subplans(r) && !bms_is_member(rel->relid, pull_varnos(root, r));
+}
+
+static List *
+nearest_bounds(PlannerInfo *root, RelOptInfo *rel, Node *dist, Node *ra0, Node *dec0)
+{
+	List	   *bounds = NIL;
+	ListCell   *lc;
+
+	foreach(lc, rel->baserestrictinfo)
+	{
+		Node	   *q = (Node *) lfirst_node(RestrictInfo, lc)->clause;
+		Node	   *r = NULL;
+
+		if (IsA(q, FuncExpr))
+		{
+			FuncExpr   *f = (FuncExpr *) q;
+			char	   *name = get_func_name(f->funcid);
+			int			n = list_length(f->args);
+
+			if (name == NULL)
+				continue;
+			if (strcmp(name, "skycell_distance_below") == 0 && n == 3 &&
+				equal(linitial(f->args), dist))
+				r = lsecond(f->args);
+			else if (strcmp(name, "skycell_cone") == 0 && n == 6 &&
+					 equal(list_nth(f->args, 3), ra0) && equal(list_nth(f->args, 4), dec0))
+				r = list_nth(f->args, 5);
+			else if (strcmp(name, "skycell_in_cone") == 0 && n >= 5 &&
+					 equal(lthird(f->args), ra0) && equal(lfourth(f->args), dec0))
+				r = list_nth(f->args, 4);
+		}
+		else if (IsA(q, OpExpr) && list_length(((OpExpr *) q)->args) == 2)
+		{
+			OpExpr	   *op = (OpExpr *) q;
+			Oid			fn = OidIsValid(op->opfuncid) ? op->opfuncid : get_opcode(op->opno);
+
+			if ((fn == F_FLOAT8LT || fn == F_FLOAT8LE) && equal(linitial(op->args), dist))
+				r = lsecond(op->args);
+			else if ((fn == F_FLOAT8GT || fn == F_FLOAT8GE) && equal(lsecond(op->args), dist))
+				r = linitial(op->args);
+		}
+		if (r != NULL && radius_expr_ok(root, rel, r))
+			bounds = lappend(bounds, copyObject(r));
+	}
+	return bounds;
+}
+
 static void
 add_nearest_path(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte)
 {
@@ -1502,6 +1566,9 @@ add_nearest_path(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte)
 					all;
 		bool		bitmap,
 					bitmap_all;
+		List	   *bounds;
+		ListCell   *lb;
+		double		bound = -1;
 
 		if (em->em_is_const || !bms_equal(em->em_relids, rel->relids))
 			continue;
@@ -1531,6 +1598,23 @@ add_nearest_path(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte)
 		else
 			want = rel->rows;
 		k0 = fmin(n, fmax(NEAREST_MIN_ROWS, NEAREST_MARGIN * want / sel));
+
+		/*
+		 * A radius the conditions bound the answer to caps the first ring --
+		 * by the rows a cone of it holds at the relation's mean density, when
+		 * it is a constant -- and there is no reading past it.
+		 */
+		bounds = nearest_bounds(root, rel, expr, ra0, dec0);
+		foreach(lb, bounds)
+		{
+			Const	   *b = (Const *) lfirst(lb);
+
+			if (IsA(b, Const) && !b->constisnull &&
+				(bound < 0 || DatumGetFloat8(b->constvalue) < bound))
+				bound = fmax(0.0, DatumGetFloat8(b->constvalue));
+		}
+		if (bound >= 0)
+			k0 = fmin(k0, fmax(NEAREST_MIN_ROWS, n * cap_area(bound) / (4.0 * M_PI)));
 		corr = cell_correlation(rte, ix, cell);
 		cost_qual_eval_node(&dist_cost, expr, root);
 		nearest_ring_cost(root, rel, ix, corr, dist_cost.per_tuple, k0, &first, &bitmap);
@@ -1552,7 +1636,7 @@ add_nearest_path(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte)
 		 * for the cells each ring's edge shares with the next.
 		 */
 		cp->path.startup_cost = first;
-		cp->path.total_cost = (k0 >= n) ? first : first + 2.0 * all;
+		cp->path.total_cost = (k0 >= n || bound >= 0) ? first : first + 2.0 * all;
 		/* ExecScan projects, so a computed target needs no Result above */
 		cp->flags = CUSTOMPATH_SUPPORT_PROJECTION;
 		cp->custom_paths = NIL;
@@ -1565,7 +1649,7 @@ add_nearest_path(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte)
 												   makeConst(INT2OID, -1, InvalidOid, sizeof(int16),
 															 Int16GetDatum(IsA(cell, Var) ? ((Var *) cell)->varattno : 1),
 															 false, true)),
-										list_make3(expr, ra0, dec0));
+										list_concat(list_make3(expr, ra0, dec0), bounds));
 		cp->methods = &nearest_path_methods;
 		add_path(rel, &cp->path);
 		return;
@@ -1578,7 +1662,7 @@ add_nearest_path(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte)
  * reads a run-time cone's -- (index, NULL bounds, mode, no index filter,
  * relation, statistics relation, attribute, not joined) -- then the first
  * ring's rows and the rows the query was planned to read; custom_exprs holds
- * the centre and the ORDER BY expression.
+ * the centre, the ORDER BY expression and the radii the answer is bounded by.
  */
 static Plan *
 nearest_plan(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
@@ -1609,8 +1693,9 @@ nearest_plan(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
 	cs->custom_private = lappend(cs->custom_private, makeBoolConst(false, false));
 	cs->custom_private = lappend(cs->custom_private, linitial((List *) lfourth(p)));
 	cs->custom_private = lappend(cs->custom_private, lsecond((List *) lfourth(p)));
-	cs->custom_exprs = list_make3(copyObject(lsecond(e)), copyObject(lthird(e)),
-								  copyObject(linitial(e)));
+	cs->custom_exprs = list_concat(list_make3(copyObject(lsecond(e)), copyObject(lthird(e)),
+											  copyObject(linitial(e))),
+								   copyObject(list_copy_tail(e, 3)));
 	cs->custom_scan_tlist = NIL;
 	cs->methods = &nearest_scan_methods;
 	return &cs->scan.plan;
@@ -2293,6 +2378,8 @@ typedef struct NearestScanState
 				dec0;
 	double		rprev,			/* the current ring is (rprev, r]; rprev < 0 */
 				r;				/* for the first, which starts at the centre */
+	double		bound;			/* no ring reads past this radius; < 0: none */
+	bool		last;			/* the current ring reaches the bound */
 
 	/*
 	 * The current ring's rows: copies of their heap tuples with their
@@ -2688,6 +2775,29 @@ nearest_ring(NearestScanState *ns)
 		ns->started = true;
 		ns->rprev = -1.0;
 		ns->n_inside = ns->n_passed = 0;
+		ns->last = false;
+
+		/*
+		 * The radii the conditions bound the answer to, the least of them a
+		 * hair wider, as the rings are: rows the conditions keep are no
+		 * farther.  A NULL one keeps no row at all.
+		 */
+		ns->bound = -1.0;
+		for (int i = 3; i < list_length(st->args); i++)
+		{
+			bool		isnull;
+			Datum		v = ExecEvalExpr((ExprState *) list_nth(st->args, i), econtext, &isnull);
+			double		b = isnull ? -1.0 : DatumGetFloat8(v);
+
+			if (isnull || isnan(b))
+			{
+				ns->done = true;
+				return;
+			}
+			b = fmin(180.0, fmax(0.0, b) * (1.0 + 1e-9) + 1e-12);
+			if (ns->bound < 0 || b < ns->bound)
+				ns->bound = b;
+		}
 		ns->ra0 = null1 ? 0.0 : DatumGetFloat8(a);
 		ns->dec0 = null2 ? 0.0 : DatumGetFloat8(b);
 		/*
@@ -2700,7 +2810,12 @@ nearest_ring(NearestScanState *ns)
 		{
 			ns->r = nearest_first_radius(ns, ns->k0, n);
 			ns->final = ns->r >= 180.0 || ns->k0 >= 0.5 * n;
-
+			if (ns->bound >= 0 && (ns->final || ns->r >= ns->bound))
+			{
+				ns->r = ns->bound;
+				ns->final = false;
+				ns->last = true;
+			}
 		}
 	}
 
@@ -2781,6 +2896,14 @@ nearest_ring(NearestScanState *ns)
 		ns->rprev = ns->r;
 		ns->r = cap_radius(cap_area(ns->r) * grow);
 		ns->final = ns->r >= 180.0 || ns->n_inside * grow >= 0.5 * n;
+		if (ns->last)
+			ns->done = true;	/* that ring reached the bound */
+		else if (ns->bound >= 0 && (ns->final || ns->r >= ns->bound))
+		{
+			ns->r = ns->bound;
+			ns->final = false;
+			ns->last = true;
+		}
 	}
 	ExecClearTuple(ns->fetch);
 	ResetExprContext(econtext);
