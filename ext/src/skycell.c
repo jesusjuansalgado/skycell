@@ -507,6 +507,14 @@ typedef struct idx_entry
 } idx_entry;
 
 static MemoryContext skycell_cache_cxt = NULL;
+
+/*
+ * The coverings live in a context of their own, so that evicting them does not
+ * take the density model with them: cover_cached() evicts while its caller
+ * holds an sc_density whose map points into skycell_cache_cxt, and a reload
+ * of the histogram and map costs more than the coverings it would save.
+ */
+static MemoryContext skycell_cover_cxt = NULL;
 static HTAB *dens_cache = NULL;
 static HTAB *idx_cache = NULL;
 
@@ -518,6 +526,8 @@ skycell_cache_flush(Datum arg, int cacheid, uint32 hashvalue)
 	cover_cache = NULL;
 	if (skycell_cache_cxt)
 		MemoryContextReset(skycell_cache_cxt);
+	if (skycell_cover_cxt)
+		MemoryContextReset(skycell_cover_cxt);
 }
 
 static void
@@ -540,6 +550,10 @@ skycell_cache_init(void)
 		CacheRegisterSyscacheCallback(RELOID, skycell_cache_flush, (Datum) 0);
 		CacheRegisterRelcacheCallback(skycell_cache_flush_rel, (Datum) 0);
 	}
+	if (skycell_cover_cxt == NULL)
+		skycell_cover_cxt = AllocSetContextCreate(TopMemoryContext,
+												  "skycell covering cache",
+												  ALLOCSET_DEFAULT_SIZES);
 	if (dens_cache == NULL)
 	{
 		memset(&ctl, 0, sizeof(ctl));
@@ -563,7 +577,7 @@ skycell_cache_init(void)
 		memset(&ctl, 0, sizeof(ctl));
 		ctl.keysize = sizeof(cover_key);
 		ctl.entrysize = sizeof(cover_entry);
-		ctl.hcxt = skycell_cache_cxt;
+		ctl.hcxt = skycell_cover_cxt;
 		cover_cache = hash_create("skycell coverings", 64, &ctl,
 								  HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
 	}
@@ -585,8 +599,12 @@ cover_cached(const sc_region *reg, const sc_density *d, const sc_cover_params *p
 	}
 	skycell_cache_init();
 	if (hash_get_num_entries(cover_cache) >= SKYCELL_COVER_CACHE_MAX)
-		skycell_cache_flush((Datum) 0, 0, 0);	/* simplest eviction: start over */
-	skycell_cache_init();
+	{
+		/* simplest eviction: start over, the coverings only */
+		cover_cache = NULL;
+		MemoryContextReset(skycell_cover_cxt);
+		skycell_cache_init();
+	}
 
 	memset(&key, 0, sizeof(key));	/* padding must be zero: hashed as bytes */
 	key.ra0 = ra0;
@@ -606,7 +624,7 @@ cover_cached(const sc_region *reg, const sc_density *d, const sc_cover_params *p
 	if (!found)
 	{
 		sc_cover	fresh;
-		MemoryContext old = MemoryContextSwitchTo(skycell_cache_cxt);
+		MemoryContext old = MemoryContextSwitchTo(skycell_cover_cxt);
 
 		sc_cover_compute(reg, d, p, &fresh);
 		MemoryContextSwitchTo(old);
@@ -798,10 +816,13 @@ load_density_map(Oid statrel, AttrNumber attnum, dens_entry *e)
 static void
 load_density_cached(Oid relid, Oid statrel, AttrNumber attnum, sc_density *d)
 {
-	dens_key	key = {statrel, attnum};
+	dens_key	key;
 	dens_entry *entry;
 	bool		found;
 
+	memset(&key, 0, sizeof(key));	/* padding must be zero: hashed as bytes */
+	key.statrel = statrel;
+	key.attnum = attnum;
 	skycell_cache_init();
 	entry = (dens_entry *) hash_search(dens_cache, &key, HASH_ENTER, &found);
 	if (!found)
