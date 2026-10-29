@@ -1,0 +1,36 @@
+psql:18_xmatch_sweep.sql:65: NOTICE:  function xms_run(pg_catalog.int4[],float8[],text[],pg_catalog.int4,pg_catalog.int4) does not exist, skipping
+run 1 (0.26) start 11:22:10
+NOTICE:  table "xp" does not exist, skipping
+ xms_run 
+---------
+ 
+(1 row)
+
+run 1 (0.26) done 11:27:19
+psql:18_xmatch_sweep.sql:23: NOTICE:  relation "xms" already exists, skipping
+psql:18_xmatch_sweep.sql:65: NOTICE:  function xms_run(pg_catalog.int4[],float8[],text[],pg_catalog.int4,pg_catalog.int4) does not exist, skipping
+run 2 (0.36) start 11:27:20
+ xms_run 
+---------
+ 
+(1 row)
+
+run 2 (0.36) done 11:32:27
+psql:18_xmatch_sweep.sql:23: NOTICE:  relation "xms" already exists, skipping
+psql:18_xmatch_sweep.sql:65: NOTICE:  function xms_run(pg_catalog.int4[],float8[],text[],pg_catalog.int4,pg_catalog.int4) does not exist, skipping
+run 3 (0.36) start 11:32:27
+ xms_run 
+---------
+ 
+(1 row)
+
+run 3 (0.36) done 11:37:09
+psql:18_xmatch_sweep.sql:23: NOTICE:  relation "xms" already exists, skipping
+psql:18_xmatch_sweep.sql:65: NOTICE:  function xms_run(pg_catalog.int4[],float8[],text[],pg_catalog.int4,pg_catalog.int4) does not exist, skipping
+run 4 (0.26) start 11:37:10
+ xms_run 
+---------
+ 
+(1 row)
+
+run 4 (0.26) done 11:41:41

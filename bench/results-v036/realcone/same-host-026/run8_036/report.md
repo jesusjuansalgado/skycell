@@ -1,0 +1,58 @@
+
+## Real corpus, warm (gaia_realc, per-method blocks, two orders): skycell / pgsphere
+
+| radius | n | total, skycell/pgsphere | execution only | planning, skycell - pgsphere (ms) | buffers, a / b |
+|---|---|---|---|---|---|
+| 1" | 400 | 0.78 [0.77, 0.80] | 0.47 [0.46, 0.48] | +0.004 | 4.3 / 5.6 |
+| 10" | 400 | 0.75 [0.72, 0.77] | 0.46 [0.44, 0.47] | +0.003 | 4.7 / 5.8 |
+| 1' | 300 | 0.73 [0.70, 0.76] | 0.49 [0.46, 0.52] | +0.002 | 5.3 / 6.2 |
+| 6' | 200 | 0.83 [0.80, 0.87] | 0.69 [0.65, 0.72] | +0.003 | 10.5 / 11.8 |
+| 30' | 100 | 0.79 [0.75, 0.84] | 0.73 [0.70, 0.76] | +0.005 | 41.9 / 93.9 |
+| 1deg | 40 | 0.86 [0.79, 0.97] | 0.81 [0.73, 0.91] | +0.010 | 90.6 / 308.0 |
+| 3deg | 16 | 0.70 [0.62, 0.76] | 0.70 [0.60, 0.74] | +0.003 | 543.2 / 963.0 |
+
+Row-count mismatches between the methods: 0 (expect 0).
+
+## Real corpus, warm (gaia_realc, per-method blocks, two orders): skycell-rw / pgsphere
+
+| radius | n | total, skycell-rw/pgsphere | execution only | planning, skycell-rw - pgsphere (ms) | buffers, a / b |
+|---|---|---|---|---|---|
+| 1" | 400 | 1.26 [1.21, 1.29] | 0.58 [0.56, 0.61] | +0.019 | 4.2 / 5.6 |
+| 10" | 400 | 1.17 [1.13, 1.21] | 0.54 [0.51, 0.56] | +0.018 | 4.7 / 5.8 |
+| 1' | 300 | 1.16 [1.11, 1.20] | 0.59 [0.57, 0.63] | +0.018 | 5.1 / 6.2 |
+| 6' | 200 | 1.44 [1.37, 1.53] | 0.93 [0.87, 1.01] | +0.031 | 9.5 / 11.8 |
+| 30' | 100 | 1.36 [1.12, 1.56] | 0.96 [0.83, 1.04] | +0.078 | 35.6 / 93.9 |
+| 1deg | 40 | 0.99 [0.80, 1.12] | 0.71 [0.64, 0.85] | +0.090 | 82.5 / 308.0 |
+| 3deg | 16 | 0.65 [0.61, 0.99] | 0.61 [0.56, 0.77] | +0.247 | 538.2 / 963.0 |
+
+Row-count mismatches between the methods: 0 (expect 0).
+
+## Real corpus, warm (gaia_realc, per-method blocks, two orders): skycell / skycell-rw
+
+| radius | n | total, skycell/skycell-rw | execution only | planning, skycell - skycell-rw (ms) | buffers, a / b |
+|---|---|---|---|---|---|
+| 1" | 400 | 0.62 [0.61, 0.64] | 0.81 [0.80, 0.84] | -0.016 | 4.3 / 4.2 |
+| 10" | 400 | 0.65 [0.63, 0.67] | 0.84 [0.82, 0.86] | -0.015 | 4.7 / 4.7 |
+| 1' | 300 | 0.64 [0.61, 0.66] | 0.82 [0.78, 0.84] | -0.016 | 5.3 / 5.1 |
+| 6' | 200 | 0.58 [0.56, 0.60] | 0.73 [0.71, 0.76] | -0.027 | 10.5 / 9.5 |
+| 30' | 100 | 0.61 [0.56, 0.69] | 0.79 [0.74, 0.88] | -0.073 | 41.9 / 35.6 |
+| 1deg | 40 | 0.89 [0.81, 0.97] | 1.03 [0.99, 1.18] | -0.080 | 90.6 / 82.5 |
+| 3deg | 16 | 1.06 [0.84, 1.16] | 1.11 [1.05, 1.20] | -0.254 | 543.2 / 538.2 |
+
+Row-count mismatches between the methods: 0 (expect 0).
+
+## Real corpus, cold (gaia_real_cell / gaia_real_sphere, restart before each pass): skycell / pgsphere
+
+| radius | n | total, skycell/pgsphere | execution only | planning, skycell - pgsphere (ms) | pages read, skycell / pgSphere | buffers, skycell / pgSphere | I/O ms, skycell / pgSphere |
+|---|---|---|---|---|---|---|---|
+| 1" | 400 | 0.80 [0.78, 0.84] | 0.78 [0.74, 0.80] | +0.004 | 1.7 / 2.6 | 4.1 / 6.0 | 0.185 / 0.210 |
+| 10" | 400 | 0.61 [0.57, 0.66] | 0.57 [0.53, 0.61] | -0.002 | 1.8 / 2.6 | 4.4 / 6.0 | 0.185 / 0.288 |
+| 1' | 300 | 0.81 [0.76, 0.89] | 0.77 [0.71, 0.83] | +0.011 | 2.5 / 2.9 | 5.2 / 6.1 | 0.193 / 0.256 |
+| 6' | 200 | 1.18 [1.10, 1.25] | 1.07 [1.00, 1.16] | +0.042 | 4.5 / 5.7 | 8.9 / 10.1 | 0.371 / 0.351 |
+| 30' | 100 | 0.87 [0.82, 0.98] | 0.80 [0.75, 0.91] | +0.056 | 17.1 / 26.6 | 30.3 / 58.3 | 0.719 / 0.927 |
+| 1deg | 40 | 0.51 [0.42, 0.56] | 0.48 [0.41, 0.54] | +0.030 | 56.4 / 97.3 | 78.1 / 249.9 | 1.198 / 2.300 |
+| 3deg | 16 | 0.41 [0.32, 0.56] | 0.40 [0.36, 0.52] | +0.049 | 432.6 / 802.5 | 470.8 / 805.1 | 2.415 / 6.328 |
+
+Row-count mismatches between the methods: 0 (expect 0).
+
+Cold reads only count as cold if the I/O time per page read is disk-like (milliseconds); round sixty-nine saw about 0.08 ms, a host cache.

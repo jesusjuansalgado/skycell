@@ -1,0 +1,577 @@
+library	rep	script	scope	method	pass	n	ms
+v0.34	1	21		skycell	1	718	245.199
+v0.34	1	21		skycell	2	718	243.363
+v0.34	1	21		pgsphere	1	718	79.704
+v0.34	1	21		pgsphere	2	718	77.691
+v0.34	1	22		gist	1	718	9.196
+v0.34	1	22		gist	2	718	8.947
+v0.34	1	23		brute	1	555	3754.628
+v0.34	1	23		brute	2	555	3576.786
+v0.34	1	23		gist	1	555	12.266
+v0.34	1	23		gist	2	555	12.927
+v0.34	1	23		pgsphere	1	555	13.171
+v0.34	1	23		pgsphere	2	555	15.337
+v0.34	1	24	contains	brute	1	561	8217.383
+v0.34	1	24	contains	brute	2	561	8306.675
+v0.34	1	24	contains	gist	1	561	7.639
+v0.34	1	24	contains	gist	2	561	9.747
+v0.34	1	24	contains	pgsphere	1	561	14.899
+v0.34	1	24	contains	pgsphere	2	561	14.499
+v0.34	1	24	covered_by	brute	1	12193	9529.195
+v0.34	1	24	covered_by	brute	2	12193	9674.921
+v0.34	1	24	covered_by	gist	1	12193	28.887
+v0.34	1	24	covered_by	gist	2	12193	26.633
+v0.34	1	24	covered_by	pgsphere	1	12193	121.384
+v0.34	1	24	covered_by	pgsphere	2	12193	126.811
+v0.35	1	21		skycell	1	718	238.625
+v0.35	1	21		skycell	2	718	239.656
+v0.35	1	21		pgsphere	1	718	76.444
+v0.35	1	21		pgsphere	2	718	75.942
+v0.35	1	22		gist	1	718	8.983
+v0.35	1	22		gist	2	718	8.196
+v0.35	1	23		brute	1	555	3562.935
+v0.35	1	23		brute	2	555	3621.143
+v0.35	1	23		gist	1	555	12.669
+v0.35	1	23		gist	2	555	12.895
+v0.35	1	23		pgsphere	1	555	14.434
+v0.35	1	23		pgsphere	2	555	24.437
+v0.35	1	24	contains	brute	1	561	8086.605
+v0.35	1	24	contains	brute	2	561	8153.536
+v0.35	1	24	contains	gist	1	561	7.288
+v0.35	1	24	contains	gist	2	561	6.829
+v0.35	1	24	contains	pgsphere	1	561	13.44
+v0.35	1	24	contains	pgsphere	2	561	13.545
+v0.35	1	24	covered_by	brute	1	12193	10583.678
+v0.35	1	24	covered_by	brute	2	12193	10468.404
+v0.35	1	24	covered_by	gist	1	12193	28.993
+v0.35	1	24	covered_by	gist	2	12193	29.045
+v0.35	1	24	covered_by	pgsphere	1	12193	147.849
+v0.35	1	24	covered_by	pgsphere	2	12193	130.515
+main	1	21		skycell	1	718	264.252
+main	1	21		skycell	2	718	258.363
+main	1	21		pgsphere	1	718	91.504
+main	1	21		pgsphere	2	718	116.191
+main	1	22		gist	1	718	8.982
+main	1	22		gist	2	718	8.418
+main	1	23		brute	1	555	3678.987
+main	1	23		brute	2	555	3829.548
+main	1	23		gist	1	555	7.349
+main	1	23		gist	2	555	7.909
+main	1	23		pgsphere	1	555	12.403
+main	1	23		pgsphere	2	555	13.254
+main	1	24	contains	brute	1	561	8560.952
+main	1	24	contains	brute	2	561	8080.001
+main	1	24	contains	gist	1	561	7.473
+main	1	24	contains	gist	2	561	7.986
+main	1	24	contains	pgsphere	1	561	13.42
+main	1	24	contains	pgsphere	2	561	13.255
+main	1	24	covered_by	brute	1	12193	10488.342
+main	1	24	covered_by	brute	2	12193	10440.611
+main	1	24	covered_by	gist	1	12193	31.231
+main	1	24	covered_by	gist	2	12193	32.048
+main	1	24	covered_by	pgsphere	1	12193	126.266
+main	1	24	covered_by	pgsphere	2	12193	193.397
+main	2	21		skycell	1	718	237.415
+main	2	21		skycell	2	718	238.226
+main	2	21		pgsphere	1	718	77.886
+main	2	21		pgsphere	2	718	77.459
+main	2	22		gist	1	718	8.378
+main	2	22		gist	2	718	8.103
+main	2	23		brute	1	555	3815.086
+main	2	23		brute	2	555	3764.056
+main	2	23		gist	1	555	7.764
+main	2	23		gist	2	555	7.396
+main	2	23		pgsphere	1	555	14.428
+main	2	23		pgsphere	2	555	13.062
+main	2	24	contains	brute	1	561	8734.405
+main	2	24	contains	brute	2	561	8229.26
+main	2	24	contains	gist	1	561	7.677
+main	2	24	contains	gist	2	561	7.383
+main	2	24	contains	pgsphere	1	561	14.273
+main	2	24	contains	pgsphere	2	561	14.679
+main	2	24	covered_by	brute	1	12193	10536.077
+main	2	24	covered_by	brute	2	12193	10539.577
+main	2	24	covered_by	gist	1	12193	29.79
+main	2	24	covered_by	gist	2	12193	29.208
+main	2	24	covered_by	pgsphere	1	12193	180.796
+main	2	24	covered_by	pgsphere	2	12193	142.841
+v0.35	2	21		skycell	1	718	264.718
+v0.35	2	21		skycell	2	718	249.256
+v0.35	2	21		pgsphere	1	718	78.03
+v0.35	2	21		pgsphere	2	718	77.246
+v0.35	2	22		gist	1	718	9.39
+v0.35	2	22		gist	2	718	9.135
+v0.35	2	23		brute	1	555	3760.168
+v0.35	2	23		brute	2	555	3784.858
+v0.35	2	23		gist	1	555	13.102
+v0.35	2	23		gist	2	555	15.277
+v0.35	2	23		pgsphere	1	555	18.074
+v0.35	2	23		pgsphere	2	555	17.744
+v0.35	2	24	contains	brute	1	561	8395.866
+v0.35	2	24	contains	brute	2	561	8713.354
+v0.35	2	24	contains	gist	1	561	7.882
+v0.35	2	24	contains	gist	2	561	7.396
+v0.35	2	24	contains	pgsphere	1	561	22.779
+v0.35	2	24	contains	pgsphere	2	561	16.26
+v0.35	2	24	covered_by	brute	1	12193	10812.255
+v0.35	2	24	covered_by	brute	2	12193	11021.407
+v0.35	2	24	covered_by	gist	1	12193	30.854
+v0.35	2	24	covered_by	gist	2	12193	30.665
+v0.35	2	24	covered_by	pgsphere	1	12193	154.48
+v0.35	2	24	covered_by	pgsphere	2	12193	155.925
+v0.34	2	21		skycell	1	718	267.31
+v0.34	2	21		skycell	2	718	252.073
+v0.34	2	21		pgsphere	1	718	77.271
+v0.34	2	21		pgsphere	2	718	77.528
+v0.34	2	22		gist	1	718	18.781
+v0.34	2	22		gist	2	718	20.015
+v0.34	2	23		brute	1	555	3751.442
+v0.34	2	23		brute	2	555	3683.514
+v0.34	2	23		gist	1	555	12.214
+v0.34	2	23		gist	2	555	12.084
+v0.34	2	23		pgsphere	1	555	12.206
+v0.34	2	23		pgsphere	2	555	12.304
+v0.34	2	24	contains	brute	1	561	8006.065
+v0.34	2	24	contains	brute	2	561	8146.526
+v0.34	2	24	contains	gist	1	561	7.506
+v0.34	2	24	contains	gist	2	561	9.111
+v0.34	2	24	contains	pgsphere	1	561	14.678
+v0.34	2	24	contains	pgsphere	2	561	14.801
+v0.34	2	24	covered_by	brute	1	12193	9888.055
+v0.34	2	24	covered_by	brute	2	12193	9763.323
+v0.34	2	24	covered_by	gist	1	12193	30.992
+v0.34	2	24	covered_by	gist	2	12193	29.792
+v0.34	2	24	covered_by	pgsphere	1	12193	129.76
+v0.34	2	24	covered_by	pgsphere	2	12193	128.454
+v0.34	3	21		skycell	1	718	251.903
+v0.34	3	21		skycell	2	718	313.874
+v0.34	3	21		pgsphere	1	718	100.571
+v0.34	3	21		pgsphere	2	718	79.763
+v0.34	3	22		gist	1	718	10.084
+v0.34	3	22		gist	2	718	9.754
+v0.34	3	23		brute	1	555	3625.368
+v0.34	3	23		brute	2	555	3550.195
+v0.34	3	23		gist	1	555	12.507
+v0.34	3	23		gist	2	555	12.132
+v0.34	3	23		pgsphere	1	555	12.928
+v0.34	3	23		pgsphere	2	555	12.696
+v0.34	3	24	contains	brute	1	561	8290.909
+v0.34	3	24	contains	brute	2	561	8385.346
+v0.34	3	24	contains	gist	1	561	7.284
+v0.34	3	24	contains	gist	2	561	7.066
+v0.34	3	24	contains	pgsphere	1	561	14.168
+v0.34	3	24	contains	pgsphere	2	561	13.958
+v0.34	3	24	covered_by	brute	1	12193	9909.189
+v0.34	3	24	covered_by	brute	2	12193	9759.299
+v0.34	3	24	covered_by	gist	1	12193	38.511
+v0.34	3	24	covered_by	gist	2	12193	27.593
+v0.34	3	24	covered_by	pgsphere	1	12193	131.657
+v0.34	3	24	covered_by	pgsphere	2	12193	124.303
+v0.35	3	21		skycell	1	718	240.374
+v0.35	3	21		skycell	2	718	237.941
+v0.35	3	21		pgsphere	1	718	76.359
+v0.35	3	21		pgsphere	2	718	76.698
+v0.35	3	22		gist	1	718	8.817
+v0.35	3	22		gist	2	718	8.527
+v0.35	3	23		brute	1	555	3648.829
+v0.35	3	23		brute	2	555	3777.479
+v0.35	3	23		gist	1	555	12.56
+v0.35	3	23		gist	2	555	12.543
+v0.35	3	23		pgsphere	1	555	12.606
+v0.35	3	23		pgsphere	2	555	13.463
+v0.35	3	24	contains	brute	1	561	8422.691
+v0.35	3	24	contains	brute	2	561	8457.125
+v0.35	3	24	contains	gist	1	561	7.526
+v0.35	3	24	contains	gist	2	561	7.983
+v0.35	3	24	contains	pgsphere	1	561	13.629
+v0.35	3	24	contains	pgsphere	2	561	13.728
+v0.35	3	24	covered_by	brute	1	12193	10430.228
+v0.35	3	24	covered_by	brute	2	12193	10649.103
+v0.35	3	24	covered_by	gist	1	12193	36.121
+v0.35	3	24	covered_by	gist	2	12193	39.518
+v0.35	3	24	covered_by	pgsphere	1	12193	137.578
+v0.35	3	24	covered_by	pgsphere	2	12193	174.794
+main	3	21		skycell	1	718	293.527
+main	3	21		skycell	2	718	302.962
+main	3	21		pgsphere	1	718	103.306
+main	3	21		pgsphere	2	718	84.619
+main	3	22		gist	1	718	8.836
+main	3	22		gist	2	718	9.822
+main	3	23		brute	1	555	3755.71
+main	3	23		brute	2	555	3734.139
+main	3	23		gist	1	555	7.397
+main	3	23		gist	2	555	6.867
+main	3	23		pgsphere	1	555	12.187
+main	3	23		pgsphere	2	555	12.457
+main	3	24	contains	brute	1	561	8335.257
+main	3	24	contains	brute	2	561	8136.237
+main	3	24	contains	gist	1	561	8.058
+main	3	24	contains	gist	2	561	7.468
+main	3	24	contains	pgsphere	1	561	13.647
+main	3	24	contains	pgsphere	2	561	14.289
+main	3	24	covered_by	brute	1	12193	10502.833
+main	3	24	covered_by	brute	2	12193	11076.323
+main	3	24	covered_by	gist	1	12193	31.064
+main	3	24	covered_by	gist	2	12193	32.315
+main	3	24	covered_by	pgsphere	1	12193	126.32
+main	3	24	covered_by	pgsphere	2	12193	124.068
+main	4	21		skycell	1	718	261.642
+main	4	21		skycell	2	718	236.636
+main	4	21		pgsphere	1	718	77.35
+main	4	21		pgsphere	2	718	75.995
+main	4	22		gist	1	718	9.064
+main	4	22		gist	2	718	8.636
+main	4	23		brute	1	555	3845.87
+main	4	23		brute	2	555	3833.446
+main	4	23		gist	1	555	7.179
+main	4	23		gist	2	555	7
+main	4	23		pgsphere	1	555	13.483
+main	4	23		pgsphere	2	555	12.431
+main	4	24	contains	brute	1	561	8482.782
+main	4	24	contains	brute	2	561	8259.203
+main	4	24	contains	gist	1	561	7.689
+main	4	24	contains	gist	2	561	7.823
+main	4	24	contains	pgsphere	1	561	14.51
+main	4	24	contains	pgsphere	2	561	15.165
+main	4	24	covered_by	brute	1	12193	10449.876
+main	4	24	covered_by	brute	2	12193	10442.976
+main	4	24	covered_by	gist	1	12193	29.934
+main	4	24	covered_by	gist	2	12193	30.352
+main	4	24	covered_by	pgsphere	1	12193	170.742
+main	4	24	covered_by	pgsphere	2	12193	144.41
+v0.35	4	21		skycell	1	718	291.95
+v0.35	4	21		skycell	2	718	250.6
+v0.35	4	21		pgsphere	1	718	78.724
+v0.35	4	21		pgsphere	2	718	82.835
+v0.35	4	22		gist	1	718	9.191
+v0.35	4	22		gist	2	718	9.525
+v0.35	4	23		brute	1	555	3670.554
+v0.35	4	23		brute	2	555	3708.58
+v0.35	4	23		gist	1	555	12.292
+v0.35	4	23		gist	2	555	12.033
+v0.35	4	23		pgsphere	1	555	12.454
+v0.35	4	23		pgsphere	2	555	12.432
+v0.35	4	24	contains	brute	1	561	8589.367
+v0.35	4	24	contains	brute	2	561	8034.249
+v0.35	4	24	contains	gist	1	561	7.735
+v0.35	4	24	contains	gist	2	561	7.952
+v0.35	4	24	contains	pgsphere	1	561	13.935
+v0.35	4	24	contains	pgsphere	2	561	13.781
+v0.35	4	24	covered_by	brute	1	12193	10502.241
+v0.35	4	24	covered_by	brute	2	12193	10445.576
+v0.35	4	24	covered_by	gist	1	12193	70.113
+v0.35	4	24	covered_by	gist	2	12193	43.565
+v0.35	4	24	covered_by	pgsphere	1	12193	144.955
+v0.35	4	24	covered_by	pgsphere	2	12193	164.535
+v0.34	4	21		skycell	1	718	245.079
+v0.34	4	21		skycell	2	718	262.693
+v0.34	4	21		pgsphere	1	718	78.167
+v0.34	4	21		pgsphere	2	718	78.113
+v0.34	4	22		gist	1	718	8.325
+v0.34	4	22		gist	2	718	8.087
+v0.34	4	23		brute	1	555	3660.138
+v0.34	4	23		brute	2	555	3625.224
+v0.34	4	23		gist	1	555	12.239
+v0.34	4	23		gist	2	555	12.556
+v0.34	4	23		pgsphere	1	555	12.326
+v0.34	4	23		pgsphere	2	555	12.663
+v0.34	4	24	contains	brute	1	561	8422.337
+v0.34	4	24	contains	brute	2	561	7923.721
+v0.34	4	24	contains	gist	1	561	9.496
+v0.34	4	24	contains	gist	2	561	9.114
+v0.34	4	24	contains	pgsphere	1	561	13.788
+v0.34	4	24	contains	pgsphere	2	561	15.018
+v0.34	4	24	covered_by	brute	1	12193	9442.947
+v0.34	4	24	covered_by	brute	2	12193	9474.166
+v0.34	4	24	covered_by	gist	1	12193	50.23
+v0.34	4	24	covered_by	gist	2	12193	42.992
+v0.34	4	24	covered_by	pgsphere	1	12193	126.651
+v0.34	4	24	covered_by	pgsphere	2	12193	137.858
+v0.34	5	21		skycell	1	718	269.267
+v0.34	5	21		skycell	2	718	242.463
+v0.34	5	21		pgsphere	1	718	76.631
+v0.34	5	21		pgsphere	2	718	76.666
+v0.34	5	22		gist	1	718	8.987
+v0.34	5	22		gist	2	718	9.121
+v0.34	5	23		brute	1	555	3575.79
+v0.34	5	23		brute	2	555	3572.032
+v0.34	5	23		gist	1	555	12.376
+v0.34	5	23		gist	2	555	12.205
+v0.34	5	23		pgsphere	1	555	12.643
+v0.34	5	23		pgsphere	2	555	12.573
+v0.34	5	24	contains	brute	1	561	8299.244
+v0.34	5	24	contains	brute	2	561	8278.702
+v0.34	5	24	contains	gist	1	561	11.071
+v0.34	5	24	contains	gist	2	561	13.975
+v0.34	5	24	contains	pgsphere	1	561	24.719
+v0.34	5	24	contains	pgsphere	2	561	20.028
+v0.34	5	24	covered_by	brute	1	12193	9797.376
+v0.34	5	24	covered_by	brute	2	12193	9848.627
+v0.34	5	24	covered_by	gist	1	12193	29.091
+v0.34	5	24	covered_by	gist	2	12193	29.411
+v0.34	5	24	covered_by	pgsphere	1	12193	130.08
+v0.34	5	24	covered_by	pgsphere	2	12193	122.394
+v0.35	5	21		skycell	1	718	272.935
+v0.35	5	21		skycell	2	718	269.815
+v0.35	5	21		pgsphere	1	718	80.561
+v0.35	5	21		pgsphere	2	718	80.177
+v0.35	5	22		gist	1	718	8.612
+v0.35	5	22		gist	2	718	9.243
+v0.35	5	23		brute	1	555	3909.763
+v0.35	5	23		brute	2	555	4078.358
+v0.35	5	23		gist	1	555	12.214
+v0.35	5	23		gist	2	555	12.215
+v0.35	5	23		pgsphere	1	555	12.514
+v0.35	5	23		pgsphere	2	555	13.39
+v0.35	5	24	contains	brute	1	561	8272.46
+v0.35	5	24	contains	brute	2	561	8481.363
+v0.35	5	24	contains	gist	1	561	7.768
+v0.35	5	24	contains	gist	2	561	7.322
+v0.35	5	24	contains	pgsphere	1	561	14.337
+v0.35	5	24	contains	pgsphere	2	561	13.858
+v0.35	5	24	covered_by	brute	1	12193	10835.239
+v0.35	5	24	covered_by	brute	2	12193	10384.206
+v0.35	5	24	covered_by	gist	1	12193	29.527
+v0.35	5	24	covered_by	gist	2	12193	28.358
+v0.35	5	24	covered_by	pgsphere	1	12193	124.332
+v0.35	5	24	covered_by	pgsphere	2	12193	124.932
+main	5	21		skycell	1	718	245.098
+main	5	21		skycell	2	718	246.47
+main	5	21		pgsphere	1	718	83.407
+main	5	21		pgsphere	2	718	80.75
+main	5	22		gist	1	718	8.947
+main	5	22		gist	2	718	8.857
+main	5	23		brute	1	555	3778.89
+main	5	23		brute	2	555	3739.263
+main	5	23		gist	1	555	9.678
+main	5	23		gist	2	555	8.581
+main	5	23		pgsphere	1	555	12.754
+main	5	23		pgsphere	2	555	13.012
+main	5	24	contains	brute	1	561	8504.419
+main	5	24	contains	brute	2	561	8393.496
+main	5	24	contains	gist	1	561	7.929
+main	5	24	contains	gist	2	561	7.536
+main	5	24	contains	pgsphere	1	561	14.577
+main	5	24	contains	pgsphere	2	561	14.041
+main	5	24	covered_by	brute	1	12193	10737.058
+main	5	24	covered_by	brute	2	12193	11589.148
+main	5	24	covered_by	gist	1	12193	30.194
+main	5	24	covered_by	gist	2	12193	29.018
+main	5	24	covered_by	pgsphere	1	12193	127.964
+main	5	24	covered_by	pgsphere	2	12193	129.634
+main	6	21		skycell	1	718	278.385
+main	6	21		skycell	2	718	277.534
+main	6	21		pgsphere	1	718	77.491
+main	6	21		pgsphere	2	718	77.231
+main	6	22		gist	1	718	8.845
+main	6	22		gist	2	718	8.694
+main	6	23		brute	1	555	3752.651
+main	6	23		brute	2	555	3789.987
+main	6	23		gist	1	555	7.472
+main	6	23		gist	2	555	7.001
+main	6	23		pgsphere	1	555	12.873
+main	6	23		pgsphere	2	555	13.694
+main	6	24	contains	brute	1	561	8334.087
+main	6	24	contains	brute	2	561	8325.07
+main	6	24	contains	gist	1	561	12.62
+main	6	24	contains	gist	2	561	13.457
+main	6	24	contains	pgsphere	1	561	17.009
+main	6	24	contains	pgsphere	2	561	17.776
+main	6	24	covered_by	brute	1	12193	10716.009
+main	6	24	covered_by	brute	2	12193	10728
+main	6	24	covered_by	gist	1	12193	30.305
+main	6	24	covered_by	gist	2	12193	29.17
+main	6	24	covered_by	pgsphere	1	12193	123.946
+main	6	24	covered_by	pgsphere	2	12193	127.358
+v0.35	6	21		skycell	1	718	234.448
+v0.35	6	21		skycell	2	718	239.263
+v0.35	6	21		pgsphere	1	718	75.72
+v0.35	6	21		pgsphere	2	718	75.412
+v0.35	6	22		gist	1	718	8.538
+v0.35	6	22		gist	2	718	8.722
+v0.35	6	23		brute	1	555	3805.187
+v0.35	6	23		brute	2	555	3618.838
+v0.35	6	23		gist	1	555	12.658
+v0.35	6	23		gist	2	555	12.22
+v0.35	6	23		pgsphere	1	555	12.31
+v0.35	6	23		pgsphere	2	555	12.419
+v0.35	6	24	contains	brute	1	561	9294.602
+v0.35	6	24	contains	brute	2	561	8714.779
+v0.35	6	24	contains	gist	1	561	7.488
+v0.35	6	24	contains	gist	2	561	7.312
+v0.35	6	24	contains	pgsphere	1	561	13.815
+v0.35	6	24	contains	pgsphere	2	561	13.573
+v0.35	6	24	covered_by	brute	1	12193	10396.387
+v0.35	6	24	covered_by	brute	2	12193	10524.729
+v0.35	6	24	covered_by	gist	1	12193	35.324
+v0.35	6	24	covered_by	gist	2	12193	36.686
+v0.35	6	24	covered_by	pgsphere	1	12193	130.888
+v0.35	6	24	covered_by	pgsphere	2	12193	129.093
+v0.34	6	21		skycell	1	718	240.752
+v0.34	6	21		skycell	2	718	236.329
+v0.34	6	21		pgsphere	1	718	77.619
+v0.34	6	21		pgsphere	2	718	77.061
+v0.34	6	22		gist	1	718	8.243
+v0.34	6	22		gist	2	718	8.147
+v0.34	6	23		brute	1	555	3567.826
+v0.34	6	23		brute	2	555	3583.668
+v0.34	6	23		gist	1	555	13.525
+v0.34	6	23		gist	2	555	12.398
+v0.34	6	23		pgsphere	1	555	12.425
+v0.34	6	23		pgsphere	2	555	12.388
+v0.34	6	24	contains	brute	1	561	8413.279
+v0.34	6	24	contains	brute	2	561	8017.268
+v0.34	6	24	contains	gist	1	561	15.402
+v0.34	6	24	contains	gist	2	561	8.672
+v0.34	6	24	contains	pgsphere	1	561	14.612
+v0.34	6	24	contains	pgsphere	2	561	18.085
+v0.34	6	24	covered_by	brute	1	12193	9931.545
+v0.34	6	24	covered_by	brute	2	12193	9845.357
+v0.34	6	24	covered_by	gist	1	12193	28.67
+v0.34	6	24	covered_by	gist	2	12193	27.881
+v0.34	6	24	covered_by	pgsphere	1	12193	123.692
+v0.34	6	24	covered_by	pgsphere	2	12193	123.114
+v0.34	7	21		skycell	1	718	238.091
+v0.34	7	21		skycell	2	718	241.96
+v0.34	7	21		pgsphere	1	718	77.037
+v0.34	7	21		pgsphere	2	718	89.873
+v0.34	7	22		gist	1	718	8.985
+v0.34	7	22		gist	2	718	9.257
+v0.34	7	23		brute	1	555	3633.563
+v0.34	7	23		brute	2	555	3766.753
+v0.34	7	23		gist	1	555	13.18
+v0.34	7	23		gist	2	555	12.25
+v0.34	7	23		pgsphere	1	555	13.137
+v0.34	7	23		pgsphere	2	555	12.363
+v0.34	7	24	contains	brute	1	561	8164.553
+v0.34	7	24	contains	brute	2	561	8242.333
+v0.34	7	24	contains	gist	1	561	7.482
+v0.34	7	24	contains	gist	2	561	7.389
+v0.34	7	24	contains	pgsphere	1	561	17.1
+v0.34	7	24	contains	pgsphere	2	561	14.536
+v0.34	7	24	covered_by	brute	1	12193	9521.175
+v0.34	7	24	covered_by	brute	2	12193	9721.655
+v0.34	7	24	covered_by	gist	1	12193	29.901
+v0.34	7	24	covered_by	gist	2	12193	30.303
+v0.34	7	24	covered_by	pgsphere	1	12193	130.797
+v0.34	7	24	covered_by	pgsphere	2	12193	127.129
+v0.35	7	21		skycell	1	718	252.659
+v0.35	7	21		skycell	2	718	276.712
+v0.35	7	21		pgsphere	1	718	78.36
+v0.35	7	21		pgsphere	2	718	92.899
+v0.35	7	22		gist	1	718	8.713
+v0.35	7	22		gist	2	718	8.747
+v0.35	7	23		brute	1	555	4067.141
+v0.35	7	23		brute	2	555	3687.009
+v0.35	7	23		gist	1	555	13.462
+v0.35	7	23		gist	2	555	12.334
+v0.35	7	23		pgsphere	1	555	24.741
+v0.35	7	23		pgsphere	2	555	17.332
+v0.35	7	24	contains	brute	1	561	8674.3
+v0.35	7	24	contains	brute	2	561	8245.989
+v0.35	7	24	contains	gist	1	561	8.208
+v0.35	7	24	contains	gist	2	561	7.195
+v0.35	7	24	contains	pgsphere	1	561	13.75
+v0.35	7	24	contains	pgsphere	2	561	13.922
+v0.35	7	24	covered_by	brute	1	12193	10666.218
+v0.35	7	24	covered_by	brute	2	12193	10572.247
+v0.35	7	24	covered_by	gist	1	12193	56.603
+v0.35	7	24	covered_by	gist	2	12193	51.012
+v0.35	7	24	covered_by	pgsphere	1	12193	153.29
+v0.35	7	24	covered_by	pgsphere	2	12193	152.536
+main	7	21		skycell	1	718	239.525
+main	7	21		skycell	2	718	344.024
+main	7	21		pgsphere	1	718	77.325
+main	7	21		pgsphere	2	718	76.662
+main	7	22		gist	1	718	8.624
+main	7	22		gist	2	718	8.625
+main	7	23		brute	1	555	3584.048
+main	7	23		brute	2	555	3876.981
+main	7	23		gist	1	555	7.118
+main	7	23		gist	2	555	6.852
+main	7	23		pgsphere	1	555	12.28
+main	7	23		pgsphere	2	555	12.333
+main	7	24	contains	brute	1	561	8923.121
+main	7	24	contains	brute	2	561	8316.174
+main	7	24	contains	gist	1	561	7.691
+main	7	24	contains	gist	2	561	7.705
+main	7	24	contains	pgsphere	1	561	14.468
+main	7	24	contains	pgsphere	2	561	15.521
+main	7	24	covered_by	brute	1	12193	11137.524
+main	7	24	covered_by	brute	2	12193	10842.6
+main	7	24	covered_by	gist	1	12193	29.96
+main	7	24	covered_by	gist	2	12193	29.539
+main	7	24	covered_by	pgsphere	1	12193	122.842
+main	7	24	covered_by	pgsphere	2	12193	125.359
+main	8	21		skycell	1	718	240.158
+main	8	21		skycell	2	718	257.585
+main	8	21		pgsphere	1	718	79.344
+main	8	21		pgsphere	2	718	76.359
+main	8	22		gist	1	718	8.952
+main	8	22		gist	2	718	8.876
+main	8	23		brute	1	555	3641.219
+main	8	23		brute	2	555	3634.321
+main	8	23		gist	1	555	9.986
+main	8	23		gist	2	555	7.461
+main	8	23		pgsphere	1	555	17.574
+main	8	23		pgsphere	2	555	12.633
+main	8	24	contains	brute	1	561	8611.651
+main	8	24	contains	brute	2	561	8856.092
+main	8	24	contains	gist	1	561	9.407
+main	8	24	contains	gist	2	561	7.949
+main	8	24	contains	pgsphere	1	561	14.217
+main	8	24	contains	pgsphere	2	561	14.266
+main	8	24	covered_by	brute	1	12193	10794.551
+main	8	24	covered_by	brute	2	12193	10572.234
+main	8	24	covered_by	gist	1	12193	30.131
+main	8	24	covered_by	gist	2	12193	29.092
+main	8	24	covered_by	pgsphere	1	12193	124.63
+main	8	24	covered_by	pgsphere	2	12193	150.225
+v0.35	8	21		skycell	1	718	286.411
+v0.35	8	21		skycell	2	718	283.26
+v0.35	8	21		pgsphere	1	718	114.993
+v0.35	8	21		pgsphere	2	718	77.024
+v0.35	8	22		gist	1	718	8.514
+v0.35	8	22		gist	2	718	8.304
+v0.35	8	23		brute	1	555	3677.552
+v0.35	8	23		brute	2	555	3642.951
+v0.35	8	23		gist	1	555	12.94
+v0.35	8	23		gist	2	555	12.013
+v0.35	8	23		pgsphere	1	555	12.3
+v0.35	8	23		pgsphere	2	555	12.833
+v0.35	8	24	contains	brute	1	561	8257.413
+v0.35	8	24	contains	brute	2	561	8641.15
+v0.35	8	24	contains	gist	1	561	8.107
+v0.35	8	24	contains	gist	2	561	9.763
+v0.35	8	24	contains	pgsphere	1	561	14.784
+v0.35	8	24	contains	pgsphere	2	561	14.689
+v0.35	8	24	covered_by	brute	1	12193	11178.3
+v0.35	8	24	covered_by	brute	2	12193	10484.767
+v0.35	8	24	covered_by	gist	1	12193	28.894
+v0.35	8	24	covered_by	gist	2	12193	27.636
+v0.35	8	24	covered_by	pgsphere	1	12193	160.464
+v0.35	8	24	covered_by	pgsphere	2	12193	176.629
+v0.34	8	21		skycell	1	718	300.896
+v0.34	8	21		skycell	2	718	250.292
+v0.34	8	21		pgsphere	1	718	81.697
+v0.34	8	21		pgsphere	2	718	94.932
+v0.34	8	22		gist	1	718	9.296
+v0.34	8	22		gist	2	718	9.395
+v0.34	8	23		brute	1	555	3683.282
+v0.34	8	23		brute	2	555	3829.055
+v0.34	8	23		gist	1	555	13.362
+v0.34	8	23		gist	2	555	12.031
+v0.34	8	23		pgsphere	1	555	13.255
+v0.34	8	23		pgsphere	2	555	12.767
+v0.34	8	24	contains	brute	1	561	9145.397
+v0.34	8	24	contains	brute	2	561	8337.361
+v0.34	8	24	contains	gist	1	561	7.742
+v0.34	8	24	contains	gist	2	561	8.082
+v0.34	8	24	contains	pgsphere	1	561	14.498
+v0.34	8	24	contains	pgsphere	2	561	14.459
+v0.34	8	24	covered_by	brute	1	12193	9907.426
+v0.34	8	24	covered_by	brute	2	12193	9937.522
+v0.34	8	24	covered_by	gist	1	12193	29.041
+v0.34	8	24	covered_by	gist	2	12193	28.69
+v0.34	8	24	covered_by	pgsphere	1	12193	127.014
+v0.34	8	24	covered_by	pgsphere	2	12193	125.823

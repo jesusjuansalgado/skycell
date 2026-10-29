@@ -1,0 +1,51 @@
+NOTICE:  database "pf26" does not exist, skipping
+pf26:
+NOTICE:  table "oc" does not exist, skipping
+NOTICE:  table "cat_q3c" does not exist, skipping
+NOTICE:  table "cat_sphere" does not exist, skipping
+NOTICE:  table "cat_cell" does not exist, skipping
+NOTICE:  table "src_prev" does not exist, skipping
+NOTICE:  relation "src" does not exist, skipping
+NOTICE:  extension "q3c" already exists, skipping
+NOTICE:  extension "pg_sphere" already exists, skipping
+NOTICE:  extension "skycell" already exists, skipping
+NOTICE:  table "cat_q3c" does not exist, skipping
+NOTICE:  table "cat_sphere" does not exist, skipping
+NOTICE:  table "cat_cell" does not exist, skipping
+NOTICE:  table "bench_pool" does not exist, skipping
+NOTICE:  table "bench_centers" does not exist, skipping
+NOTICE:  table "bench_poly" does not exist, skipping
+NOTICE:  table "bench_polys" does not exist, skipping
+NOTICE:  table "probe" does not exist, skipping
+NOTICE:  table "fp" does not exist, skipping
+NOTICE:  table "fp_cells" does not exist, skipping
+NOTICE:  table "fp_meta" does not exist, skipping
+NOTICE:  table "fp_meta" does not exist, skipping
+src 10001306 -4368699304178
+probe 200000 -178044391082
+fp_cells 152143 74456936833
+cone36:
+NOTICE:  relation "gaia_map" already exists, skipping
+NOTICE:  table "oc" does not exist, skipping
+NOTICE:  table "src_prev" does not exist, skipping
+NOTICE:  extension "q3c" already exists, skipping
+NOTICE:  extension "pg_sphere" already exists, skipping
+NOTICE:  extension "skycell" already exists, skipping
+NOTICE:  relation "bench_build" already exists, skipping
+NOTICE:  table "cat_q3c" does not exist, skipping
+NOTICE:  table "cat_sphere" does not exist, skipping
+NOTICE:  table "cat_cell" does not exist, skipping
+NOTICE:  drop cascades to function cone_sql(text,bench_centers)
+NOTICE:  relation "bench_cone" already exists, skipping
+NOTICE:  relation "bench_cone_x" already exists, skipping
+NOTICE:  relation "bench_xmatch" already exists, skipping
+NOTICE:  relation "bench_fp" already exists, skipping
+NOTICE:  table "fp_meta" does not exist, skipping
+src 9994125 2269113738267
+probe 200000 -849308581244
+fp_cells 152189 74333522049
+run 1 (26) done 22:34:42
+run 2 (36) done 22:34:50
+run 3 (36) done 22:34:59
+run 4 (26) done 22:35:07
+exit 0

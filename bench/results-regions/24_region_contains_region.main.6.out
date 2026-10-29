@@ -1,0 +1,47 @@
+
+=== consistency: brute force vs the GiST-indexed @>/<@ vs pgSphere native ~/<@ ===
+
+
+
+
+
+
+covered_by|12193|12193|12193
+contains|561|561|561
+=== plans (should be Bitmap/Index Scans using fpr_region_gist) ===
+contains|Aggregate
+  ->  Nested Loop
+        ->  Seq Scan on rox_probe_tiny p
+        ->  Index Scan using fpr_region_gist on fpr f
+              Index Cond: (s_region @> p.s_region)
+
+covered_by|Aggregate
+  ->  Nested Loop
+        ->  Seq Scan on rox_probe_big p
+        ->  Index Scan using fpr_region_gist on fpr f
+              Index Cond: (s_region <@ p.s_region)
+
+
+
+
+
+
+
+
+
+
+
+
+
+contains|brute|1|561|8334.09
+contains|brute|2|561|8325.07
+contains|gist|1|561|12.62
+contains|gist|2|561|13.46
+contains|pgsphere|1|561|17.01
+contains|pgsphere|2|561|17.78
+covered_by|brute|1|12193|10716.01
+covered_by|brute|2|12193|10728.00
+covered_by|gist|1|12193|30.31
+covered_by|gist|2|12193|29.17
+covered_by|pgsphere|1|12193|123.95
+covered_by|pgsphere|2|12193|127.36

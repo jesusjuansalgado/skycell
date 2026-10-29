@@ -1,0 +1,20 @@
+[21:57:46] 10M Gaia-density corpus (11, 02)
+NOTICE:  relation "gaia_map" already exists, skipping
+NOTICE:  table "oc" does not exist, skipping
+NOTICE:  table "cat_q3c" does not exist, skipping
+NOTICE:  table "cat_sphere" does not exist, skipping
+NOTICE:  table "cat_cell" does not exist, skipping
+NOTICE:  table "src_prev" does not exist, skipping
+NOTICE:  relation "src" does not exist, skipping
+NOTICE:  extension "q3c" already exists, skipping
+NOTICE:  extension "pg_sphere" already exists, skipping
+NOTICE:  extension "skycell" already exists, skipping
+NOTICE:  relation "bench_build" already exists, skipping
+NOTICE:  table "cat_q3c" does not exist, skipping
+NOTICE:  table "cat_sphere" does not exist, skipping
+NOTICE:  table "cat_cell" does not exist, skipping
+[22:00:00] probes (04) and 11_xmatch_ab.sql
+NOTICE:  table "probe" does not exist, skipping
+[22:00:06] bench_xm_ab_run(10, {1,10}, 2)
+[22:01:24] DONE
+exit 0

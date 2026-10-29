@@ -1,0 +1,17 @@
+[15:54:27] dense05: build
+[15:54:40] dense05: Table 8 protocol, seed 0.19
+[15:54:41] dense05: Table 8 protocol, seed 0.53
+[15:54:42] dense05: three-way
+[15:54:42] sparse10: build
+[15:57:23] sparse10: Table 8 protocol, seed 0.19
+[15:57:24] sparse10: Table 8 protocol, seed 0.53
+[15:57:25] sparse10: three-way
+[15:57:26] dense10: build
+[15:59:52] dense10: Table 8 protocol, seed 0.19
+[15:59:57] dense10: Table 8 protocol, seed 0.53
+[16:00:01] dense10: three-way
+[16:00:07] sparse10b: build
+[16:02:48] sparse10b: Table 8 protocol, seed 0.19
+[16:02:49] sparse10b: Table 8 protocol, seed 0.53
+[16:02:49] sparse10b: three-way
+[16:02:50] DONE

@@ -1,0 +1,64 @@
+[22:20:19] STAGE gaia: 1e7 rows resampled from the DR3 order-9 map
+NOTICE:  table "oc" does not exist, skipping
+NOTICE:  table "cat_q3c" does not exist, skipping
+NOTICE:  table "cat_sphere" does not exist, skipping
+NOTICE:  table "cat_cell" does not exist, skipping
+NOTICE:  table "src_prev" does not exist, skipping
+NOTICE:  relation "src" does not exist, skipping
+NOTICE:  extension "q3c" already exists, skipping
+NOTICE:  extension "pg_sphere" already exists, skipping
+NOTICE:  extension "skycell" already exists, skipping
+NOTICE:  relation "bench_build" already exists, skipping
+NOTICE:  table "cat_q3c" does not exist, skipping
+NOTICE:  table "cat_sphere" does not exist, skipping
+NOTICE:  table "cat_cell" does not exist, skipping
+[22:22:37]   gaia: query pool (03), polygons (05)
+NOTICE:  drop cascades to 2 other objects
+DETAIL:  drop cascades to function cone_sql(text,bench_centers)
+drop cascades to function ab_trial(text,text,integer,bench_centers,text[])
+NOTICE:  relation "bench_cone" already exists, skipping
+NOTICE:  relation "bench_cone_x" already exists, skipping
+NOTICE:  table "bench_poly" does not exist, skipping
+NOTICE:  table "bench_polys" does not exist, skipping
+[22:22:37]   poly q3c
+[22:22:38]   poly pgsphere
+[22:22:40]   poly skycell
+[22:22:40]   poly skycell (reverse order)
+[22:22:40]   poly pgsphere (reverse order)
+[22:22:43]   poly q3c (reverse order)
+[22:22:44]   gaia: probes (04), footprints (06)
+NOTICE:  table "probe" does not exist, skipping
+NOTICE:  relation "bench_xmatch" already exists, skipping
+NOTICE:  table "fp" does not exist, skipping
+NOTICE:  table "fp_cells" does not exist, skipping
+NOTICE:  table "fp_meta" does not exist, skipping
+NOTICE:  table "fp_meta" does not exist, skipping
+[22:22:47]   footprints pgsphere
+[22:22:50]   footprints skycell
+[22:22:53]   footprints skycell (reverse order)
+[22:22:56]   footprints pgsphere (reverse order)
+[22:22:59] STAGE designed: 01_data.sql (10M), 02_build.sql
+NOTICE:  extension "q3c" already exists, skipping
+NOTICE:  extension "pg_sphere" already exists, skipping
+NOTICE:  extension "skycell" already exists, skipping
+NOTICE:  relation "bench_build" already exists, skipping
+[22:25:54]   designed: query pool (03), polygons (05)
+NOTICE:  drop cascades to function cone_sql(text,bench_centers)
+NOTICE:  relation "bench_cone" already exists, skipping
+NOTICE:  relation "bench_cone_x" already exists, skipping
+[22:25:54]   poly q3c
+[22:25:55]   poly pgsphere
+[22:25:56]   poly skycell
+[22:25:57]   poly skycell (reverse order)
+[22:25:57]   poly pgsphere (reverse order)
+[22:25:58]   poly q3c (reverse order)
+[22:25:59]   designed: probes (04), footprints (06)
+NOTICE:  relation "bench_xmatch" already exists, skipping
+NOTICE:  relation "bench_fp" already exists, skipping
+NOTICE:  table "fp_meta" does not exist, skipping
+[22:26:02]   footprints pgsphere
+[22:26:05]   footprints skycell
+[22:26:08]   footprints skycell (reverse order)
+[22:26:10]   footprints pgsphere (reverse order)
+[22:26:13] DONE
+exit 0

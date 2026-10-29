@@ -1,0 +1,42 @@
+[22:20:19] STAGE gaia: 1e7 rows resampled from the DR3 order-9 map
+[22:22:37]   gaia: query pool (03), polygons (05)
+[22:22:37]   poly q3c
+[22:22:38]   poly pgsphere
+[22:22:40]   poly skycell
+[22:22:40]   poly skycell (reverse order)
+[22:22:40]   poly pgsphere (reverse order)
+[22:22:43]   poly q3c (reverse order)
+[22:22:44]   gaia: probes (04), footprints (06)
+[22:22:47]   footprints pgsphere
+[22:22:50]   footprints skycell
+[22:22:53]   footprints skycell (reverse order)
+[22:22:56]   footprints pgsphere (reverse order)
+[22:22:59] STAGE designed: 01_data.sql (10M), 02_build.sql
+[22:25:54]   designed: query pool (03), polygons (05)
+[22:25:54]   poly q3c
+[22:25:55]   poly pgsphere
+[22:25:56]   poly skycell
+[22:25:57]   poly skycell (reverse order)
+[22:25:57]   poly pgsphere (reverse order)
+[22:25:58]   poly q3c (reverse order)
+[22:25:59]   designed: probes (04), footprints (06)
+[22:26:02]   footprints pgsphere
+[22:26:05]   footprints skycell
+[22:26:08]   footprints skycell (reverse order)
+[22:26:10]   footprints pgsphere (reverse order)
+[22:26:13] DONE
+[re-run of the designed stage: the first overlapped other work on the host]
+[22:26:49] STAGE designed: 01_data.sql (10M), 02_build.sql
+[22:29:37]   designed: query pool (03), polygons (05)
+[22:29:37]   poly q3c
+[22:29:38]   poly pgsphere
+[22:29:40]   poly skycell
+[22:29:40]   poly skycell (reverse order)
+[22:29:40]   poly pgsphere (reverse order)
+[22:29:41]   poly q3c (reverse order)
+[22:29:42]   designed: probes (04), footprints (06)
+[22:29:46]   footprints pgsphere
+[22:29:48]   footprints skycell
+[22:29:51]   footprints skycell (reverse order)
+[22:29:54]   footprints pgsphere (reverse order)
+[22:29:57] DONE

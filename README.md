@@ -525,7 +525,7 @@ defaults throughout (ratio below 1 = skycell faster):
 | stored regions: footprints that contain a position (`@>` a point) | 0.57 on x86; 0.75–0.93 on an Apple M3 with 0.6 | |
 
 The stored-region rows were re-measured on the x86 cloud host with skycell 0.34,
-0.35 and 0.36, 8 runs each (skycell-paper's `bench/results-regions/`; 0.36 as
+0.35 and 0.36, 8 runs each ([`bench/results-regions/`](bench/results-regions/); 0.36 as
 `main` at b3bb7be, the same library code). Overlap and containment between regions kept their
 margins there (0.11, 0.55, 0.22), and the v0.35 GiST key changed none of them.
 Point-in-footprint was within 5% of pgSphere with 0.34 and 0.35 (0.98 and
@@ -563,11 +563,14 @@ workers use the four cores. Q3C's and pgSphere's cross-matches can run under a
 parallel nested loop too. They were not measured that way, so these figures
 compare skycell with itself only.
 
-The paper describing skycell, the benchmark harness, the raw results of every
-measurement and how to reproduce them are in
-[skycell-paper](https://github.com/jesusjuansalgado/skycell-paper), together
-with the design notebook (`GIST_REGION_DESIGN.md`) that the "Round …"
-references in the source comments point to.
+The benchmark scripts behind the paper describing skycell, and the
+documentation of every measurement it quotes, are in [`bench/`](bench/):
+[`bench/README.md`](bench/README.md) maps each table to its directory, and
+[`bench/REPRODUCING.md`](bench/REPRODUCING.md) gives the hosts, settings and run
+order. The paper itself, the raw per-query results, the runs of earlier versions
+and the design notebook (`GIST_REGION_DESIGN.md`) that the "Round …" references
+in the source comments point to are in
+[skycell-paper](https://github.com/jesusjuansalgado/skycell-paper).
 
 ---
 

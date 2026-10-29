@@ -1,0 +1,16 @@
+
+=== consistency: brute force vs the GiST-indexed && ===
+
+
+718|718
+=== plan (should be an Index Scan using fpr_region_gist) ===
+Aggregate
+  ->  Nested Loop
+        ->  Seq Scan on rox_probe p
+        ->  Index Scan using fpr_region_gist on fpr f
+              Index Cond: (s_region && p.s_region)
+
+
+
+gist|1|718|8.38
+gist|2|718|8.10
