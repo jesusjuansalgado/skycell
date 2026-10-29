@@ -486,7 +486,7 @@ for speed, though: `ORDER BY` the distance with a `LIMIT` is the fast form on
 its own. Rows with a NULL distance come last, as `ASC NULLS LAST` puts them.
 Without a `LIMIT`, or ordered `DESC`, the query keeps PostgreSQL's sort.
 
-On 10M real Gaia DR3 positions it takes 0.45–0.70 of the time of pgSphere's
+On 10M real Gaia DR3 positions it takes 0.47–0.69 of the time of pgSphere's
 GiST ordering for k from 10 to 1000 (warm, a new point every query, planning
 included); see [Limitations](#limitations) for a clustered relation.
 
@@ -612,7 +612,7 @@ defaults throughout (ratio below 1 = skycell faster):
 | cone searches, 1″–3°, cold | 0.40–0.98; level below 6′ on real positions | |
 | cross-matching, 1″–10″ | 0.26–0.33 | 0.73–0.84 |
 | convex polygons, 0.05°–2° | 0.21–0.23 | |
-| nearest neighbours, k = 10–1000, real Gaia DR3 positions | 0.45–0.70 | |
+| nearest neighbours, k = 10–1000, real Gaia DR3 positions | 0.47–0.69 | |
 | stored regions: overlap and region-in-region (`&&`, `@>`, `<@` between regions) | 0.12–0.70 | |
 | stored regions: footprints that contain a position (`@>` a point) | 0.57 on x86; 0.75–0.93 on an Apple M3 with 0.6 | |
 
