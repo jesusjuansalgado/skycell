@@ -454,5 +454,39 @@ RESET enable_indexscan;
 RESET enable_bitmapscan;
 RESET skycell.custom_scan;
 SELECT count(*), sum(id) FROM cs_fcat WHERE skycell_cone(skycell_ang2cell(ra, dec), ra, dec, 10, 20, 3);
+-- an invalidation between the outer rows of a cross-match flushes the
+-- backend's density cache, which the scan's per-row coverings read: a
+-- function on the outer side that changes a catalog, with a density map built
+-- (the map is what the scan would otherwise read after it was freed)
+SELECT skycell_density_build('cs_fcat', 'skycell_ang2cell', 20) > 0 AS map_built;
+CREATE TABLE cs_inval (x int);
+CREATE FUNCTION cs_inval(i int) RETURNS int LANGUAGE plpgsql VOLATILE AS $$
+BEGIN
+  EXECUTE format('ALTER TABLE cs_inval ALTER COLUMN x SET STATISTICS %s', 100 + i % 100);
+  RETURN i;
+END $$;
+CREATE FUNCTION cs_explain(q text) RETURNS SETOF text LANGUAGE plpgsql AS $$
+DECLARE l text;
+BEGIN
+  FOR l IN EXECUTE 'EXPLAIN (COSTS OFF) ' || q LOOP RETURN NEXT l; END LOOP;
+END $$;
+SET enable_hashjoin = off;
+SET enable_mergejoin = off;
+SELECT count(*) FILTER (WHERE line ~ 'Ranges: per rescan') AS per_rescan
+FROM cs_explain($q$SELECT sum(n) FROM (SELECT cs_inval(pid) k, ra, dec FROM cs_fwide) o,
+  LATERAL (SELECT count(*) n FROM cs_fcat
+           WHERE skycell_cone(skycell_ang2cell(ra, dec), ra, dec, o.ra, o.dec, 3)) c$q$) AS line;
+SELECT (SELECT sum(n) FROM (SELECT cs_inval(pid) k, ra, dec FROM cs_fwide) o,
+          LATERAL (SELECT count(*) n FROM cs_fcat
+                   WHERE skycell_cone(skycell_ang2cell(ra, dec), ra, dec, o.ra, o.dec, 3)) c)
+     = (SELECT sum(n) FROM cs_fwide o,
+          LATERAL (SELECT count(*) n FROM cs_fcat
+                   WHERE skycell_in_cone(ra, dec, o.ra, o.dec, 3, -1)) c) AS same_rows;
+RESET enable_hashjoin;
+RESET enable_mergejoin;
+SELECT skycell_density_drop('cs_fcat', 'skycell_ang2cell') > 0 AS map_dropped;
+DROP FUNCTION cs_inval(int);
+DROP FUNCTION cs_explain(text);
+DROP TABLE cs_inval;
 DROP FUNCTION cs_filter(text);
 DROP TABLE cs_fwide, cs_fprobe, cs_fcat, cs_fsorted;

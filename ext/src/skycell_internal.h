@@ -46,6 +46,7 @@ extern bool skycell_const_cone_cover(PlannerInfo *root, List *args, sc_region *r
 									 sc_cover *cov, sc_density *dens);
 
 extern void skycell_load_density(Oid relid, Oid statrel, AttrNumber attnum, sc_density *d);
+extern uint64 skycell_density_generation(void);
 extern void skycell_scan_params(sc_cover_params *p, const sc_density *d);
 
 /* cone_scan.c: the custom scan for constant and cross-match cones (skycell.custom_scan) */
