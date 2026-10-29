@@ -36,6 +36,7 @@
 #include "nodes/makefuncs.h"
 #include "nodes/nodeFuncs.h"
 #include "nodes/supportnodes.h"
+#include "optimizer/clauses.h"
 #include "optimizer/optimizer.h"
 #include "parser/parse_coerce.h"
 #include "parser/parse_func.h"
@@ -2091,6 +2092,94 @@ valid_const_pos(Node *ra, Node *dec)
 
 		if (!(d >= -90.0 && d <= 90.0))
 			return false;
+	}
+	return true;
+}
+
+/*
+ * An ORDER BY expression the nearest-neighbour scan (cone_scan.c) can produce
+ * in order: the distance from relation relid's position to a centre that does
+ * not read the relation -- constants and parameters, such as a LATERAL
+ * sub-select's outer columns.  Accepted spellings: distance(p, q) and its
+ * operator p <-> q, distance(ra, dec, ra0, dec0) and skycell_dist(...), with
+ * either argument first, p a column or point([coordsys,] ra, dec).  On success
+ * *cell is the cell expression of the relation's position, which an index has
+ * to hold for the scan to be possible (skycell_ang2cell(ra, dec), or
+ * skycell_cell(pos) for a skypos column), and *ra0, *dec0 the centre's
+ * coordinates as float8 expressions.
+ */
+bool
+skycell_distance_order(Node *expr, Index relid, Node **cell, Node **ra0, Node **dec0)
+{
+	Oid			ff[2] = {FLOAT8OID, FLOAT8OID};
+	Oid			funcid;
+	List	   *args;
+	Node	   *mine,
+			   *other;
+
+	if (IsA(expr, FuncExpr))
+	{
+		funcid = ((FuncExpr *) expr)->funcid;
+		args = ((FuncExpr *) expr)->args;
+	}
+	else if (IsA(expr, OpExpr))
+	{
+		funcid = OidIsValid(((OpExpr *) expr)->opfuncid) ? ((OpExpr *) expr)->opfuncid
+			: get_opcode(((OpExpr *) expr)->opno);
+		args = ((OpExpr *) expr)->args;
+	}
+	else
+		return false;
+	if (!is_distance_func(funcid) || contain_volatile_functions(expr) ||
+		contain_subplans(expr) || checkExprHasSubLink(expr))
+		return false;
+
+	if (list_length(args) == 4)
+	{
+		/* the relation's (ra, dec) pair, and the other pair as the centre */
+		Node	   *a = (Node *) list_make2(linitial(args), lsecond(args));
+		Node	   *b = (Node *) list_make2(lthird(args), lfourth(args));
+
+		if (single_varno(b) == 0 && single_varno(a) == (int) relid)
+			mine = a, other = b;
+		else if (single_varno(a) == 0 && single_varno(b) == (int) relid)
+			mine = b, other = a;
+		else
+			return false;
+		*cell = (Node *) makeFuncExpr(lookup_sibling_func(funcid, "skycell_ang2cell", 2, ff),
+									  INT8OID, list_copy((List *) mine),
+									  InvalidOid, InvalidOid, COERCE_EXPLICIT_CALL);
+		*ra0 = copyObject(linitial((List *) other));
+		*dec0 = copyObject(lsecond((List *) other));
+		return true;
+	}
+	if (list_length(args) != 2)
+		return false;
+	if (single_varno(lsecond(args)) == 0 && single_varno(linitial(args)) == (int) relid)
+		mine = linitial(args), other = lsecond(args);
+	else if (single_varno(linitial(args)) == 0 && single_varno(lsecond(args)) == (int) relid)
+		mine = lsecond(args), other = linitial(args);
+	else
+		return false;
+	if (!plain_pos(funcid, mine) || IsA(mine, Const) ||
+		(*cell = cell_expr_for_point(funcid, mine)) == NULL)
+		return false;
+	if (IsA(other, FuncExpr) || IsA(other, Const) || IsA(other, Var))
+	{
+		if (!plain_pos(funcid, other) || !pos_ra_dec(funcid, other, ra0, dec0))
+			return false;
+	}
+	else
+	{
+		/* a parameter, or another expression of skypos: its coordinates */
+		Oid			one[1] = {exprType(other)};
+
+		*ra0 = (Node *) makeFuncExpr(lookup_sibling_func(funcid, "coord1", 1, one), FLOAT8OID,
+									 list_make1(copyObject(other)), InvalidOid, InvalidOid,
+									 COERCE_EXPLICIT_CALL);
+		*dec0 = (Node *) makeFuncExpr(lookup_sibling_func(funcid, "coord2", 1, one), FLOAT8OID,
+									  list_make1(copyObject(other)), InvalidOid, InvalidOid,
+									  COERCE_EXPLICIT_CALL);
 	}
 	return true;
 }
