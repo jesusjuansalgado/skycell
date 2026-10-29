@@ -461,8 +461,12 @@ the `ORDER BY` expression itself, so the order is the one a sort would give;
 the `LIMIT` stops it after the ring that completes the answer. The first ring
 is sized from the density round the point for the rows the `LIMIT` asks for,
 over the share the query's other conditions keep; those conditions are tested
-as a ring is read. Rows with a NULL distance come last, as `ASC NULLS LAST`
-puts them. Without a `LIMIT`, or ordered `DESC`, the query keeps PostgreSQL's
+as a ring is read. A radius the conditions bound the answer to — the
+distance below `r`, ADQL's `CONTAINS(..., CIRCLE(...))` or a `skycell_cone`
+round the same point — is as far as the rings go, so "the 10 nearest within
+1′" of an empty patch reads that patch, not the relation. No cone is needed
+for speed, though: `ORDER BY` the distance with a `LIMIT` is the fast form on
+its own. Rows with a NULL distance come last, as `ASC NULLS LAST` puts them. Without a `LIMIT`, or ordered `DESC`, the query keeps PostgreSQL's
 sort.
 
 ### Coming from Q3C
@@ -748,10 +752,11 @@ locally), the standalone selftests, and the reference translators.
   that reads a system column of the relation
   (`ctid`, `FOR UPDATE`) keeps the sort too, since the scan returns rows from
   its own buffer. Against pgSphere's GiST ordering on a clustered relation (an
-  ObsCore table, observations grouped in fields) it is level for a few rows
-  and slower for hundreds or more: the density estimate round the point
-  averages the fields with the empty sky between them, so the first ring is
-  too wide.
+  ObsCore table, observations grouped in fields, its heap out of cell order)
+  it is level for a few rows and slower for hundreds or more: it reads about
+  twice the rows it returns (the ring's margin and the cells its edge
+  crosses), each through a bitmap over an unordered heap, where pgSphere's
+  GiST reads close to exactly the rows it returns.
 - **Where the custom scan applies.** It answers cones and cross-matches; polygons
   and stored regions use the range rewrite and the region indexes. The cone must
   be a top-level `AND` term of a `WHERE` or `JOIN ON`: a cone under an `OR` is
