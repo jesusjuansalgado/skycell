@@ -1196,6 +1196,7 @@ skycell_cell_density(PlannerInfo *root, Node **cell, sc_density *d, Oid *statrel
 	AttrNumber	att;
 	bool		ops;
 
+	memset(d, 0, sizeof(*d));
 	*statrel = InvalidOid;
 	*uses_cell_ops = false;
 	if (root == NULL || root->parse == NULL)
@@ -1511,9 +1512,11 @@ void
 density_for_var(PlannerInfo *root, Node *arg, sc_density *d, Oid *statrel,
 				 bool *uses_cell_ops)
 {
-	d->ntotal = 0;
-	d->nbounds = 0;
-	d->bounds = NULL;
+	/*
+	 * All of it: with no statistics found, the caller still covers against
+	 * this as a uniform sky, and the covering reads the map fields too.
+	 */
+	memset(d, 0, sizeof(*d));
 	*statrel = InvalidOid;
 	*uses_cell_ops = false;
 
