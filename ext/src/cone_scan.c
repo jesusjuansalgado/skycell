@@ -148,6 +148,7 @@ typedef struct ConeScanState
 				statrel;
 	AttrNumber	attnum;
 	bool		have_dens;
+	uint64		dens_generation;	/* skycell_density_generation() at the load */
 	sc_density	dens;
 	int64	   *rt_bounds;		/* bounds' storage, rt_cap ranges */
 	int			rt_cap;
@@ -1662,9 +1663,18 @@ cone_cover_row(ConeScanState *st)
 			return;
 		v[i++] = DatumGetFloat8(d);
 	}
-	if (!st->have_dens)
+	/*
+	 * The density points into the backend's cache, which an invalidation
+	 * processed since the last row -- by the outer side, say -- may have
+	 * freed.  Evaluating the arguments above can do that too, so this check
+	 * comes after them; nothing below takes a lock.
+	 */
+	if (!st->have_dens || st->dens_generation != skycell_density_generation())
 	{
 		old = MemoryContextSwitchTo(estate->es_query_cxt);
+		if (st->have_dens && st->dens.bounds)
+			pfree((void *) st->dens.bounds);	/* a copy in es_query_cxt */
+		st->dens_generation = skycell_density_generation();
 		skycell_load_density(st->relid, st->statrel, st->attnum, &st->dens);
 		MemoryContextSwitchTo(old);
 		st->have_dens = true;

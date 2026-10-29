@@ -518,9 +518,26 @@ static MemoryContext skycell_cover_cxt = NULL;
 static HTAB *dens_cache = NULL;
 static HTAB *idx_cache = NULL;
 
+/*
+ * A flush frees what the cache handed out, so it is counted: a caller that
+ * keeps an sc_density across anything that can process invalidations -- a
+ * lock, a catalog lookup, a function on the outer side of a join -- checks
+ * skycell_density_generation() before using it again, and reloads if the
+ * count moved.  Those are the cross-match scan, which holds its density for
+ * every outer row, and a function's fn_extra.
+ */
+static uint64 skycell_cache_generation = 0;
+
+uint64
+skycell_density_generation(void)
+{
+	return skycell_cache_generation;
+}
+
 static void
 skycell_cache_flush(Datum arg, int cacheid, uint32 hashvalue)
 {
+	skycell_cache_generation++;
 	dens_cache = NULL;
 	idx_cache = NULL;
 	cover_cache = NULL;
@@ -818,28 +835,46 @@ load_density_cached(Oid relid, Oid statrel, AttrNumber attnum, sc_density *d)
 {
 	dens_key	key;
 	dens_entry *entry;
-	bool		found;
+	dens_entry	fresh;			/* an uncached load, when the cache moved */
 
 	memset(&key, 0, sizeof(key));	/* padding must be zero: hashed as bytes */
 	key.statrel = statrel;
 	key.attnum = attnum;
 	skycell_cache_init();
-	entry = (dens_entry *) hash_search(dens_cache, &key, HASH_ENTER, &found);
-	if (!found)
+	entry = (dens_entry *) hash_search(dens_cache, &key, HASH_FIND, NULL);
+	if (entry == NULL)
 	{
-		sc_density	fresh;
-		MemoryContext old = MemoryContextSwitchTo(skycell_cache_cxt);
+		/*
+		 * Loading looks up the catalogs and opens the map, and either can
+		 * process an invalidation, which flushes the cache.  So the load goes
+		 * into a context of its own, and joins the cache only if no flush
+		 * happened meanwhile; otherwise it serves this caller alone and is
+		 * freed with the caller's context.
+		 */
+		sc_density	fd;
+		uint64		generation = skycell_cache_generation;
+		MemoryContext loadcxt = AllocSetContextCreate(CurrentMemoryContext,
+													  "skycell density load",
+													  ALLOCSET_SMALL_SIZES);
+		MemoryContext old = MemoryContextSwitchTo(loadcxt);
 
-		/* load in the cache context so the bounds survive the query */
-		load_density_from(relid, statrel, attnum, &fresh);
+		memset(&fresh, 0, sizeof(fresh));
+		fresh.key = key;
+		load_density_from(relid, statrel, attnum, &fd);
+		fresh.ntotal = fd.ntotal;
+		fresh.nbounds = fd.nbounds;
+		fresh.bounds = (int64 *) fd.bounds;
+		fresh.relpages = fd.relpages;
+		load_density_map(statrel, attnum, &fresh);
 		MemoryContextSwitchTo(old);
-		entry->ntotal = fresh.ntotal;
-		entry->nbounds = fresh.nbounds;
-		entry->bounds = (int64 *) fresh.bounds;
-		entry->relpages = fresh.relpages;
-		old = MemoryContextSwitchTo(skycell_cache_cxt);
-		load_density_map(statrel, attnum, entry);
-		MemoryContextSwitchTo(old);
+
+		entry = &fresh;
+		if (generation == skycell_cache_generation)
+		{
+			MemoryContextSetParent(loadcxt, skycell_cache_cxt);
+			entry = (dens_entry *) hash_search(dens_cache, &key, HASH_ENTER, NULL);
+			*entry = fresh;
+		}
 	}
 	d->ntotal = entry->ntotal;
 	d->relpages = entry->relpages;
@@ -984,7 +1019,6 @@ density_for_expr(PlannerInfo *root, Node *arg, sc_density *d, Oid *statrel,
 
 				if (!found || (this_uses_cell_ops && !matched_uses_cell_ops))
 				{
-					load_density_cached(rte->relid, indexoid, 1, d);
 					found = true;
 					matched = indexoid;
 					*statrel = indexoid;
@@ -999,6 +1033,13 @@ density_for_expr(PlannerInfo *root, Node *arg, sc_density *d, Oid *statrel,
 	list_free(indexes);
 	table_close(rel, NoLock);
 	*uses_cell_ops = matched_uses_cell_ops;
+
+	/*
+	 * Loaded only now: opening the next index takes a lock, which can process
+	 * an invalidation and free a density loaded in the loop.
+	 */
+	if (found)
+		load_density_cached(rte->relid, matched, 1, d);
 
 	/* remember the outcome, including "this relation has no cell index" */
 	{
@@ -2408,6 +2449,7 @@ typedef struct rel_density_cache
 {
 	Oid			relid;
 	AttrNumber	attnum;
+	uint64		generation;		/* skycell_cache_generation it was loaded at */
 	sc_density	d;
 } rel_density_cache;
 
@@ -2427,13 +2469,19 @@ density_from_args(FunctionCallInfo fcinfo, int ai)
 	if (attnum == InvalidAttrNumber)
 		ereport(ERROR, (errmsg("skycell: column not found in %s", get_rel_name(relid))));
 
-	if (rc == NULL || rc->relid != relid || rc->attnum != attnum)
+	if (rc == NULL || rc->relid != relid || rc->attnum != attnum ||
+		rc->generation != skycell_cache_generation)
 	{
 		MemoryContext old = MemoryContextSwitchTo(fcinfo->flinfo->fn_mcxt);
 
-		rc = palloc0(sizeof(rel_density_cache));
+		if (rc == NULL)
+			rc = palloc0(sizeof(rel_density_cache));
+		else if (rc->d.bounds)
+			pfree((void *) rc->d.bounds);	/* load_density() copied them here */
 		rc->relid = relid;
 		rc->attnum = attnum;
+		/* before the load: a flush during it must make the next call reload */
+		rc->generation = skycell_cache_generation;
 		load_density(relid, attnum, &rc->d);
 		fcinfo->flinfo->fn_extra = rc;
 		MemoryContextSwitchTo(old);
