@@ -31,7 +31,8 @@ It **beats each established PostgreSQL sky index at its own speciality**:
 - **Cross-matching, Q3C's speciality:** 16–27% faster than `q3c_join`, and
   about 3× faster than pgSphere.
 
-It also answers convex polygons 4.3–4.8× faster than pgSphere, and the k
+It also answers convex polygons 4.3–4.8× faster than pgSphere, non-convex ones
+3.4–7.7× faster, and the k
 nearest sources to a point (`ORDER BY DISTANCE(...) LIMIT k`) from the same
 index, in about half of pgSphere's time on real Gaia DR3 positions for k up to
 100. Its index is a third the size of pgSphere's and builds about 23× faster,
@@ -621,6 +622,7 @@ defaults throughout (ratio below 1 = skycell faster):
 | cone searches, 1″–3°, cold | 0.40–0.98; level below 6′ on real positions | |
 | cross-matching, 1″–10″ | 0.26–0.33 | 0.73–0.84 |
 | convex polygons, 0.05°–2° | 0.21–0.23 | |
+| non-convex polygons (U, L, comb, star), 0.05°–2°, real Gaia DR3 positions | 0.13–0.29 | |
 | nearest neighbours, k = 10–1000, real Gaia DR3 positions | 0.47–0.69 | |
 | stored regions: overlap and region-in-region (`&&`, `@>`, `<@` between regions) | 0.12–0.70 | |
 | stored regions: footprints that contain a position (`@>` a point) | 0.57 on x86; 0.75–0.93 on an Apple M3 with 0.6 | |

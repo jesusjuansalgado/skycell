@@ -1,0 +1,40 @@
+CREATE TABLE
+INSERT 0 5
+ setseed 
+---------
+ 
+(1 row)
+
+SELECT 60
+SELECT 300
+CREATE FUNCTION
+CREATE TABLE
+CREATE FUNCTION
+ setseed 
+---------
+ 
+(1 row)
+
+ nc_run 
+--------
+ 
+(1 row)
+
+COPY 1800
+SET
+SET
+SET
+SELECT 40
+RESET
+RESET
+RESET
+ polygons | methods_disagree 
+----------+------------------
+      300 |                0
+(1 row)
+
+ checked | differ_from_exact 
+---------+-------------------
+      40 |                 0
+(1 row)
+
