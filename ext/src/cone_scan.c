@@ -46,6 +46,7 @@
 #include "access/tableam.h"
 #include "catalog/pg_am_d.h"
 #include "catalog/pg_class_d.h"
+#include "catalog/pg_proc_d.h"
 #include "catalog/pg_type_d.h"
 #include "catalog/pg_statistic.h"
 #include "commands/explain.h"
@@ -69,6 +70,7 @@
 #include "parser/parsetree.h"
 #include "utils/array.h"
 #include "utils/guc.h"
+#include "utils/datum.h"
 #include "utils/lsyscache.h"
 #include "storage/bufmgr.h"
 #include "utils/memutils.h"
@@ -255,6 +257,33 @@ cone_kind(List *args, Index varno)
  * so the query's own terms are compared by value: an argument matches if it is
  * equal as written or once folded the same way.
  */
+/*
+ * The common unfolded argument is a literal under a one-argument cast, such
+ * as the numeric literal 12.5 passed as float8.  Folding it is calling that
+ * cast on the constant, which is what eval_const_expressions() does for an
+ * immutable strict function, without the executor state evaluate_expr()
+ * builds for every argument.  Returns false, leaving *v unset, for anything
+ * else; then the caller folds the argument the general way.
+ */
+static bool
+fold_cast_of_const(Node *x, Datum *v)
+{
+	FuncExpr   *f;
+	Const	   *c;
+
+	if (!IsA(x, FuncExpr))
+		return false;
+	f = (FuncExpr *) x;
+	if (list_length(f->args) != 1 || f->funcretset || !IsA(linitial(f->args), Const))
+		return false;
+	c = (Const *) linitial(f->args);
+	if (c->constisnull || func_volatile(f->funcid) != PROVOLATILE_IMMUTABLE ||
+		!func_strict(f->funcid))
+		return false;
+	*v = OidFunctionCall1Coll(f->funcid, f->inputcollid, c->constvalue);
+	return true;
+}
+
 static bool
 call_matches(PlannerInfo *root, Oid funcid, List *args, FuncExpr *fcall)
 {
@@ -267,12 +296,25 @@ call_matches(PlannerInfo *root, Oid funcid, List *args, FuncExpr *fcall)
 	forboth(a, args, b, fcall->args)
 	{
 		Node	   *x = (Node *) lfirst(a);
+		Node	   *y = (Node *) lfirst(b);
+		Datum		v;
 
-		if (equal(x, lfirst(b)))
+		if (equal(x, y))
 			continue;
 		if (IsA(x, Var) || IsA(x, Const))
 			return false;
-		if (!equal(eval_const_expressions(root, copyObject(x)), lfirst(b)))
+		if (IsA(y, Const) && !((Const *) y)->constisnull &&
+			exprType(x) == ((Const *) y)->consttype &&
+			exprTypmod(x) == ((Const *) y)->consttypmod &&
+			exprCollation(x) == ((Const *) y)->constcollid && fold_cast_of_const(x, &v))
+		{
+			Const	   *k = (Const *) y;
+
+			if (!datumIsEqual(v, k->constvalue, k->constbyval, k->constlen))
+				return false;
+			continue;
+		}
+		if (!equal(eval_const_expressions(root, copyObject(x)), y))
 			return false;
 	}
 	return true;

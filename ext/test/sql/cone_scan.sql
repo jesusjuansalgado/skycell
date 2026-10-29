@@ -122,8 +122,23 @@ SELECT t.name, (cs_both(t.q)).same, cs_plan(t.q) AS plan FROM (VALUES
   ('join on',       'SELECT count(*) FROM cs_cat c JOIN (VALUES (1)) x(k) ON skycell_cone(c.cell, c.ra, c.dec, 10, 20, 1)'),
   ('subquery',      'SELECT count(*) FROM (SELECT * FROM cs_cat WHERE skycell_cone(cell, ra, dec, 10, 20, 1) OFFSET 0) s'),
   ('folded radius', 'SELECT count(*) FROM cs_cat WHERE skycell_cone(cell, ra, dec, 10, 20, 2.0 / 2)'),
+  -- numeric literals reach the support function as casts already folded
+  ('numeric',       'SELECT count(*) FROM cs_cat WHERE skycell_cone(cell, ra, dec, 10.5, 20.25, 1.5)'),
+  ('numeric, or',   'SELECT count(*) FROM cs_cat WHERE skycell_cone(cell, ra, dec, 10.5, 20.25, 1.5) OR skycell_cone(cell, ra, dec, 10.5, 20.25, 2.5)'),
+  ('numeric, and + or', 'SELECT count(*) FROM cs_cat WHERE skycell_cone(cell, ra, dec, 10.5, 20.25, 1.5) AND (skycell_cone(cell, ra, dec, 10.5, 20.25, 2.5) OR id = 7)'),
   ('target list',   'SELECT count(*) FILTER (WHERE skycell_cone(cell, ra, dec, 10, 20, 1)) FROM cs_cat')
 ) t(name, q);
+-- ...and the cone under the OR is rewritten into cell ranges, not taken for the
+-- top-level one it differs from only in its radius
+CREATE FUNCTION cs_plan_kept_call(q text) RETURNS bool LANGUAGE plpgsql AS $$
+DECLARE l text;
+BEGIN
+  FOR l IN EXECUTE 'EXPLAIN (COSTS OFF) ' || q LOOP
+    IF l ~ 'skycell_cone\(' THEN RETURN true; END IF;
+  END LOOP;
+  RETURN false;
+END $$;
+SELECT cs_plan_kept_call('SELECT count(*) FROM cs_cat WHERE skycell_cone(cell, ra, dec, 10.5, 20.25, 1.5) AND (skycell_cone(cell, ra, dec, 10.5, 20.25, 2.5) OR id = 7)') AS or_cone_unrewritten;
 
 -- cross-match: a cone whose centre (or radius) comes from another relation is
 -- answered by the scan parameterized by the outer row, one covering per row;
@@ -370,6 +385,7 @@ DROP FUNCTION cs_join(text);
 DROP VIEW cs_view;
 DROP FUNCTION cs_both(text);
 DROP FUNCTION cs_plan(text);
+DROP FUNCTION cs_plan_kept_call(text);
 DROP TABLE cs_cat, cs_sorted;
 
 -- the index filter: with the position in the cell index (INCLUDE), the scan
