@@ -77,12 +77,15 @@
 #include "utils/rel.h"
 #include "utils/snapmgr.h"
 #include "utils/syscache.h"
+#include "utils/tuplesort.h"
+#include "catalog/pg_operator_d.h"
 
 #include "cover.h"
 #include "skycell_internal.h"
 
 static bool skycell_custom_scan = true;
 static bool skycell_index_filter = true;
+static bool skycell_nearest_scan = true;
 
 /* the six-argument skycell_cone, as last seen by cone_scan_keep() */
 static Oid	cone_funcid = InvalidOid;
@@ -101,6 +104,35 @@ static TupleTableSlot *cone_exec(CustomScanState *node);
 static void cone_end(CustomScanState *node);
 static void cone_rescan(CustomScanState *node);
 static void cone_explain(CustomScanState *node, List *ancestors, ExplainState *es);
+
+static void add_nearest_path(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte);
+static Plan *nearest_plan(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
+						  List *tlist, List *clauses, List *custom_plans);
+static Node *nearest_create_state(CustomScan *cscan);
+static void nearest_begin(CustomScanState *node, EState *estate, int eflags);
+static TupleTableSlot *nearest_exec(CustomScanState *node);
+static void nearest_end(CustomScanState *node);
+static void nearest_rescan(CustomScanState *node);
+static void nearest_explain(CustomScanState *node, List *ancestors, ExplainState *es);
+
+static const CustomPathMethods nearest_path_methods = {
+	.CustomName = "SkycellNearest",
+	.PlanCustomPath = nearest_plan,
+};
+
+static const CustomScanMethods nearest_scan_methods = {
+	.CustomName = "SkycellNearest",
+	.CreateCustomScanState = nearest_create_state,
+};
+
+static const CustomExecMethods nearest_exec_methods = {
+	.CustomName = "SkycellNearest",
+	.BeginCustomScan = nearest_begin,
+	.ExecCustomScan = nearest_exec,
+	.EndCustomScan = nearest_end,
+	.ReScanCustomScan = nearest_rescan,
+	.ExplainCustomScan = nearest_explain,
+};
 
 static const CustomPathMethods cone_path_methods = {
 	.CustomName = "SkycellCone",
@@ -1233,7 +1265,7 @@ cone_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, Index rti, RangeTblEnt
 	if (prev_set_rel_pathlist_hook)
 		prev_set_rel_pathlist_hook(root, rel, rti, rte);
 
-	if (!skycell_custom_scan || !OidIsValid(cone_funcid) || rel->indexlist == NIL)
+	if (!skycell_custom_scan || rel->indexlist == NIL)
 		return;
 	if (rel->reloptkind != RELOPT_BASEREL && rel->reloptkind != RELOPT_OTHER_MEMBER_REL)
 		return;
@@ -1253,6 +1285,10 @@ cone_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, Index rti, RangeTblEnt
 		if (!heap)
 			return;
 	}
+
+	add_nearest_path(root, rel, rte);
+	if (!OidIsValid(cone_funcid))
+		return;
 
 	foreach(lc, rel->baserestrictinfo)
 	{
@@ -1342,6 +1378,241 @@ cone_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, Index rti, RangeTblEnt
 			continue;
 		add_runtime_path(root, rel, rte, f, get_baserel_parampathinfo(root, rel, outer));
 	}
+}
+
+/* ------------------------------------------------------------------ */
+/* nearest neighbours: ORDER BY distance(...) [LIMIT k]               */
+/* ------------------------------------------------------------------ */
+
+/*
+ * A B-tree on the cell has no notion of distance, so a query ordered by the
+ * distance to a point gets no index path from PostgreSQL: it sorts the whole
+ * relation.  SkycellNearest returns the rows in distance order from the cell
+ * index itself, ring by ring.  It covers the cone of radius r1 around the
+ * centre, reads its rows, keeps those with distance <= r1, sorts them and
+ * returns them; then the cone of radius r2 > r1, keeping r1 < distance <= r2;
+ * and so on.  Each ring's rows all come after the previous ring's, so the
+ * output is in order, and a LIMIT above stops the scan at the ring that
+ * completes it.  The first radius is the one the density expects to hold the
+ * rows the query asks for; each later one grows the area by what the rings so
+ * far found.  A ring that would reach most of the relation is the last one,
+ * read sequentially: it returns every row not yet returned, those with a NULL
+ * or NaN distance included, in the order ORDER BY gives them.
+ *
+ * The distance kept is the ORDER BY expression itself, evaluated per row, so
+ * the order is the one a Sort would produce.  The cones are covered a hair
+ * wider than the ring, as for a distance comparison (adql.c), so no row on a
+ * ring's edge can be missed, and less the cells wholly inside the previous
+ * ring's cone, whose rows were all returned: a ring reads its own band and
+ * the cells the previous edge crossed.  The query's other conditions are
+ * tested as a ring is read, so the rows they reject are never sorted.
+ *
+ * Rows come out of the ring's buffer, not the heap, so a query that reads a
+ * system column of the relation (ctid, a row lock) is left to PostgreSQL.
+ */
+
+/* does the query read a system column of rel? */
+static bool
+reads_system_column(RelOptInfo *rel)
+{
+	Bitmapset  *attrs = NULL;
+	ListCell   *lc;
+	int			x = -1;
+
+	pull_varattnos((Node *) rel->reltarget->exprs, rel->relid, &attrs);
+	foreach(lc, rel->baserestrictinfo)
+		pull_varattnos((Node *) lfirst_node(RestrictInfo, lc)->clause, rel->relid, &attrs);
+	while ((x = bms_next_member(attrs, x)) >= 0)
+		if (x + FirstLowInvalidHeapAttributeNumber < 0)
+			return true;
+	return false;
+}
+
+/* ascending, NULLs last, by float8's own ordering: what the scan produces */
+static bool
+nearest_pathkey(PathKey *pk)
+{
+#if PG_VERSION_NUM >= 180000
+	if (pk->pk_cmptype != COMPARE_LT)
+		return false;
+#else
+	if (pk->pk_strategy != BTLessStrategyNumber)
+		return false;
+#endif
+	return !pk->pk_nulls_first &&
+		get_opfamily_member(pk->pk_opfamily, FLOAT8OID, FLOAT8OID,
+							BTLessStrategyNumber) == Float8LessOperator;
+}
+
+/* the fewest rows a first ring is sized for */
+#define NEAREST_MIN_ROWS 16.0
+/* a ring is sized for this many times the rows the query is expected to read */
+#define NEAREST_MARGIN 1.25
+/* the rows a LIMIT is taken to ask for when its count is a parameter */
+#define NEAREST_UNKNOWN_LIMIT 100.0
+
+/*
+ * The cost of one ring of c candidate rows: the cone scan's own cost for
+ * them, the distance on each, and their sort.
+ */
+static void
+nearest_ring_cost(PlannerInfo *root, RelOptInfo *rel, IndexOptInfo *ix, double corr,
+				  Cost per_row, double c, Cost *cost, bool *bitmap)
+{
+	Cost		startup,
+				total;
+
+	/* a ring is a few ranges, whatever its size: covering steps and descents */
+	cone_cost(root, rel, ix, 4.0, c, c, corr, 1.0, per_row, &startup, &total, bitmap);
+	*cost = total + 30.0 * 10.0 * cpu_operator_cost
+		+ c * (cpu_tuple_cost + 2.0 * cpu_operator_cost * log2(fmax(c, 2.0)));
+}
+
+static void
+add_nearest_path(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte)
+{
+	PathKey    *pk;
+	ListCell   *lc;
+
+	if (!skycell_nearest_scan || root->query_pathkeys == NIL)
+		return;
+	pk = linitial_node(PathKey, root->query_pathkeys);
+	if (!nearest_pathkey(pk) || reads_system_column(rel))
+		return;
+
+	foreach(lc, pk->pk_eclass->ec_members)
+	{
+		EquivalenceMember *em = (EquivalenceMember *) lfirst(lc);
+		Node	   *expr = (Node *) em->em_expr;
+		Node	   *cell,
+				   *ra0,
+				   *dec0;
+		IndexOptInfo *ix;
+		sc_density	dens;
+		Oid			statrel = InvalidOid;
+		bool		uses_cell_ops;
+		CustomPath *cp;
+		QualCost	dist_cost;
+		double		n = fmax(rel->tuples, 1.0),
+					sel = fmin(1.0, fmax(rel->rows / n, 1e-9)),
+					want,
+					k0,
+					corr;
+		Cost		first,
+					all;
+		bool		bitmap,
+					bitmap_all;
+
+		if (em->em_is_const || !bms_equal(em->em_relids, rel->relids))
+			continue;
+		while (IsA(expr, RelabelType))
+			expr = (Node *) ((RelabelType *) expr)->arg;
+		if (!skycell_distance_order(expr, rel->relid, &cell, &ra0, &dec0) ||
+			(ix = cell_index(rel, cell)) == NULL)
+			continue;
+		density_for_var(root, cell, &dens, &statrel, &uses_cell_ops);
+		if (!OidIsValid(statrel))
+			continue;
+
+		/*
+		 * The first ring holds the rows the query reads -- the LIMIT, over the
+		 * fraction of rows the other conditions keep -- with a margin, so that it
+		 * usually completes the query alone; a LIMIT whose count is a
+		 * parameter is taken as NEAREST_UNKNOWN_LIMIT rows, and the rings
+		 * grow from there if it asks for more.  Without a LIMIT it is the
+		 * whole relation, read through the index and sorted: never cheaper
+		 * than the sequential scan and sort PostgreSQL plans itself.
+		 */
+		if (root->limit_tuples > 0)
+			want = root->limit_tuples;
+		else if (root->parse->limitCount != NULL &&
+				 !(IsA(root->parse->limitCount, Const) &&
+				   ((Const *) root->parse->limitCount)->constisnull))
+			want = NEAREST_UNKNOWN_LIMIT;	/* LIMIT $1: the rings will grow */
+		else
+			want = rel->rows;
+		k0 = fmin(n, fmax(NEAREST_MIN_ROWS, NEAREST_MARGIN * want / sel));
+		corr = cell_correlation(rte, ix, cell);
+		cost_qual_eval_node(&dist_cost, expr, root);
+		nearest_ring_cost(root, rel, ix, corr, dist_cost.per_tuple, k0, &first, &bitmap);
+		nearest_ring_cost(root, rel, ix, corr, dist_cost.per_tuple, n, &all, &bitmap_all);
+
+		cp = makeNode(CustomPath);
+		cp->path.pathtype = T_CustomScan;
+		cp->path.parent = rel;
+		cp->path.pathtarget = rel->reltarget;
+		cp->path.param_info = NULL;
+		cp->path.parallel_aware = false;
+		cp->path.parallel_safe = rel->consider_parallel && is_parallel_safe(root, expr);
+		cp->path.parallel_workers = 0;
+		cp->path.rows = rel->rows;
+		cp->path.pathkeys = list_make1(pk);
+		/*
+		 * Nothing comes out before the first ring is sorted.  Reading on
+		 * past it costs about the whole relation's ring again, twice over
+		 * for the cells each ring's edge shares with the next.
+		 */
+		cp->path.startup_cost = first;
+		cp->path.total_cost = (k0 >= n) ? first : first + 2.0 * all;
+		/* ExecScan projects, so a computed target needs no Result above */
+		cp->flags = CUSTOMPATH_SUPPORT_PROJECTION;
+		cp->custom_paths = NIL;
+		cp->custom_private = list_make5(makeConst(OIDOID, -1, InvalidOid, sizeof(Oid),
+												  ObjectIdGetDatum(ix->indexoid), false, true),
+										makeConst(OIDOID, -1, InvalidOid, sizeof(Oid),
+												  ObjectIdGetDatum(statrel), false, true),
+										makeBoolConst(bitmap, false),
+										list_make2(float8_const(k0), float8_const(want)),
+										list_make3(expr, ra0, dec0));
+		cp->methods = &nearest_path_methods;
+		add_path(rel, &cp->path);
+		return;
+	}
+}
+
+/*
+ * The plan: every condition on the relation stays a qual, applied to the rows
+ * as they come out in order.  custom_private is laid out as cone_begin()
+ * reads a run-time cone's -- (index, NULL bounds, mode, no index filter,
+ * relation, statistics relation, attribute, not joined) -- then the first
+ * ring's rows and the rows the query was planned to read; custom_exprs holds
+ * the centre and the ORDER BY expression.
+ */
+static Plan *
+nearest_plan(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
+			 List *tlist, List *clauses, List *custom_plans)
+{
+	CustomScan *cs = makeNode(CustomScan);
+	List	   *p = best_path->custom_private;
+	List	   *e = (List *) list_nth(p, 4);
+	RangeTblEntry *rte = planner_rt_fetch(rel->relid, root);
+
+	cs->scan.plan.targetlist = tlist;
+	cs->scan.plan.qual = extract_actual_clauses(clauses, false);
+	cs->scan.scanrelid = rel->relid;
+	cs->flags = best_path->flags;
+	cs->custom_plans = NIL;
+	cs->custom_private = list_make5(linitial(p),
+									makeNullConst(INT8ARRAYOID, -1, InvalidOid),
+									lthird(p),
+									makeConst(INT2OID, -1, InvalidOid, sizeof(int16),
+											  Int16GetDatum(0), false, true),
+									makeConst(INT2OID, -1, InvalidOid, sizeof(int16),
+											  Int16GetDatum(0), false, true));
+	cs->custom_private = lappend(cs->custom_private,
+								 makeConst(OIDOID, -1, InvalidOid, sizeof(Oid),
+										   ObjectIdGetDatum(rte->relid), false, true));
+	cs->custom_private = lappend(cs->custom_private, lsecond(p));
+	cs->custom_private = lappend(cs->custom_private,
+								 makeConst(INT2OID, -1, InvalidOid, sizeof(int16),
+										   Int16GetDatum(1), false, true));
+	cs->custom_private = lappend(cs->custom_private, makeBoolConst(false, false));
+	cs->custom_private = list_concat(cs->custom_private, list_copy((List *) lfourth(p)));
+	cs->custom_exprs = list_make3(copyObject(lsecond(e)), copyObject(lthird(e)),
+								  copyObject(linitial(e)));
+	cs->custom_scan_tlist = NIL;
+	cs->methods = &nearest_scan_methods;
+	return &cs->scan.plan;
 }
 
 static Oid
@@ -1630,59 +1901,49 @@ cone_next_tid(ConeScanState *st)
 	return NULL;
 }
 
-/*
- * A cross-match cone's covering for the current outer row: centre and radius
- * evaluated (the outer row's columns are nestloop parameters by now), covered
- * against the relation's density with the custom scan's parameters, and the
- * ranges copied into the scan state.  The covering is built in the per-tuple
- * context, which ExecScan resets before every fetch.  NULL arguments match
- * nothing, as the strict skycell_cone would; an invalid centre is an error, as
- * it is in the rewrite's run-time bounds and in skycell_cone_ranges().
- */
 static void
-cone_cover_row(ConeScanState *st)
+cone_load_density(ConeScanState *st)
+{
+	EState	   *estate = st->css.ss.ps.state;
+	MemoryContext old;
+
+	/*
+	 * The density points into the backend's cache, which an invalidation
+	 * processed since the last row -- by the outer side, say -- may have
+	 * freed.  Evaluating the arguments can do that too, so callers check
+	 * after them; nothing between this and the covering takes a lock.
+	 */
+	if (st->have_dens && st->dens_generation == skycell_density_generation())
+		return;
+	old = MemoryContextSwitchTo(estate->es_query_cxt);
+	if (st->have_dens && st->dens.bounds)
+		pfree((void *) st->dens.bounds);	/* a copy in es_query_cxt */
+	st->dens_generation = skycell_density_generation();
+	skycell_load_density(st->relid, st->statrel, st->attnum, &st->dens);
+	MemoryContextSwitchTo(old);
+	st->have_dens = true;
+}
+
+/*
+ * Cover the cone (ra0, dec0, radius) into the scan state's ranges, and return
+ * the rows the density expects inside the cone itself.  The covering is built
+ * in the per-tuple context, which ExecScan resets before every fetch, and the
+ * ranges are copied out of it.
+ */
+static double
+cone_cover_at(ConeScanState *st, double ra0, double dec0, double radius)
 {
 	ExprContext *econtext = st->css.ss.ps.ps_ExprContext;
 	EState	   *estate = st->css.ss.ps.state;
-	double		v[3];
-	int			i = 0;
-	ListCell   *lc;
 	MemoryContext old;
 	sc_region	reg;
 	sc_cover	cov;
 	sc_cover_params p;
+	double		rows;
 
-	st->need_cover = false;
-	st->nranges = 0;
-	foreach(lc, st->args)
-	{
-		bool		isnull;
-		Datum		d = ExecEvalExpr((ExprState *) lfirst(lc), econtext, &isnull);
-
-		if (isnull)
-			return;
-		v[i++] = DatumGetFloat8(d);
-	}
-	/*
-	 * The density points into the backend's cache, which an invalidation
-	 * processed since the last row -- by the outer side, say -- may have
-	 * freed.  Evaluating the arguments above can do that too, so this check
-	 * comes after them; nothing below takes a lock.
-	 */
-	if (!st->have_dens || st->dens_generation != skycell_density_generation())
-	{
-		old = MemoryContextSwitchTo(estate->es_query_cxt);
-		if (st->have_dens && st->dens.bounds)
-			pfree((void *) st->dens.bounds);	/* a copy in es_query_cxt */
-		st->dens_generation = skycell_density_generation();
-		skycell_load_density(st->relid, st->statrel, st->attnum, &st->dens);
-		MemoryContextSwitchTo(old);
-		st->have_dens = true;
-	}
-	if (st->ira != 0)
-		cone_set_centre(st, v[0], v[1], v[2]);
+	cone_load_density(st);
 	old = MemoryContextSwitchTo(econtext->ecxt_per_tuple_memory);
-	check_err(sc_region_cone(&reg, v[0], v[1], v[2], true));
+	check_err(sc_region_cone(&reg, ra0, dec0, radius, true));
 	skycell_scan_params(&p, &st->dens);
 	sc_cover_compute(&reg, &st->dens, &p, &cov);
 	MemoryContextSwitchTo(old);
@@ -1702,7 +1963,41 @@ cone_cover_row(ConeScanState *st)
 	st->nranges = cov.n;
 	st->ncoverings += 1;
 	st->nranges_total += cov.n;
+	rows = (cov.area > 0) ? cov.exp_rows * fmin(1.0, reg.area / cov.area) : 0.0;
 	sc_cover_free(&cov);
+	return rows;
+}
+
+/*
+ * A cross-match cone's covering for the current outer row: centre and radius
+ * evaluated (the outer row's columns are nestloop parameters by now) and
+ * covered against the relation's density with the custom scan's parameters.
+ * NULL arguments match nothing, as the strict skycell_cone would; an invalid
+ * centre is an error, as it is in the rewrite's run-time bounds and in
+ * skycell_cone_ranges().
+ */
+static void
+cone_cover_row(ConeScanState *st)
+{
+	ExprContext *econtext = st->css.ss.ps.ps_ExprContext;
+	double		v[3];
+	int			i = 0;
+	ListCell   *lc;
+
+	st->need_cover = false;
+	st->nranges = 0;
+	foreach(lc, st->args)
+	{
+		bool		isnull;
+		Datum		d = ExecEvalExpr((ExprState *) lfirst(lc), econtext, &isnull);
+
+		if (isnull)
+			return;
+		v[i++] = DatumGetFloat8(d);
+	}
+	if (st->ira != 0)
+		cone_set_centre(st, v[0], v[1], v[2]);
+	(void) cone_cover_at(st, v[0], v[1], v[2]);
 }
 
 /* point the scan keys at range i and restart the index scan there */
@@ -1970,6 +2265,606 @@ cone_explain(CustomScanState *node, List *ancestors, ExplainState *es)
 }
 
 /* ------------------------------------------------------------------ */
+/* nearest neighbours: execution                                      */
+/* ------------------------------------------------------------------ */
+
+typedef struct NearestRow
+{
+	double		d;
+	bool		isnull;
+	HeapTuple	tup;
+} NearestRow;
+
+typedef struct NearestScanState
+{
+	ConeScanState cone;			/* must be first: the ranges and their scans */
+	ExprState  *dist;			/* the ORDER BY expression */
+	ExprState  *prequal;		/* the conditions safe to test in the ring */
+	TupleTableSlot *fetch;		/* a row as the heap returns it */
+	double		k0;				/* rows the first ring should hold */
+	double		want;			/* rows the query was planned to read */
+	double		n_inside,		/* rows read nearer than r, and of them */
+				n_passed;		/* those the conditions kept */
+	bool		started,
+				final,			/* the next ring is the rest of the relation */
+				done;			/* no ring after the current one */
+	double		ra0,
+				dec0;
+	double		rprev,			/* the current ring is (rprev, r]; rprev < 0 */
+				r;				/* for the first, which starts at the centre */
+
+	/*
+	 * The current ring's rows: copies of their heap tuples with their
+	 * distance, sorted in memory, while they fit in work_mem; past that, a
+	 * tuplesort of the relation's columns and the distance, which can spill.
+	 */
+	MemoryContext ringcxt;
+	NearestRow *rows;
+	int			nrows,
+				cap,
+				next;
+	Size		mem;
+	Tuplesortstate *sort;
+	TupleDesc	sortdesc;		/* the relation's columns, then the distance */
+	TupleTableSlot *put,
+			   *got;
+
+	double		nrings,			/* for EXPLAIN ANALYZE */
+				nread;
+} NearestScanState;
+
+static Node *
+nearest_create_state(CustomScan *cscan)
+{
+	NearestScanState *ns = (NearestScanState *) newNode(sizeof(NearestScanState),
+														T_CustomScanState);
+
+	ns->cone.css.methods = &nearest_exec_methods;
+	/* rows come out of the ring's buffer as heap tuples, not from a buffer page */
+	ns->cone.css.slotOps = &TTSOpsHeapTuple;
+	return (Node *) ns;
+}
+
+static void
+nearest_begin(CustomScanState *node, EState *estate, int eflags)
+{
+	NearestScanState *ns = (NearestScanState *) node;
+	CustomScan *cscan = (CustomScan *) node->ss.ps.plan;
+	Relation	heap = node->ss.ss_currentRelation;
+	TupleDesc	hd = RelationGetDescr(heap);
+
+	cone_begin(node, estate, eflags);
+	ns->k0 = DatumGetFloat8(list_nth_node(Const, cscan->custom_private, 9)->constvalue);
+	ns->want = DatumGetFloat8(list_nth_node(Const, cscan->custom_private, 10)->constvalue);
+	if (eflags & EXEC_FLAG_EXPLAIN_ONLY)
+		return;
+
+	/*
+	 * Without a parent, so that it reads whichever slot it is handed -- the
+	 * heap's, not the scan's own -- the way PostgreSQL compiles an index's
+	 * expressions.  It holds no sub-plan (adql.c checks).
+	 */
+	ns->dist = ExecInitExpr((Expr *) lthird(cscan->custom_exprs), NULL);
+
+	/*
+	 * The relation's conditions, tested as a row is read: a row they reject
+	 * is never copied or sorted, which matters when they reject the nearest
+	 * rows -- each ring would otherwise sort rows only to have the scan's
+	 * filter drop them.  Not a volatile one, which would then run twice on
+	 * the rows the scan returns, and not one with a sub-plan, which needs the
+	 * plan state; ExecScan still tests them all on the rows returned.
+	 */
+	{
+		List	   *safe = NIL;
+		ListCell   *lc;
+
+		foreach(lc, cscan->scan.plan.qual)
+		{
+			Node	   *q = (Node *) lfirst(lc);
+
+			if (!contain_volatile_functions(q) && !contain_subplans(q))
+				safe = lappend(safe, q);
+		}
+		ns->prequal = safe ? ExecInitQual(safe, NULL) : NULL;
+	}
+	ns->fetch = table_slot_create(heap, &estate->es_tupleTable);
+	ns->ringcxt = AllocSetContextCreate(estate->es_query_cxt, "skycell nearest ring",
+										ALLOCSET_DEFAULT_SIZES);
+	ns->sortdesc = CreateTemplateTupleDesc(hd->natts + 1);
+	for (int i = 1; i <= hd->natts; i++)
+		TupleDescCopyEntry(ns->sortdesc, i, hd, i);
+	TupleDescInitEntry(ns->sortdesc, hd->natts + 1, "distance", FLOAT8OID, -1, 0);
+	ns->put = ExecInitExtraTupleSlot(estate, ns->sortdesc, &TTSOpsVirtual);
+	ns->got = ExecInitExtraTupleSlot(estate, ns->sortdesc, &TTSOpsMinimalTuple);
+}
+
+/* solid angle of a cone of radius r degrees */
+static double
+cap_area(double r)
+{
+	return 2.0 * M_PI * (1.0 - cos(fmin(r, 180.0) * M_PI / 180.0));
+}
+
+/* radius in degrees of a cone of solid angle a, 180 for the sky and beyond */
+static double
+cap_radius(double a)
+{
+	double		c = 1.0 - a / (2.0 * M_PI);
+
+	return (c <= -1.0) ? 180.0 : acos(c) * 180.0 / M_PI;
+}
+
+/* one row into the tuplesort, as the relation's columns and the distance */
+static void
+nearest_put_sorted(NearestScanState *ns, HeapTuple tup, double d, bool isnull)
+{
+	int			natts = ns->sortdesc->natts - 1;
+
+	ExecClearTuple(ns->put);
+	heap_deform_tuple(tup, RelationGetDescr(ns->cone.css.ss.ss_currentRelation),
+					  ns->put->tts_values, ns->put->tts_isnull);
+	ns->put->tts_values[natts] = Float8GetDatum(d);
+	ns->put->tts_isnull[natts] = isnull;
+	ExecStoreVirtualTuple(ns->put);
+	tuplesort_puttupleslot(ns->sort, ns->put);
+}
+
+/* the ring outgrew work_mem: what it holds so far goes into a tuplesort */
+static void
+nearest_spill(NearestScanState *ns)
+{
+	AttrNumber	key = ns->sortdesc->natts;
+	Oid			lt = Float8LessOperator;
+	Oid			coll = InvalidOid;
+	bool		nulls_first = false;
+
+	ns->sort = tuplesort_begin_heap(ns->sortdesc, 1, &key, &lt, &coll, &nulls_first,
+									work_mem, NULL, TUPLESORT_NONE);
+	for (int i = 0; i < ns->nrows; i++)
+		nearest_put_sorted(ns, ns->rows[i].tup, ns->rows[i].d, ns->rows[i].isnull);
+	ns->nrows = 0;
+	MemoryContextReset(ns->ringcxt);
+	ns->rows = NULL;
+	ns->cap = 0;
+}
+
+/* keep a candidate row if it belongs to the current ring */
+static void
+nearest_consider(NearestScanState *ns, TupleTableSlot *row)
+{
+	ExprContext *econtext = ns->cone.css.ss.ps.ps_ExprContext;
+	bool		isnull;
+	double		d;
+	Datum		v;
+	HeapTuple	tup;
+	MemoryContext old;
+
+	ResetExprContext(econtext);
+	econtext->ecxt_scantuple = row;
+	v = ExecEvalExprSwitchContext(ns->dist, econtext, &isnull);
+	d = isnull ? 0.0 : DatumGetFloat8(v);
+	ns->nread += 1;
+	if (!ns->final)
+	{
+		/* a NULL or NaN distance sorts last: the final ring's */
+		if (isnull || isnan(d) || d > ns->r)
+			return;
+		if (ns->rprev >= 0 && !(d > ns->rprev))
+			return;				/* an inner ring's, returned already */
+		ns->n_inside += 1;
+	}
+	else if (!isnull && !isnan(d) && ns->rprev >= 0 && !(d > ns->rprev))
+		return;
+	if (ns->prequal && !ExecQual(ns->prequal, econtext))
+	{
+		InstrCountFiltered1(&ns->cone.css.ss.ps, 1);
+		return;
+	}
+	ns->n_passed += 1;
+
+	if (ns->sort == NULL)
+	{
+		old = MemoryContextSwitchTo(ns->ringcxt);
+		tup = ExecCopySlotHeapTuple(row);
+		ns->mem += HEAPTUPLESIZE + tup->t_len + sizeof(NearestRow);
+		if (ns->nrows == ns->cap)
+		{
+			ns->cap = ns->cap ? 2 * ns->cap : 256;
+			ns->rows = ns->rows ? repalloc(ns->rows, sizeof(NearestRow) * ns->cap)
+				: palloc(sizeof(NearestRow) * ns->cap);
+		}
+		ns->rows[ns->nrows].d = d;
+		ns->rows[ns->nrows].isnull = isnull;
+		ns->rows[ns->nrows].tup = tup;
+		ns->nrows++;
+		MemoryContextSwitchTo(old);
+		if (ns->mem > (Size) work_mem * 1024)
+			nearest_spill(ns);
+		return;
+	}
+	tup = ExecFetchSlotHeapTuple(row, false, NULL);
+	nearest_put_sorted(ns, tup, d, isnull);
+}
+
+/*
+ * By distance, as float8's ordering has it (NaN after every number, and equal
+ * to NaN), NULL last.  A sort specialised for the rows, with the comparison
+ * inline: through qsort()'s function pointer, sorting was a third of a ring.
+ */
+static inline int
+nearest_row_cmp(const NearestRow *x, const NearestRow *y)
+{
+	if (x->isnull || y->isnull)
+		return (int) x->isnull - (int) y->isnull;
+	if (isnan(x->d) || isnan(y->d))
+		return (int) isnan(x->d) - (int) isnan(y->d);
+	return (x->d > y->d) - (x->d < y->d);
+}
+
+#define ST_SORT nearest_sort_rows
+#define ST_ELEMENT_TYPE NearestRow
+#define ST_COMPARE(a, b) nearest_row_cmp(a, b)
+#define ST_SCOPE static
+#define ST_DEFINE
+#include "lib/sort_template.h"
+
+/*
+ * The radius whose cone the density expects to hold k rows around the centre:
+ * the density of the finest HEALPix cell round the centre that still holds a
+ * few times k rows -- a crowded field gets a small first ring, empty sky a
+ * wide one.  A lookup per order, where computing coverings to size the ring
+ * cost more than reading it.
+ */
+static double
+nearest_first_radius(NearestScanState *ns, double k, double n)
+{
+	const sc_density *d = &ns->cone.dens;
+	int64_t		pix = sc_ang2pix(SC_MAX_ORDER, ns->ra0, ns->dec0);
+	double		rho = n / (4.0 * M_PI);
+
+	for (int m = 0; m <= SC_MAX_ORDER; m++)
+	{
+		int64_t		p = pix >> (2 * (SC_MAX_ORDER - m));
+		double		rows = sc_density_rows(d, sc_pix_lo(m, p), sc_pix_hi(m, p));
+
+		if (rows < 4.0 * k)
+			break;
+		rho = rows / (4.0 * M_PI / (12.0 * pow(4.0, m)));
+	}
+	return cap_radius(k / fmax(rho, 1e-300));
+}
+
+/*
+ * The cells wholly inside the cone (ra0, dec0, r), as sorted, disjoint ranges
+ * of order-29 cells (lo, hi pairs, palloc'd into *out): from the twelve base
+ * cells down, refining only the cells the cone's edge crosses, to the order
+ * whose cells are a sixteenth of r across.  The cap test's IN is never wrong,
+ * so every row of these cells is nearer the centre than r.  Stops refining
+ * after NEAREST_INTERIOR_STEPS classifications: fewer cells, still all inside.
+ */
+#define NEAREST_INTERIOR_STEPS 4096
+
+static int
+cone_interior(double ra0, double dec0, double r, int64 **out)
+{
+	sc_region	reg;
+	struct
+	{
+		int			order;
+		int64_t		pix;
+	}			stack[12 + 3 * (SC_MAX_ORDER + 1)];
+	int			top = 0,
+				n = 0,
+				cap = 64,
+				steps = 0,
+				maxo;
+	int64	   *b = palloc(sizeof(int64) * 2 * cap);
+
+	if (sc_region_cone(&reg, ra0, dec0, r, true) != NULL)
+	{
+		*out = b;
+		return 0;
+	}
+	maxo = (int) floor(log2(1.0233267079464885 / fmax(r * M_PI / 180.0 / 16.0, 1e-12)));
+	maxo = Max(0, Min(maxo, SC_MAX_ORDER));
+	/* children pushed last to first, so that they come off in cell order */
+	for (int i = 11; i >= 0; i--)
+	{
+		stack[top].order = 0;
+		stack[top++].pix = i;
+	}
+	while (top > 0)
+	{
+		int			order = stack[--top].order;
+		int64_t		pix = stack[top].pix;
+		double		fo;
+		sc_class	cls = sc_region_classify_cap(&reg, order, pix, &fo);
+
+		steps++;
+		if (cls == SC_IN)
+		{
+			int64		lo = sc_pix_lo(order, pix),
+						hi = sc_pix_hi(order, pix);
+
+			if (n > 0 && b[2 * n - 1] + 1 == lo)
+				b[2 * n - 1] = hi;
+			else
+			{
+				if (n == cap)
+				{
+					cap *= 2;
+					b = repalloc(b, sizeof(int64) * 2 * cap);
+				}
+				b[2 * n] = lo;
+				b[2 * n + 1] = hi;
+				n++;
+			}
+		}
+		else if (cls == SC_PARTIAL && order < maxo && steps < NEAREST_INTERIOR_STEPS)
+		{
+			for (int c = 3; c >= 0; c--)
+			{
+				stack[top].order = order + 1;
+				stack[top++].pix = 4 * pix + c;
+			}
+		}
+	}
+	*out = b;
+	return n;
+}
+
+/* ranges a less ranges x, both sorted, disjoint, inclusive (lo, hi) pairs */
+static int
+ranges_minus(const int64 *a, int na, const int64 *x, int nx, int64 *out)
+{
+	int			n = 0,
+				j = 0;
+
+	for (int i = 0; i < na; i++)
+	{
+		int64		lo = a[2 * i],
+					hi = a[2 * i + 1];
+
+		while (j < nx && x[2 * j + 1] < lo)
+			j++;
+		for (int k = j; k < nx && x[2 * k] <= hi && lo <= hi; k++)
+		{
+			if (x[2 * k] > lo)
+			{
+				out[2 * n] = lo;
+				out[2 * n + 1] = x[2 * k] - 1;
+				n++;
+			}
+			if (x[2 * k + 1] >= hi)
+				lo = hi + 1;	/* the rest of the range is excluded */
+			else
+				lo = Max(lo, x[2 * k + 1] + 1);
+		}
+		if (lo <= hi)
+		{
+			out[2 * n] = lo;
+			out[2 * n + 1] = hi;
+			n++;
+		}
+	}
+	return n;
+}
+
+/* drop the current ring's rows */
+static void
+nearest_clear_ring(NearestScanState *ns)
+{
+	ExecClearTuple(ns->cone.css.ss.ss_ScanTupleSlot);
+	if (ns->sort)
+		tuplesort_end(ns->sort);
+	ns->sort = NULL;
+	if (ns->ringcxt)
+		MemoryContextReset(ns->ringcxt);
+	ns->rows = NULL;
+	ns->nrows = ns->cap = ns->next = 0;
+	ns->mem = 0;
+}
+
+/* collect and sort the next ring's rows, and choose the one after it */
+static void
+nearest_ring(NearestScanState *ns)
+{
+	ConeScanState *st = &ns->cone;
+	ExprContext *econtext = st->css.ss.ps.ps_ExprContext;
+	EState	   *estate = st->css.ss.ps.state;
+	double		n;
+
+	nearest_clear_ring(ns);
+	cone_load_density(st);
+	n = fmax(st->dens.ntotal, 1.0);
+	if (!ns->started)
+	{
+		bool		null1,
+					null2;
+		Datum		a = ExecEvalExpr((ExprState *) linitial(st->args), econtext, &null1);
+		Datum		b = ExecEvalExpr((ExprState *) lsecond(st->args), econtext, &null2);
+
+		ns->started = true;
+		ns->rprev = -1.0;
+		ns->n_inside = ns->n_passed = 0;
+		ns->ra0 = null1 ? 0.0 : DatumGetFloat8(a);
+		ns->dec0 = null2 ? 0.0 : DatumGetFloat8(b);
+		/*
+		 * No centre to search around: every distance is NULL, or whatever
+		 * the expression makes of it, and the one ring is the relation.
+		 */
+		if (null1 || null2 || !isfinite(ns->ra0) || !(ns->dec0 >= -90.0 && ns->dec0 <= 90.0))
+			ns->final = true;
+		else
+		{
+			ns->r = nearest_first_radius(ns, ns->k0, n);
+			ns->final = ns->r >= 180.0 || ns->k0 >= 0.5 * n;
+
+		}
+	}
+
+	if (ns->final)
+	{
+		TableScanDesc seq = table_beginscan(st->css.ss.ss_currentRelation,
+											estate->es_snapshot, 0, NULL);
+
+		while (table_scan_getnextslot(seq, ForwardScanDirection, ns->fetch))
+			nearest_consider(ns, ns->fetch);
+		table_endscan(seq);
+		ns->done = true;
+	}
+	else
+	{
+		double		grow;
+
+		/* a hair wider than the ring, as for a distance comparison */
+		(void) cone_cover_at(st, ns->ra0, ns->dec0, fmin(180.0, ns->r * (1.0 + 1e-9) + 1e-12));
+
+		/*
+		 * Less the cells wholly inside the previous ring's cone -- a hair
+		 * narrower than it -- whose rows were all returned already: a ring
+		 * then reads its own band, and the cells the previous edge crossed.
+		 */
+		if (ns->rprev > 0 && ns->rprev * (1.0 - 1e-9) - 1e-12 > 0)
+		{
+			MemoryContext old = MemoryContextSwitchTo(econtext->ecxt_per_tuple_memory);
+			int64	   *inner;
+			int			ni = cone_interior(ns->ra0, ns->dec0,
+										   ns->rprev * (1.0 - 1e-9) - 1e-12, &inner);
+
+			if (ni > 0 && st->nranges > 0)
+			{
+				int64	   *b = palloc(sizeof(int64) * 2 * (st->nranges + ni));
+				int			nb = ranges_minus(st->bounds, st->nranges, inner, ni, b);
+
+				MemoryContextSwitchTo(old);
+				if (nb > st->rt_cap)
+				{
+					st->rt_cap = Max(nb, 2 * st->rt_cap);
+					st->rt_bounds = repalloc(st->rt_bounds, sizeof(int64) * 2 * st->rt_cap);
+				}
+				memcpy(st->rt_bounds, b, sizeof(int64) * 2 * nb);
+				st->bounds = st->rt_bounds;
+				st->nranges = nb;
+			}
+			MemoryContextSwitchTo(old);
+		}
+		st->cur = -1;
+		cone_release_bitmap(st, false);
+		for (;;)
+		{
+			TupleTableSlot *row = st->bitmap ? cone_next_bitmap(st, ns->fetch)
+				: cone_next_ordered(st, ns->fetch);
+
+			if (TupIsNull(row))
+				break;
+			nearest_consider(ns, row);
+		}
+
+		/*
+		 * The next cone: grown to where, at the density and the share the
+		 * conditions kept so far, the rows kept would be what the query was
+		 * planned to read, with a margin -- at least twice the area, and
+		 * twice while the conditions have kept nothing: a ring too wide
+		 * costs every row it reads past the ones needed, one too narrow only
+		 * a covering and a few descents.  Sixteen times while the cones have
+		 * held nothing.  Once that reaches most of the relation, the next
+		 * ring is the rest of it.
+		 */
+		if (ns->n_inside <= 0)
+			grow = 16.0;
+		else if (ns->n_passed <= 0)
+			grow = 2.0;
+		else
+			grow = fmin(64.0, fmax(2.0, NEAREST_MARGIN * ns->want / ns->n_passed));
+		ns->rprev = ns->r;
+		ns->r = cap_radius(cap_area(ns->r) * grow);
+		ns->final = ns->r >= 180.0 || ns->n_inside * grow >= 0.5 * n;
+	}
+	ExecClearTuple(ns->fetch);
+	ResetExprContext(econtext);
+	if (ns->sort)
+		tuplesort_performsort(ns->sort);
+	else if (ns->nrows > 1)
+		nearest_sort_rows(ns->rows, ns->nrows);
+	ns->nrings += 1;
+}
+
+static TupleTableSlot *
+nearest_next(ScanState *ss)
+{
+	NearestScanState *ns = (NearestScanState *) ss;
+	TupleTableSlot *out = ss->ss_ScanTupleSlot;
+
+	for (;;)
+	{
+		if (ns->sort == NULL && ns->next < ns->nrows)
+		{
+			ExecStoreHeapTuple(ns->rows[ns->next++].tup, out, false);
+			return out;
+		}
+		if (ns->sort != NULL && tuplesort_gettupleslot(ns->sort, true, false, ns->got, NULL))
+		{
+			slot_getallattrs(ns->got);
+			ExecStoreHeapTuple(heap_form_tuple(out->tts_tupleDescriptor, ns->got->tts_values,
+											   ns->got->tts_isnull), out, true);
+			return out;
+		}
+		if (ns->done)
+			return ExecClearTuple(out);
+		nearest_ring(ns);
+	}
+}
+
+static TupleTableSlot *
+nearest_exec(CustomScanState *node)
+{
+	return ExecScan(&node->ss, nearest_next, cone_recheck);
+}
+
+static void
+nearest_reset(NearestScanState *ns)
+{
+	nearest_clear_ring(ns);
+	ns->started = ns->final = ns->done = false;
+	ns->cone.cur = -1;
+}
+
+static void
+nearest_end(CustomScanState *node)
+{
+	nearest_reset((NearestScanState *) node);
+	cone_end(node);
+}
+
+static void
+nearest_rescan(CustomScanState *node)
+{
+	NearestScanState *ns = (NearestScanState *) node;
+
+	nearest_reset(ns);
+	cone_release_bitmap(&ns->cone, false);
+	ExecScanReScan(&node->ss);
+}
+
+static void
+nearest_explain(CustomScanState *node, List *ancestors, ExplainState *es)
+{
+	NearestScanState *ns = (NearestScanState *) node;
+
+	ExplainPropertyText("Index", RelationGetRelationName(ns->cone.index), es);
+	ExplainPropertyText("Mode", ns->cone.bitmap ? "bitmap" : "ordered", es);
+	if (es->analyze)
+	{
+		double		loops = (node->ss.ps.instrument && node->ss.ps.instrument->nloops > 0)
+			? node->ss.ps.instrument->nloops : 1.0;
+
+		ExplainPropertyFloat("Rings", NULL, ns->nrings / loops, 1, es);
+		ExplainPropertyFloat("Rows Read by Rings", NULL, ns->nread / loops, 0, es);
+	}
+}
+
+/* ------------------------------------------------------------------ */
 
 void
 cone_scan_init(void)
@@ -1992,7 +2887,17 @@ cone_scan_init(void)
 							 "cone. Off fetches every row of the covering cells.",
 							 &skycell_index_filter, true,
 							 PGC_USERSET, 0, NULL, NULL, NULL);
+	DefineCustomBoolVariable("skycell.nearest_scan",
+							 "Return rows ordered by their distance to a point from the cell "
+							 "index, for ORDER BY distance(...) LIMIT k.",
+							 "The scan reads widening rings around the point through the "
+							 "cell index and sorts each ring, so a LIMIT stops it after the "
+							 "ring that completes it. Off leaves such a query to a sort of "
+							 "the whole relation. Needs skycell.custom_scan.",
+							 &skycell_nearest_scan, true,
+							 PGC_USERSET, 0, NULL, NULL, NULL);
 	RegisterCustomScanMethods(&cone_scan_methods);
+	RegisterCustomScanMethods(&nearest_scan_methods);
 
 	/*
 	 * The library is usually loaded by the first skycell call a query makes,

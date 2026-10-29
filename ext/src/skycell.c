@@ -2640,14 +2640,50 @@ skycell_ang2pix(PG_FUNCTION_ARGS)
 	PG_RETURN_INT64(sc_ang2pix(order, ra, dec));
 }
 
-/* angular distance in degrees */
+/*
+ * angular distance in degrees.  One of the two points is usually the same on
+ * every call -- the centre a query orders or filters by -- so the vector of
+ * each argument pair is kept with the call site, and converted again only
+ * when the pair changes: the same arithmetic, so the same result.
+ */
+typedef struct dist_point_cache
+{
+	bool		valid[2];
+	double		ra[2],
+				dec[2];
+	sc_vec3		v[2];
+} dist_point_cache;
+
+static sc_vec3
+dist_point(dist_point_cache *c, int i, double ra, double dec)
+{
+	if (c == NULL)
+		return sc_radec2vec(ra, dec);
+	/* compared as bits: -0.0 is not 0.0 to sin(), and NaN is never equal */
+	if (!c->valid[i] || memcmp(&c->ra[i], &ra, sizeof(double)) != 0 ||
+		memcmp(&c->dec[i], &dec, sizeof(double)) != 0)
+	{
+		c->ra[i] = ra;
+		c->dec[i] = dec;
+		c->v[i] = sc_radec2vec(ra, dec);
+		c->valid[i] = true;
+	}
+	return c->v[i];
+}
+
 PG_FUNCTION_INFO_V1(skycell_dist);
 Datum
 skycell_dist(PG_FUNCTION_ARGS)
 {
-	sc_vec3		a = sc_radec2vec(PG_GETARG_FLOAT8(0), PG_GETARG_FLOAT8(1));
-	sc_vec3		b = sc_radec2vec(PG_GETARG_FLOAT8(2), PG_GETARG_FLOAT8(3));
+	dist_point_cache *c = fcinfo->flinfo ? (dist_point_cache *) fcinfo->flinfo->fn_extra : NULL;
+	sc_vec3		a,
+				b;
 
+	if (c == NULL && fcinfo->flinfo != NULL)
+		c = fcinfo->flinfo->fn_extra = MemoryContextAllocZero(fcinfo->flinfo->fn_mcxt,
+															  sizeof(dist_point_cache));
+	a = dist_point(c, 0, PG_GETARG_FLOAT8(0), PG_GETARG_FLOAT8(1));
+	b = dist_point(c, 1, PG_GETARG_FLOAT8(2), PG_GETARG_FLOAT8(3));
 	PG_RETURN_FLOAT8(sc_angle(a, b) / DEG2RAD);
 }
 

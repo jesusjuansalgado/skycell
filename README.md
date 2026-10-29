@@ -403,6 +403,42 @@ for comparison.
 | `skycell_in_poly(ra, dec, poly [, sel])` | likewise |
 | `skycell_in_region(p skypos, r skyregion [, sel])` | likewise, on the types |
 
+### Nearest neighbours
+
+`ORDER BY` the distance to a point, with a `LIMIT`, is answered from the cell
+index by the `SkycellNearest` scan: the k nearest rows, without sorting the
+relation.
+
+```sql
+SELECT source_id, skycell_dist(ra, dec, 266.4, -29.0) AS d
+FROM cat ORDER BY skycell_dist(ra, dec, 266.4, -29.0) LIMIT 10;
+
+-- the nearest neighbour of every row of another table
+SELECT t.id, n.source_id, n.d
+FROM targets t CROSS JOIN LATERAL (
+  SELECT source_id, skycell_dist(ra, dec, t.ra, t.dec) AS d
+  FROM cat ORDER BY 2 LIMIT 1) n;
+```
+
+The distance can be written `skycell_dist(ra, dec, ra0, dec0)`,
+`distance(ra, dec, ra0, dec0)`, `distance(p, q)` or `p <-> q` (ADQL's
+`DISTANCE(POINT(...), POINT(...))`), with either point first. The relation's
+side is its columns, as `ra, dec`, `point([coordsys,] ra, dec)` or a `skypos`
+column, and needs the index the cone searches use:
+`skycell_ang2cell(ra, dec)`, or `skycell_cell(pos)` for a `skypos` column. The
+other side may be constants or parameters: a generic plan's, or a `LATERAL`
+sub-select's outer columns, as above.
+
+The scan reads widening rings round the point, each the cone of the cell index
+less the cells the previous ring's cone wholly holds, and sorts each ring by
+the `ORDER BY` expression itself, so the order is the one a sort would give;
+the `LIMIT` stops it after the ring that completes the answer. The first ring
+is sized from the density round the point for the rows the `LIMIT` asks for,
+over the share the query's other conditions keep; those conditions are tested
+as a ring is read. Rows with a NULL distance come last, as `ASC NULLS LAST`
+puts them. Without a `LIMIT`, or ordered `DESC`, the query keeps PostgreSQL's
+sort.
+
 ### Coming from Q3C
 
 `skycell_join` and `skycell_radial_query` take Q3C's own argument lists, so
@@ -494,6 +530,7 @@ WHERE point('ICRS', ra, dec) <@ circle('ICRS', 269.45, 4.69, 0.05 + 0.006)
 |---|---|---|
 | `skycell.custom_scan` | on | answer `skycell_cone` (and `skycell_join`, `skycell_radial_query`, and ADQL's `point <@ circle`) with the `SkycellCone` scan node instead of rewriting it into B-tree range conditions — constant cones, cross-match cones (a parameterized scan, one covering per outer row) and cones over parameters alone (generic plans, correlated sub-selects). A cone that is not a top-level `AND` term of a `WHERE`/`JOIN ON` (one under an `OR`, say) keeps the rewrite, so it stays indexable. Off restores the rewrite everywhere |
 | `skycell.index_filter` | on | when the cell index also holds the position — `CREATE INDEX ON t ((skycell_ang2cell(ra, dec))) INCLUDE (ra, dec)` — the `SkycellCone` scan tests the cone on each index entry and fetches from the table only the rows inside it, instead of every row of the covering cells (both modes, constant cones and cross-matches). The plan's exact test still applies to every row, so the answer is the same; off reads every row of the covering cells |
+| `skycell.nearest_scan` | on | answer `ORDER BY` a distance to a point, with a `LIMIT`, with the `SkycellNearest` scan ([Nearest neighbours](#nearest-neighbours)); needs `skycell.custom_scan`. Off leaves the query to a sort of the relation |
 | `skycell.range_cost` | -1 (derive) | price of one index range, in rows; -1 derives it from the relation's rows/page and the planner's cost factors (for the custom scan, also from how much of the relation `shared_buffers` holds) |
 | `skycell.max_ranges` | 64 | cap on ranges per covering |
 | `skycell.max_area_ratio` | 64 | a partly covered cell may not exceed this × the region's area |
@@ -640,6 +677,17 @@ Two layers, both in [`ext/test/`](ext/test/).
   - Under `debug_parallel_query` a whole cone search runs inside a worker, in
     both modes, with the index filter, as a cross-match and as a generic plan's
     run-time cone, and returns the serial answer.
+- `nearest`: the nearest-neighbour scan. Every query must return what
+  PostgreSQL's sort returns, the same distances in the same order and the same
+  rows (ties aside): on a catalogue with duplicated positions, NULL
+  coordinates and a knot past RA = 0 at the pole, its heap in and out of cell
+  order, for centres at both poles and either side of RA = 0, k from one row
+  to past the relation (NULL distances last), every spelling of the distance,
+  with conditions that take several rings, a `work_mem` small enough that a
+  ring spills to a tuplesort, a NULL or invalid centre, a generic plan whose
+  centre and `LIMIT` are parameters, `LATERAL` per outer row, and inside a
+  parallel worker. The spellings it does not take (no `LIMIT`, `DESC`, a
+  system column, a centre that reads the row) must keep the sort.
 
 **Reference translators** — [`adql_geometry/tests/`](adql_geometry/tests/): the
 Python translator's tests (pytest), and `cross_check.py`, which requires the
@@ -661,9 +709,18 @@ locally), the standalone selftests, and the reference translators.
   yields are as few, so the rows read do not change. Setting one up is
   quadratic in its vertices: 10 ms for 1,000 vertices, about 1 s for 10,000.
   A constant polygon is set up once per query, a stored one once per row.
-- **No KNN ordering yet.** `ORDER BY pos <-> point(…) LIMIT k` is not indexed.
-  A correlated sub-select with `ORDER BY skycell_dist(…) LIMIT 1` over a cone
-  is indexed (the custom scan covers the cone per rescan), so use that instead.
+- **Nearest neighbours.** The `SkycellNearest` scan needs the relation's
+  position to be the one its cell index is built on: an expression index on
+  `skycell_ang2cell(ra, dec)` or `skycell_cell(pos)`. A stored `cell` column
+  (setup 2) does not tell the planner which columns it was computed from, so
+  there the query is sorted, as ADQL's `distance()` and `contains()` are not
+  indexed on it either. A query that reads a system column of the relation
+  (`ctid`, `FOR UPDATE`) keeps the sort too, since the scan returns rows from
+  its own buffer. Against pgSphere's GiST ordering on a clustered relation (an
+  ObsCore table, observations grouped in fields) it is level for a few rows
+  and slower for hundreds or more: the density estimate round the point
+  averages the fields with the empty sky between them, so the first ring is
+  too wide.
 - **Where the custom scan applies.** It answers cones and cross-matches; polygons
   and stored regions use the range rewrite and the region indexes. The cone must
   be a top-level `AND` term of a `WHERE` or `JOIN ON`: a cone under an `OR` is
