@@ -255,6 +255,128 @@ SELECT nn_same('SELECT id, skycell_dist(ra, dec, 10, 20) d FROM nn_cat ORDER BY 
 
 RESET debug_parallel_query;
 SET max_parallel_workers_per_gather = 0;
+-- a table that stores the cell instead of indexing the expression (README,
+-- setup 2): its column serves when the planner is told what it holds -- a
+-- generated column, or a validated, enforced CHECK on a NOT NULL column --
+-- for the nearest scan and for the spellings that synthesise the cell
+-- expression (ADQL's contains() and distance(), skycell_radial_query,
+-- skycell_join); and not otherwise.  nn_chk's rows without a position hold
+-- cell 0, which its CHECK allows.
+CREATE TABLE nn_gen (id int, ra float8, dec float8,
+                     cell int8 GENERATED ALWAYS AS (skycell_ang2cell(ra, dec)) STORED);
+INSERT INTO nn_gen (id, ra, dec) SELECT id, ra, dec FROM nn_cat ORDER BY skycell_ang2cell(ra, dec);
+CREATE TABLE nn_chk AS SELECT id, ra, dec, coalesce(skycell_ang2cell(ra, dec), 0) AS cell FROM nn_cat ORDER BY 4;
+CREATE TABLE nn_nullable AS SELECT * FROM nn_chk;
+CREATE TABLE nn_notvalid AS SELECT * FROM nn_chk;
+CREATE TABLE nn_unenforced AS SELECT * FROM nn_chk;
+CREATE TABLE nn_other AS SELECT * FROM nn_chk;
+ALTER TABLE nn_chk ALTER COLUMN cell SET NOT NULL,
+  ADD CONSTRAINT nn_chk_cell CHECK (cell = skycell_ang2cell(ra, dec));
+ALTER TABLE nn_nullable ADD CONSTRAINT nn_nullable_cell CHECK (cell = skycell_ang2cell(ra, dec));
+ALTER TABLE nn_notvalid ALTER COLUMN cell SET NOT NULL,
+  ADD CONSTRAINT nn_notvalid_cell CHECK (cell = skycell_ang2cell(ra, dec)) NOT VALID;
+ALTER TABLE nn_other ALTER COLUMN cell SET NOT NULL,
+  ADD CONSTRAINT nn_other_cell CHECK (cell = skycell_ang2pix(29, ra, dec));
+DO $$
+BEGIN
+  -- NOT ENFORCED is PostgreSQL 18's; before it the table has no CHECK at all
+  ALTER TABLE nn_unenforced ALTER COLUMN cell SET NOT NULL;
+  IF current_setting('server_version_num')::int >= 180000 THEN
+    EXECUTE 'ALTER TABLE nn_unenforced ADD CONSTRAINT nn_unenforced_cell
+             CHECK (cell = skycell_ang2cell(ra, dec)) NOT ENFORCED';
+  END IF;
+END $$;
+CREATE INDEX ON nn_gen (cell);
+CREATE INDEX ON nn_chk (cell);
+CREATE INDEX ON nn_nullable (cell);
+CREATE INDEX ON nn_notvalid (cell);
+CREATE INDEX ON nn_unenforced (cell);
+CREATE INDEX ON nn_other (cell);
+ANALYZE nn_gen; ANALYZE nn_chk; ANALYZE nn_nullable; ANALYZE nn_notvalid;
+ANALYZE nn_unenforced; ANALYZE nn_other;
+CREATE FUNCTION nn_scan(q text) RETURNS text LANGUAGE plpgsql AS $$
+DECLARE l text; p text := '';
+BEGIN
+  FOR l IN EXECUTE 'EXPLAIN (COSTS OFF) ' || q LOOP
+    IF l ~ 'SkycellNearest' THEN p := p || 'nearest '; END IF;
+    IF l ~ 'SkycellCone' THEN p := p || 'cone '; END IF;
+    IF l ~ 'Seq Scan on nn_' THEN p := p || 'seq '; END IF;
+  END LOOP;
+  RETURN rtrim(p);
+END $$;
+SELECT t,
+  nn_scan(format('SELECT id FROM %I ORDER BY skycell_dist(ra, dec, 10, 20) LIMIT 5', t)) AS nearest,
+  nn_scan(format($f$SELECT count(*) FROM %I WHERE contains(point('ICRS', ra, dec), circle('ICRS', 10, 20, 1)) = 1$f$, t)) AS contains,
+  nn_scan(format('SELECT count(*) FROM %I WHERE distance(ra, dec, 10, 20) < 1', t)) AS distance,
+  nn_scan(format('SELECT count(*) FROM %I WHERE skycell_radial_query(ra, dec, 10, 20, 1)', t)) AS radial,
+  nn_scan(format('SELECT count(*) FROM nn_centre c JOIN %I s ON skycell_join(s.ra, s.dec, c.ra, c.dec, 1)', t)) AS xmatch
+FROM unnest(ARRAY['nn_gen', 'nn_chk', 'nn_nullable', 'nn_notvalid', 'nn_unenforced', 'nn_other']) t;
+       t       | nearest | contains | distance | radial |  xmatch  
+---------------+---------+----------+----------+--------+----------
+ nn_gen        | nearest | cone     | cone     | cone   | seq cone
+ nn_chk        | nearest | cone     | cone     | cone   | seq cone
+ nn_nullable   | seq     | seq      | seq      | seq    | seq seq
+ nn_notvalid   | seq     | seq      | seq      | seq    | seq seq
+ nn_unenforced | seq     | seq      | seq      | seq    | seq seq
+ nn_other      | seq     | seq      | seq      | seq    | seq seq
+(6 rows)
+
+-- the answers are the plain predicates'
+CREATE FUNCTION nn_val(q text) RETURNS text LANGUAGE plpgsql AS $$
+DECLARE r text; BEGIN EXECUTE q INTO r; RETURN r; END $$;
+SELECT t, count(*) AS queries,
+  count(*) FILTER (WHERE nn_same(format('SELECT id, skycell_dist(ra, dec, %s, %s) d FROM %I ORDER BY 2 LIMIT %s',
+                                        c.ra, c.dec, t, k))) AS nearest_same,
+  count(*) FILTER (WHERE
+    nn_val(format($f$SELECT count(*) || ':' || coalesce(sum(id), 0) FROM %I
+                     WHERE contains(point('ICRS', ra, dec), circle('ICRS', %s, %s, %s)) = 1$f$, t, c.ra, c.dec, k / 10.0))
+    = nn_val(format($f$SELECT count(*) || ':' || coalesce(sum(id), 0) FROM nn_cat
+                       WHERE skycell_in_cone(ra, dec, %s, %s, %s, -1)$f$, c.ra, c.dec, k / 10.0))
+    AND nn_val(format($f$SELECT count(*) || ':' || coalesce(sum(id), 0) FROM %I
+                         WHERE skycell_radial_query(ra, dec, %s, %s, %s)$f$, t, c.ra, c.dec, k / 10.0))
+    = nn_val(format($f$SELECT count(*) || ':' || coalesce(sum(id), 0) FROM nn_cat
+                       WHERE skycell_in_cone(ra, dec, %s, %s, %s, -1)$f$, c.ra, c.dec, k / 10.0))) AS cones_same
+FROM unnest(ARRAY['nn_gen', 'nn_chk']) t, nn_centre c, unnest(ARRAY[1, 50]) k
+GROUP BY 1 ORDER BY 1;
+   t    | queries | nearest_same | cones_same 
+--------+---------+--------------+------------
+ nn_chk |      16 |           16 |         16
+ nn_gen |      16 |           16 |         16
+(2 rows)
+
+SELECT (SELECT count(*) || ':' || sum(s.id) FROM nn_centre c JOIN nn_chk s ON skycell_join(s.ra, s.dec, c.ra, c.dec, 2))
+     = (SELECT count(*) || ':' || sum(s.id) FROM nn_centre c JOIN nn_cat s ON skycell_in_cone(s.ra, s.dec, c.ra, c.dec, 2, -1))
+       AS xmatch_same;
+ xmatch_same 
+-------------
+ t
+(1 row)
+
+-- dropping the constraint, or one not validated, takes the column away again
+ALTER TABLE nn_chk DROP CONSTRAINT nn_chk_cell;
+SELECT nn_scan('SELECT id FROM nn_chk ORDER BY skycell_dist(ra, dec, 10, 20) LIMIT 5') AS dropped;
+ dropped 
+---------
+ seq
+(1 row)
+
+ALTER TABLE nn_chk ADD CONSTRAINT nn_chk_cell CHECK (cell = skycell_ang2cell(ra, dec)) NOT VALID;
+SELECT nn_scan('SELECT id FROM nn_chk ORDER BY skycell_dist(ra, dec, 10, 20) LIMIT 5') AS not_valid;
+ not_valid 
+-----------
+ seq
+(1 row)
+
+ALTER TABLE nn_chk VALIDATE CONSTRAINT nn_chk_cell;
+SELECT nn_scan('SELECT id FROM nn_chk ORDER BY skycell_dist(ra, dec, 10, 20) LIMIT 5') AS validated;
+ validated 
+-----------
+ nearest
+(1 row)
+
+DROP FUNCTION nn_val(text);
+DROP FUNCTION nn_scan(text);
+DROP TABLE nn_gen, nn_chk, nn_nullable, nn_notvalid, nn_unenforced, nn_other;
 DROP FUNCTION nn_param(float8, float8, int);
 DROP FUNCTION nn_rings(text);
 DROP FUNCTION nn_same(text);

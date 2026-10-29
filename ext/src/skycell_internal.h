@@ -36,6 +36,8 @@ extern bool density_for_expr(PlannerInfo *root, Node *arg, sc_density *d, Oid *s
 							  bool *uses_cell_ops);
 extern bool region_area_histogram(Oid selfid, PlannerInfo *root, Node *region_expr,
 								   double **areas, int *n);
+extern bool skycell_cell_density(PlannerInfo *root, Node **cell, sc_density *d, Oid *statrel,
+								 bool *uses_cell_ops);
 extern void density_for_var(PlannerInfo *root, Node *arg, sc_density *d, Oid *statrel,
 							 bool *uses_cell_ops);
 extern bool gin_moc_index_for_region(PlannerInfo *root, Node *rg, Node **moc_expr,

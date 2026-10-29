@@ -1507,11 +1507,10 @@ add_nearest_path(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte)
 			continue;
 		while (IsA(expr, RelabelType))
 			expr = (Node *) ((RelabelType *) expr)->arg;
+		/* the cell expression, or a stored column holding it (README, setup 2) */
 		if (!skycell_distance_order(expr, rel->relid, &cell, &ra0, &dec0) ||
+			!skycell_cell_density(root, &cell, &dens, &statrel, &uses_cell_ops) ||
 			(ix = cell_index(rel, cell)) == NULL)
-			continue;
-		density_for_var(root, cell, &dens, &statrel, &uses_cell_ops);
-		if (!OidIsValid(statrel))
 			continue;
 
 		/*
@@ -1562,7 +1561,10 @@ add_nearest_path(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte)
 										makeConst(OIDOID, -1, InvalidOid, sizeof(Oid),
 												  ObjectIdGetDatum(statrel), false, true),
 										makeBoolConst(bitmap, false),
-										list_make2(float8_const(k0), float8_const(want)),
+										list_make3(float8_const(k0), float8_const(want),
+												   makeConst(INT2OID, -1, InvalidOid, sizeof(int16),
+															 Int16GetDatum(IsA(cell, Var) ? ((Var *) cell)->varattno : 1),
+															 false, true)),
 										list_make3(expr, ra0, dec0));
 		cp->methods = &nearest_path_methods;
 		add_path(rel, &cp->path);
@@ -1603,11 +1605,10 @@ nearest_plan(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
 								 makeConst(OIDOID, -1, InvalidOid, sizeof(Oid),
 										   ObjectIdGetDatum(rte->relid), false, true));
 	cs->custom_private = lappend(cs->custom_private, lsecond(p));
-	cs->custom_private = lappend(cs->custom_private,
-								 makeConst(INT2OID, -1, InvalidOid, sizeof(int16),
-										   Int16GetDatum(1), false, true));
+	cs->custom_private = lappend(cs->custom_private, lthird((List *) lfourth(p)));
 	cs->custom_private = lappend(cs->custom_private, makeBoolConst(false, false));
-	cs->custom_private = list_concat(cs->custom_private, list_copy((List *) lfourth(p)));
+	cs->custom_private = lappend(cs->custom_private, linitial((List *) lfourth(p)));
+	cs->custom_private = lappend(cs->custom_private, lsecond((List *) lfourth(p)));
 	cs->custom_exprs = list_make3(copyObject(lsecond(e)), copyObject(lthird(e)),
 								  copyObject(linitial(e)));
 	cs->custom_scan_tlist = NIL;
