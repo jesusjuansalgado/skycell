@@ -392,12 +392,11 @@ run-time range slots.
 **Region opclasses.** `CREATE INDEX ON t USING gist (region)` picks
 `skyregion_box4_gist_ops`: an axis-aligned 3D box rounded outward to `float4`
 (24 bytes, pgSphere's own representation). It beats pgSphere's native GiST on
-every region operator (see [Performance](#performance)). Two others can be
-named explicitly:
+every region operator (see [Performance](#performance)). Another can be named
+explicitly:
 
 ```sql
 CREATE INDEX ON t USING gist (region skyregion_gist_ops);      -- a few spherical caps per entry
-CREATE INDEX ON t USING gist (region skyregion_box_gist_ops);  -- the float8 box, kept for comparison
 ```
 
 `skyregion_gist_ops` keys each entry by spherical caps, exact for a circle at
@@ -418,10 +417,20 @@ CREATE INDEX ON t USING gin (skycell_region_moc(region));
 
 When both a GiST and this GIN index exist on the column, the GIN rewrite wins.
 
-**Experimental point opclasses.** `skypos_spgist_ops` (SP-GiST over the HEALPix
-hierarchy) and `skypos_cap_gist_ops` (GiST with a spherical-cap key) index a
-`skypos` column directly. Neither beats the default cell B-tree; they are kept
-for comparison.
+**Deprecated operator classes.** Three operator classes were kept for
+comparison and are deprecated: they will be removed in the next version of the
+extension. None of them beats what replaces it.
+
+| operator class | indexes | use instead |
+|---|---|---|
+| `skyregion_box_gist_ops` | a `skyregion` column, by a `float8` box | the default, `skyregion_box4_gist_ops` |
+| `skypos_spgist_ops` | a `skypos` column, SP-GiST over the HEALPix hierarchy | a B-tree on `skycell_cell(pos)` |
+| `skypos_cap_gist_ops` | a `skypos` column, GiST with a spherical-cap key | a B-tree on `skycell_cell(pos)` |
+
+`skypos_spgist_ops` is the default for `USING spgist` on a `skypos` column, so
+`CREATE INDEX ON t USING spgist (pos)` builds one. An index built on any of the
+three has to be dropped before `ALTER EXTENSION skycell UPDATE` to that
+version.
 
 ### The index key
 
