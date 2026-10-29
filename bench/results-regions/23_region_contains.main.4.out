@@ -1,0 +1,25 @@
+
+=== consistency: brute force vs the GiST-indexed <@ vs pgSphere native ===
+
+
+
+555|555|555
+=== plan (should be an Index Scan using fpr_region_gist, Index Cond: region @> pos) ===
+Aggregate
+  ->  Nested Loop
+        ->  Seq Scan on rox_probe_pts p
+        ->  Index Scan using fpr_region_gist on fpr f
+              Index Cond: (s_region @> p.pos)
+
+
+
+
+
+
+
+brute|1|555|3845.87
+brute|2|555|3833.45
+gist|1|555|7.18
+gist|2|555|7.00
+pgsphere|1|555|13.48
+pgsphere|2|555|12.43

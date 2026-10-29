@@ -1,0 +1,10 @@
+NOTICE:  table "bench_realcone" does not exist, skipping
+NOTICE:  table "bench_realcone_cold" does not exist, skipping
+run 1 (0.26) start 11:12:57
+run 1 (0.26) done 11:13:52
+run 2 (0.36) start 11:13:52
+run 2 (0.36) done 11:14:45
+run 3 (0.36) start 11:14:45
+run 3 (0.36) done 11:15:38
+run 4 (0.26) start 11:15:39
+run 4 (0.26) done 11:16:34

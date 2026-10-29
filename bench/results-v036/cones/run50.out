@@ -1,0 +1,20 @@
+[21:42:57] STAGE gaia50: 5e7 rows resampled from the DR3 order-9 map
+NOTICE:  relation "gaia_map" already exists, skipping
+NOTICE:  table "oc" does not exist, skipping
+NOTICE:  table "cat_q3c" does not exist, skipping
+NOTICE:  table "cat_sphere" does not exist, skipping
+NOTICE:  table "cat_cell" does not exist, skipping
+NOTICE:  relation "src" does not exist, skipping
+[21:54:20]   gaia50: query centres (03) + 07
+NOTICE:  drop cascades to 2 other objects
+DETAIL:  drop cascades to function cone_sql(text,bench_centers)
+drop cascades to function ab_trial(text,text,integer,bench_centers,text[])
+NOTICE:  relation "bench_cone" already exists, skipping
+NOTICE:  relation "bench_cone_x" already exists, skipping
+NOTICE:  function bench_ab_run(text,text,pg_catalog.int4,float8) does not exist, skipping
+NOTICE:  function bench_ab_explain(text,float8) does not exist, skipping
+[21:54:27]   gaia50: warm A/B, 5 repetitions
+[21:55:25]   gaia50: cold A/B
+[21:55:43]   gaia50: EXPLAIN pass
+[21:56:16] DONE
+exit 0

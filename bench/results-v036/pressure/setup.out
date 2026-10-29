@@ -1,0 +1,15 @@
+ setseed 
+---------
+ 
+(1 row)
+
+ setseed 
+---------
+ 
+(1 row)
+
+ heap  | bytes_per_row |  gist  |  cell  | gist_mb | cell_mb 
+-------+---------------+--------+--------+---------+---------
+ 11 GB |          1170 | 592 MB | 214 MB |     591 |     214
+(1 row)
+

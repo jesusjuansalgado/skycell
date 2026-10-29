@@ -1,0 +1,12 @@
+[23:08:29] oc20_gist 591 MB, oc20_cell 214 MB: shared_buffers 394MB (gist/sb 1.5, cell/sb 0.54), memory limit 1498 MB, effective_cache_size 999MB
+[23:11:55] phase A1 (pgsphere) done
+[23:12:50] phase A2 (skycell) done
+[23:13:43] phase B1 (skycell) done
+[23:17:07] phase B2 (pgsphere) done
+[23:17:07] DONE
+[23:17:38] oc20_gist 591 MB, oc20_cell 214 MB: shared_buffers 394MB (gist/sb 1.5, cell/sb 0.54), memory limit 1498 MB, effective_cache_size 999MB
+[23:20:52] phase A1 (pgsphere) done
+[23:21:40] phase A2 (skycell) done
+[23:22:28] phase B1 (skycell) done
+[23:25:29] phase B2 (pgsphere) done
+[23:25:30] DONE

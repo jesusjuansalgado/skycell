@@ -1,0 +1,17 @@
+[21:06:33] 10_crossover.sql
+NOTICE:  function bench_cross_run(float8,pg_catalog.int4,float8,pg_catalog.int4) does not exist, skipping
+[21:06:33] seed 0.19: 0.5 M rows
+NOTICE:  table "oc" does not exist, skipping
+NOTICE:  table "oc_centers" does not exist, skipping
+[21:06:44] seed 0.19: 2 M rows
+NOTICE:  table "oc_centers" does not exist, skipping
+[21:07:17] seed 0.19: 10 M rows
+NOTICE:  table "oc_centers" does not exist, skipping
+[21:09:37] seed 0.53: 0.5 M rows
+NOTICE:  table "oc_centers" does not exist, skipping
+[21:09:49] seed 0.53: 2 M rows
+NOTICE:  table "oc_centers" does not exist, skipping
+[21:10:18] seed 0.53: 10 M rows
+NOTICE:  table "oc_centers" does not exist, skipping
+[21:12:33] DONE
+exit 0

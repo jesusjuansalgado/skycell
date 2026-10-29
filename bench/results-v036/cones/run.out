@@ -1,0 +1,44 @@
+[21:29:42] STAGE designed: 01_data.sql (10M), 02_build.sql
+NOTICE:  table "bench_ab" does not exist, skipping
+NOTICE:  table "bench_ab_x" does not exist, skipping
+NOTICE:  table "src" does not exist, skipping
+NOTICE:  table "clusters" does not exist, skipping
+NOTICE:  extension "q3c" already exists, skipping
+NOTICE:  extension "pg_sphere" already exists, skipping
+NOTICE:  extension "skycell" already exists, skipping
+NOTICE:  table "cat_q3c" does not exist, skipping
+NOTICE:  table "cat_sphere" does not exist, skipping
+NOTICE:  table "cat_cell" does not exist, skipping
+[21:32:37]   designed: query centres (03) + 07
+NOTICE:  table "bench_pool" does not exist, skipping
+NOTICE:  table "bench_centers" does not exist, skipping
+NOTICE:  function bench_ab_run(text,text,pg_catalog.int4,float8) does not exist, skipping
+NOTICE:  function bench_ab_explain(text,float8) does not exist, skipping
+[21:32:37]   designed: warm A/B, 5 repetitions
+[21:33:13]   designed: cold A/B
+[21:33:23]   designed: EXPLAIN pass
+[21:33:36] STAGE gaia: 1e7 rows resampled from the DR3 order-9 map
+NOTICE:  table "oc" does not exist, skipping
+NOTICE:  table "src_prev" does not exist, skipping
+NOTICE:  extension "q3c" already exists, skipping
+NOTICE:  extension "pg_sphere" already exists, skipping
+NOTICE:  extension "skycell" already exists, skipping
+NOTICE:  relation "bench_build" already exists, skipping
+NOTICE:  table "cat_q3c" does not exist, skipping
+NOTICE:  table "cat_sphere" does not exist, skipping
+NOTICE:  table "cat_cell" does not exist, skipping
+[21:36:04]   gaia: query centres (03) + 07
+NOTICE:  drop cascades to 2 other objects
+DETAIL:  drop cascades to function cone_sql(text,bench_centers)
+drop cascades to function ab_trial(text,text,integer,bench_centers,text[])
+NOTICE:  relation "bench_cone" already exists, skipping
+NOTICE:  relation "bench_cone_x" already exists, skipping
+NOTICE:  relation "bench_ab" already exists, skipping
+NOTICE:  relation "bench_ab_x" already exists, skipping
+NOTICE:  function bench_ab_run(text,text,pg_catalog.int4,float8) does not exist, skipping
+NOTICE:  function bench_ab_explain(text,float8) does not exist, skipping
+[21:36:05]   gaia: warm A/B, 5 repetitions
+[21:36:41]   gaia: cold A/B
+[21:36:51]   gaia: EXPLAIN pass
+[21:37:36] DONE
+exit 0

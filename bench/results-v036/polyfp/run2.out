@@ -1,0 +1,24 @@
+[22:26:49] STAGE designed: 01_data.sql (10M), 02_build.sql
+NOTICE:  extension "q3c" already exists, skipping
+NOTICE:  extension "pg_sphere" already exists, skipping
+NOTICE:  extension "skycell" already exists, skipping
+NOTICE:  relation "bench_build" already exists, skipping
+[22:29:37]   designed: query pool (03), polygons (05)
+NOTICE:  drop cascades to function cone_sql(text,bench_centers)
+NOTICE:  relation "bench_cone" already exists, skipping
+NOTICE:  relation "bench_cone_x" already exists, skipping
+[22:29:37]   poly q3c
+[22:29:38]   poly pgsphere
+[22:29:40]   poly skycell
+[22:29:40]   poly skycell (reverse order)
+[22:29:40]   poly pgsphere (reverse order)
+[22:29:41]   poly q3c (reverse order)
+[22:29:42]   designed: probes (04), footprints (06)
+NOTICE:  relation "bench_xmatch" already exists, skipping
+NOTICE:  relation "bench_fp" already exists, skipping
+NOTICE:  table "fp_meta" does not exist, skipping
+[22:29:46]   footprints pgsphere
+[22:29:48]   footprints skycell
+[22:29:51]   footprints skycell (reverse order)
+[22:29:54]   footprints pgsphere (reverse order)
+[22:29:57] DONE

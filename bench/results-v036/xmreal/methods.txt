@@ -1,0 +1,13 @@
+results-pg18 0.26 -> this 0.36 run
+q3c_join       1.08
+skycell_cs     1.15
+skycell_join   1.13
+skycell_slots  1.24
+pgsphere       1.32
+
+same host, 0.26 (runs 1, 4) -> 0.36 (runs 2, 3)
+q3c_join       1.05
+skycell_cs     1.01
+skycell_join   0.99
+skycell_slots  1.08
+pgsphere       1.13

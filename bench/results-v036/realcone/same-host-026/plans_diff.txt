@@ -1,0 +1,5 @@
+Warm centres whose plan text (COSTS OFF) differs, per radius and method, of 2,912 (1,456 centres x 2 methods)
+
+0.26 (real26) vs 0.36 (real36): 119  {"1' skycell": 2, "1' skycell-rw": 12, '10" skycell': 1, '1deg skycell': 9, '1deg skycell-rw': 12, "30' skycell": 12, "30' skycell-rw": 18, '3deg skycell': 1, '3deg skycell-rw': 4, "6' skycell": 18, "6' skycell-rw": 30}
+0.36 vs 0.36 after a fresh ANALYZE of real36: 131  {"1' skycell": 2, "1' skycell-rw": 18, '10" skycell': 1, '1deg skycell': 8, '1deg skycell-rw': 14, "30' skycell": 19, "30' skycell-rw": 19, '3deg skycell': 1, '3deg skycell-rw': 2, "6' skycell": 15, "6' skycell-rw": 32}
+0.26 vs 0.36 after the fresh ANALYZE: 120  {"1' skycell-rw": 16, '1deg skycell': 10, '1deg skycell-rw': 13, "30' skycell": 17, "30' skycell-rw": 19, '3deg skycell-rw': 4, "6' skycell": 16, "6' skycell-rw": 25}

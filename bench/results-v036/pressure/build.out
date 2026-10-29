@@ -1,0 +1,20 @@
+[22:14:25] initdb, build the relation (outside the memory limit)
+psql:/home/user/skycell-paper/bench/results-v036/pressure/setup.sql:38: NOTICE:  table "oc20" does not exist, skipping
+ setseed 
+---------
+ 
+(1 row)
+
+psql:/home/user/skycell-paper/bench/results-v036/pressure/setup.sql:75: NOTICE:  table "c20c" does not exist, skipping
+ setseed 
+---------
+ 
+(1 row)
+
+ heap  | bytes_per_row |  gist  |  cell  | gist_mb | cell_mb 
+-------+---------------+--------+--------+---------+---------
+ 11 GB |          1170 | 592 MB | 214 MB |     591 |     214
+(1 row)
+
+[22:19:17] oc20_gist 591 MB, oc20_cell 214 MB: shared_buffers 394MB (gist/sb 1.5, cell/sb 0.54), memory limit 149 MB, effective_cache_size 99MB
+exit 0

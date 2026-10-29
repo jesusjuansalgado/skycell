@@ -1,0 +1,26 @@
+ bm_run 
+--------
+ 
+(1 row)
+
+ bm_run 
+--------
+ 
+(1 row)
+
+ cls |        m        |       node       | vs_pgsphere_as_planned | median_ms | buffers | reads | rows 
+-----+-----------------+------------------+------------------------+-----------+---------+-------+------
+ Q05 | pgsphere        | Index Scan       |                   1.00 |     0.055 |      10 |   0.0 |   52
+ Q05 | pgsphere-bitmap | Bitmap Heap Scan |                   1.03 |     0.056 |       9 |   0.0 |   52
+ Q05 | skycell         | Custom Scan      |                   0.91 |     0.049 |      13 |   0.0 |   52
+ Q06 | pgsphere        | Index Scan       |                   1.00 |     0.403 |     224 |   0.0 |  936
+ Q06 | pgsphere-bitmap | Bitmap Heap Scan |                   0.96 |     0.391 |     103 |   0.0 |  936
+ Q06 | skycell         | Custom Scan      |                   0.57 |     0.165 |     143 |   0.0 |  936
+ Q07 | pgsphere        | Index Scan       |                   1.00 |     0.153 |      16 |   0.0 |  123
+ Q07 | pgsphere-bitmap | Bitmap Heap Scan |                   0.94 |     0.143 |      12 |   0.0 |  123
+ Q07 | skycell         | Custom Scan      |                   0.81 |     0.121 |      28 |   0.0 |  123
+ Q12 | pgsphere        | Index Scan       |                   1.00 |     0.058 |       6 |   0.0 |    0
+ Q12 | pgsphere-bitmap | Bitmap Heap Scan |                   0.99 |     0.058 |       6 |   0.0 |    0
+ Q12 | skycell         | Custom Scan      |                   0.61 |     0.035 |       3 |   0.0 |    0
+(12 rows)
+

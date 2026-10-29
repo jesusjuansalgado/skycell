@@ -1,0 +1,17 @@
+[21:29:42] STAGE designed: 01_data.sql (10M), 02_build.sql
+[21:32:37]   designed: query centres (03) + 07
+[21:32:37]   designed: warm A/B, 5 repetitions
+[21:33:13]   designed: cold A/B
+[21:33:23]   designed: EXPLAIN pass
+[21:33:36] STAGE gaia: 1e7 rows resampled from the DR3 order-9 map
+[21:36:04]   gaia: query centres (03) + 07
+[21:36:05]   gaia: warm A/B, 5 repetitions
+[21:36:41]   gaia: cold A/B
+[21:36:51]   gaia: EXPLAIN pass
+[21:37:36] DONE
+[21:42:57] STAGE gaia50: 5e7 rows resampled from the DR3 order-9 map
+[21:54:20]   gaia50: query centres (03) + 07
+[21:54:27]   gaia50: warm A/B, 5 repetitions
+[21:55:25]   gaia50: cold A/B
+[21:55:43]   gaia50: EXPLAIN pass
+[21:56:16] DONE
