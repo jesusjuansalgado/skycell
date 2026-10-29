@@ -1154,10 +1154,10 @@ want_swap(SupportRequestSimplify *req, Oid funcid, Node *pt, Node *rg,
 									  list_make2(copyObject(linitial(c)), copyObject(lsecond(c))),
 									  InvalidOid, InvalidOid, COERCE_EXPLICIT_CALL);
 	cell2 = cell_expr_for_point(funcid, newpt);
-	if (cell2 == NULL || !density_for_expr(req->root, cell2, &d2, &statrel, &cell_ops))
+	if (cell2 == NULL || !skycell_cell_density(req->root, &cell2, &d2, &statrel, &cell_ops))
 		return false;
 	cell1 = cell_expr_for_point(funcid, pt);
-	if (cell1 != NULL && density_for_expr(req->root, cell1, &d1, &statrel, &cell_ops) &&
+	if (cell1 != NULL && skycell_cell_density(req->root, &cell1, &d1, &statrel, &cell_ops) &&
 		d1.ntotal >= d2.ntotal)
 		return false;
 
@@ -1384,8 +1384,8 @@ region_simplify_oriented(SupportRequestSimplify *req, Oid funcid, Node *pt, Node
 	if (cell == NULL)
 		return NULL;
 
-	/* only worth rewriting if an index answers that expression */
-	if (!density_for_expr(req->root, cell, &dens, &statrel, &uses_cell_ops))
+	/* only worth rewriting if an index answers that expression, or a column holding it */
+	if (!skycell_cell_density(req->root, &cell, &dens, &statrel, &uses_cell_ops))
 	{
 		Node	   *moc_expr;
 		int			max_order;
@@ -1688,7 +1688,7 @@ region_pos_density_sel(Oid selfid, PlannerInfo *root, Node *pt, Node *rg)
 			Oid			statrel = InvalidOid;
 			bool		uses_cell_ops;
 
-			if (density_for_expr(root, cell, &dens, &statrel, &uses_cell_ops) &&
+			if (skycell_cell_density(root, &cell, &dens, &statrel, &uses_cell_ops) &&
 				dens.ntotal > 0)
 			{
 				sc_cover_params p;

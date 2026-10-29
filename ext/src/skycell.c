@@ -504,6 +504,14 @@ typedef struct idx_entry
 	Oid			indexoid;		/* the matching expression index, or InvalidOid */
 	Node	   *expr;			/* its first key expression (varno 1) */
 	bool		uses_cell_ops;	/* that index's opclass is skycell_cell_ops */
+
+	/*
+	 * With no such index: a stored column known to hold expr and indexed by
+	 * a B-tree (stored_cell_column()), or 0; and whether that index is
+	 * skycell_cell_ops.
+	 */
+	AttrNumber	stored;
+	bool		stored_cell_ops;
 } idx_entry;
 
 static MemoryContext skycell_cache_cxt = NULL;
@@ -940,6 +948,103 @@ cell_ops_opfamily(void)
  * cross-match) can emit its operators and get a real selectivity estimate
  * instead of the stock DEFAULT_INEQ_SEL fallback -- see skycell_cellsel().
  */
+/*
+ * A column of rel that holds the cell expression key (varno 1), for a table
+ * that stores the cell instead of indexing the expression (README, setup 2).
+ * The planner has to be told what the column was computed from, in either of
+ * two ways PostgreSQL itself enforces:
+ *
+ *   - a stored generated column, GENERATED ALWAYS AS (key) STORED;
+ *   - a validated, enforced CHECK (column = key) on a NOT NULL column.
+ *     NOT NULL as well because a CHECK passes on NULL: a row whose cell were
+ *     NULL beside a valid position would be in no range of the index.
+ *
+ * The column must be int8 and the first key of a B-tree index without a
+ * predicate.  0 when there is none; *cell_ops says whether that index is
+ * skycell_cell_ops.
+ */
+static bool
+attr_not_null(TupleDesc desc, AttrNumber att)
+{
+#if PG_VERSION_NUM >= 180000
+	/* 18's NOT NULL can be NOT VALID; only a validated one says anything */
+	return TupleDescCompactAttr(desc, att - 1)->attnullability == ATTNULLABLE_VALID;
+#else
+	return TupleDescAttr(desc, att - 1)->attnotnull;
+#endif
+}
+
+/* column = key or key = column, as int8's equality, else 0 */
+static AttrNumber
+check_column_equal(Node *e, Node *key)
+{
+	OpExpr	   *op = (OpExpr *) e;
+	Node	   *a,
+			   *b;
+
+	if (!IsA(e, OpExpr) || list_length(op->args) != 2 ||
+		(OidIsValid(op->opfuncid) ? op->opfuncid : get_opcode(op->opno)) != F_INT8EQ)
+		return 0;
+	a = linitial(op->args);
+	b = lsecond(op->args);
+	if (IsA(a, Var) && ((Var *) a)->varno == 1 && ((Var *) a)->varlevelsup == 0 && equal(b, key))
+		return ((Var *) a)->varattno;
+	if (IsA(b, Var) && ((Var *) b)->varno == 1 && ((Var *) b)->varlevelsup == 0 && equal(a, key))
+		return ((Var *) b)->varattno;
+	return 0;
+}
+
+static AttrNumber
+stored_cell_column(Relation rel, List *indexes, Node *key, bool *cell_ops)
+{
+	TupleDesc	desc = RelationGetDescr(rel);
+	TupleConstr *constr = desc->constr;
+	Oid			cellops_oid = cell_ops_opfamily();
+	ListCell   *lc;
+
+	*cell_ops = false;
+	if (constr == NULL)
+		return 0;
+	foreach(lc, indexes)
+	{
+		Relation	irel = index_open(lfirst_oid(lc), AccessShareLock);
+		AttrNumber	att = irel->rd_index->indkey.values[0];
+		bool		ok = false;
+
+		if (irel->rd_rel->relam == BTREE_AM_OID && att > 0 &&
+			heap_attisnull(irel->rd_indextuple, Anum_pg_index_indpred, NULL) &&
+			TupleDescAttr(desc, att - 1)->atttypid == INT8OID &&
+			!TupleDescAttr(desc, att - 1)->attisdropped)
+		{
+			if (TupleDescAttr(desc, att - 1)->attgenerated == ATTRIBUTE_GENERATED_STORED)
+			{
+				for (int i = 0; i < constr->num_defval && !ok; i++)
+					if (constr->defval[i].adnum == att)
+						ok = equal(stringToNode(constr->defval[i].adbin), key);
+			}
+			else if (attr_not_null(desc, att))
+			{
+				for (int i = 0; i < constr->num_check && !ok; i++)
+				{
+					ConstrCheck *cc = &constr->check[i];
+
+#if PG_VERSION_NUM >= 180000
+					if (!cc->ccenforced)
+						continue;
+#endif
+					ok = cc->ccvalid && check_column_equal(stringToNode(cc->ccbin), key) == att;
+				}
+			}
+		}
+		if (ok)
+			*cell_ops = OidIsValid(cellops_oid) && irel->rd_opfamily[0] == cellops_oid;
+		index_close(irel, AccessShareLock);
+		if (ok)
+			return att;
+	}
+	return 0;
+}
+
 bool
 density_for_expr(PlannerInfo *root, Node *arg, sc_density *d, Oid *statrel,
 				  bool *uses_cell_ops)
@@ -955,6 +1060,8 @@ density_for_expr(PlannerInfo *root, Node *arg, sc_density *d, Oid *statrel,
 	Oid			cellops_oid;
 	bool		found = false;
 	bool		matched_uses_cell_ops = false;
+	AttrNumber	stored_att = 0;
+	bool		stored_ops = false;
 
 	*uses_cell_ops = false;
 	foreach(lc, vars)
@@ -1030,9 +1137,17 @@ density_for_expr(PlannerInfo *root, Node *arg, sc_density *d, Oid *statrel,
 		if (matched_uses_cell_ops)
 			break;					/* nothing beats a cell_ops match */
 	}
-	list_free(indexes);
-	table_close(rel, NoLock);
-	*uses_cell_ops = matched_uses_cell_ops;
+	{
+		bool		scops = false;
+		AttrNumber	stored = found ? 0 : stored_cell_column(rel, indexes, key, &scops);
+
+		list_free(indexes);
+		table_close(rel, NoLock);
+		*uses_cell_ops = matched_uses_cell_ops;
+		/* remembered below with the rest of the outcome */
+		stored_att = stored;
+		stored_ops = scops;
+	}
 
 	/*
 	 * Loaded only now: opening the next index takes a lock, which can process
@@ -1053,9 +1168,69 @@ density_for_expr(PlannerInfo *root, Node *arg, sc_density *d, Oid *statrel,
 		entry->indexoid = matched;
 		entry->expr = copyObject(key);
 		entry->uses_cell_ops = matched_uses_cell_ops;
+		entry->stored = stored_att;
+		entry->stored_cell_ops = stored_ops;
 		MemoryContextSwitchTo(old);
 	}
 	return found;
+}
+
+/*
+ * density_for_expr() for a cell expression a query synthesised from its
+ * position -- skycell_ang2cell(ra, dec), skycell_cell(pos) -- that also takes
+ * a table storing the cell: when no index holds the expression but a stored
+ * column is known to hold it (stored_cell_column()), *cell becomes that
+ * column, and the density is its statistics'.  Callers then build their
+ * conditions and paths on *cell, which an index answers either way.
+ */
+bool
+skycell_cell_density(PlannerInfo *root, Node **cell, sc_density *d, Oid *statrel,
+					 bool *uses_cell_ops)
+{
+	List	   *vars;
+	Index		varno = 0;
+	ListCell   *lc;
+	RangeTblEntry *rte;
+	Node	   *key;
+	idx_entry  *entry;
+	AttrNumber	att;
+	bool		ops;
+
+	*statrel = InvalidOid;
+	*uses_cell_ops = false;
+	if (root == NULL || root->parse == NULL)
+		return false;
+	if (density_for_expr(root, *cell, d, statrel, uses_cell_ops))
+		return true;
+	vars = pull_var_clause(*cell, 0);
+	foreach(lc, vars)
+	{
+		Var		   *v = (Var *) lfirst(lc);
+
+		if (!IsA(v, Var) || v->varlevelsup != 0 || (varno != 0 && v->varno != varno))
+			return false;
+		varno = v->varno;
+	}
+	if (varno == 0 || varno > list_length(root->parse->rtable))
+		return false;
+	rte = rt_fetch(varno, root->parse->rtable);
+	if (rte->rtekind != RTE_RELATION)
+		return false;
+	key = copyObject(*cell);
+	ChangeVarNodes(key, varno, 1, 0);
+
+	/* density_for_expr() has just looked, and remembered what it found */
+	skycell_cache_init();
+	entry = (idx_entry *) hash_search(idx_cache, &rte->relid, HASH_FIND, NULL);
+	if (entry == NULL || !equal(entry->expr, key) || entry->stored == 0)
+		return false;
+	att = entry->stored;
+	ops = entry->stored_cell_ops;
+	*cell = (Node *) makeVar(varno, att, INT8OID, -1, InvalidOid, 0);
+	load_density(rte->relid, att, d);
+	*statrel = rte->relid;
+	*uses_cell_ops = ops;
+	return true;
 }
 
 /*
@@ -1668,6 +1843,19 @@ simplify_poly(PlannerInfo *root, FuncExpr *fexpr)
 	}
 }
 
+/* the synthesised cell expression, or the stored column that holds it */
+static Expr *
+stored_cell_or(PlannerInfo *root, Expr *cell)
+{
+	Node	   *c = (Node *) cell;
+	sc_density	d;
+	Oid			statrel;
+	bool		ops;
+
+	(void) skycell_cell_density(root, &c, &d, &statrel, &ops);
+	return (Expr *) c;
+}
+
 /*
  * skycell_poly_join(ra, dec, poly): the Q3C-poly-query-shaped spelling for a
  * cross-match whose polygon comes from another table's row. Like
@@ -1688,6 +1876,7 @@ simplify_poly3(PlannerInfo *root, FuncExpr *fexpr)
 								 list_make2(copyObject(linitial(fexpr->args)),
 											copyObject(lsecond(fexpr->args))),
 								 InvalidOid, InvalidOid, COERCE_EXPLICIT_CALL);
+	cell = stored_cell_or(root, cell);
 
 	four->args = lcons(cell, four->args);
 	return simplify_poly(root, four);
@@ -1717,6 +1906,7 @@ simplify_cone5(PlannerInfo *root, FuncExpr *fexpr)
 								 list_make2(copyObject(linitial(fexpr->args)),
 											copyObject(lsecond(fexpr->args))),
 								 InvalidOid, InvalidOid, COERCE_EXPLICIT_CALL);
+	cell = stored_cell_or(root, cell);
 
 	six->args = lcons(cell, six->args);
 

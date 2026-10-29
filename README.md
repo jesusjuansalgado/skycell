@@ -242,6 +242,31 @@ ANALYZE cat;
 VACUUM (FREEZE) cat;
 ```
 
+`skycell_cone(cell, ra, dec, ...)` names the column itself. The spellings that
+do not — ADQL's `contains()` and `distance()`, `skycell_radial_query`,
+`skycell_join` and the [nearest-neighbour scan](#nearest-neighbours) — work
+from `ra` and `dec`, and use the column only when the planner is told what it
+holds. Either declaration does it, and PostgreSQL then enforces it:
+
+```sql
+-- a new table: the column computed by PostgreSQL itself
+CREATE TABLE cat (id bigint, ra float8, dec float8, mag float4,
+                  cell int8 GENERATED ALWAYS AS (skycell_ang2cell(ra, dec)) STORED);
+INSERT INTO cat (id, ra, dec, mag)
+  SELECT id, ra, dec, mag FROM staging ORDER BY skycell_ang2cell(ra, dec);
+
+-- an existing table: a constraint, checked once (no rewrite, the heap stays
+-- in order); NOT NULL as well, since a CHECK lets a NULL through
+ALTER TABLE cat ALTER COLUMN cell SET NOT NULL;
+ALTER TABLE cat ADD CONSTRAINT cat_cell CHECK (cell = skycell_ang2cell(ra, dec)) NOT VALID;
+ALTER TABLE cat VALIDATE CONSTRAINT cat_cell;
+```
+
+A row without a position needs a `cell` value under the `NOT NULL`, such as 0;
+the constraint allows it, and no cone or distance selects the row. The same
+works for a `skypos` column with `skycell_cell(pos)`. A constraint not
+validated, or (PostgreSQL 18) not enforced, does not count.
+
 **3. Regions rather than positions** (observation footprints, tiles, MOCs).
 Store each region's covering as MOC cells, one row per cell, and index those:
 
@@ -397,7 +422,7 @@ for comparison.
 |---|---|
 | `skycell_cone(cell, ra, dec, ra0, dec0, radius)` | cone test, answered by the custom scan: a constant cone covered at plan time; a per-row cone (a cross-match, `JOIN cat c ON skycell_cone(c.cell, c.ra, c.dec, p.ra, p.dec, r)`) covered per outer row; a generic plan or correlated sub-select covered per rescan |
 | `skycell_poly(cell, ra, dec, poly float8[])` | the same for a polygon |
-| `skycell_radial_query(ra, dec, ra0, dec0, radius)` | Q3C's spelling of the cone test — no cell argument, the planner synthesises `skycell_ang2cell(ra, dec)`; the custom scan answers it through an expression index on that |
+| `skycell_radial_query(ra, dec, ra0, dec0, radius)` | Q3C's spelling of the cone test — no cell argument, the planner synthesises `skycell_ang2cell(ra, dec)`; the custom scan answers it through an expression index on that, or a stored column declared to hold it ([setup 2](#setting-up-a-table)) |
 | `skycell_join(ra1, dec1, ra2, dec2, radius)` | Q3C's spelling of the cross-match — likewise; the first pair is the indexed side, as in `q3c_join` |
 | `skycell_in_cone(ra, dec, ra0, dec0, radius [, sel])` | the exact test alone, no index |
 | `skycell_in_poly(ra, dec, poly [, sel])` | likewise |
@@ -425,7 +450,8 @@ The distance can be written `skycell_dist(ra, dec, ra0, dec0)`,
 `DISTANCE(POINT(...), POINT(...))`), with either point first. The relation's
 side is its columns, as `ra, dec`, `point([coordsys,] ra, dec)` or a `skypos`
 column, and needs the index the cone searches use:
-`skycell_ang2cell(ra, dec)`, or `skycell_cell(pos)` for a `skypos` column. The
+`skycell_ang2cell(ra, dec)`, or `skycell_cell(pos)` for a `skypos` column — or
+a stored column declared to hold it ([setup 2](#setting-up-a-table)). The
 other side may be constants or parameters: a generic plan's, or a `LATERAL`
 sub-select's outer columns, as above.
 
@@ -687,7 +713,12 @@ Two layers, both in [`ext/test/`](ext/test/).
   ring spills to a tuplesort, a NULL or invalid centre, a generic plan whose
   centre and `LIMIT` are parameters, `LATERAL` per outer row, and inside a
   parallel worker. The spellings it does not take (no `LIMIT`, `DESC`, a
-  system column, a centre that reads the row) must keep the sort.
+  system column, a centre that reads the row) must keep the sort. A stored
+  `cell` column serves the nearest scan, ADQL's `contains()` and `distance()`,
+  `skycell_radial_query` and `skycell_join` when it is generated or carries a
+  validated `CHECK` with `NOT NULL`, with the plain predicates' answers, and
+  not when the `CHECK` lacks `NOT NULL`, is not validated, not enforced or
+  names another expression, or once it is dropped.
 
 **Reference translators** — [`adql_geometry/tests/`](adql_geometry/tests/): the
 Python translator's tests (pytest), and `cross_check.py`, which requires the
@@ -711,10 +742,10 @@ locally), the standalone selftests, and the reference translators.
   A constant polygon is set up once per query, a stored one once per row.
 - **Nearest neighbours.** The `SkycellNearest` scan needs the relation's
   position to be the one its cell index is built on: an expression index on
-  `skycell_ang2cell(ra, dec)` or `skycell_cell(pos)`. A stored `cell` column
-  (setup 2) does not tell the planner which columns it was computed from, so
-  there the query is sorted, as ADQL's `distance()` and `contains()` are not
-  indexed on it either. A query that reads a system column of the relation
+  `skycell_ang2cell(ra, dec)` or `skycell_cell(pos)`, or a stored `cell`
+  column declared to hold it (setup 2); an undeclared one leaves the query to
+  a sort, as it leaves ADQL's `distance()` and `contains()` unindexed. A query
+  that reads a system column of the relation
   (`ctid`, `FOR UPDATE`) keeps the sort too, since the scan returns rows from
   its own buffer. Against pgSphere's GiST ordering on a clustered relation (an
   ObsCore table, observations grouped in fields) it is level for a few rows
