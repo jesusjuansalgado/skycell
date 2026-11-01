@@ -186,6 +186,136 @@ make_shape(int k, xy *P)
 	return n;
 }
 
+
+/* ------------------------------------------------------------------ */
+/* composite regions: random unions, intersections, differences, NOTs   */
+/* ------------------------------------------------------------------ */
+
+/* a point at angle rho from c, in direction az */
+static sc_vec3
+point_at(sc_vec3 c, double rho, double az)
+{
+	sc_vec3 e1 = (fabs(c.z) < 0.9) ? (sc_vec3) {-c.y, c.x, 0} : (sc_vec3) {0, -c.z, c.y}, e2, pt;
+	double nn = sqrt(sc_dot(e1, e1));
+	e1.x /= nn; e1.y /= nn; e1.z /= nn;
+	e2 = sc_cross(c, e1);
+	pt.x = cos(rho) * c.x + sin(rho) * (cos(az) * e1.x + sin(az) * e2.x);
+	pt.y = cos(rho) * c.y + sin(rho) * (cos(az) * e1.y + sin(az) * e2.y);
+	pt.z = cos(rho) * c.z + sin(rho) * (cos(az) * e1.z + sin(az) * e2.z);
+	return pt;
+}
+
+static void
+vec_radec(sc_vec3 v, double *a, double *d)
+{
+	*d = atan2(v.z, hypot(v.x, v.y)) * 180 / M_PI;
+	*a = atan2(v.y, v.x) * 180 / M_PI;
+	if (*a < 0) *a += 360;
+}
+
+/*
+ * An order-29 cell on the edge of cell (order, pix): its index within the
+ * cell has x (even bits) or y (odd bits) all 0 or all 1.  Those are where a
+ * cell's own boundary runs, so where a class test that reads only corners and
+ * edge midpoints could be wrong.
+ */
+static int64_t
+edge_subcell(int order, int64_t pix)
+{
+	int k = SC_MAX_ORDER - order, side = (int) (4 * urand());
+	int64_t m = ((int64_t) 1 << k) - 1, a = (int64_t) (urand() * (double) (m + 1)), x, y, t = 0;
+
+	x = (side == 0) ? 0 : (side == 1) ? m : a;
+	y = (side == 2) ? 0 : (side == 3) ? m : a;
+	for (int b = 0; b < k; b++)
+		t |= ((x >> b) & 1) << (2 * b) | ((y >> b) & 1) << (2 * b + 1);
+	return (pix << (2 * k)) + t;
+}
+
+/* leaves kept for sampling points round them */
+#define MAXLEAF 64
+static sc_vec3 leaf_c[MAXLEAF];
+static double leaf_r[MAXLEAF];
+static int nleaf;
+
+/* a cone, a convex polygon or a non-convex one, round (cra, cde), size in rad */
+static int
+make_leaf(sc_region *r, double cra, double cde, double size)
+{
+	int kind = (int) (3 * urand());
+
+	if (nleaf < MAXLEAF)
+	{
+		leaf_c[nleaf] = sc_radec2vec(cra, cde);
+		leaf_r[nleaf] = size * 1.5;
+		nleaf++;
+	}
+	if (kind == 0)
+		return sc_region_cone(r, cra, cde, size * 180 / M_PI, true) == NULL;
+	{
+		xy P[40];
+		double pra[40], pde[40];
+		frame3 f = frame_at(cra, cde);
+		double rot = 2 * M_PI * urand();
+		int n;
+
+		if (kind == 1)
+		{
+			n = 3 + (int) (4 * urand());
+			for (int i = 0; i < n; i++)
+			{
+				double a = 2 * M_PI * (i + 0.3 * urand()) / n;
+				P[i] = (xy) {cos(a), sin(a)};
+			}
+		}
+		else
+			n = make_shape((int) (4 * urand()), P);
+		for (int i = 0; i < n; i++)
+		{
+			xy t = {size * (P[i].x * cos(rot) - P[i].y * sin(rot)), size * (P[i].x * sin(rot) + P[i].y * cos(rot))};
+			vec_radec(from_plane(&f, t), &pra[i], &pde[i]);
+		}
+		if (sc_region_poly(r, n, pra, pde, true) != NULL)
+		{
+			sc_region_free(r);
+			return sc_region_cone(r, cra, cde, size * 180 / M_PI, true) == NULL;
+		}
+		return 1;
+	}
+}
+
+/* a random composite of depth <= depth round (cra, cde) */
+static int
+make_composite(sc_region *r, double cra, double cde, double size, int depth)
+{
+	sc_region kids[3];
+	int op, n;
+
+	if (depth == 0)
+		return make_leaf(r, cra, cde, size);
+	op = SC_REGION_UNION + (int) (4 * urand());
+	n = (op == SC_REGION_NOT) ? 1 : (op == SC_REGION_DIFFERENCE) ? 2 : 2 + (int) (2 * urand());
+	for (int i = 0; i < n; i++)
+	{
+		/* kids overlapping, and a hair apart now and then */
+		double off = size * (i == 0 ? 0 : 0.3 + 0.9 * urand()), az = 2 * M_PI * urand();
+		double ka, kd;
+		vec_radec(point_at(sc_radec2vec(cra, cde), off, az), &ka, &kd);
+		if (!make_composite(&kids[i], ka, kd, size * (0.4 + 0.8 * urand()),
+							urand() < 0.5 ? depth - 1 : 0))
+		{
+			for (int j = 0; j <= i; j++) sc_region_free(&kids[j]);
+			return 0;
+		}
+	}
+	if (sc_region_combine(r, op, kids, n) != NULL)
+	{
+		sc_region_free(r);
+		return 0;
+	}
+	return 1;
+}
+
 int
 main(void)
 {
@@ -707,6 +837,123 @@ main(void)
 		printf("disc sampling (seed=%d): %d cones x 200 pts, %d misses; avg %.1f ranges, %.0f steps, %.2f us/cover\n",
 			   use_seed, ncones, bad, ranges / ncones, steps / ncones, us / ncones);
 		failures += bad;
+	}
+
+	/*
+	 * Composites: every point inside one has its cell in the covering, for the
+	 * catalogue and for points drawn round its leaves -- half of them a hair
+	 * either side of a leaf's edge, where a NOT or a DIFFERENCE turns the
+	 * leaf's inside into the composite's outside.  And the cell classes are
+	 * honest: a cell called OUT holds no point of the region, and one the cap
+	 * test calls IN holds no point outside it, for sampled points of random
+	 * cells round the composite.
+	 */
+	{
+		int ncomp = 1500, built = 0, bad_cov = 0, bad_out = 0, bad_in = 0;
+		long pts = 0, cells = 0;
+		double tot_ranges = 0, tot_true = 0, tot_cov = 0;
+		sc_cover_params p;
+		const char *opname[] = {"", "", "", "UNION", "INTERSECTION", "DIFFERENCE", "NOT"};
+
+		sc_cover_params_default(&p);
+		rs = 4242;
+		for (int q = 0; q < ncomp; q++)
+		{
+			double cra, cde, size = pow(10, -5 + 4.5 * urand());
+			sc_region r;
+			sc_cover c;
+			int ntrue = 0, ncov = 0;
+
+			switch (q % 5)
+			{
+				case 0: cra = 360 * urand(); cde = 90 - 20 * size * 180 / M_PI * urand(); break;	/* pole */
+				case 1: cra = 360 * urand(); cde = 41.8103148958; break;	/* zone boundary */
+				case 2: cra = 0; cde = 80 * (2 * urand() - 1); break;		/* RA wrap */
+				case 3: cra = 90.0 * (q % 4); cde = asin(2 * urand() - 1) * 180 / M_PI; break;	/* face edge */
+				default: cra = 360 * urand(); cde = asin(2 * urand() - 1) * 180 / M_PI; break;
+			}
+			if (cde > 90) cde = 90;
+			nleaf = 0;
+			if (!make_composite(&r, cra, cde, size, 1 + q % 3))
+				continue;
+			built++;
+			sc_cover_compute(&r, (q % 2) ? &dens_hist : &dens_uni, &p, &c);
+			tot_ranges += c.n;
+
+			/* the catalogue: only a NOT or a big region holds much of it */
+			if (q % 10 == 0)
+				for (int i = 0; i < NPTS; i++)
+				{
+					int inr = in_ranges(&c, cell[i]);
+					if (inr) ncov++;
+					if (sc_region_contains(&r, sc_radec2vec(ra[i], de[i])))
+					{
+						ntrue++;
+						if (!inr) { bad_cov++; if (bad_cov < 10) printf("COMPOSITE FALSE NEGATIVE %s q=%d (catalogue)\n", opname[r.kind], q); }
+					}
+				}
+			tot_true += ntrue; tot_cov += ncov;
+
+			/* round the leaves: inside, outside, and on the edge of each */
+			for (int l = 0; l < nleaf; l++)
+				for (int k = 0; k < 400; k++)
+				{
+					double rho = (k < 200 ? urand() : 1 / 1.5 * (1 + (urand() - 0.5) * 2e-6)) * leaf_r[l];
+					sc_vec3 pt = point_at(leaf_c[l], rho, 2 * M_PI * urand());
+					pts++;
+					if (sc_region_contains(&r, pt) && !in_ranges(&c, sc_vec2pix(SC_MAX_ORDER, pt)))
+					{
+						bad_cov++;
+						if (bad_cov < 10) printf("COMPOSITE FALSE NEGATIVE %s q=%d size=%g leaf %d\n", opname[r.kind], q, size, l);
+					}
+				}
+
+			/* the classes: random cells round a random leaf, 128 points in each */
+			for (int k = 0; k < 400 && nleaf > 0; k++)
+			{
+				int l = (int) (nleaf * urand()), order = 2 + (int) (17 * urand());
+				sc_vec3 at = point_at(leaf_c[l], leaf_r[l] * 1.2 * urand(), 2 * M_PI * urand());
+				int64_t pix = sc_vec2pix(order, at);
+				double fo;
+				sc_class ct = sc_region_classify(&r, order, pix, &fo);
+				sc_class cc = sc_region_classify_cap(&r, order, pix, &fo);
+				int shift = 2 * (SC_MAX_ORDER - order);
+
+				cells++;
+				if (ct != SC_OUT && cc != SC_IN && cc != SC_OUT)
+					continue;
+				for (int j = 0; j < 128; j++)
+				{
+					/* half inside the cell, half on its edges */
+					int64_t sub = (j % 2) ? edge_subcell(order, pix)
+						: (pix << shift) + (int64_t) (urand() * (double) ((int64_t) 1 << shift));
+					sc_vec3 v = sc_pix2vec(SC_MAX_ORDER, sub);
+					int in = sc_region_contains(&r, v);
+
+					if ((ct == SC_OUT || cc == SC_OUT) && in)
+					{
+						bad_out++;
+						if (bad_out < 10) printf("COMPOSITE OUT CELL HOLDS A POINT %s q=%d order %d (%s)\n",
+												 opname[r.kind], q, order, ct == SC_OUT ? "classify" : "cap");
+						break;
+					}
+					if (cc == SC_IN && !in)
+					{
+						bad_in++;
+						if (bad_in < 10) printf("COMPOSITE CAP IN CELL MISSES A POINT %s q=%d order %d\n", opname[r.kind], q, order);
+						break;
+					}
+				}
+			}
+			sc_cover_free(&c);
+			sc_region_free(&r);
+		}
+		printf("composites: %d built of %d, %.1f ranges; %ld points round the leaves, %d misses; "
+			   "%ld cells classified, %d OUT cells holding a point, %d cap-IN cells missing one; "
+			   "catalogue fp %.3f\n",
+			   built, ncomp, tot_ranges / (built ? built : 1), pts, bad_cov, cells, bad_out, bad_in,
+			   tot_cov > 0 ? 1 - tot_true / tot_cov : 0);
+		failures += bad_cov + bad_out + bad_in;
 	}
 
 	printf("%s (%d false negatives)\n", failures ? "FAILED" : "ALL OK", failures);
