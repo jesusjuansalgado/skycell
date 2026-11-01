@@ -177,6 +177,10 @@ make upgrade PGDATABASE=mydb     # just one
 psql -d mydb -c "ALTER EXTENSION skycell UPDATE"   # or do it by hand
 ```
 
+From 0.36 or 0.37 to 0.38, first drop any index built on the three removed
+operator classes ([Removed operator classes](#operators), under Operators). The
+upgrade names them if any are left.
+
 `make upgrade` reports what it finds and skips databases that are already
 current; connection settings come from the usual `PG*` variables. It is a
 separate step on purpose — `make install` may run with no server up, and
@@ -351,9 +355,9 @@ for ADQL compatibility and must be `'ICRS'`; convert other frames first with
 | `contains(p skypos, r skyregion)`<br>`contains(a skyregion, b skyregion)` | `integer` (1/0) | ADQL `CONTAINS`. Compared with 1 (`contains(…) = 1`, or `1 = …`) in a `WHERE` or `JOIN ON` it is planned as the `<@` operator below, so it is indexed |
 | `intersects(p skypos, r skyregion)`<br>`intersects(r skyregion, p skypos)`<br>`intersects(a skyregion, b skyregion)` | `integer` (1/0) | ADQL `INTERSECTS`, the point on either side (the second form since 0.38). Compared with 1 it is planned as `<@` or `@>` (point-region) or `&&` (region-region) below, so it is indexed |
 | `distance(a skypos, b skypos)`<br>`distance(ra1, dec1, ra2, dec2)` | `float8` | degrees. ADQL `DISTANCE`, both forms. `distance(…) < r` (or `<=`) in a `WHERE` or `JOIN ON` is planned as the cone, like `<@` below |
-| `area(r skyregion)` | `float8` | square degrees. ADQL `AREA`. Not computed for a composite region (it errors), except a `NOT` of a cone or polygon |
+| `area(r skyregion)` | `float8` | square degrees. ADQL `AREA`. A composite region's is integrated over cells, to about 10⁻³ of its area (since 0.38; exact for a `NOT` of a cone or polygon) |
 | `coord1(p)` / `coord2(p)` | `float8` | right ascension / declination, degrees |
-| `centroid(r skyregion)` | `skypos` | ADQL `CENTROID`: a cone's centre, a polygon's centre of mass, which may lie outside a non-convex one, as a U's does. Before 0.35 a polygon's was the mean of its vertices. Not computed for a composite region (it errors) |
+| `centroid(r skyregion)` | `skypos` | ADQL `CENTROID`: a cone's centre, a polygon's centre of mass, which may lie outside a non-convex one, as a U's does. Before 0.35 a polygon's was the mean of its vertices. A composite region's is integrated over cells, to about 10⁻³ of its size (since 0.38); an empty one has none, and says so |
 | `region(stcs text)` | `skyregion` | ADQL `REGION`: any region written in STC-S, e.g. `region('DIFFERENCE ICRS (CIRCLE 10 20 2 CIRCLE 10 20 1)')`. The same as casting the text to `skyregion` |
 | `skycell_union(VARIADIC skyregion[])`<br>`skycell_intersection(VARIADIC skyregion[])` | `skyregion` | two regions or more; STC-S `UNION` / `INTERSECTION` |
 | `skycell_difference(a, b)` | `skyregion` | `a` less `b`; STC-S `DIFFERENCE` |
@@ -401,8 +405,19 @@ PostGIS for an empty geometry, it meets nothing, holds nothing and is held by
 nothing; otherwise it would lie inside every region, which no index on the
 regions could find. A comparison takes 0.25 ms on average against random
 composites up to three deep, and up to about 10 ms where long boundaries
-nearly coincide. `AREA` and `CENTROID` are not computed for a composite and
-say so.
+nearly coincide.
+
+`AREA` and `CENTROID` of a composite integrate over cells. Cells inside it count
+whole (HEALPix cells have equal areas), cells outside it not at all, and cells
+on its boundary are refined to 3·10⁻³ of its size and then counted by their
+centre. A composite larger than a hemisphere is integrated through the rest of
+the sky. Against exact values (circles, annuli, inclusion–exclusion with
+polygons), the area is within 2·10⁻⁴ of the true one and the centroid within
+2·10⁻⁴ of the region's size, at about 3 ms per region. A `NOT` of a cone or
+polygon is exact.
+
+STC-S `BOX ICRS ra dec width height` is read as the four-corner polygon
+`box()` makes, alone or inside a composite, and prints as that `POLYGON`.
 
 ### Operators
 
@@ -472,20 +487,19 @@ CREATE INDEX ON t USING gin (skycell_region_moc(region));
 
 When both a GiST and this GIN index exist on the column, the GIN rewrite wins.
 
-**Deprecated operator classes.** Three operator classes were kept for
-comparison and are deprecated: they will be removed in the next version of the
-extension. None of them beats what replaces it.
+**Removed operator classes.** Three operator classes, kept for comparison and
+deprecated in 0.36, were removed in 0.38. None of them beat what replaces it.
 
-| operator class | indexes | use instead |
+| operator class | indexed | use instead |
 |---|---|---|
 | `skyregion_box_gist_ops` | a `skyregion` column, by a `float8` box | the default, `skyregion_box4_gist_ops` |
 | `skypos_spgist_ops` | a `skypos` column, SP-GiST over the HEALPix hierarchy | a B-tree on `skycell_cell(pos)` |
 | `skypos_cap_gist_ops` | a `skypos` column, GiST with a spherical-cap key | a B-tree on `skycell_cell(pos)` |
 
-`skypos_spgist_ops` is the default for `USING spgist` on a `skypos` column, so
-`CREATE INDEX ON t USING spgist (pos)` builds one. An index built on any of the
-three has to be dropped before `ALTER EXTENSION skycell UPDATE` to that
-version.
+An index built on one of them has to be dropped before `ALTER EXTENSION
+skycell UPDATE` to 0.38. The upgrade stops, naming each such index, while one
+exists. Once the 0.38 library is installed, a query that reaches such an index
+fails with the same advice until the index is dropped.
 
 ### The index key
 
@@ -797,7 +811,12 @@ Two layers, both in [`ext/test/`](ext/test/).
   regions means they overlap, a point of the first outside the second means
   it is not contained, and every non-empty region holds itself
   (`SC_SELFTEST_PAIRS=1 SC_SELFTEST_NPAIR=20000` runs only these, more of
-  them: 0 wrong in 20,000). Current run: **0 false negatives**.
+  them: 0 wrong in 20,000). Then AREA and CENTROID of 300 composites against
+  what shares none of their code: a circle's area and moment in closed form,
+  annuli, inclusion–exclusion (A + B = A ∪ B + A ∩ B) for circles and for a
+  polygon with its exact area, and a union against its complement; each within
+  the bounds the integration reports (`SC_SELFTEST_INT=1`, with
+  `SC_SELFTEST_NINT`, runs only these). Current run: **0 false negatives**.
 
 **SQL regression** — `make installcheck` in `ext/`, against a running server:
 
@@ -861,7 +880,7 @@ Two layers, both in [`ext/test/`](ext/test/).
   composite's membership against the boolean combination of its pieces,
   region-to-region answers that can be checked by hand (a circle in an
   annulus's hole, one across the gap between a union's pieces, nested NOTs),
-  and the refusals. A constant composite on the catalogue index (eight fixed
+  AREA and CENTROID against exact values, and STC-S `BOX`. A constant composite on the catalogue index (eight fixed
   shapes and 40 random ones) must give the exact test's and the sequential
   scan's rows; stored composites must give the sequential answer under each
   region index, for a point, a join, ADQL `CONTAINS` and a correlated
@@ -886,10 +905,10 @@ locally), the standalone selftests, and the reference translators.
 ## Limitations
 
 - **Geometry.** A polygon must be simple, with no crossing or touching edges,
-  and every vertex must lie within 90° of the vertices' mean. STC-S `BOX`
-  is not read (write a `POLYGON`, or call `box()`). A composite region
-  (`UNION`, `INTERSECTION`, `DIFFERENCE`, `NOT`) has no `AREA` or
-  `CENTROID` (they error). Comparing it with another region is decided to
+  and every vertex must lie within 90° of the vertices' mean. A `BOX` may
+  not reach a pole. A composite region (`UNION`, `INTERSECTION`,
+  `DIFFERENCE`, `NOT`) has its `AREA` and `CENTROID` integrated to about
+  10⁻³, not computed exactly. Comparing it with another region is decided to
   10⁻⁴ of its smallest piece where its operands do not decide it, and an empty
   composite is contained in nothing. Its
   covering is as tight as its pieces' cell classes allow, so a deep

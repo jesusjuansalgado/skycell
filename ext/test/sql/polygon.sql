@@ -204,9 +204,9 @@ ANALYZE preg;
 SELECT name, seq = idx AS agree, split_part(seq, ':', 1)::int > 0 AS nonempty
 FROM region_counts() ORDER BY name;
 DROP INDEX preg_r;
-CREATE INDEX preg_box ON preg USING gist (r skyregion_box_gist_ops);
+CREATE INDEX preg_caps ON preg USING gist (r skyregion_gist_ops);
 SELECT name, seq = idx AS agree FROM region_counts() ORDER BY name;
-DROP INDEX preg_box;
+DROP INDEX preg_caps;
 CREATE INDEX preg_box4 ON preg USING gist (r skyregion_box4_gist_ops);
 SELECT name, seq = idx AS agree FROM region_counts() ORDER BY name;
 

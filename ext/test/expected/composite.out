@@ -58,7 +58,7 @@ ERROR:  invalid input syntax for type skyregion: "UNION ICRS (CIRCLE 1 2 3) (CIR
 LINE 1: SELECT 'UNION ICRS (CIRCLE 1 2 3) (CIRCLE 1 2 3)'::skyregion...
                ^
 DETAIL:  Write all the regions of a UNION, INTERSECTION or DIFFERENCE inside one pair of parentheses: "UNION ICRS (CIRCLE ... POLYGON ...)".
-HINT:  Write STC-S: "CIRCLE ICRS ra dec radius", "POLYGON ICRS ra1 dec1 ra2 dec2 ..." (degrees), or "UNION ICRS (...)", "INTERSECTION ICRS (...)", "DIFFERENCE ICRS (a b)", "NOT ICRS (a)".
+HINT:  Write STC-S: "CIRCLE ICRS ra dec radius", "BOX ICRS ra dec width height", "POLYGON ICRS ra1 dec1 ra2 dec2 ..." (degrees), or "UNION ICRS (...)", "INTERSECTION ICRS (...)", "DIFFERENCE ICRS (a b)", "NOT ICRS (a)".
 SELECT 'UNION ICRS (CIRCLE 1 2 3)'::skyregion;                 -- error: one region
 ERROR:  UNION needs two regions or more
 LINE 1: SELECT 'UNION ICRS (CIRCLE 1 2 3)'::skyregion;
@@ -81,19 +81,37 @@ ERROR:  invalid input syntax for type skyregion: "UNION ICRS (CIRCLE 1 2 3 CIRCL
 LINE 1: SELECT 'UNION ICRS (CIRCLE 1 2 3 CIRCLE 1 2 3'::skyregion;
                ^
 DETAIL:  Unbalanced parentheses.
-HINT:  Write STC-S: "CIRCLE ICRS ra dec radius", "POLYGON ICRS ra1 dec1 ra2 dec2 ..." (degrees), or "UNION ICRS (...)", "INTERSECTION ICRS (...)", "DIFFERENCE ICRS (a b)", "NOT ICRS (a)".
+HINT:  Write STC-S: "CIRCLE ICRS ra dec radius", "BOX ICRS ra dec width height", "POLYGON ICRS ra1 dec1 ra2 dec2 ..." (degrees), or "UNION ICRS (...)", "INTERSECTION ICRS (...)", "DIFFERENCE ICRS (a b)", "NOT ICRS (a)".
 SELECT 'UNION ICRS (CIRCLE 1 2 3 CIRCLE 1 2 3) x'::skyregion;  -- error: trailing text
 ERROR:  invalid input syntax for type skyregion: "UNION ICRS (CIRCLE 1 2 3 CIRCLE 1 2 3) x"
 LINE 1: SELECT 'UNION ICRS (CIRCLE 1 2 3 CIRCLE 1 2 3) x'::skyregion...
                ^
 DETAIL:  Unexpected text after the region.
-HINT:  Write STC-S: "CIRCLE ICRS ra dec radius", "POLYGON ICRS ra1 dec1 ra2 dec2 ..." (degrees), or "UNION ICRS (...)", "INTERSECTION ICRS (...)", "DIFFERENCE ICRS (a b)", "NOT ICRS (a)".
+HINT:  Write STC-S: "CIRCLE ICRS ra dec radius", "BOX ICRS ra dec width height", "POLYGON ICRS ra1 dec1 ra2 dec2 ..." (degrees), or "UNION ICRS (...)", "INTERSECTION ICRS (...)", "DIFFERENCE ICRS (a b)", "NOT ICRS (a)".
 SELECT 'UNION ICRS CIRCLE 1 2 3'::skyregion;                   -- error: no parentheses
 ERROR:  invalid input syntax for type skyregion: "UNION ICRS CIRCLE 1 2 3"
 LINE 1: SELECT 'UNION ICRS CIRCLE 1 2 3'::skyregion;
                ^
 DETAIL:  A UNION, INTERSECTION, DIFFERENCE or NOT takes its regions in parentheses.
-HINT:  Write STC-S: "CIRCLE ICRS ra dec radius", "POLYGON ICRS ra1 dec1 ra2 dec2 ..." (degrees), or "UNION ICRS (...)", "INTERSECTION ICRS (...)", "DIFFERENCE ICRS (a b)", "NOT ICRS (a)".
+HINT:  Write STC-S: "CIRCLE ICRS ra dec radius", "BOX ICRS ra dec width height", "POLYGON ICRS ra1 dec1 ra2 dec2 ..." (degrees), or "UNION ICRS (...)", "INTERSECTION ICRS (...)", "DIFFERENCE ICRS (a b)", "NOT ICRS (a)".
+-- STC-S Box: read as the polygon box() makes
+SELECT 'BOX ICRS 10 20 2 1'::skyregion::text = box('ICRS', 10, 20, 2, 1)::text AS box_is_box,
+       contains(point('ICRS', 10.9, 20.4), 'BOX ICRS 10 20 2 1'::skyregion) AS inside,
+       contains(point('ICRS', 10, 20.6), 'BOX ICRS 10 20 2 1'::skyregion) AS above,
+       region('DIFFERENCE ICRS (BOX 10 20 2 2 CIRCLE 10 20 0.5)')::text LIKE 'DIFFERENCE ICRS (POLYGON %' AS in_a_composite;
+ box_is_box | inside | above | in_a_composite 
+------------+--------+-------+----------------
+ t          |      1 |     0 | t
+(1 row)
+
+SELECT 'BOX ICRS 10 20 2'::skyregion;                          -- error: four numbers
+ERROR:  BOX takes ra, dec, width and height
+LINE 1: SELECT 'BOX ICRS 10 20 2'::skyregion;
+               ^
+SELECT 'BOX ICRS 10 89.5 2 2'::skyregion;                      -- error: reaches the pole
+ERROR:  BOX reaches a pole; use a POLYGON or a CIRCLE instead
+LINE 1: SELECT 'BOX ICRS 10 89.5 2 2'::skyregion;
+               ^
 SELECT (repeat('NOT ICRS (', 33) || 'CIRCLE 1 2 3' || repeat(')', 33))::skyregion;  -- error: depth
 ERROR:  regions nested more than 32 deep
 SELECT length((repeat('NOT ICRS (', 32) || 'CIRCLE 1 2 3' || repeat(')', 32))::skyregion::text) > 0 AS depth_32_ok;
@@ -188,21 +206,43 @@ FROM (SELECT skycell_intersection(circle('ICRS', 90, 0, 1), circle('ICRS', 90.8,
  t       | f               | f              | t             | t          | f               | t            | t         | t
 (1 row)
 
--- what is not computed for a composite says so
-SELECT area(skycell_union(circle('ICRS', 1, 2, 3), circle('ICRS', 4, 5, 6)));
-ERROR:  AREA is not computed for a UNION, INTERSECTION, DIFFERENCE or NOT
-HINT:  A position in one is: CONTAINS(POINT(...), region) = 1.
-SELECT centroid(skycell_not(circle('ICRS', 1, 2, 3)));
-ERROR:  CENTROID is not computed for a UNION, INTERSECTION, DIFFERENCE or NOT
-HINT:  A position in one is: CONTAINS(POINT(...), region) = 1.
--- except the area of a complement, which is exact
-SELECT round(area(skycell_not(circle('ICRS', 1, 2, 3)))::numeric, 6)
-     = round((41252.961249419271 - area(circle('ICRS', 1, 2, 3)))::numeric, 6) AS not_area;
- not_area 
-----------
- t
+-- AREA and CENTROID: integrated over cells, against what is known exactly.
+-- An annulus is its circles' difference; a union and an intersection add up
+-- to their pieces; a lens of equal circles is centred on the great-circle
+-- midpoint of their centres; a NOT is exact, and points the other way
+SELECT abs(area(r) - (area(circle('ICRS', 10, 20, 1)) - area(circle('ICRS', 10, 20, 0.5)))) / area(r) < 1e-3 AS annulus_area,
+       distance(centroid(r), point('ICRS', 10, 20)) < 1e-3 AS annulus_centre
+FROM (SELECT region('DIFFERENCE ICRS (CIRCLE 10 20 1 CIRCLE 10 20 0.5)') AS r) t;
+ annulus_area | annulus_centre 
+--------------+----------------
+ t            | t
 (1 row)
 
+SELECT abs(area(skycell_union(a, b)) + area(skycell_intersection(a, b)) - area(a) - area(b))
+         / (area(a) + area(b)) < 1e-3 AS inclusion_exclusion,
+       abs(area(skycell_union(p, a)) + area(skycell_intersection(p, a)) - area(p) - area(a))
+         / (area(p) + area(a)) < 1e-3 AS with_a_polygon,
+       distance(centroid(skycell_intersection(a, b)), point('ICRS', 10.5, 20.00068)) < 1e-3 AS lens_centre,
+       distance(centroid(region('DIFFERENCE ICRS (CIRCLE 10 20 1 CIRCLE 10.3 20 0.5)')), point('ICRS', 10, 20)) > 0.05 AS hole_pulls_away,
+       round(area(skycell_not(a))::numeric, 6) = round((41252.961249419271 - area(a))::numeric, 6) AS not_area,
+       distance(centroid(skycell_not(a)), point('ICRS', 190, -20)) < 1e-9 AS not_centre,
+       abs(area(skycell_not(skycell_union(a, b))) - (41252.961249419271 - area(skycell_union(a, b)))) < 1e-2 AS not_union
+FROM (SELECT circle('ICRS', 10, 20, 1) AS a, circle('ICRS', 11, 20, 1) AS b,
+             polygon('ICRS', 10,19, 12,19, 12,21, 10,21) AS p) t;
+ inclusion_exclusion | with_a_polygon | lens_centre | hole_pulls_away | not_area | not_centre | not_union 
+---------------------+----------------+-------------+-----------------+----------+------------+-----------
+ t                   | t              | t           | t               | t        | t          | t
+(1 row)
+
+-- an empty composite has area 0 and no centroid
+SELECT area(skycell_intersection(circle('ICRS', 0, 0, 1), circle('ICRS', 90, 0, 1))) AS empty_area;
+ empty_area 
+------------
+          0
+(1 row)
+
+SELECT centroid(skycell_intersection(circle('ICRS', 0, 0, 1), circle('ICRS', 90, 0, 1)));  -- error
+ERROR:  an empty region has no centroid
 -- a constant composite on the catalogue index -------------------------
 CREATE TABLE ccat AS
 SELECT i AS id, ra, dec, skycell_point(ra, dec) AS pos FROM (

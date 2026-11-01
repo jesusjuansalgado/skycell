@@ -8,7 +8,7 @@
  * "Round fifty-seven"), applied to this extension's own box opclass.
  *
  * WHY THIS EXISTS: the question raised after round fifty-seven was whether
- * pgSphere's win over skyregion_box_gist_ops is mostly explained by its
+ * pgSphere's win over skyregion_box_gist_ops (removed in 0.38) is mostly explained by its
  * smaller, denser key (half the bytes, no varlena header, higher fanout per
  * page) rather than anything about *what* the key represents -- both
  * opclasses already store the same kind of thing, an axis-aligned box, so
