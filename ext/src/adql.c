@@ -958,6 +958,24 @@ skycell_pos_in_region_sel(PG_FUNCTION_ARGS)
 	PG_RETURN_BOOL(pos_in_region(fcinfo, PG_GETARG_SKYPOS(0), PG_GETARG_DATUM(1)));
 }
 
+/*
+ * skycell_region_scan(cell, ra, dec, region): a position in a constant
+ * composite, as the custom scan answers it (the cell is its index key).  On
+ * its own it is the exact test, read straight from ra and dec.
+ */
+PG_FUNCTION_INFO_V1(skycell_region_scan);
+Datum
+skycell_region_scan(PG_FUNCTION_ARGS)
+{
+	double		ra = PG_GETARG_FLOAT8(1),
+				dec = PG_GETARG_FLOAT8(2);
+	sc_region  *reg = cached_region_arg(fcinfo, 0, PG_GETARG_DATUM(3));
+
+	if (!isfinite(ra) || !(dec >= -90.0 && dec <= 90.0))
+		PG_RETURN_BOOL(false);
+	PG_RETURN_BOOL(sc_region_contains(reg, sc_radec2vec(ra, dec)) != 0);
+}
+
 PG_FUNCTION_INFO_V1(skycell_contains);
 Datum
 skycell_contains(PG_FUNCTION_ARGS)
@@ -1804,6 +1822,39 @@ region_simplify_oriented(SupportRequestSimplify *req, Oid funcid, Node *pt, Node
 
 		if (((Const *) rg)->constisnull)
 			return makeBoolConst(false, true);
+
+		/*
+		 * A composite as a top-level term goes to the custom scan, as a
+		 * circle does: one scan over its covering's ranges in cell order,
+		 * with no covering computed here and no OR of ranges to plan.  An
+		 * extension older than 0.39 has no skycell_region_scan and keeps
+		 * the rewrite below.
+		 */
+		{
+			SkyRegion  *sr = DatumGetSkyRegion(((Const *) rg)->constvalue);
+			Node	   *ra,
+					   *dec;
+
+			if (SKY_IS_COMPOSITE(sr->kind) && !IsA(pt, Const) &&
+				pos_ra_dec(funcid, pt, &ra, &dec))
+			{
+				Oid			t[4] = {INT8OID, FLOAT8OID, FLOAT8OID, exprType(rg)};
+				char	   *nsp = get_namespace_name(get_func_namespace(funcid));
+				Oid			fn = LookupFuncName(list_make2(makeString(nsp),
+														   makeString(pstrdup("skycell_region_scan"))),
+												4, t, true);
+
+				if (OidIsValid(fn))
+				{
+					FuncExpr   *scan = makeFuncExpr(fn, BOOLOID,
+													list_make4(copyObject(cell), ra, dec, copyObject(rg)),
+													InvalidOid, InvalidOid, COERCE_EXPLICIT_CALL);
+
+					if (region_scan_keep(req->root, req->fcall, scan))
+						return (Node *) scan;
+				}
+			}
+		}
 
 		skycell_region_from_datum(((Const *) rg)->constvalue, &reg);
 		current_params(&p, 64, &dens);

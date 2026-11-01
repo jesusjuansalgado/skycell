@@ -29,7 +29,7 @@ each directory's README names the script that did it.
 | TAP service | `tap-ab/` | 0.6 |
 | nearest neighbours, README only (not in the paper) | `results-nearest/` | main after #52 |
 | non-convex polygons, README only (not in the paper) | `results-nonconvex/` (`../27_nonconvex.sql`) | main after #52 |
-| composite regions against boolean predicates, README only | `results-composite/` (`../34_composite.sql`) | main after #54, with the ADQL OR fix and composite coverings from their operands |
+| composite regions against boolean predicates, README only | `results-composite/` (`../34_composite.sql`) | 0.39: composites through the custom scan (the 0.38 run is in the history) |
 
 skycell 0.37 differs from 0.36 only in planning, and returns the same
 coverings, so only the cone searches were re-measured with it

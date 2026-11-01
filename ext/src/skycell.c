@@ -2039,6 +2039,123 @@ cone_selectivity(PlannerInfo *root, List *args)
 	return pow(sin(fmin(fmax(r, 0), M_PI) / 2.0), 2);	/* cap area / 4pi */
 }
 
+/*
+ * A constant composite region answered by the custom scan
+ * (skycell_region_scan(cell, ra, dec, region), cone_scan.c): its covering,
+ * computed once per planning however many times selectivity and path ask.
+ * Composites are not keyed by a centre and radius as cones are, so they get
+ * a small cache of their own, matched on the region's bytes.
+ */
+#define REGION_COVER_CACHE 16
+
+typedef struct
+{
+	Oid			statrel;
+	sc_cover_params params;
+	Size		len;
+	char	   *bytes;
+	sc_cover	cov;
+} region_cover_entry;
+
+static MemoryContext region_cover_cxt = NULL;
+static region_cover_entry region_cover_cache[REGION_COVER_CACHE];
+static int	region_cover_n = 0;
+
+static bool
+params_equal(const sc_cover_params *a, const sc_cover_params *b)
+{
+	return a->max_order == b->max_order && a->max_ranges == b->max_ranges &&
+		a->range_cost == b->range_cost && a->split_cost == b->split_cost &&
+		a->max_steps == b->max_steps && a->probe_split_cost == b->probe_split_cost &&
+		a->max_area_ratio == b->max_area_ratio && a->use_seed == b->use_seed &&
+		a->direct == b->direct && a->force_order == b->force_order;
+}
+
+bool
+skycell_const_region_cover(PlannerInfo *root, List *args, sc_region *reg,
+						   sc_cover *cov, sc_density *dens)
+{
+	Const	   *rc;
+	bytea	   *b;
+	Size		len;
+	Oid			statrel;
+	bool		uses_cell_ops;
+	sc_cover_params p;
+	region_cover_entry *e;
+
+	if (list_length(args) != 4 || !IsA(llast(args), Const) || ((Const *) llast(args))->constisnull)
+		return false;
+	rc = (Const *) llast(args);
+	b = DatumGetByteaPP(rc->constvalue);
+	len = VARSIZE_ANY(b);
+
+	density_for_var(root, linitial(args), dens, &statrel, &uses_cell_ops);
+	skycell_region_from_datum(rc->constvalue, reg);
+	current_params_scan(&p, skycell_max_ranges, dens);
+
+	for (int i = 0; i < region_cover_n; i++)
+	{
+		e = &region_cover_cache[i];
+		if (e->statrel == statrel && e->len == len && params_equal(&e->params, &p) &&
+			memcmp(e->bytes, b, len) == 0)
+		{
+			*cov = e->cov;		/* the ranges stay owned by the cache */
+			return true;
+		}
+	}
+	if (region_cover_cxt == NULL)
+		region_cover_cxt = AllocSetContextCreate(TopMemoryContext, "skycell region coverings",
+												 ALLOCSET_DEFAULT_SIZES);
+	if (region_cover_n == REGION_COVER_CACHE)
+	{
+		MemoryContextReset(region_cover_cxt);	/* start over */
+		region_cover_n = 0;
+	}
+	{
+		MemoryContext old = MemoryContextSwitchTo(region_cover_cxt);
+
+		e = &region_cover_cache[region_cover_n++];
+		e->statrel = statrel;
+		e->params = p;
+		e->len = len;
+		e->bytes = palloc(len);
+		memcpy(e->bytes, b, len);
+		sc_cover_compute(reg, dens, &p, &e->cov);
+		MemoryContextSwitchTo(old);
+	}
+	*cov = e->cov;
+	return true;
+}
+
+/* selectivity of skycell_region_scan(): as a cone's, from its covering */
+PG_FUNCTION_INFO_V1(skycell_region_scan_support);
+Datum
+skycell_region_scan_support(PG_FUNCTION_ARGS)
+{
+	Node	   *rawreq = (Node *) PG_GETARG_POINTER(0);
+
+	if (IsA(rawreq, SupportRequestSelectivity))
+	{
+		SupportRequestSelectivity *req = (SupportRequestSelectivity *) rawreq;
+		sc_region	reg;
+		sc_cover	cov;
+		sc_density	dens;
+
+		if (!req->is_join && req->root != NULL &&
+			skycell_const_region_cover(req->root, req->args, &reg, &cov, &dens) &&
+			dens.ntotal > 0)
+		{
+			/* an empty covering (an empty composite) holds no row */
+			req->selectivity = cov.area <= 0 ? 1e-12
+				: fmin(1.0, fmax(cov.exp_rows * fmin(1.0, reg.area / cov.area)
+								 / dens.ntotal, 1e-12));
+			sc_region_free(&reg);
+			PG_RETURN_POINTER(req);
+		}
+	}
+	PG_RETURN_POINTER(NULL);
+}
+
 PG_FUNCTION_INFO_V1(skycell_support);
 Datum
 skycell_support(PG_FUNCTION_ARGS)

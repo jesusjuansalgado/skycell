@@ -90,6 +90,9 @@ typedef struct
 
 extern sc_vec3 skycell_pos_from_datum_cached(Datum d, skycell_pos_cache *c);
 extern void skycell_region_from_datum(Datum d, sc_region *r);
+extern bool skycell_const_region_cover(PlannerInfo *root, List *args, sc_region *reg,
+									   sc_cover *cov, sc_density *dens);
+extern bool region_scan_keep(PlannerInfo *root, FuncExpr *written, FuncExpr *fcall);
 extern void skycell_region_from_datum_lite(Datum d, sc_region *r);
 
 #endif

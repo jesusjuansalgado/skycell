@@ -711,7 +711,7 @@ by up to 7.1× and Q3C's by up to 2.6×. At Gaia
 DR3 scale that is one 38 GiB index where an archive running pgSphere for cones
 and Q3C for cross-matching keeps 160 GiB.
 
-**Composite regions** (0.38, [`bench/results-composite/`](bench/results-composite/)).
+**Composite regions** (0.39, [`bench/results-composite/`](bench/results-composite/)).
 Five shapes on 60 centres on the 10M real Gaia DR3 positions, 0.05°–2° across.
 Each is written three ways: one `REGION`, the same pieces as a boolean of ADQL
 `CONTAINS` predicates in skycell, and pgSphere's boolean of `<@`. pgSphere has
@@ -722,20 +722,30 @@ same rows. Median ms per query, and the `REGION`'s summed time over the others':
 
 | shape | `REGION` | skycell boolean | pgSphere boolean | `REGION` ÷ skycell boolean | `REGION` ÷ pgSphere |
 |---|---|---|---|---|---|
-| annulus (circle less circle) | 0.21 | 0.14 | 0.10 | 1.26 | 1.33 |
-| two circles, union | 0.15 | 0.37 | 0.11 | 0.34 | 1.39 |
-| lens (intersection of two circles) | 0.12 | 0.11 | 0.09 | 1.09 | 0.76 |
-| square less a circle | 0.18 | 0.21 | 0.36 | 0.88 | 0.21 |
-| five circles, union | 0.16 | 0.75 | 0.21 | 0.19 | 0.84 |
+| annulus (circle less circle) | 0.11 | 0.13 | 0.11 | 0.84 | 0.89 |
+| two circles, union | 0.10 | 0.42 | 0.11 | 0.23 | 0.92 |
+| lens (intersection of two circles) | 0.07 | 0.10 | 0.10 | 0.71 | 0.45 |
+| square less a circle | 0.13 | 0.21 | 0.36 | 0.61 | 0.14 |
+| five circles, union | 0.10 | 0.67 | 0.20 | 0.17 | 0.62 |
 
 A composite is covered from its operands' own coverings: the union of theirs
 for a `UNION`, their intersection for an `INTERSECTION`, the first operand's
 for a `DIFFERENCE` that takes away at most half of it. A circle operand then
 takes the cone's direct path. A `NOT`, and a difference with a large hole, are
 covered by classifying cells against the whole composite, which keeps a thin
-ring from reading its hole. A union of circles still costs up to 1.4×
-pgSphere's boolean, most of it in planning, where pgSphere does little work per
-circle.
+ring from reading its hole.
+
+Since 0.39 a constant composite written as a top-level condition is answered
+by the custom scan, as a circle is: the planner keeps one call,
+`skycell_region_scan(cell, ra, dec, region)`, covers the composite once (cached
+for its estimate and its path), and the scan reads the ranges in cell order,
+testing each row from its `ra` and `dec`.
+In 0.38 the covering became an `OR` of range conditions that the planner costed
+one bitmap index scan at a time, and each row built a `point` for its test.
+That took the annulus from 1.33 to 0.89 of pgSphere's time and the union of two
+circles from 1.39 to 0.92; every shape is now faster than both boolean
+spellings. Under an `OR`, or with `skycell.custom_scan` off, a composite keeps
+the range rewrite.
 
 Before 0.38, an ADQL `OR` of `CONTAINS` predicates was a sequential scan in
 skycell: 2.4 s for two circles and 4.9 s for five on these 10M rows. It is now
@@ -882,7 +892,9 @@ Two layers, both in [`ext/test/`](ext/test/).
   annulus's hole, one across the gap between a union's pieces, nested NOTs),
   AREA and CENTROID against exact values, and STC-S `BOX`. A constant composite on the catalogue index (eight fixed
   shapes and 40 random ones) must give the exact test's and the sequential
-  scan's rows; stored composites must give the sequential answer under each
+  scan's rows, and take the custom scan as a top-level condition (from a
+  `skypos` column or from `ra`/`dec`, alone or with another condition) and the
+  range rewrite under an `OR` or with the custom scan off; stored composites must give the sequential answer under each
   region index, for a point, a join, ADQL `CONTAINS` and a correlated
   sub-select, and for overlap and containment against cones, polygons and
   composites (`&&`, `@>`, `<@`, ADQL `INTERSECTS` and `CONTAINS`). Every pair
