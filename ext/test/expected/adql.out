@@ -341,3 +341,46 @@ FROM corr_probe pr, LATERAL (SELECT fid FROM corr_reg WHERE r @> pr.p) l;
 
 DROP FUNCTION corr_counts();
 DROP TABLE corr_cat, corr_reg, corr_probe;
+-- CONTAINS(...) = 1 under OR, AND and NOT ----------------------------
+-- the union of two cones written as ADQL writes it is indexed like
+-- pos <@ a OR pos <@ b (a BitmapOr over cell ranges); it used to be a
+-- sequential scan, since only a top-level comparison became the operator
+CREATE FUNCTION bool_counts(OUT name text, OUT idx text, OUT seq text, OUT indexed bool) RETURNS SETOF record
+LANGUAGE plpgsql AS $$
+DECLARE q text;
+BEGIN
+  FOR name, q IN VALUES
+    ('or',          'SELECT count(*) || '':'' || coalesce(sum(id), 0) FROM acat WHERE CONTAINS(POINT(''ICRS'', ra, dec), CIRCLE(''ICRS'', 10, 20, 2)) = 1 OR 1 = CONTAINS(POINT(''ICRS'', ra, dec), CIRCLE(''ICRS'', 14, 20, 2))'),
+    ('or of five',  'SELECT count(*) || '':'' || coalesce(sum(id), 0) FROM acat WHERE CONTAINS(pos, CIRCLE(''ICRS'', 10, 20, 1)) = 1 OR CONTAINS(pos, CIRCLE(''ICRS'', 12, 20, 1)) = 1 OR CONTAINS(pos, CIRCLE(''ICRS'', 8, 20, 1)) = 1 OR CONTAINS(pos, CIRCLE(''ICRS'', 10, 22, 1)) = 1 OR CONTAINS(pos, POLYGON(''ICRS'', 9,17, 11,17, 10,18.5)) = 1'),
+    ('or in and',   'SELECT count(*) || '':'' || coalesce(sum(id), 0) FROM acat WHERE id > 100 AND (CONTAINS(pos, CIRCLE(''ICRS'', 10, 20, 2)) = 1 OR CONTAINS(pos, CIRCLE(''ICRS'', 200, -30, 2)) = 1)'),
+    ('and in or',   'SELECT count(*) || '':'' || coalesce(sum(id), 0) FROM acat WHERE (CONTAINS(pos, CIRCLE(''ICRS'', 10, 20, 2)) = 1 AND CONTAINS(pos, CIRCLE(''ICRS'', 10, 20, 1)) = 0) OR CONTAINS(pos, CIRCLE(''ICRS'', 200, -30, 2)) = 1'),
+    ('intersects',  'SELECT count(*) || '':'' || coalesce(sum(id), 0) FROM acat WHERE INTERSECTS(pos, CIRCLE(''ICRS'', 10, 20, 2)) = 1 OR INTERSECTS(pos, CIRCLE(''ICRS'', 50, 60, 2)) = 1'),
+    ('not',         'SELECT count(*) || '':'' || coalesce(sum(id), 0) FROM acat WHERE NOT (CONTAINS(pos, CIRCLE(''ICRS'', 10, 20, 90)) = 1 OR id < 10)')
+  LOOP
+    SET LOCAL enable_seqscan = off;
+    SET LOCAL enable_indexscan = on;
+    SET LOCAL enable_bitmapscan = on;
+    EXECUTE q INTO idx;
+    indexed := adql_plan_uses_index(q);
+    SET LOCAL enable_seqscan = on;
+    SET LOCAL enable_indexscan = off;
+    SET LOCAL enable_bitmapscan = off;
+    SET LOCAL skycell.custom_scan = off;
+    EXECUTE q INTO seq;
+    RESET skycell.custom_scan;
+    RETURN NEXT;
+  END LOOP;
+END $$;
+SELECT name, idx = seq AS agree, split_part(seq, ':', 1)::int > 0 AS nonempty, indexed
+FROM bool_counts() ORDER BY name;
+    name    | agree | nonempty | indexed 
+------------+-------+----------+---------
+ and in or  | t     | t        | t
+ intersects | t     | t        | t
+ not        | t     | t        | f
+ or         | t     | t        | t
+ or in and  | t     | t        | t
+ or of five | t     | t        | t
+(6 rows)
+
+DROP FUNCTION bool_counts();

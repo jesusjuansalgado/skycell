@@ -2393,6 +2393,48 @@ adql_predicate_operator(Node *qual)
 	return (Node *) res;
 }
 
+/*
+ * adql_predicate_operator() inside AND / OR / NOT: a query that writes the
+ * union of two cones as CONTAINS(...) = 1 OR CONTAINS(...) = 1 gets the
+ * operators, which the support function rewrites into cell ranges under the
+ * OR (a BitmapOr), as it does for <@ OR <@.  *changed is set when any term
+ * was replaced; n itself is returned otherwise.
+ */
+static Node *
+adql_predicates_in_bool(Node *n, bool *changed)
+{
+	Node	   *opx;
+
+	check_stack_depth();
+	if ((opx = adql_predicate_operator(n)) != NULL)
+	{
+		*changed = true;
+		return opx;
+	}
+	if (IsA(n, BoolExpr))
+	{
+		BoolExpr   *b = (BoolExpr *) n;
+		List	   *args = NIL;
+		bool		any = false;
+		ListCell   *lc;
+
+		foreach(lc, b->args)
+			args = lappend(args, adql_predicates_in_bool(lfirst(lc), &any));
+		if (any)
+		{
+			BoolExpr   *nb = makeNode(BoolExpr);
+
+			nb->boolop = b->boolop;
+			nb->args = args;
+			nb->location = b->location;
+			*changed = true;
+			return (Node *) nb;
+		}
+		list_free(args);
+	}
+	return n;
+}
+
 /* a position the cone machinery reads: a column, a constant or point(...) */
 static bool
 plain_pos(Oid funcid, Node *p)
@@ -2683,6 +2725,14 @@ add_distance_cones(PlannerInfo *root, Node **quals)
 		Node	   *opx = adql_predicate_operator(list_nth(conj, i));
 		Node	   *cone;
 
+		bool		nested = false;
+
+		if (opx == NULL && IsA(list_nth(conj, i), BoolExpr))
+		{
+			opx = adql_predicates_in_bool(list_nth(conj, i), &nested);
+			if (!nested)
+				opx = NULL;
+		}
 		if (opx != NULL)
 		{
 			lfirst(list_nth_cell(conj, i)) = opx;
