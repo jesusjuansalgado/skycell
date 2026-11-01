@@ -122,6 +122,22 @@ ensure_cone_bounds(const sc_region *r_in, int order)
 	r->filled |= (uint32_t) 1 << order;
 }
 
+/*
+ * sin(rho + eps) for a polygon's cells at this order.  Filled eagerly when the
+ * polygon was built for coverings; a polygon decoded only for membership tests
+ * (zeroed table) can still reach sc_region_classify_cap() as part of a
+ * region-against-region test with a composite, so it is filled here on first use.
+ */
+static inline double
+poly_sin_rho(const sc_region *r_in, int order)
+{
+	sc_region  *r = (sc_region *) r_in;
+
+	if (r->sin_rho[order] == 0)
+		r->sin_rho[order] = sin(sc_pixrad(order) + SC_ANG_EPS);
+	return r->sin_rho[order];
+}
+
 static const char *
 poly_setup(sc_region *r)
 {
@@ -1078,7 +1094,7 @@ sc_region_classify_cap(const sc_region *r, int order, int64_t pix, double *f_out
 		 * circle passes within the cap (|n.c| <= sin(rho + eps)) can reach it;
 		 * the pieces' diagonals are not boundary and play no part.
 		 */
-		double		s = r->sin_rho[order];
+		double		s = poly_sin_rho(r, order);
 		double		dist = M_PI;
 		int			inside;
 
@@ -1096,7 +1112,7 @@ sc_region_classify_cap(const sc_region *r, int order, int64_t pix, double *f_out
 	}
 	else
 	{
-		double		s = r->sin_rho[order];
+		double		s = poly_sin_rho(r, order);
 		double		mind = 2.0;
 		int			all_in = 1;
 		double		sd;
@@ -1631,9 +1647,9 @@ contained_in_nonconvex(const sc_region *a, const sc_region *b)
 	return ok;
 }
 
-/* ADQL CONTAINS: is every point of a also in b? */
-int
-sc_region_contains_region(const sc_region *a, const sc_region *b)
+/* ADQL CONTAINS: is every point of a also in b? (cones and polygons) */
+static int
+prim_contains_region(const sc_region *a, const sc_region *b)
 {
 	if (a->kind == SC_REGION_CONE && a->radius < 0)
 		return 1;				/* the empty region is inside anything */
@@ -1658,9 +1674,9 @@ sc_region_contains_region(const sc_region *a, const sc_region *b)
 	return 1;					/* b convex: a's vertices inside is enough */
 }
 
-/* ADQL INTERSECTS: do a and b share any point? */
-int
-sc_region_overlaps(const sc_region *a, const sc_region *b)
+/* ADQL INTERSECTS: do a and b share any point? (cones and polygons) */
+static int
+prim_overlaps(const sc_region *a, const sc_region *b)
 {
 	if ((a->kind == SC_REGION_CONE && a->radius < 0) ||
 		(b->kind == SC_REGION_CONE && b->radius < 0))
@@ -1685,6 +1701,258 @@ sc_region_overlaps(const sc_region *a, const sc_region *b)
 						   b->v[j], b->v[(j + 1) % b->nv], b->n[j]))
 				return 1;
 	return 0;
+}
+
+/* ------------------------------------------------------------------ */
+/* region against region, for composites                              */
+/* ------------------------------------------------------------------ */
+
+/*
+ * Cells finer than this are not examined: the emptiness test below is
+ * decided to SC_REL_TOL of the radius of the smallest cone or polygon in
+ * either region, and never finer than an order-SC_EMPTY_MAX_ORDER cell
+ * (about 0.01 arcsec).
+ */
+#define SC_REL_TOL 1e-4
+#define SC_EMPTY_MAX_ORDER 24
+#define SC_EMPTY_BUDGET 2000000
+
+/*
+ * Does z hold no point?  Cells are refined breadth first under the classes
+ * of sc_region_classify_cap(), which are sound both ways for a composite: an
+ * IN cell, or a cell whose centre the exact membership test puts inside, is a
+ * point of z, and OUT cells hold none.  What is left PARTIAL without a point
+ * found when the cells reach max_order -- a boundary shared, or regions that
+ * meet in less than a cell -- counts as empty.
+ */
+static int
+region_is_empty(const sc_region *z, int max_order)
+{
+	typedef struct
+	{
+		int64_t		pix;
+		int			order;
+	} qcell;
+	int			cap = 1024,
+				head = 0,
+				tail = 0,
+				steps = 0;
+	qcell	   *q = SC_MALLOC(sizeof(qcell) * cap);
+	int			empty = 1;
+
+	for (int f = 0; f < 12; f++)
+		q[tail++] = (qcell) {f, 0};
+	while (head < tail)
+	{
+		qcell		c = q[head++];
+		double		fo;
+		sc_class	cls = sc_region_classify_cap(z, c.order, c.pix, &fo);
+
+		if (cls == SC_OUT)
+			continue;
+		if (cls == SC_IN || sc_region_contains(z, sc_pix2vec(c.order, c.pix)))
+		{
+			empty = 0;
+			break;
+		}
+		if (c.order >= max_order || ++steps > SC_EMPTY_BUDGET)
+			continue;
+		if (head > cap / 2)
+		{
+			memmove(q, q + head, sizeof(qcell) * (tail - head));
+			tail -= head;
+			head = 0;
+		}
+		if (tail + 4 > cap)
+		{
+			cap *= 2;
+			q = SC_REALLOC(q, sizeof(qcell) * cap);
+		}
+		for (int k = 0; k < 4; k++)
+			q[tail++] = (qcell) {4 * c.pix + k, c.order + 1};
+	}
+	SC_FREE(q);
+	return empty;
+}
+
+/*
+ * The radius of the smallest cone or polygon in r: the scale of its finest
+ * feature.  Not r's own bounding cap, which is the whole sky for a NOT.
+ */
+static double
+smallest_piece(const sc_region *r)
+{
+	sc_vec3		c;
+	double		rad = M_PI;
+
+	if (!SC_REGION_IS_COMPOSITE(r))
+	{
+		sc_region_bounding_cap(r, &c, &rad);
+		return fmax(rad, 0);
+	}
+	for (int i = 0; i < r->nkids; i++)
+		rad = fmin(rad, smallest_piece(&r->kids[i]));
+	return rad;
+}
+
+/* the order whose cells are about SC_REL_TOL of the smallest piece of either */
+static int
+empty_test_order(const sc_region *a, const sc_region *b)
+{
+	double		tol = SC_REL_TOL * fmin(smallest_piece(a), smallest_piece(b));
+	int			k = 0;
+
+	while (k < SC_EMPTY_MAX_ORDER && sc_pixrad(k) > tol)
+		k++;
+	return k;
+}
+
+/* a and b, or a and the rest of the sky outside b, as one region for the test */
+static int
+meet_is_empty(const sc_region *a, const sc_region *b, int negate_b)
+{
+	sc_region	nb = {0},
+				z = {0};
+	sc_region	kids[2];
+
+	kids[0] = *a;
+	if (negate_b)
+	{
+		nb.kind = SC_REGION_NOT;
+		nb.nkids = 1;
+		nb.kids = (sc_region *) b;
+		kids[1] = nb;
+	}
+	else
+		kids[1] = *b;
+	z.kind = SC_REGION_INTERSECTION;
+	z.nkids = 2;
+	z.kids = kids;
+	return region_is_empty(&z, empty_test_order(a, b));
+}
+
+static int	region_meets(const sc_region *a, const sc_region *b);
+static int	region_within(const sc_region *a, const sc_region *b);
+
+/*
+ * The answer from the operands, where the operator decides it; the
+ * emptiness test otherwise.  Every rule below is an identity of sets, so it is
+ * as exact as the operands' own answers.
+ */
+static int
+composite_overlaps(const sc_region *a, const sc_region *b)
+{
+	if (!SC_REGION_IS_COMPOSITE(a))
+	{
+		const sc_region *t = a;
+
+		a = b;
+		b = t;
+	}
+	switch (a->kind)
+	{
+		case SC_REGION_UNION:
+			for (int i = 0; i < a->nkids; i++)
+				if (region_meets(&a->kids[i], b))
+					return 1;
+			return 0;
+		case SC_REGION_NOT:
+			/* b meets the rest of the sky unless it lies inside a's operand */
+			return !region_within(b, &a->kids[0]);
+		case SC_REGION_INTERSECTION:
+			for (int i = 0; i < a->nkids; i++)
+				if (!region_meets(&a->kids[i], b))
+					return 0;
+			break;
+		case SC_REGION_DIFFERENCE:
+			if (!region_meets(&a->kids[0], b))
+				return 0;
+			if (region_within(b, &a->kids[1]))
+				return 0;		/* b lies in the hole */
+			if (!region_meets(&a->kids[1], b))
+				return 1;		/* b meets the first and misses the hole */
+			break;
+		default:
+			break;
+	}
+	return !meet_is_empty(a, b, 0);
+}
+
+static int
+composite_contains_region(const sc_region *a, const sc_region *b)
+{
+	if (a->kind == SC_REGION_UNION)
+	{
+		for (int i = 0; i < a->nkids; i++)
+			if (!region_within(&a->kids[i], b))
+				return 0;
+		return 1;
+	}
+	if (b->kind == SC_REGION_INTERSECTION)
+	{
+		for (int i = 0; i < b->nkids; i++)
+			if (!region_within(a, &b->kids[i]))
+				return 0;
+		return 1;
+	}
+	if (b->kind == SC_REGION_NOT)
+		return !region_meets(a, &b->kids[0]);
+	if (b->kind == SC_REGION_DIFFERENCE)
+		return region_within(a, &b->kids[0]) &&
+			!region_meets(a, &b->kids[1]);
+
+	/* sufficient conditions; the emptiness test decides the rest */
+	if (a->kind == SC_REGION_INTERSECTION)
+		for (int i = 0; i < a->nkids; i++)
+			if (region_within(&a->kids[i], b))
+				return 1;
+	if (a->kind == SC_REGION_DIFFERENCE && region_within(&a->kids[0], b))
+		return 1;
+	if (b->kind == SC_REGION_UNION)
+		for (int i = 0; i < b->nkids; i++)
+			if (region_within(a, &b->kids[i]))
+				return 1;
+	return meet_is_empty(a, b, 1);
+}
+
+/* every point of a in b, an empty a included (the rules above need that) */
+static int
+region_within(const sc_region *a, const sc_region *b)
+{
+	if (SC_REGION_IS_COMPOSITE(a) || SC_REGION_IS_COMPOSITE(b))
+		return composite_contains_region(a, b);
+	return prim_contains_region(a, b);
+}
+
+static int
+region_meets(const sc_region *a, const sc_region *b)
+{
+	if (SC_REGION_IS_COMPOSITE(a) || SC_REGION_IS_COMPOSITE(b))
+		return composite_overlaps(a, b);
+	return prim_overlaps(a, b);
+}
+
+/*
+ * ADQL CONTAINS: is every point of a also in b?  A composite can be empty (an
+ * intersection of pieces that do not meet), and an empty one is contained in
+ * nothing, as PostGIS has it for an empty geometry: otherwise it would be
+ * inside every region, which no index on the regions could find.
+ */
+int
+sc_region_contains_region(const sc_region *a, const sc_region *b)
+{
+	if (!region_within(a, b))
+		return 0;
+	if (SC_REGION_IS_COMPOSITE(a))
+		return !region_is_empty(a, empty_test_order(a, a));
+	return 1;
+}
+
+/* ADQL INTERSECTS: do a and b share any point? */
+int
+sc_region_overlaps(const sc_region *a, const sc_region *b)
+{
+	return region_meets(a, b);
 }
 
 /* ------------------------------------------------------------------ */
@@ -2458,10 +2726,120 @@ rlist_score(rlist_t *l, const sc_density *d, const sc_cover_params *p, int steps
 	return l->n * p->range_cost + rows + steps * step_cost;
 }
 
+/*
+ * The covering of a composite from its operands' own coverings, where that is
+ * sound: the union of the operands' coverings covers their union, the
+ * intersection of any of them covers the intersection, and the first
+ * operand's covers a difference (used while the part taken away is at most
+ * half of it).  A circle operand then takes the direct cone
+ * path instead of being classified cell by cell through the composite, which
+ * the descent below would do (64% of a two-circle union's planning, under
+ * callgrind).  NOT has no such covering -- the complement of a covering is
+ * not one -- so a NOT, and an intersection whose every operand is a NOT,
+ * are left to the descent: returns false for those, with nothing added.
+ */
+static bool
+cover_composite(const sc_region *r, const sc_density *d, const sc_cover_params *p,
+				rlist_t *out, int *steps)
+{
+	switch (r->kind)
+	{
+		case SC_REGION_UNION:
+			for (int i = 0; i < r->nkids; i++)
+			{
+				sc_cover	kc;
+
+				sc_cover_compute(&r->kids[i], d, p, &kc);
+				*steps += kc.steps;
+				for (int j = 0; j < kc.n; j++)
+					rlist_add(out, kc.r[j].lo, kc.r[j].hi);
+				sc_cover_free(&kc);
+			}
+			return true;
+
+		case SC_REGION_DIFFERENCE:
+			{
+				sc_cover	kc;
+
+				/*
+				 * The first operand's covering keeps the hole.  Worth it while
+				 * the hole is small; a thin ring would read many times its own
+				 * rows, where the descent drops the cells inside the hole.
+				 */
+				if (r->kids[1].area > 0.5 * r->kids[0].area)
+					return false;
+
+				sc_cover_compute(&r->kids[0], d, p, &kc);
+				*steps += kc.steps;
+				for (int j = 0; j < kc.n; j++)
+					rlist_add(out, kc.r[j].lo, kc.r[j].hi);
+				sc_cover_free(&kc);
+				return true;
+			}
+
+		case SC_REGION_INTERSECTION:
+			{
+				rlist_t		acc = {0};
+				bool		first = true;
+
+				for (int i = 0; i < r->nkids; i++)
+				{
+					sc_cover	kc;
+					rlist_t		nx = {0};
+					int			a = 0,
+								b = 0;
+
+					if (r->kids[i].kind == SC_REGION_NOT)
+						continue;	/* most of the sky: it narrows nothing */
+					sc_cover_compute(&r->kids[i], d, p, &kc);
+					*steps += kc.steps;
+					if (first)
+					{
+						for (int j = 0; j < kc.n; j++)
+							rlist_add(&acc, kc.r[j].lo, kc.r[j].hi);
+						first = false;
+						sc_cover_free(&kc);
+						continue;
+					}
+					/* both sorted, disjoint: intersect them */
+					while (a < acc.n && b < kc.n)
+					{
+						int64_t		lo = Max(acc.a[a].lo, kc.r[b].lo),
+									hi = Min(acc.a[a].hi, kc.r[b].hi);
+
+						if (lo <= hi)
+							rlist_add(&nx, lo, hi);
+						if (acc.a[a].hi < kc.r[b].hi)
+							a++;
+						else
+							b++;
+					}
+					sc_cover_free(&kc);
+					if (acc.a)
+						SC_FREE(acc.a);
+					acc = nx;
+					if (acc.n == 0)
+						break;	/* empty: nothing to intersect further */
+				}
+				if (first)
+					return false;
+				for (int j = 0; j < acc.n; j++)
+					rlist_add(out, acc.a[j].lo, acc.a[j].hi);
+				if (acc.a)
+					SC_FREE(acc.a);
+				return true;
+			}
+
+		default:
+			return false;
+	}
+}
+
 void
 sc_cover_compute(const sc_region *r, const sc_density *d,
 				 const sc_cover_params *p, sc_cover *out)
 {
+
 	heap_t		h = {0};
 	rlist_t		kept = {0};
 	int			nr = 0;			/* approximate number of ranges */
@@ -2473,6 +2851,10 @@ sc_cover_compute(const sc_region *r, const sc_density *d,
 		? p->max_area_ratio * fmax(r->area, order_area(SC_MAX_ORDER)) : INFINITY;
 
 	memset(out, 0, sizeof(*out));
+
+	if (SC_REGION_IS_COMPOSITE(r) && p->force_order < 0 &&
+		cover_composite(r, d, p, &kept, &steps))
+		goto finish;
 
 	if (p->direct && r->kind == SC_REGION_CONE && r->radius >= 0 &&
 		r->radius <= 10.0 * M_PI / 180)

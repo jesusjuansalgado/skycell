@@ -378,11 +378,31 @@ A position inside one is indexed like any other region: `pos <@ r`,
 `contains(pos, r) = 1` and `r @> pos` read the catalogue's cell index through
 the composite's covering, and a column of stored composites is served by every
 region index (the default GiST, `skyregion_box4_gist_ops` and the MOC GIN). The
-covering is built from the pieces' own cell classification (inside, outside,
-straddling) combined by the operator, so it never misses a row; the exact
-membership test runs on what it keeps. Region-to-region operators (`&&`,
-`@>` and `<@` between regions, `INTERSECTS` of two regions), `AREA` and
-`CENTROID` are not computed for a composite and say so.
+covering comes from the operands' own coverings where that is sound (a union's,
+an intersection's, a difference's first operand), and otherwise from the
+operands' cell classes (inside, outside, straddling) combined by the operator.
+Either way it never misses a row, and the exact membership test runs on what
+it keeps.
+
+Regions are compared with composites too, stored or constant: `&&`, `@>`
+and `<@` between regions, and ADQL `INTERSECTS` and `CONTAINS` of two
+regions, through every region index. Where the operator decides it the
+answer comes from the operands, by identities of sets: a union meets a region
+if one of its operands does, `NOT A` meets `B` unless `B` lies inside `A`,
+`X` lies in `A − B` if it lies in `A` and misses `B`. Otherwise the combined
+region (`X ∩ Y` for an overlap, `X ∩ NOT Y` for containment) is tested for a
+point by refining cells: a cell soundly inside it, or a cell centre the exact
+test puts inside, is a point, and cells soundly outside hold none. What is
+still undecided at cells of 10⁻⁴ of the smallest circle or polygon involved
+(never finer than about 0.01″) counts as empty. So two regions that meet in
+less than that, or that only share a boundary, do not overlap. A composite
+can be empty, such as an intersection of pieces that do not meet. As in
+PostGIS for an empty geometry, it meets nothing, holds nothing and is held by
+nothing; otherwise it would lie inside every region, which no index on the
+regions could find. A comparison takes 0.25 ms on average against random
+composites up to three deep, and up to about 10 ms where long boundaries
+nearly coincide. `AREA` and `CENTROID` are not computed for a composite and
+say so.
 
 ### Operators — the indexable spelling
 
@@ -669,6 +689,36 @@ by up to 7.1× and Q3C's by up to 2.6×. At Gaia
 DR3 scale that is one 38 GiB index where an archive running pgSphere for cones
 and Q3C for cross-matching keeps 160 GiB.
 
+**Composite regions** (0.38, [`bench/results-composite/`](bench/results-composite/)).
+Five shapes on 60 centres on the 10M real Gaia DR3 positions, 0.05°–2° across.
+Each is written three ways: one `REGION`, the same pieces as a boolean of ADQL
+`CONTAINS` predicates in skycell, and pgSphere's boolean of `<@`. pgSphere has
+no composite region type. Its MOC type, `smoc`, has union and intersection, but
+it is approximate to its cells and no index serves `spoint <@ smoc`, so the
+boolean is how a query gets exact answers there. All three spellings count the
+same rows. Median ms per query, and the `REGION`'s summed time over the others':
+
+| shape | `REGION` | skycell boolean | pgSphere boolean | `REGION` ÷ skycell boolean | `REGION` ÷ pgSphere |
+|---|---|---|---|---|---|
+| annulus (circle less circle) | 0.21 | 0.14 | 0.10 | 1.26 | 1.33 |
+| two circles, union | 0.15 | 0.37 | 0.11 | 0.34 | 1.39 |
+| lens (intersection of two circles) | 0.12 | 0.11 | 0.09 | 1.09 | 0.76 |
+| square less a circle | 0.18 | 0.21 | 0.36 | 0.88 | 0.21 |
+| five circles, union | 0.16 | 0.75 | 0.21 | 0.19 | 0.84 |
+
+A composite is covered from its operands' own coverings: the union of theirs
+for a `UNION`, their intersection for an `INTERSECTION`, the first operand's
+for a `DIFFERENCE` that takes away at most half of it. A circle operand then
+takes the cone's direct path. A `NOT`, and a difference with a large hole, are
+covered by classifying cells against the whole composite, which keeps a thin
+ring from reading its hole. A union of circles still costs up to 1.4×
+pgSphere's boolean, most of it in planning, where pgSphere does little work per
+circle.
+
+Before 0.38, an ADQL `OR` of `CONTAINS` predicates was a sequential scan in
+skycell: 2.4 s for two circles and 4.9 s for five on these 10M rows. It is now
+indexed like `<@ OR <@`, which is the skycell boolean column above.
+
 **Parallel cross-matching.** The comparisons above, like the paper's, are
 serial. They run with `max_parallel_workers_per_gather = 0` for every method.
 With parallelism on, a cross-match with enough probes runs in parallel
@@ -733,7 +783,13 @@ Two layers, both in [`ext/test/`](ext/test/).
   intersections, differences and NOTs, up to four deep, of cones and convex and
   non-convex polygons): every catalogue point inside must be covered, and every
   cell class must be honest for 128 sampled points per cell, half on cell edges.
-  Current run: **0 false negatives**.
+  Then 1,200 pairs of a composite and a cone, polygon or composite nearby,
+  half of them built as SQL's membership path builds them (without the
+  covering tables). Sampled points check every answer: a point in both
+  regions means they overlap, a point of the first outside the second means
+  it is not contained, and every non-empty region holds itself
+  (`SC_SELFTEST_PAIRS=1 SC_SELFTEST_NPAIR=20000` runs only these, more of
+  them: 0 wrong in 20,000). Current run: **0 false negatives**.
 
 **SQL regression** — `make installcheck` in `ext/`, against a running server:
 
@@ -793,12 +849,17 @@ Two layers, both in [`ext/test/`](ext/test/).
 
 - `composite`: unions, intersections, differences and NOTs. STC-S in and
   out (every malformed form errors with a reason), the constructors, each
-  composite's membership against the boolean combination of its pieces, and
-  the refusals. A constant composite on the catalogue index (eight fixed
+  composite's membership against the boolean combination of its pieces,
+  region-to-region answers that can be checked by hand (a circle in an
+  annulus's hole, one across the gap between a union's pieces, nested NOTs),
+  and the refusals. A constant composite on the catalogue index (eight fixed
   shapes and 40 random ones) must give the exact test's and the sequential
   scan's rows; stored composites must give the sequential answer under each
   region index, for a point, a join, ADQL `CONTAINS` and a correlated
-  sub-select.
+  sub-select, and for overlap and containment against cones, polygons and
+  composites (`&&`, `@>`, `<@`, ADQL `INTERSECTS` and `CONTAINS`). Every pair
+  of stored regions must overlap symmetrically, and each non-empty one must
+  hold and meet itself.
 - Correlated sub-selects (in `adql`): an outer query's column used as the
   point, the centre or a polygon vertex in a sub-select must plan, use the
   index and give the join's answer.
@@ -818,8 +879,10 @@ locally), the standalone selftests, and the reference translators.
 - **Geometry.** A polygon must be simple, with no crossing or touching edges,
   and every vertex must lie within 90° of the vertices' mean. STC-S `BOX`
   is not read (write a `POLYGON`, or call `box()`). A composite region
-  (`UNION`, `INTERSECTION`, `DIFFERENCE`, `NOT`) supports position tests only:
-  region-to-region operators, `AREA` and `CENTROID` error for it, and its
+  (`UNION`, `INTERSECTION`, `DIFFERENCE`, `NOT`) has no `AREA` or
+  `CENTROID` (they error). Comparing it with another region is decided to
+  10⁻⁴ of its smallest piece where its operands do not decide it, and an empty
+  composite is contained in nothing. Its
   covering is as tight as its pieces' cell classes allow, so a deep
   `DIFFERENCE` of nearly equal regions reads more candidate rows than its
   area suggests. A non-convex polygon costs more than a

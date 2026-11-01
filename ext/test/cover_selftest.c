@@ -237,6 +237,8 @@ edge_subcell(int order, int64_t pix)
 static sc_vec3 leaf_c[MAXLEAF];
 static double leaf_r[MAXLEAF];
 static int nleaf;
+/* build leaves without the covering tables, as the SQL membership path does */
+static int leaf_lite;
 
 /* a cone, a convex polygon or a non-convex one, round (cra, cde), size in rad */
 static int
@@ -251,7 +253,7 @@ make_leaf(sc_region *r, double cra, double cde, double size)
 		nleaf++;
 	}
 	if (kind == 0)
-		return sc_region_cone(r, cra, cde, size * 180 / M_PI, true) == NULL;
+		return sc_region_cone(r, cra, cde, size * 180 / M_PI, !leaf_lite) == NULL;
 	{
 		xy P[40];
 		double pra[40], pde[40];
@@ -275,10 +277,10 @@ make_leaf(sc_region *r, double cra, double cde, double size)
 			xy t = {size * (P[i].x * cos(rot) - P[i].y * sin(rot)), size * (P[i].x * sin(rot) + P[i].y * cos(rot))};
 			vec_radec(from_plane(&f, t), &pra[i], &pde[i]);
 		}
-		if (sc_region_poly(r, n, pra, pde, true) != NULL)
+		if (sc_region_poly(r, n, pra, pde, !leaf_lite) != NULL)
 		{
 			sc_region_free(r);
-			return sc_region_cone(r, cra, cde, size * 180 / M_PI, true) == NULL;
+			return sc_region_cone(r, cra, cde, size * 180 / M_PI, !leaf_lite) == NULL;
 		}
 		return 1;
 	}
@@ -327,6 +329,10 @@ main(void)
 	make_points();
 	for (int i = 0; i <= 1000; i++)
 		bounds[i] = sorted[(int64_t) i * (NPTS - 1) / 1000];
+
+	/* SC_SELFTEST_PAIRS=1: only the region-against-region pairs (for profiling) */
+	if (getenv("SC_SELFTEST_PAIRS"))
+		goto pairs;
 
 	printf("%-8s %-5s %7s %7s %8s %6s %9s %9s %9s %8s\n", "radius", "model", "queries", "ranges", "steps", "order", "true", "covered", "fp_frac", "us/cov");
 	for (int ri = 0; ri < 10; ri++)
@@ -954,6 +960,112 @@ main(void)
 			   built, ncomp, tot_ranges / (built ? built : 1), pts, bad_cov, cells, bad_out, bad_in,
 			   tot_cov > 0 ? 1 - tot_true / tot_cov : 0);
 		failures += bad_cov + bad_out + bad_in;
+	}
+
+pairs:
+	/*
+	 * Region against region with composites: sc_region_overlaps() and
+	 * sc_region_contains_region() against points.  A point in both regions
+	 * means they overlap; a point of a outside b means a is not inside b.
+	 * Neither reference can prove the converse (the meeting may be smaller
+	 * than any sample), so those are counted, not failed.
+	 */
+	{
+		const char *pname[] = {"", "CONE", "POLYGON", "UNION", "INTERSECTION", "DIFFERENCE", "NOT"};
+		int npair = getenv("SC_SELFTEST_NPAIR") ? atoi(getenv("SC_SELFTEST_NPAIR")) : 1200, bad_ov = 0, bad_ct = 0, bad_self = 0, ov_yes = 0, ct_yes = 0,
+			ov_unseen = 0, ct_unseen = 0;
+		long samples = 0;
+		clock_t pair_clock = 0, pair_max = 0;
+		int slow_pairs = 0, ct_empty = 0;
+		double us;
+
+		for (int q = 0; q < npair; q++)
+		{
+			double cra = 360 * urand(), cde = asin(2 * urand() - 1) * 180 / M_PI;
+			double size = pow(10, -4 + 3.5 * urand());
+			sc_region a, b;
+			int ov, ct, seen_both = 0, seen_a_not_b = 0, seen_a = 0, seen_b = 0, self_a, self_b;
+
+			nleaf = 0;
+			leaf_lite = (q / 2) % 2;
+			if (!make_composite(&a, cra, cde, size, 1 + q % 3))
+				continue;
+			/* b: a leaf or a composite, nearby, from a tenth to ten times the size */
+			{
+				double s2 = size * pow(10, 2 * urand() - 1), d = size * 1.5 * urand();
+				sc_vec3 bc = point_at(sc_radec2vec(cra, cde), d * M_PI / 180, 2 * M_PI * urand());
+				double bra, bde;
+				int okb;
+
+				vec_radec(bc, &bra, &bde);
+				okb = (q % 4 == 0) ? make_leaf(&b, bra, bde, s2) : make_composite(&b, bra, bde, s2, 1 + q % 2);
+				if (!okb)
+				{
+					sc_region_free(&a);
+					continue;
+				}
+			}
+			{
+				clock_t t1 = clock();
+
+				ov = sc_region_overlaps(&a, &b);
+				ct = sc_region_contains_region(&a, &b);
+				t1 = clock() - t1;
+				pair_clock += t1;
+				if (t1 > pair_max)
+					pair_max = t1;
+				if (t1 * 1000 > CLOCKS_PER_SEC)
+					slow_pairs++;	/* over a millisecond */
+			}
+			ov_yes += ov;
+			ct_yes += ct;
+			self_a = sc_region_contains_region(&a, &a);
+			self_b = sc_region_contains_region(&b, &b);
+
+			for (int l = 0; l < nleaf; l++)
+				for (int k = 0; k < 600; k++)
+				{
+					double rho = (k % 3 ? urand() : 1 / 1.5 * (1 + (urand() - 0.5) * 2e-6)) * leaf_r[l];
+					sc_vec3 pt = point_at(leaf_c[l], rho, 2 * M_PI * urand());
+					int ia = sc_region_contains(&a, pt), ib = sc_region_contains(&b, pt);
+
+					samples++;
+					seen_a |= ia;
+					seen_b |= ib;
+					if (ia && ib)
+						seen_both = 1;
+					if (ia && !ib)
+						seen_a_not_b = 1;
+				}
+			/* a region holds itself unless it is empty (then it holds nothing) */
+			if ((seen_a && !self_a) || (seen_b && !self_b))
+				bad_self++;
+			if (ct && !seen_a)
+				ct_empty++;
+			if (seen_both && !ov)
+			{
+				bad_ov++;
+				if (bad_ov < 10) printf("OVERLAP MISSED %s/%s q=%d size %g\n", pname[a.kind], pname[b.kind], q, size);
+			}
+			if (seen_a_not_b && ct)
+			{
+				bad_ct++;
+				if (bad_ct < 10) printf("CONTAINS WRONG %s/%s q=%d size %g\n", pname[a.kind], pname[b.kind], q, size);
+			}
+			if (ov && !seen_both)
+				ov_unseen++;
+			if (!ct && !seen_a_not_b)
+				ct_unseen++;
+			sc_region_free(&a);
+			sc_region_free(&b);
+		}
+		leaf_lite = 0;
+		us = 1e6 * (double) pair_clock / CLOCKS_PER_SEC / npair;
+		printf("composite pairs: %d, %ld points; overlap %d (%d no point seen), contains %d "
+			   "(%d not-contained with no point seen, %d contained with no point of a seen); wrong: overlap %d, contains %d, self %d; %.0f us per overlap + contains (slowest %.1f ms, %d over 1 ms)\n",
+			   npair, samples, ov_yes, ov_unseen, ct_yes, ct_unseen, ct_empty, bad_ov, bad_ct, bad_self, us,
+			   1e3 * (double) pair_max / CLOCKS_PER_SEC, slow_pairs);
+		failures += bad_ov + bad_ct + bad_self;
 	}
 
 	printf("%s (%d false negatives)\n", failures ? "FAILED" : "ALL OK", failures);

@@ -953,11 +953,10 @@ skycell_contains(PG_FUNCTION_ARGS)
 }
 
 /*
- * Whether one region holds or meets another is answered exactly for cones and
- * polygons only.  For a composite it can turn on its regions together -- a
- * circle can lie in a union without lying in either of its parts -- so rather
- * than answer approximately it is refused; a position in a composite is
- * answered exactly, and is what an index serves.
+ * AREA and CENTROID are computed for cones and polygons only (and AREA for a
+ * NOT of one).  A composite's would have to be integrated over its cells, so
+ * rather than answer approximately they are refused.  Region against region
+ * is answered for composites too: see sc_region_overlaps() in cover.c.
  */
 static void
 refuse_composite(const sc_region *r, const char *what)
@@ -975,8 +974,6 @@ region_region(PG_FUNCTION_ARGS, bool contains)
 	sc_region  *b = cached_region_arg(fcinfo, 1, PG_GETARG_DATUM(1));
 	int			res;
 
-	refuse_composite(a, contains ? "Containment between regions" : "Intersection between regions");
-	refuse_composite(b, contains ? "Containment between regions" : "Intersection between regions");
 	res = contains ? sc_region_contains_region(a, b) : sc_region_overlaps(a, b);
 
 	return res ? 1 : 0;
@@ -1032,8 +1029,6 @@ skycell_region_covers(PG_FUNCTION_ARGS)
 	sc_region  *b = cached_region_arg(fcinfo, 1, PG_GETARG_DATUM(1));
 	int			res;
 
-	refuse_composite(a, "Containment between regions");
-	refuse_composite(b, "Containment between regions");
 	res = sc_region_contains_region(b, a);
 
 	PG_RETURN_BOOL(res != 0);
@@ -2393,6 +2388,48 @@ adql_predicate_operator(Node *qual)
 	return (Node *) res;
 }
 
+/*
+ * adql_predicate_operator() inside AND / OR / NOT: a query that writes the
+ * union of two cones as CONTAINS(...) = 1 OR CONTAINS(...) = 1 gets the
+ * operators, which the support function rewrites into cell ranges under the
+ * OR (a BitmapOr), as it does for <@ OR <@.  *changed is set when any term
+ * was replaced; n itself is returned otherwise.
+ */
+static Node *
+adql_predicates_in_bool(Node *n, bool *changed)
+{
+	Node	   *opx;
+
+	check_stack_depth();
+	if ((opx = adql_predicate_operator(n)) != NULL)
+	{
+		*changed = true;
+		return opx;
+	}
+	if (IsA(n, BoolExpr))
+	{
+		BoolExpr   *b = (BoolExpr *) n;
+		List	   *args = NIL;
+		bool		any = false;
+		ListCell   *lc;
+
+		foreach(lc, b->args)
+			args = lappend(args, adql_predicates_in_bool(lfirst(lc), &any));
+		if (any)
+		{
+			BoolExpr   *nb = makeNode(BoolExpr);
+
+			nb->boolop = b->boolop;
+			nb->args = args;
+			nb->location = b->location;
+			*changed = true;
+			return (Node *) nb;
+		}
+		list_free(args);
+	}
+	return n;
+}
+
 /* a position the cone machinery reads: a column, a constant or point(...) */
 static bool
 plain_pos(Oid funcid, Node *p)
@@ -2683,6 +2720,14 @@ add_distance_cones(PlannerInfo *root, Node **quals)
 		Node	   *opx = adql_predicate_operator(list_nth(conj, i));
 		Node	   *cone;
 
+		bool		nested = false;
+
+		if (opx == NULL && IsA(list_nth(conj, i), BoolExpr))
+		{
+			opx = adql_predicates_in_bool(list_nth(conj, i), &nested);
+			if (!nested)
+				opx = NULL;
+		}
 		if (opx != NULL)
 		{
 			lfirst(list_nth_cell(conj, i)) = opx;
