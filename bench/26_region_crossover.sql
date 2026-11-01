@@ -1,3 +1,7 @@
+-- Uses operator classes removed in 0.38 (skyregion_box_gist_ops,
+-- skypos_spgist_ops, skypos_cap_gist_ops): run it against skycell 0.37 or
+-- earlier to reproduce the numbers it produced.
+--
 -- A radius-stratified skyregion corpus and probe set -- small (1-3 deg),
 -- medium (20-40), large (60-80), huge (85-89 deg radius circles), 3,000
 -- rows/band, uniform-on-sphere centres -- for measuring the crossover

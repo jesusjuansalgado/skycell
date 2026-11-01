@@ -217,6 +217,14 @@ double		sc_region_distance(const sc_region *r, sc_vec3 p);
 sc_vec3		sc_region_centroid(const sc_region *r);
 
 /*
+ * Area (steradians) and moment (the integral of the unit vector over the
+ * region; its direction is the centroid) of any region, by integrating over
+ * HEALPix cells; *err bounds the area's error.  For composites, whose AREA
+ * and CENTROID have no closed form here.
+ */
+void		sc_region_integrate(const sc_region *r, double *area, sc_vec3 *moment, double *err);
+
+/*
  * A cheap, valid (not necessarily minimal) enclosing spherical cap: exact for
  * a cone (it already is one), centroid + farthest vertex for a polygon.  For
  * a GiST index key, not the cost-based covering above -- a cap is a single

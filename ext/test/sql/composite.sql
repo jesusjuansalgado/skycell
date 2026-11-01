@@ -25,6 +25,13 @@ SELECT 'UNION (CIRCLE 1 2 3 CIRCLE 1 2 3)'::skyregion;         -- error: no fram
 SELECT 'UNION ICRS (CIRCLE 1 2 3 CIRCLE 1 2 3'::skyregion;     -- error: unbalanced
 SELECT 'UNION ICRS (CIRCLE 1 2 3 CIRCLE 1 2 3) x'::skyregion;  -- error: trailing text
 SELECT 'UNION ICRS CIRCLE 1 2 3'::skyregion;                   -- error: no parentheses
+-- STC-S Box: read as the polygon box() makes
+SELECT 'BOX ICRS 10 20 2 1'::skyregion::text = box('ICRS', 10, 20, 2, 1)::text AS box_is_box,
+       contains(point('ICRS', 10.9, 20.4), 'BOX ICRS 10 20 2 1'::skyregion) AS inside,
+       contains(point('ICRS', 10, 20.6), 'BOX ICRS 10 20 2 1'::skyregion) AS above,
+       region('DIFFERENCE ICRS (BOX 10 20 2 2 CIRCLE 10 20 0.5)')::text LIKE 'DIFFERENCE ICRS (POLYGON %' AS in_a_composite;
+SELECT 'BOX ICRS 10 20 2'::skyregion;                          -- error: four numbers
+SELECT 'BOX ICRS 10 89.5 2 2'::skyregion;                      -- error: reaches the pole
 SELECT (repeat('NOT ICRS (', 33) || 'CIRCLE 1 2 3' || repeat(')', 33))::skyregion;  -- error: depth
 SELECT length((repeat('NOT ICRS (', 32) || 'CIRCLE 1 2 3' || repeat(')', 32))::skyregion::text) > 0 AS depth_32_ok;
 
@@ -80,12 +87,27 @@ SELECT r && circle('ICRS', 90.4, 0, 0.05) AS in_lens,                -- t
 FROM (SELECT skycell_intersection(circle('ICRS', 90, 0, 1), circle('ICRS', 90.8, 0, 1)) AS r,
              region('UNION ICRS (CIRCLE 70 0 1 POLYGON 71 -1 73 -1 72 1)') AS u) t;
 
--- what is not computed for a composite says so
-SELECT area(skycell_union(circle('ICRS', 1, 2, 3), circle('ICRS', 4, 5, 6)));
-SELECT centroid(skycell_not(circle('ICRS', 1, 2, 3)));
--- except the area of a complement, which is exact
-SELECT round(area(skycell_not(circle('ICRS', 1, 2, 3)))::numeric, 6)
-     = round((41252.961249419271 - area(circle('ICRS', 1, 2, 3)))::numeric, 6) AS not_area;
+-- AREA and CENTROID: integrated over cells, against what is known exactly.
+-- An annulus is its circles' difference; a union and an intersection add up
+-- to their pieces; a lens of equal circles is centred on the great-circle
+-- midpoint of their centres; a NOT is exact, and points the other way
+SELECT abs(area(r) - (area(circle('ICRS', 10, 20, 1)) - area(circle('ICRS', 10, 20, 0.5)))) / area(r) < 1e-3 AS annulus_area,
+       distance(centroid(r), point('ICRS', 10, 20)) < 1e-3 AS annulus_centre
+FROM (SELECT region('DIFFERENCE ICRS (CIRCLE 10 20 1 CIRCLE 10 20 0.5)') AS r) t;
+SELECT abs(area(skycell_union(a, b)) + area(skycell_intersection(a, b)) - area(a) - area(b))
+         / (area(a) + area(b)) < 1e-3 AS inclusion_exclusion,
+       abs(area(skycell_union(p, a)) + area(skycell_intersection(p, a)) - area(p) - area(a))
+         / (area(p) + area(a)) < 1e-3 AS with_a_polygon,
+       distance(centroid(skycell_intersection(a, b)), point('ICRS', 10.5, 20.00068)) < 1e-3 AS lens_centre,
+       distance(centroid(region('DIFFERENCE ICRS (CIRCLE 10 20 1 CIRCLE 10.3 20 0.5)')), point('ICRS', 10, 20)) > 0.05 AS hole_pulls_away,
+       round(area(skycell_not(a))::numeric, 6) = round((41252.961249419271 - area(a))::numeric, 6) AS not_area,
+       distance(centroid(skycell_not(a)), point('ICRS', 190, -20)) < 1e-9 AS not_centre,
+       abs(area(skycell_not(skycell_union(a, b))) - (41252.961249419271 - area(skycell_union(a, b)))) < 1e-2 AS not_union
+FROM (SELECT circle('ICRS', 10, 20, 1) AS a, circle('ICRS', 11, 20, 1) AS b,
+             polygon('ICRS', 10,19, 12,19, 12,21, 10,21) AS p) t;
+-- an empty composite has area 0 and no centroid
+SELECT area(skycell_intersection(circle('ICRS', 0, 0, 1), circle('ICRS', 90, 0, 1))) AS empty_area;
+SELECT centroid(skycell_intersection(circle('ICRS', 0, 0, 1), circle('ICRS', 90, 0, 1)));  -- error
 
 -- a constant composite on the catalogue index -------------------------
 CREATE TABLE ccat AS

@@ -193,6 +193,20 @@ make_shape(int k, xy *P)
 
 /* a point at angle rho from c, in direction az */
 static sc_vec3
+sc_scale(sc_vec3 a, double k)
+{
+	sc_vec3 r = {a.x * k, a.y * k, a.z * k};
+	return r;
+}
+
+static sc_vec3
+sc_add(sc_vec3 a, sc_vec3 b)
+{
+	sc_vec3 r = {a.x + b.x, a.y + b.y, a.z + b.z};
+	return r;
+}
+
+static sc_vec3
 point_at(sc_vec3 c, double rho, double az)
 {
 	sc_vec3 e1 = (fabs(c.z) < 0.9) ? (sc_vec3) {-c.y, c.x, 0} : (sc_vec3) {0, -c.z, c.y}, e2, pt;
@@ -330,7 +344,10 @@ main(void)
 	for (int i = 0; i <= 1000; i++)
 		bounds[i] = sorted[(int64_t) i * (NPTS - 1) / 1000];
 
-	/* SC_SELFTEST_PAIRS=1: only the region-against-region pairs (for profiling) */
+	/* SC_SELFTEST_PAIRS=1: only the region-against-region pairs and the
+	 * integration (for profiling); SC_SELFTEST_INT=1: only the integration */
+	if (getenv("SC_SELFTEST_INT"))
+		goto integration;
 	if (getenv("SC_SELFTEST_PAIRS"))
 		goto pairs;
 
@@ -1066,6 +1083,154 @@ pairs:
 			   npair, samples, ov_yes, ov_unseen, ct_yes, ct_unseen, ct_empty, bad_ov, bad_ct, bad_self, us,
 			   1e3 * (double) pair_max / CLOCKS_PER_SEC, slow_pairs);
 		failures += bad_ov + bad_ct + bad_self;
+	}
+
+integration:
+	/*
+	 * AREA and CENTROID of composites (sc_region_integrate) against what does
+	 * not share its code: a cap's area 2 pi (1 - cos r) and moment
+	 * c pi sin^2 r, a polygon's exact area, and inclusion-exclusion,
+	 * A + B = (A u B) + (A n B), for both.  Each must hold within the error
+	 * bounds the integration returns.
+	 */
+	{
+		int nint = getenv("SC_SELFTEST_NINT") ? atoi(getenv("SC_SELFTEST_NINT")) : 300,
+			bad_area = 0, bad_mom = 0, bad_ann = 0, bad_not = 0, bad_poly = 0, done = 0;
+		double worst = 0, worst_bound = 0, worst_mom = 0;
+		clock_t t_int = 0;
+		long ncalls = 0, ntimed = 0;
+
+		for (int q = 0; q < nint; q++)
+		{
+			double cra = 360 * urand(), cde = asin(2 * urand() - 1) * 180 / M_PI;
+			double ra_ = pow(10, -3 + 3.3 * urand()), rb_ = ra_ * pow(10, urand() - 0.5);
+			double sep = (ra_ + rb_) * 1.2 * urand();
+			sc_vec3 ca = sc_radec2vec(cra, cde), cb = point_at(ca, sep * M_PI / 180, 2 * M_PI * urand());
+			double bra, bde, Aa, Ab, au, ai, eu, ei, ad, ed, an, en;
+			sc_vec3 Ma, Mb, mu, mi, md, mn;
+			sc_region k[2], u, in, d, nu, nk[2];
+			clock_t t1;
+
+			vec_radec(cb, &bra, &bde);
+			Aa = 2 * M_PI * (1 - cos(ra_ * M_PI / 180));
+			Ab = 2 * M_PI * (1 - cos(rb_ * M_PI / 180));
+			Ma = sc_scale(ca, M_PI * pow(sin(ra_ * M_PI / 180), 2));
+			Mb = sc_scale(cb, M_PI * pow(sin(rb_ * M_PI / 180), 2));
+
+			t1 = clock();
+			sc_region_cone(&k[0], cra, cde, ra_, true); sc_region_cone(&k[1], bra, bde, rb_, true);
+			sc_region_combine(&u, SC_REGION_UNION, k, 2);
+			sc_region_integrate(&u, &au, &mu, &eu);
+			ntimed++;
+			sc_region_cone(&k[0], cra, cde, ra_, true); sc_region_cone(&k[1], bra, bde, rb_, true);
+			sc_region_combine(&in, SC_REGION_INTERSECTION, k, 2);
+			sc_region_integrate(&in, &ai, &mi, &ei);
+			ntimed++;
+			t_int += clock() - t1;
+			ncalls += 2;
+
+			/* inclusion-exclusion, area and moment */
+			{
+				double dA = fabs(au + ai - Aa - Ab), bound = eu + ei + 1e-15;
+				double dM = sc_angle(sc_add(mu, mi), sc_add(Ma, Mb)) ;
+				double rel = dA / (Aa + Ab);
+
+				if (dA > bound)
+				{
+					bad_area++;
+					if (bad_area < 10) printf("AREA OUTSIDE ITS BOUND q=%d r=%g,%g: off %g, bound %g\n", q, ra_, rb_, dA, bound);
+				}
+				if (rel > worst) worst = rel;
+				if (bound / (Aa + Ab) > worst_bound) worst_bound = bound / (Aa + Ab);
+				/* the moments' directions agree to the bound's share of the area */
+				if (dM > 4 * bound / (Aa + Ab) + 1e-9)
+				{
+					bad_mom++;
+					if (bad_mom < 10) printf("MOMENT OFF q=%d r=%g,%g: %g rad\n", q, ra_, rb_, dM);
+				}
+				if (dM / (fmax(ra_, rb_) * M_PI / 180) > worst_mom) worst_mom = dM / (fmax(ra_, rb_) * M_PI / 180);
+			}
+
+			/* an annulus: exact */
+			{
+				double rin = ra_ * (0.2 + 0.6 * urand());
+				double Ain = 2 * M_PI * (1 - cos(rin * M_PI / 180));
+				sc_vec3 Md;
+
+				sc_region_cone(&k[0], cra, cde, ra_, true); sc_region_cone(&k[1], cra, cde, rin, true);
+				sc_region_combine(&d, SC_REGION_DIFFERENCE, k, 2);
+				t1 = clock();
+				sc_region_integrate(&d, &ad, &md, &ed);
+				ntimed++;
+				t_int += clock() - t1;
+				ncalls++;
+				Md = sc_scale(ca, M_PI * (pow(sin(ra_ * M_PI / 180), 2) - pow(sin(rin * M_PI / 180), 2)));
+				if (fabs(ad - (Aa - Ain)) > ed + 1e-15 || sc_angle(md, Md) > 4 * ed / (Aa - Ain) + 1e-9)
+				{
+					bad_ann++;
+					if (bad_ann < 10) printf("ANNULUS OFF q=%d r=%g in %g: area %g vs %g (bound %g)\n", q, ra_, rin, ad, Aa - Ain, ed);
+				}
+				sc_region_free(&d);
+			}
+
+			/* the rest of the sky: through the complement path */
+			{
+				sc_region uu;
+
+				sc_region_cone(&k[0], cra, cde, ra_, true); sc_region_cone(&k[1], bra, bde, rb_, true);
+				sc_region_combine(&uu, SC_REGION_UNION, k, 2);
+				sc_region_combine(&nu, SC_REGION_NOT, &uu, 1);
+				sc_region_integrate(&nu, &an, &mn, &en);
+				ncalls++;
+				if (fabs(an - (4 * M_PI - au)) > en + eu + 1e-12 || sc_angle(mn, sc_scale(mu, -1)) > 1e-6)
+				{
+					bad_not++;
+					if (bad_not < 10) printf("NOT OFF q=%d: %g vs %g\n", q, an, 4 * M_PI - au);
+				}
+				sc_region_free(&nu);
+			}
+
+			/* a polygon in a union, against its exact area */
+			{
+				double pra[4], pde[4], h = ra_ / sqrt(2), cosd = cos(cde * M_PI / 180), Ap, ap, ep, ai2, ei2;
+				sc_vec3 mp, mi2;
+				sc_region pu, pi;
+
+				if (fabs(cde) < 80)
+				{
+					pra[0] = cra - h / cosd; pde[0] = cde - h; pra[1] = cra + h / cosd; pde[1] = cde - h;
+					pra[2] = cra + h / cosd; pde[2] = cde + h; pra[3] = cra - h / cosd; pde[3] = cde + h;
+					if (sc_region_poly(&nk[0], 4, pra, pde, true) == NULL)
+					{
+						Ap = nk[0].area;
+						sc_region_cone(&nk[1], bra, bde, rb_, true);
+						sc_region_combine(&pu, SC_REGION_UNION, nk, 2);
+						sc_region_integrate(&pu, &ap, &mp, &ep);
+						sc_region_poly(&nk[0], 4, pra, pde, true);
+						sc_region_cone(&nk[1], bra, bde, rb_, true);
+						sc_region_combine(&pi, SC_REGION_INTERSECTION, nk, 2);
+						sc_region_integrate(&pi, &ai2, &mi2, &ei2);
+						ncalls += 2;
+						if (fabs(ap + ai2 - Ap - Ab) > ep + ei2 + 1e-15)
+						{
+							bad_poly++;
+							if (bad_poly < 10) printf("POLYGON UNION OFF q=%d: %g vs %g\n", q, ap + ai2, Ap + Ab);
+						}
+						sc_region_free(&pu);
+						sc_region_free(&pi);
+					}
+				}
+			}
+			sc_region_free(&u);
+			sc_region_free(&in);
+			done++;
+		}
+		printf("composite area/centroid: %d cases, worst area error %.2g of the area (bound %.2g), "
+			   "worst centroid error %.2g of the size; outside bounds: union/intersection %d, moment %d, "
+			   "annulus %d, complement %d, polygon %d; %.2f ms per integration\n",
+			   done, worst, worst_bound, worst_mom, bad_area, bad_mom, bad_ann, bad_not, bad_poly,
+			   1e3 * (double) t_int / CLOCKS_PER_SEC / (ntimed > 0 ? ntimed : 1));
+		failures += bad_area + bad_mom + bad_ann + bad_not + bad_poly;
 	}
 
 	printf("%s (%d false negatives)\n", failures ? "FAILED" : "ALL OK", failures);

@@ -355,20 +355,13 @@ SELECT t.name, (cs_adql(t.q)).* FROM (VALUES
 RESET enable_seqscan;
 DROP TABLE cs_reg;
 DROP FUNCTION cs_adql(text);
--- the range rewrite's waste gate declines in favour of a GiST-family index on
--- the position; with none there is nothing to decline for, and the rewrite
--- stays (here the gate is forced to trigger)
+-- the range rewrite's waste gate declines only in favour of a GiST-family
+-- index on the position (none can be built on skypos since 0.38); with none
+-- there is nothing to decline for, and the rewrite stays (here the gate is
+-- forced to trigger)
 SET skycell.rewrite_max_waste = 0;
 EXPLAIN (COSTS OFF)
 SELECT count(*) FROM cs_cat WHERE point('ICRS', ra, dec) <@ polygon('ICRS', 10, 20, 12, 20, 12, 22, 10, 22);
-CREATE INDEX cs_cat_spg ON cs_cat USING spgist (point('ICRS', ra, dec) skypos_spgist_ops);
--- the index is what matters, not how it is read: PostgreSQL 16 reads it
--- through a bitmap where 18 scans it, so the plain index scan is pinned
-SET enable_bitmapscan = off;
-EXPLAIN (COSTS OFF)
-SELECT count(*) FROM cs_cat WHERE point('ICRS', ra, dec) <@ polygon('ICRS', 10, 20, 12, 20, 12, 22, 10, 22);
-RESET enable_bitmapscan;
-DROP INDEX cs_cat_spg;
 RESET skycell.rewrite_max_waste;
 DROP TABLE cs_dprobe;
 -- the first query of a session: distance()'s support function loads the

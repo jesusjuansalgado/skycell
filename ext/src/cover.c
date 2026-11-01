@@ -1956,6 +1956,132 @@ sc_region_overlaps(const sc_region *a, const sc_region *b)
 }
 
 /* ------------------------------------------------------------------ */
+/* area and moment of a composite, over cells                         */
+/* ------------------------------------------------------------------ */
+
+/*
+ * Straddling cells are refined to SC_INT_EDGE of the region's size and then
+ * counted by their centre; cells inside are summed whole once they are
+ * SC_INT_INSIDE of it (finer, a cell's centre stands for its own centroid
+ * well enough for the moment).  HEALPix cells have equal areas, so the area
+ * of those inside is exact; the error is bounded by the straddling cells
+ * counted by their centre, whose area is returned as *err.
+ */
+#define SC_INT_EDGE 3e-3
+#define SC_INT_INSIDE 0.05
+#define SC_INT_MAX_ORDER 24
+#define SC_INT_BUDGET 8000000
+
+static void
+integrate_cells(const sc_region *z, double *area, sc_vec3 *moment, double *err)
+{
+	typedef struct
+	{
+		int64_t		pix;
+		int			order;
+		int			in;			/* known inside: its parent was */
+	} icell;
+	sc_vec3		bc;
+	double		R;
+	int			kb = 0,
+				ki = 0,
+				cap = 4096,
+				head = 0,
+				tail = 0;
+	long		steps = 0;
+	icell	   *q = SC_MALLOC(sizeof(icell) * cap);
+	double		a = 0,
+				e = 0;
+	sc_vec3		m = {0, 0, 0};
+
+	sc_region_bounding_cap(z, &bc, &R);
+	R = fmax(R, 1e-12);
+	while (kb < SC_INT_MAX_ORDER && sc_pixrad(kb) > SC_INT_EDGE * R)
+		kb++;
+	while (ki < kb && sc_pixrad(ki) > SC_INT_INSIDE * R)
+		ki++;
+
+	for (int f = 0; f < 12; f++)
+		q[tail++] = (icell) {f, 0, 0};
+	while (head < tail)
+	{
+		icell		c = q[head++];
+		double		fo,
+					ca = M_PI / (3.0 * (double) ((int64_t) 1 << (2 * c.order)));
+		sc_class	cls = c.in ? SC_IN : sc_region_classify_cap(z, c.order, c.pix, &fo);
+		int			split;
+
+		if (cls == SC_OUT)
+			continue;
+		split = (cls == SC_IN) ? c.order < ki : c.order < kb;
+		if (split && ++steps > SC_INT_BUDGET)
+			split = 0;			/* out of budget: count it here */
+		if (!split)
+		{
+			sc_vec3		v = sc_pix2vec(c.order, c.pix);
+
+			if (cls != SC_IN)
+			{
+				e += ca;
+				if (!sc_region_contains(z, v))
+					continue;
+			}
+			a += ca;
+			m.x += ca * v.x;
+			m.y += ca * v.y;
+			m.z += ca * v.z;
+			continue;
+		}
+		if (head > cap / 2)
+		{
+			memmove(q, q + head, sizeof(icell) * (tail - head));
+			tail -= head;
+			head = 0;
+		}
+		if (tail + 4 > cap)
+		{
+			cap *= 2;
+			q = SC_REALLOC(q, sizeof(icell) * cap);
+		}
+		for (int k = 0; k < 4; k++)
+			q[tail++] = (icell) {4 * c.pix + k, c.order + 1, cls == SC_IN};
+	}
+	SC_FREE(q);
+	*area = a;
+	*moment = m;
+	*err = e;
+}
+
+void
+sc_region_integrate(const sc_region *r, double *area, sc_vec3 *moment, double *err)
+{
+	/*
+	 * More than a hemisphere (a NOT, a union of large regions): integrate the
+	 * rest of the sky, which is smaller and has a smaller bounding cap, and
+	 * take it from the sphere's (area 4 pi, moment 0).
+	 */
+	if (r->area > 2 * M_PI)
+	{
+		sc_region	nr = {0};
+
+		nr.kind = SC_REGION_NOT;
+		nr.nkids = 1;
+		nr.kids = (sc_region *) r;
+		nr.area = fmax(0, 4 * M_PI - r->area);
+		if (r->kind == SC_REGION_NOT)
+			integrate_cells(&r->kids[0], area, moment, err);
+		else
+			integrate_cells(&nr, area, moment, err);
+		*area = 4 * M_PI - *area;
+		moment->x = -moment->x;
+		moment->y = -moment->y;
+		moment->z = -moment->z;
+		return;
+	}
+	integrate_cells(r, area, moment, err);
+}
+
+/* ------------------------------------------------------------------ */
 /* density model                                                      */
 /* ------------------------------------------------------------------ */
 

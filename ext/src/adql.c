@@ -426,11 +426,15 @@ stcs_error(stcs_parser *ps, const char *detail)
 	ereport(ERROR, (errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
 					errmsg("invalid input syntax for type skyregion: \"%s\"", ps->str),
 					errdetail("%s", detail),
-					errhint("Write STC-S: \"CIRCLE ICRS ra dec radius\", "
+					errhint("Write STC-S: \"CIRCLE ICRS ra dec radius\", \"BOX ICRS ra dec width height\", "
 							"\"POLYGON ICRS ra1 dec1 ra2 dec2 ...\" (degrees), or "
 							"\"UNION ICRS (...)\", \"INTERSECTION ICRS (...)\", "
 							"\"DIFFERENCE ICRS (a b)\", \"NOT ICRS (a)\".")));
 }
+
+/* STC-S Box: not a stored kind, read as the four-corner polygon box() makes */
+#define STCS_BOX (-1)
+static SkyRegion *box_region(double ra, double dec, double w, double h);
 
 static int
 stcs_kind_at(const char *s, const char **after)
@@ -481,8 +485,10 @@ stcs_region(stcs_parser *ps, bool top)
 	check_stack_depth();
 	ps->s = stcs_skip_ws(ps->s);
 	kind = stcs_kind_at(ps->s, &t);
+	if (kind == 0 && (t = stcs_match_word(ps->s, "BOX")) != NULL)
+		kind = STCS_BOX;		/* read as the polygon box() makes */
 	if (kind == 0)
-		stcs_error(ps, "Expected CIRCLE, POLYGON, UNION, INTERSECTION, DIFFERENCE or NOT.");
+		stcs_error(ps, "Expected CIRCLE, BOX, POLYGON, UNION, INTERSECTION, DIFFERENCE or NOT.");
 	ps->s = t;
 	stcs_frame(ps, top);
 
@@ -528,6 +534,13 @@ stcs_region(stcs_parser *ps, bool top)
 								errmsg("too many coordinates in skyregion")));
 			vals[n++] = v;
 			ps->s = end;
+		}
+		if (kind == STCS_BOX)
+		{
+			if (n != 4)
+				ereport(ERROR, (errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
+								errmsg("BOX takes ra, dec, width and height")));
+			return box_region(vals[0], vals[1], vals[2], vals[3]);
 		}
 		if (kind == SKY_CONE)
 		{
@@ -952,21 +965,6 @@ skycell_contains(PG_FUNCTION_ARGS)
 	PG_RETURN_INT32(pos_in_region(fcinfo, PG_GETARG_SKYPOS(0), PG_GETARG_DATUM(1)) ? 1 : 0);
 }
 
-/*
- * AREA and CENTROID are computed for cones and polygons only (and AREA for a
- * NOT of one).  A composite's would have to be integrated over its cells, so
- * rather than answer approximately they are refused.  Region against region
- * is answered for composites too: see sc_region_overlaps() in cover.c.
- */
-static void
-refuse_composite(const sc_region *r, const char *what)
-{
-	if (SC_REGION_IS_COMPOSITE(r))
-		ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-						errmsg("%s is not computed for a UNION, INTERSECTION, DIFFERENCE or NOT", what),
-						errhint("A position in one is: CONTAINS(POINT(...), region) = 1.")));
-}
-
 static int
 region_region(PG_FUNCTION_ARGS, bool contains)
 {
@@ -1075,14 +1073,23 @@ skycell_area(PG_FUNCTION_ARGS)
 
 	/*
 	 * The area kept for a composite is the cost model's estimate; it is the
-	 * area only for a NOT (of a NOT ...) of a cone or a polygon.
+	 * area only for a NOT (of a NOT ...) of a cone or a polygon.  Any other
+	 * composite is integrated over cells (sc_region_integrate()).
 	 */
 	{
 		const sc_region *x = &r;
 
 		while (x->kind == SC_REGION_NOT)
 			x = &x->kids[0];
-		refuse_composite(x, "AREA");
+		if (SC_REGION_IS_COMPOSITE(x))
+		{
+			sc_vec3		m;
+			double		err;
+
+			sc_region_integrate(&r, &a, &m, &err);
+			sc_region_free(&r);
+			PG_RETURN_FLOAT8(a * RAD2DEG * RAD2DEG);
+		}
 	}
 	a = r.area * RAD2DEG * RAD2DEG;
 	sc_region_free(&r);
@@ -1113,8 +1120,48 @@ skycell_centroid(PG_FUNCTION_ARGS)
 				dec;
 
 	skycell_region_from_datum(PG_GETARG_DATUM(0), &r);
-	refuse_composite(&r, "CENTROID");
-	c = sc_region_centroid(&r);
+	if (SC_REGION_IS_COMPOSITE(&r))
+	{
+		const sc_region *x = &r;
+		int			flips = 0;
+
+		/* a NOT of a cone or polygon: the opposite direction, exactly */
+		while (x->kind == SC_REGION_NOT)
+		{
+			x = &x->kids[0];
+			flips++;
+		}
+		if (!SC_REGION_IS_COMPOSITE(x))
+		{
+			c = sc_region_centroid(x);
+			if (flips % 2)
+			{
+				c.x = -c.x;
+				c.y = -c.y;
+				c.z = -c.z;
+			}
+		}
+		else
+		{
+			double		area,
+						err,
+						norm;
+
+			sc_region_integrate(&r, &area, &c, &err);
+			norm = sqrt(sc_dot(c, c));
+			if (area <= 0)
+				ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+								errmsg("an empty region has no centroid")));
+			if (norm <= 1e-9 * area)
+				ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+								errmsg("the region has no centroid: it is balanced about the centre of the sphere")));
+			c.x /= norm;
+			c.y /= norm;
+			c.z /= norm;
+		}
+	}
+	else
+		c = sc_region_centroid(&r);
 	sc_region_free(&r);
 	dec = asin(fmax(-1.0, fmin(1.0, c.z))) * RAD2DEG;
 	ra = atan2(c.y, c.x) * RAD2DEG;
@@ -1949,8 +1996,8 @@ skycell_region_sel_support(PG_FUNCTION_ARGS)
 /*
  * Restriction selectivity for the raw, un-rewritten <@(skypos,skyregion) and
  * @>(skyregion,skypos) operators -- the ones a GiST or SP-GiST index on
- * skypos indexes directly (skypos_spgist_ops, gist_point_cap.c's
- * experimental skypos_cap_gist_ops), with no B-tree rewrite in the picture
+ * skypos indexed directly (the SP-GiST and cap-GiST operator classes,
+ * removed in 0.38), with no B-tree rewrite in the picture
  * to hand off to skycell_in_region/skycell_region_sel_support above.
  *
  * Both operators are declared with `RESTRICT = contsel` (see their CREATE

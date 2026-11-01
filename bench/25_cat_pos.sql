@@ -1,3 +1,7 @@
+-- Uses operator classes removed in 0.38 (skyregion_box_gist_ops,
+-- skypos_spgist_ops, skypos_cap_gist_ops): run it against skycell 0.37 or
+-- earlier to reproduce the numbers it produced.
+--
 -- A skypos-typed, point-indexed view of the catalogue, with all three
 -- point-indexing strategies registered on the same column at once:
 -- skypos_spgist_ops (the shipped default), the plain btree expression
