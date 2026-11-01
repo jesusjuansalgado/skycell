@@ -1317,7 +1317,7 @@ circle_as_cone(SupportRequestSimplify *req, Oid funcid, Node *pt, Node *rg, Node
 static int
 single_varno(Node *node)
 {
-	List	   *vars = pull_var_clause(node, PVC_RECURSE_AGGREGATES |
+	List	   *vars = sc_pull_local_vars(node, PVC_RECURSE_AGGREGATES |
 									   PVC_RECURSE_WINDOWFUNCS |
 									   PVC_RECURSE_PLACEHOLDERS);
 	ListCell   *lc;
