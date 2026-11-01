@@ -953,11 +953,10 @@ skycell_contains(PG_FUNCTION_ARGS)
 }
 
 /*
- * Whether one region holds or meets another is answered exactly for cones and
- * polygons only.  For a composite it can turn on its regions together -- a
- * circle can lie in a union without lying in either of its parts -- so rather
- * than answer approximately it is refused; a position in a composite is
- * answered exactly, and is what an index serves.
+ * AREA and CENTROID are computed for cones and polygons only (and AREA for a
+ * NOT of one).  A composite's would have to be integrated over its cells, so
+ * rather than answer approximately they are refused.  Region against region
+ * is answered for composites too: see sc_region_overlaps() in cover.c.
  */
 static void
 refuse_composite(const sc_region *r, const char *what)
@@ -975,8 +974,6 @@ region_region(PG_FUNCTION_ARGS, bool contains)
 	sc_region  *b = cached_region_arg(fcinfo, 1, PG_GETARG_DATUM(1));
 	int			res;
 
-	refuse_composite(a, contains ? "Containment between regions" : "Intersection between regions");
-	refuse_composite(b, contains ? "Containment between regions" : "Intersection between regions");
 	res = contains ? sc_region_contains_region(a, b) : sc_region_overlaps(a, b);
 
 	return res ? 1 : 0;
@@ -1032,8 +1029,6 @@ skycell_region_covers(PG_FUNCTION_ARGS)
 	sc_region  *b = cached_region_arg(fcinfo, 1, PG_GETARG_DATUM(1));
 	int			res;
 
-	refuse_composite(a, "Containment between regions");
-	refuse_composite(b, "Containment between regions");
 	res = sc_region_contains_region(b, a);
 
 	PG_RETURN_BOOL(res != 0);

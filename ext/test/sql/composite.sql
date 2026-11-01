@@ -58,10 +58,31 @@ SELECT contains(point('ICRS', 10, 20.75), r) AS ring, contains(point('ICRS', 10,
        contains(point('ICRS', 10, 21.5), r) AS outside
 FROM (SELECT region('DIFFERENCE ICRS (CIRCLE 10 20 1 CIRCLE 10 20 0.5)') AS r) t;
 
+-- region against region: from the operands where the operator decides it,
+-- by refining cells otherwise; each answer here can be checked by hand
+SELECT r && circle('ICRS', 50, 10, 0.3) AS hole_meets_annulus,       -- f: inside the hole
+       r && circle('ICRS', 50, 10, 0.6) AS reaches_ring,             -- t
+       circle('ICRS', 50, 10, 0.3) <@ skycell_not(r) AS hole_outside, -- t
+       circle('ICRS', 50, 11.2, 0.2) <@ r AS in_ring,                -- t
+       circle('ICRS', 50, 10.8, 0.4) <@ r AS over_hole_edge,         -- f: reaches the hole
+       r <@ circle('ICRS', 50, 10, 2.01) AS inside_bigger,          -- t
+       r <@ circle('ICRS', 50.1, 10, 2) AS not_inside_shifted       -- f
+FROM (SELECT region('DIFFERENCE ICRS (CIRCLE 50 10 2 CIRCLE 50 10 0.5)') AS r) t;
+SELECT r && circle('ICRS', 90.4, 0, 0.05) AS in_lens,                -- t
+       r && circle('ICRS', 89.2, 0, 0.1) AS one_circle_only,         -- f
+       circle('ICRS', 71, 0, 0.3) <@ u AS across_the_gap,            -- f: 71.0-71.5 is in neither piece
+       circle('ICRS', 70.6, 0, 0.3) <@ u AS in_the_circle,           -- t
+       circle('ICRS', 70.9, 0, 0.15) <@ skycell_union(u, circle('ICRS', 71.25, 0, 0.3)) AS needs_both, -- t
+       1 = intersects(skycell_not(circle('ICRS', 0, 0, 10)), circle('ICRS', 0, 0, 5)) AS not_meets_inner,  -- f
+       1 = contains(circle('ICRS', 40, 0, 5), skycell_not(circle('ICRS', 0, 0, 10))) AS outer_in_not,    -- t
+       skycell_not(circle('ICRS', 0, 0, 10)) <@ skycell_not(circle('ICRS', 0, 0, 5)) AS nots_nest,       -- t
+       r <@ r AND u <@ u AS self                                     -- t
+FROM (SELECT skycell_intersection(circle('ICRS', 90, 0, 1), circle('ICRS', 90.8, 0, 1)) AS r,
+             region('UNION ICRS (CIRCLE 70 0 1 POLYGON 71 -1 73 -1 72 1)') AS u) t;
+
 -- what is not computed for a composite says so
 SELECT area(skycell_union(circle('ICRS', 1, 2, 3), circle('ICRS', 4, 5, 6)));
 SELECT centroid(skycell_not(circle('ICRS', 1, 2, 3)));
-SELECT skycell_not(circle('ICRS', 1, 2, 3)) && circle('ICRS', 1, 2, 3);
 -- except the area of a complement, which is exact
 SELECT round(area(skycell_not(circle('ICRS', 1, 2, 3)))::numeric, 6)
      = round((41252.961249419271 - area(circle('ICRS', 1, 2, 3)))::numeric, 6) AS not_area;
@@ -143,6 +164,9 @@ CREATE TABLE cprobe AS
 SELECT i AS pid, point('ICRS', 6 + 8 * random(), 16 + 8 * random()) AS p FROM generate_series(1, 300) i
 UNION ALL SELECT 1000 + i, point('ICRS', 360 * random(), degrees(asin(2 * random() - 1))) FROM generate_series(1, 100) i;
 ANALYZE cprobe;
+-- regions to compare the stored ones with: cones, polygons and composites
+CREATE TABLE cquery AS
+SELECT i AS qid, CASE i % 3 WHEN 0 THEN rand_leaf() ELSE rand_region(2) END AS q FROM generate_series(1, 20) i;
 
 CREATE FUNCTION store_counts(OUT name text, OUT idx text, OUT seq text) RETURNS SETOF record
 LANGUAGE plpgsql AS $$
@@ -152,7 +176,12 @@ BEGIN
     ('point join', 'SELECT count(*) || '':'' || coalesce(sum(fid * 10000 + pid), 0) FROM cprobe JOIN cstore ON r @> p'),
     ('one point',  'SELECT count(*) || '':'' || coalesce(sum(fid), 0) FROM cstore WHERE r @> point(''ICRS'', 10, 20)'),
     ('ADQL',       'SELECT count(*) || '':'' || coalesce(sum(fid), 0) FROM cstore WHERE contains(point(''ICRS'', 10.5, 19.5), r) = 1'),
-    ('correlated', 'SELECT sum((SELECT count(*) FROM cstore WHERE r @> pr.p)) || '''' FROM cprobe pr')
+    ('correlated', 'SELECT sum((SELECT count(*) FROM cstore WHERE r @> pr.p)) || '''' FROM cprobe pr'),
+    ('overlap',    'SELECT count(*) || '':'' || coalesce(sum(fid * 100 + qid), 0) FROM cquery JOIN cstore ON r && q'),
+    ('holds',      'SELECT count(*) || '':'' || coalesce(sum(fid * 100 + qid), 0) FROM cquery JOIN cstore ON r @> q'),
+    ('inside',     'SELECT count(*) || '':'' || coalesce(sum(fid * 100 + qid), 0) FROM cquery JOIN cstore ON r <@ q'),
+    ('ADQL meets', 'SELECT count(*) || '':'' || coalesce(sum(fid), 0) FROM cstore WHERE 1 = intersects(r, region(''DIFFERENCE ICRS (CIRCLE 10 20 3 CIRCLE 10 20 1)''))'),
+    ('ADQL in',    'SELECT count(*) || '':'' || coalesce(sum(fid), 0) FROM cstore WHERE 1 = contains(r, circle(''ICRS'', 10, 20, 3))')
   LOOP
     SET LOCAL enable_seqscan = off;
     SET LOCAL enable_indexscan = on;
@@ -179,9 +208,18 @@ DROP INDEX cstore_box4;
 CREATE INDEX cstore_moc ON cstore USING gin (skycell_region_moc(r));
 ANALYZE cstore;
 SELECT 'moc' AS idx, name, idx = seq AS agree FROM store_counts() ORDER BY name;
--- comparing two stored regions is not computed for a composite
-SELECT count(*) FROM cstore a JOIN cstore b ON a.r && b.r;
+-- stored regions against each other, every pair: overlap is symmetric, and
+-- each region holds and meets itself unless it is empty (a random
+-- intersection or difference can be; an empty region holds nothing, is held
+-- by nothing and meets nothing, as PostGIS has it)
+SELECT count(*) FILTER (WHERE (a.r && b.r) <> (b.r && a.r)) AS asymmetric,
+       count(*) FILTER (WHERE a.fid = b.fid AND NOT (a.r @> b.r AND a.r && b.r)
+                        AND EXISTS (SELECT 1 FROM ccat WHERE skycell_in_region(pos, a.r))) AS nonempty_self_fails,
+       count(*) FILTER (WHERE a.fid = b.fid AND (a.r @> b.r OR a.r && b.r)
+                        AND NOT EXISTS (SELECT 1 FROM ccat WHERE skycell_in_region(pos, a.r))) AS empty_self_holds,
+       count(*) FILTER (WHERE a.r && b.r) > count(*) FILTER (WHERE a.fid = b.fid) AS some_meet
+FROM cstore a, cstore b;
 
-DROP TABLE cpts, cparts, ccat, cregs, crand, cstore, cprobe;
+DROP TABLE cpts, cparts, ccat, cregs, crand, cstore, cprobe, cquery;
 DROP FUNCTION store_counts(), comp_counts(skyregion), comp_plan_uses_index(text),
               rand_region(int), rand_leaf();
