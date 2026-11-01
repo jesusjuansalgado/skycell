@@ -1001,6 +1001,14 @@ skycell_intersects_pos(PG_FUNCTION_ARGS)
 	PG_RETURN_INT32(pos_in_region(fcinfo, PG_GETARG_SKYPOS(0), PG_GETARG_DATUM(1)) ? 1 : 0);
 }
 
+/* ADQL lets INTERSECTS take the point second: INTERSECTS(CIRCLE(...), POINT(...)) */
+PG_FUNCTION_INFO_V1(skycell_intersects_region_pos);
+Datum
+skycell_intersects_region_pos(PG_FUNCTION_ARGS)
+{
+	PG_RETURN_INT32(pos_in_region(fcinfo, PG_GETARG_SKYPOS(1), PG_GETARG_DATUM(0)) ? 1 : 0);
+}
+
 PG_FUNCTION_INFO_V1(skycell_region_overlap);
 Datum
 skycell_region_overlap(PG_FUNCTION_ARGS)
@@ -2336,6 +2344,7 @@ is_distance_func(Oid fn)
  * itself, which the support function, the custom scan and the GiST
  * opclasses all index:
  *   contains(skypos, skyregion), intersects(skypos, skyregion)  ->  <@
+ *   intersects(skyregion, skypos)                               ->  @>
  *   contains(skyregion, skyregion)                              ->  <@
  *   intersects(skyregion, skyregion)                            ->  &&
  * NULL when qual is not one of these.
@@ -2374,6 +2383,8 @@ adql_predicate_operator(Node *qual)
 		opname = "<@";
 	else if (strcmp(src, "skycell_intersects") == 0)
 		opname = "&&";
+	else if (strcmp(src, "skycell_intersects_region_pos") == 0)
+		opname = "@>";
 	else
 		return NULL;
 	opno = OpernameGetOprid(list_make2(makeString(get_namespace_name(get_func_namespace(f->funcid))),

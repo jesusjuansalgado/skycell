@@ -349,7 +349,7 @@ for ADQL compatibility and must be `'ICRS'`; convert other frames first with
 | `box(ra, dec, width, height)`<br>`box(coordsys, …)` | `skyregion` | centre and extent, as ADQL defines it. Errors if it reaches a pole — use a polygon there. ADQL `BOX` |
 | `polygon(ra1, dec1, ra2, dec2, …)`<br>`polygon(coordsys, …)` | `skyregion` | ≥ 3 vertices, convex or not (non-convex since 0.35), but simple: no two edges may cross or touch. Every vertex must lie within 90° of the vertices' mean. ADQL `POLYGON` |
 | `contains(p skypos, r skyregion)`<br>`contains(a skyregion, b skyregion)` | `integer` (1/0) | ADQL `CONTAINS`. Compared with 1 (`contains(…) = 1`, or `1 = …`) in a `WHERE` or `JOIN ON` it is planned as the `<@` operator below, so it is indexed |
-| `intersects(p skypos, r skyregion)`<br>`intersects(a skyregion, b skyregion)` | `integer` (1/0) | ADQL `INTERSECTS`. Compared with 1 it is planned as `<@` (point-region) or `&&` (region-region) below, so it is indexed |
+| `intersects(p skypos, r skyregion)`<br>`intersects(r skyregion, p skypos)`<br>`intersects(a skyregion, b skyregion)` | `integer` (1/0) | ADQL `INTERSECTS`, the point on either side (the second form since 0.38). Compared with 1 it is planned as `<@` or `@>` (point-region) or `&&` (region-region) below, so it is indexed |
 | `distance(a skypos, b skypos)`<br>`distance(ra1, dec1, ra2, dec2)` | `float8` | degrees. ADQL `DISTANCE`, both forms. `distance(…) < r` (or `<=`) in a `WHERE` or `JOIN ON` is planned as the cone, like `<@` below |
 | `area(r skyregion)` | `float8` | square degrees. ADQL `AREA`. Not computed for a composite region (it errors), except a `NOT` of a cone or polygon |
 | `coord1(p)` / `coord2(p)` | `float8` | right ascension / declination, degrees |
@@ -404,17 +404,25 @@ composites up to three deep, and up to about 10 ms where long boundaries
 nearly coincide. `AREA` and `CENTROID` are not computed for a composite and
 say so.
 
-### Operators — the indexable spelling
+### Operators
 
-| Operator | Meaning |
-|---|---|
-| `skypos <@ skyregion` | position inside region — **the indexable ADQL `CONTAINS`**: against a circle (constant, or built per row as in a cross-match) it is planned exactly as `skycell_cone`, through the custom scan; against a polygon it is rewritten into index ranges |
-| `skyregion @> skypos` | the same, reversed; when `skyregion` is a stored column with a GiST (or MOC GIN) index, indexed through that instead |
-| `skyregion && skyregion` | regions overlap — indexed by `CREATE INDEX ON t USING gist (region)` |
-| `skyregion @> skyregion` | region wholly contains region — the same index, either spelling |
-| `skyregion <@ skyregion` | the same, reversed |
+The ADQL functions above and these operators run the same tests, and both are
+indexed. `CONTAINS(…) = 1` and `INTERSECTS(…) = 1` are planned as the operator
+in the table below, wherever they appear: `WHERE`, `JOIN ON` and `LEFT JOIN`,
+under `OR`, in views, CTEs, `EXISTS` and `LATERAL` sub-selects, with
+an outer query's columns as the centre. So a TAP service can pass ADQL geometry
+through as it is written. The operators return a boolean rather than 1 or 0,
+read more naturally in plain SQL, and are what a pgSphere user already writes.
 
-`<@`/`@>` against a circle and a plain `ra`/`dec` (or `skypos`) catalogue go
+| Operator | ADQL spelling | Meaning |
+|---|---|---|
+| `skypos <@ skyregion` | `CONTAINS(p, r) = 1`, `INTERSECTS(p, r) = 1` | position inside region. Against a circle (constant, or built per row as in a cross-match) it is planned exactly as `skycell_cone`, through the custom scan; against a polygon or a composite it is rewritten into index ranges |
+| `skyregion @> skypos` | `INTERSECTS(r, p) = 1` | the same, reversed. When `skyregion` is a stored column with a GiST (or MOC GIN) index, indexed through that instead |
+| `skyregion && skyregion` | `INTERSECTS(a, b) = 1` | regions overlap. Indexed by `CREATE INDEX ON t USING gist (region)` |
+| `skyregion @> skyregion` | `CONTAINS(b, a) = 1` | `a` wholly contains `b`. The same index |
+| `skyregion <@ skyregion` | `CONTAINS(a, b) = 1` | `a` lies wholly inside `b`. The same index |
+
+Both spellings take the same plans. `<@`/`@>` against a circle and a plain `ra`/`dec` (or `skypos`) catalogue go
 through the custom scan, like `skycell_cone`, whether the circle is a constant or
 comes from another table's row (`JOIN cat c ON point('ICRS', c.ra, c.dec) <@
 circle('ICRS', p.ra, p.dec, r)` is a cross-match). Either side can be the one
@@ -798,8 +806,9 @@ Two layers, both in [`ext/test/`](ext/test/).
   clustered catalogue with clusters at both poles and across RA = 0: cones,
   polygons, the Q3C-shaped spellings, cross-matches, MOC-stored regions and the
   GiST region operator classes.
-- `adql`: the ADQL surface — the standard's spelling, the indexable operator
-  form, and the IVOA UDF astronomy functions.
+- `adql`: the ADQL surface — the standard's spelling and the operator form,
+  each indexed (under `OR` and in correlated sub-selects too), and the IVOA
+  UDF astronomy functions.
 - `cone_scan`: the custom scan. Every query returns the same rows with
   `skycell.custom_scan` on and off, in both of its modes (a heap in cell order
   and one that is not), rescanned in a nested loop, under a generic plan and

@@ -1126,3 +1126,8 @@ COMMENT ON FUNCTION skycell_difference(skyregion, skyregion) IS 'a less b (STC-S
 CREATE FUNCTION skycell_not(r skyregion) RETURNS skyregion
 AS 'MODULE_PATHNAME' LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
 COMMENT ON FUNCTION skycell_not(skyregion) IS 'the sky less r (STC-S Not)';
+
+-- ADQL's INTERSECTS takes its point either side: INTERSECTS(CIRCLE(...), POINT(...))
+CREATE FUNCTION intersects(r skyregion, p skypos) RETURNS int
+AS 'MODULE_PATHNAME', 'skycell_intersects_region_pos' LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
+ALTER FUNCTION intersects(skyregion, skypos) SUPPORT skycell_distance_support;

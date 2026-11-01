@@ -232,6 +232,7 @@ BEGIN
     ('or in and',   'SELECT count(*) || '':'' || coalesce(sum(id), 0) FROM acat WHERE id > 100 AND (CONTAINS(pos, CIRCLE(''ICRS'', 10, 20, 2)) = 1 OR CONTAINS(pos, CIRCLE(''ICRS'', 200, -30, 2)) = 1)'),
     ('and in or',   'SELECT count(*) || '':'' || coalesce(sum(id), 0) FROM acat WHERE (CONTAINS(pos, CIRCLE(''ICRS'', 10, 20, 2)) = 1 AND CONTAINS(pos, CIRCLE(''ICRS'', 10, 20, 1)) = 0) OR CONTAINS(pos, CIRCLE(''ICRS'', 200, -30, 2)) = 1'),
     ('intersects',  'SELECT count(*) || '':'' || coalesce(sum(id), 0) FROM acat WHERE INTERSECTS(pos, CIRCLE(''ICRS'', 10, 20, 2)) = 1 OR INTERSECTS(pos, CIRCLE(''ICRS'', 50, 60, 2)) = 1'),
+    ('point second', 'SELECT count(*) || '':'' || coalesce(sum(id), 0) FROM acat WHERE INTERSECTS(CIRCLE(''ICRS'', 10, 20, 2), POINT(''ICRS'', ra, dec)) = 1 OR 1 = INTERSECTS(POLYGON(''ICRS'', 50,60, 54,60, 52,63), pos)'),
     ('not',         'SELECT count(*) || '':'' || coalesce(sum(id), 0) FROM acat WHERE NOT (CONTAINS(pos, CIRCLE(''ICRS'', 10, 20, 90)) = 1 OR id < 10)')
   LOOP
     SET LOCAL enable_seqscan = off;
@@ -250,4 +251,8 @@ BEGIN
 END $$;
 SELECT name, idx = seq AS agree, split_part(seq, ':', 1)::int > 0 AS nonempty, indexed
 FROM bool_counts() ORDER BY name;
+-- and the point second is the point first: ADQL's INTERSECTS is symmetric
+SELECT (SELECT count(*) FROM acat WHERE INTERSECTS(CIRCLE('ICRS', 10, 20, 2), pos) = 1)
+     = (SELECT count(*) FROM acat WHERE INTERSECTS(pos, CIRCLE('ICRS', 10, 20, 2)) = 1) AS symmetric,
+       adql_plan_uses_index('SELECT * FROM acat WHERE INTERSECTS(CIRCLE(''ICRS'', 10, 20, 2), POINT(''ICRS'', ra, dec)) = 1') AS indexed;
 DROP FUNCTION bool_counts();
