@@ -43,7 +43,7 @@ public final class SkycellAdqlGeometry {
     private static final List<String> FRAMES =
             Arrays.asList("ICRS", "UNKNOWN", "");
     private static final List<String> GEOMETRY =
-            Arrays.asList("POINT", "CIRCLE", "BOX", "POLYGON", "CENTROID");
+            Arrays.asList("POINT", "CIRCLE", "BOX", "POLYGON", "CENTROID", "REGION");
     private static final List<String> OTHER =
             Arrays.asList("CONTAINS", "INTERSECTS", "DISTANCE", "AREA", "COORD1", "COORD2");
 
@@ -301,6 +301,15 @@ public final class SkycellAdqlGeometry {
                 throw new TranslationException("CENTROID has no direct pgSphere equivalent "
                         + "for a polygon; compute it in the client or use skycell");
             }
+            case "REGION": {
+                need(raw, 1, "REGION takes one STC-S string");
+                if (dialect == Dialect.SKYCELL) {
+                    return "region(" + translateExpression(raw.get(0)) + ")";
+                }
+                throw new TranslationException("REGION has no pgSphere equivalent; "
+                        + "use skycell, which reads STC-S including UNION, INTERSECTION, "
+                        + "DIFFERENCE and NOT");
+            }
             default:
                 throw new TranslationException(fn + " is not supported");
         }
@@ -437,10 +446,17 @@ public final class SkycellAdqlGeometry {
 
     // ------------------------------------------------------------- predicates
 
-    private static final Pattern EQ1 =
-            Pattern.compile("(\\((?:[^()]|\\([^()]*\\))*\\))\\s*=\\s*([01])\\b");
-    private static final Pattern EQ2 =
-            Pattern.compile("\\b([01])\\s*=\\s*(\\((?:[^()]|\\([^()]*\\))*\\))");
+    /** A parenthesised group nested up to five deep; string literals are skipped
+     *  whole, so the parentheses inside REGION's STC-S do not count. */
+    private static final String GROUP;
+    static {
+        String str = "'(?:[^']|'')*'";
+        String g = "\\((?:[^()']|" + str + ")*\\)";
+        for (int i = 0; i < 4; i++) g = "\\((?:[^()']|" + str + "|" + g + ")*\\)";
+        GROUP = g;
+    }
+    private static final Pattern EQ1 = Pattern.compile("(" + GROUP + ")\\s*=\\s*([01])\\b");
+    private static final Pattern EQ2 = Pattern.compile("\\b([01])\\s*=\\s*(" + GROUP + ")");
 
     /** {@code CONTAINS(...) = 1} is already boolean in PostgreSQL. */
     private static String foldPredicates(String sql) {
@@ -467,6 +483,11 @@ public final class SkycellAdqlGeometry {
     public static void main(String[] args) {
         Dialect d = args.length > 1 && args[1].equalsIgnoreCase("pgsphere")
                 ? Dialect.PGSPHERE : Dialect.SKYCELL;
-        System.out.println(new SkycellAdqlGeometry(d, "2.1").translate(args[0]));
+        try {
+            System.out.println(new SkycellAdqlGeometry(d, "2.1").translate(args[0]));
+        } catch (TranslationException e) {
+            System.err.println("error: " + e.getMessage());
+            System.exit(1);
+        }
     }
 }

@@ -501,6 +501,8 @@ stcs_region(stcs_parser *ps, bool top)
 			ps->s = stcs_skip_ws(ps->s);
 		}
 		ps->s = stcs_skip_ws(ps->s + 1);
+		if (n < 2 && kind != SKY_NOT && *ps->s == '(')
+			stcs_error(ps, "Write all the regions of a UNION, INTERSECTION or DIFFERENCE inside one pair of parentheses: \"UNION ICRS (CIRCLE ... POLYGON ...)\".");
 		return region_combine(kind, kids, n);
 	}
 

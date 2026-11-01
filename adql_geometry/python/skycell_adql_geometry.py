@@ -404,6 +404,17 @@ def _centroid(args: list[str], d: Dialect, version: str) -> str:
     )
 
 
+def _region(args: list[str], d: Dialect, version: str) -> str:
+    if len(args) != 1:
+        raise TranslationError("REGION takes one STC-S string")
+    if d is SKYCELL:
+        return f"region({translate_expr(args[0], d, version)})"
+    raise TranslationError(
+        "REGION has no pgSphere equivalent; use skycell, which reads STC-S "
+        "including UNION, INTERSECTION, DIFFERENCE and NOT"
+    )
+
+
 def translate_expr(sql: str, d: Dialect = SKYCELL, version: str = "2.1") -> str:
     """Rewrite every ADQL geometry construct in `sql`; pass the rest through."""
     toks = tokenize(sql)
@@ -429,6 +440,8 @@ def translate_expr(sql: str, d: Dialect = SKYCELL, version: str = "2.1") -> str:
                     out.append(_coord(int(fn[-1]), args, d, version))
                 elif fn == "CENTROID":
                     out.append(_centroid(args, d, version))
+                elif fn == "REGION":
+                    out.append(_region(args, d, version))
                 else:
                     raise TranslationError(f"{fn} is not supported")
                 i = end
@@ -439,8 +452,14 @@ def translate_expr(sql: str, d: Dialect = SKYCELL, version: str = "2.1") -> str:
 
 
 #: `CONTAINS(...) = 1`, `1 = CONTAINS(...)`, and the `= 0` negations
-_EQ1 = re.compile(r"(\((?:[^()]|\([^()]*\))*\))\s*=\s*([01])\b")
-_EQ2 = re.compile(r"\b([01])\s*=\s*(\((?:[^()]|\([^()]*\))*\))")
+#: a parenthesised group nested up to five deep; string literals are skipped
+#: whole, so the parentheses inside REGION's STC-S do not count
+_STR = r"'(?:[^']|'')*'"
+_GROUP = r"\((?:[^()']|" + _STR + r")*\)"
+for _ in range(4):
+    _GROUP = r"\((?:[^()']|" + _STR + "|" + _GROUP + r")*\)"
+_EQ1 = re.compile("(" + _GROUP + r")\s*=\s*([01])\b")
+_EQ2 = re.compile(r"\b([01])\s*=\s*(" + _GROUP + ")")
 
 
 def _fold_predicates(sql: str) -> str:
