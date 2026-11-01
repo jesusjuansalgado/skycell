@@ -436,7 +436,7 @@ keep_cone(PlannerInfo *root, FuncExpr *written, FuncExpr *fcall)
 	if (!skycell_custom_scan || root == NULL || root->parse == NULL ||
 		list_length(args) != 6)
 		return false;
-	vars = pull_var_clause((Node *) list_make3(linitial(args), lsecond(args), lthird(args)),
+	vars = sc_pull_local_vars((Node *) list_make3(linitial(args), lsecond(args), lthird(args)),
 						   PVC_INCLUDE_AGGREGATES | PVC_INCLUDE_WINDOWFUNCS | PVC_INCLUDE_PLACEHOLDERS);
 	foreach(lc, vars)
 	{
@@ -1034,7 +1034,7 @@ cone_join_selectivity(PlannerInfo *root, List *args)
 
 	if (!skycell_custom_scan || list_length(args) != 6)
 		return -1;
-	vars = pull_var_clause((Node *) list_make3(linitial(args), lsecond(args), lthird(args)),
+	vars = sc_pull_local_vars((Node *) list_make3(linitial(args), lsecond(args), lthird(args)),
 						   PVC_INCLUDE_AGGREGATES | PVC_INCLUDE_WINDOWFUNCS | PVC_INCLUDE_PLACEHOLDERS);
 	foreach(lc, vars)
 	{

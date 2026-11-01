@@ -660,11 +660,117 @@ sc_region_free(sc_region *r)
 	}
 	r->parts = NULL;
 	r->nparts = 0;
+	if (r->kids)
+	{
+		for (int i = 0; i < r->nkids; i++)
+			sc_region_free(&r->kids[i]);
+		SC_FREE(r->kids);
+	}
+	r->kids = NULL;
+	r->nkids = 0;
+}
+
+/*
+ * Composite regions: the union, intersection or difference of regions, or the
+ * sky less one (STC-S Union, Intersection, Difference, Not), nested freely.
+ * A point is in one as the boolean combination of its kids says.  A cell is
+ * classified from its kids' classes (classify_composite()), and the covering
+ * descends through those exactly as through a polygon's.  The area is only an
+ * estimate for the cost model: exact for NOT, an upper bound for the rest.
+ */
+#define SC_REGION_MAX_DEPTH 32
+
+static int
+region_depth(const sc_region *r)
+{
+	int			d = 0;
+
+	for (int i = 0; i < r->nkids; i++)
+		d = (int) fmax(d, region_depth(&r->kids[i]));
+	return SC_REGION_IS_COMPOSITE(r) ? d + 1 : 0;
+}
+
+const char *
+sc_region_combine(sc_region *r, sc_region_kind op, const sc_region *kids, int n)
+{
+	double		a = 0;
+
+	memset(r, 0, sizeof(*r));
+	switch (op)
+	{
+		case SC_REGION_UNION:
+		case SC_REGION_INTERSECTION:
+			if (n < 2)
+				return "UNION and INTERSECTION need two regions or more";
+			break;
+		case SC_REGION_DIFFERENCE:
+			if (n != 2)
+				return "DIFFERENCE takes two regions";
+			break;
+		case SC_REGION_NOT:
+			if (n != 1)
+				return "NOT takes one region";
+			break;
+		default:
+			return "not a composite region";
+	}
+	r->kind = op;
+	r->nkids = n;
+	r->kids = SC_MALLOC(sizeof(sc_region) * n);
+	memcpy(r->kids, kids, sizeof(sc_region) * n);
+	if (region_depth(r) > SC_REGION_MAX_DEPTH)
+		return "regions nested too deep";
+
+	switch (op)
+	{
+		case SC_REGION_UNION:
+			for (int i = 0; i < n; i++)
+				a += kids[i].area;
+			a = fmin(a, 4.0 * M_PI);
+			break;
+		case SC_REGION_INTERSECTION:
+			a = kids[0].area;
+			for (int i = 1; i < n; i++)
+				a = fmin(a, kids[i].area);
+			break;
+		case SC_REGION_DIFFERENCE:
+			a = kids[0].area;
+			break;
+		default:
+			a = fmax(0.0, 4.0 * M_PI - kids[0].area);
+			break;
+	}
+	r->area = a;
+	return NULL;
+}
+
+static int
+composite_contains(const sc_region *r, sc_vec3 p)
+{
+	switch (r->kind)
+	{
+		case SC_REGION_UNION:
+			for (int i = 0; i < r->nkids; i++)
+				if (sc_region_contains(&r->kids[i], p))
+					return 1;
+			return 0;
+		case SC_REGION_INTERSECTION:
+			for (int i = 0; i < r->nkids; i++)
+				if (!sc_region_contains(&r->kids[i], p))
+					return 0;
+			return 1;
+		case SC_REGION_DIFFERENCE:
+			return sc_region_contains(&r->kids[0], p) && !sc_region_contains(&r->kids[1], p);
+		default:
+			return !sc_region_contains(&r->kids[0], p);
+	}
 }
 
 int
 sc_region_contains(const sc_region *r, sc_vec3 p)
 {
+	if (SC_REGION_IS_COMPOSITE(r))
+		return composite_contains(r, p);
 	if (r->kind == SC_REGION_CONE)
 		return r->radius >= 0 &&
 			sc_chord2(p, r->center) <= 4.0 * pow(sin(r->radius / 2.0), 2);
@@ -692,6 +798,17 @@ sc_region_contains(const sc_region *r, sc_vec3 p)
 			return 0;
 	return 1;
 }
+
+/* how certain a composite's kids' classes must be (classify_composite()) */
+typedef enum
+{
+	CLASSIFY_OUT_SOUND,			/* OUT must be certain: sc_region_classify() */
+	CLASSIFY_IN_SOUND,			/* IN must be certain: under a negation */
+	CLASSIFY_BOTH_SOUND			/* both: sc_region_classify_cap() */
+} classify_mode;
+
+static sc_class classify_composite(const sc_region *r, int order, int64_t pix,
+								   double *f_out, classify_mode m);
 
 /* angular distance from p to the minor great-circle arc a-b (unit normal n) */
 static double arc_dist(sc_vec3 p, sc_vec3 a, sc_vec3 b, sc_vec3 n);
@@ -821,12 +938,133 @@ classify_cap_cone_at(const sc_region *r, int order, sc_vec3 c, double *f_out)
  * region (used only to prioritise refinement).
  */
 /* the cap test alone: cheap, conservative, used while descending */
+/*
+ * A composite's class for a cell, from its kids'.  The kids' classes are
+ * conservative in one direction only: sc_region_classify() may call a cell IN
+ * that is only partly inside (classify_cone_exact() is optimistic there,
+ * which costs false positives and never rows), and only its OUT is certain.
+ * A plain region needs no more.  Under a NOT, though, a kid's IN becomes the
+ * composite's OUT, and an optimistic one would drop the rows of the part of
+ * the cell outside the kid.  So the certainty asked of each kid follows the
+ * polarity: where the composite's OUT must be certain (the covering), a kid
+ * under an even number of negations needs a certain OUT and one under an odd
+ * number a certain IN, which sc_region_classify_cap() gives (its cap test is
+ * certain both ways).  DIFFERENCE negates its second region.  The cap mode
+ * asks both of every kid, for sc_region_classify_cap() itself.
+ */
+static sc_class
+classify_kid(const sc_region *r, int order, int64_t pix, double *f_out, classify_mode m)
+{
+	if (SC_REGION_IS_COMPOSITE(r))
+		return classify_composite(r, order, pix, f_out, m);
+	if (m == CLASSIFY_OUT_SOUND)
+		return sc_region_classify(r, order, pix, f_out);
+	return sc_region_classify_cap(r, order, pix, f_out);
+}
+
+static classify_mode
+negated(classify_mode m)
+{
+	return m == CLASSIFY_OUT_SOUND ? CLASSIFY_IN_SOUND
+		: m == CLASSIFY_IN_SOUND ? CLASSIFY_OUT_SOUND : CLASSIFY_BOTH_SOUND;
+}
+
+static sc_class
+flip(sc_class c)
+{
+	return c == SC_IN ? SC_OUT : c == SC_OUT ? SC_IN : SC_PARTIAL;
+}
+
+static sc_class
+classify_composite(const sc_region *r, int order, int64_t pix, double *f_out, classify_mode m)
+{
+	double		fo,
+				f = 0;
+	sc_class	c,
+				a,
+				b;
+
+	switch (r->kind)
+	{
+		case SC_REGION_UNION:
+			{
+				int			all_out = 1;
+
+				f = 1.0;
+				for (int i = 0; i < r->nkids; i++)
+				{
+					c = classify_kid(&r->kids[i], order, pix, &fo, m);
+					if (c == SC_IN)
+					{
+						*f_out = 0.0;
+						return SC_IN;
+					}
+					if (c != SC_OUT)
+						all_out = 0;
+					f = fmin(f, fo);
+				}
+				*f_out = all_out ? 1.0 : f;
+				return all_out ? SC_OUT : SC_PARTIAL;
+			}
+		case SC_REGION_INTERSECTION:
+			{
+				int			all_in = 1;
+
+				for (int i = 0; i < r->nkids; i++)
+				{
+					c = classify_kid(&r->kids[i], order, pix, &fo, m);
+					if (c == SC_OUT)
+					{
+						*f_out = 1.0;
+						return SC_OUT;
+					}
+					if (c != SC_IN)
+						all_in = 0;
+					f = fmax(f, fo);
+				}
+				*f_out = all_in ? 0.0 : f;
+				return all_in ? SC_IN : SC_PARTIAL;
+			}
+		case SC_REGION_DIFFERENCE:
+			{
+				double		fa,
+							fb;
+
+				a = classify_kid(&r->kids[0], order, pix, &fa, m);
+				if (a == SC_OUT)
+				{
+					*f_out = 1.0;
+					return SC_OUT;
+				}
+				b = classify_kid(&r->kids[1], order, pix, &fb, negated(m));
+				if (b == SC_IN)
+				{
+					*f_out = 1.0;
+					return SC_OUT;
+				}
+				if (a == SC_IN && b == SC_OUT)
+				{
+					*f_out = 0.0;
+					return SC_IN;
+				}
+				*f_out = fmax(fa, 1.0 - fb);
+				return SC_PARTIAL;
+			}
+		default:
+			c = flip(classify_kid(&r->kids[0], order, pix, &fo, negated(m)));
+			*f_out = 1.0 - fo;
+			return c;
+	}
+}
+
 sc_class
 sc_region_classify_cap(const sc_region *r, int order, int64_t pix, double *f_out)
 {
 	sc_vec3		c;
 	double		rho;
 
+	if (SC_REGION_IS_COMPOSITE(r))
+		return classify_composite(r, order, pix, f_out, CLASSIFY_BOTH_SOUND);
 	c = sc_pix2vec(order, pix);
 	rho = sc_pixrad(order);
 
@@ -905,6 +1143,8 @@ sc_region_classify_cap(const sc_region *r, int order, int64_t pix, double *f_out
 sc_class
 sc_region_classify(const sc_region *r, int order, int64_t pix, double *f_out)
 {
+	if (SC_REGION_IS_COMPOSITE(r))
+		return classify_composite(r, order, pix, f_out, CLASSIFY_OUT_SOUND);
 	if (r->kind == SC_REGION_CONE && sc_exact_cells)
 		return classify_cone_exact(r, order, pix, f_out);
 	return sc_region_classify_cap(r, order, pix, f_out);
@@ -1093,6 +1333,15 @@ poly_centroid(const sc_region *r)
 sc_vec3
 sc_region_centroid(const sc_region *r)
 {
+	if (SC_REGION_IS_COMPOSITE(r))
+	{
+		/* no centroid computed: the centre of an enclosing cap stands in */
+		sc_vec3		c;
+		double		rad;
+
+		sc_region_bounding_cap(r, &c, &rad);
+		return c;
+	}
 	if (r->kind == SC_REGION_CONE)
 		return r->center;
 	return poly_centroid(r);
@@ -1106,6 +1355,26 @@ region_farthest(const sc_region *r, sc_vec3 p)
 
 	sc_vec3		q = {-p.x, -p.y, -p.z};
 
+	if (SC_REGION_IS_COMPOSITE(r))
+	{
+		/* bounds, not the farthest point: all that a bounding cap needs */
+		switch (r->kind)
+		{
+			case SC_REGION_UNION:
+				for (int i = 0; i < r->nkids; i++)
+					d = fmax(d, region_farthest(&r->kids[i], p));
+				return d;
+			case SC_REGION_INTERSECTION:
+				d = M_PI;
+				for (int i = 0; i < r->nkids; i++)
+					d = fmin(d, region_farthest(&r->kids[i], p));
+				return d;
+			case SC_REGION_DIFFERENCE:
+				return region_farthest(&r->kids[0], p);
+			default:
+				return M_PI;
+		}
+	}
 	if (r->kind == SC_REGION_CONE)
 		return sc_angle(p, r->center) + r->radius;
 
@@ -1134,9 +1403,102 @@ region_farthest(const sc_region *r, sc_vec3 p)
 	return d;
 }
 
+/*
+ * The smallest cap holding the caps (a, ra) and (b, rb): along the arc from a
+ * to b, reaching the far side of each.  A hair wider, so that rounding cannot
+ * leave a point of either outside.
+ */
+static void
+cap_merge(sc_vec3 a, double ra, sc_vec3 b, double rb, sc_vec3 *c, double *r)
+{
+	double		d = sc_angle(a, b);
+
+	if (d + rb <= ra)
+	{
+		*c = a;
+		*r = ra;
+		return;
+	}
+	if (d + ra <= rb)
+	{
+		*c = b;
+		*r = rb;
+		return;
+	}
+	*r = (d + ra + rb) / 2.0;
+	if (*r >= M_PI || d < 1e-15)
+	{
+		*c = a;
+		*r = fmin(M_PI, fmax(*r, fmax(ra, rb)));
+		return;
+	}
+	{
+		/* the point at angle (r - ra) from a, towards b */
+		double		t = *r - ra;
+		sc_vec3		u = {b.x - cos(d) * a.x, b.y - cos(d) * a.y, b.z - cos(d) * a.z};
+
+		u = vnormalize(u);
+		c->x = cos(t) * a.x + sin(t) * u.x;
+		c->y = cos(t) * a.y + sin(t) * u.y;
+		c->z = cos(t) * a.z + sin(t) * u.z;
+		*c = vnormalize(*c);
+		*r = fmin(M_PI, *r * (1.0 + 1e-12) + 1e-15);
+	}
+}
+
+/*
+ * An enclosing cap for a composite: the merge of the kids' for a union; for
+ * an intersection the narrowest kid's, which holds it; the first region's for
+ * a difference; the sky for a NOT.
+ */
+static void
+composite_bounding_cap(const sc_region *r, sc_vec3 *center, double *radius)
+{
+	sc_vec3		c;
+	double		rad;
+
+	switch (r->kind)
+	{
+		case SC_REGION_UNION:
+			sc_region_bounding_cap(&r->kids[0], center, radius);
+			for (int i = 1; i < r->nkids; i++)
+			{
+				sc_region_bounding_cap(&r->kids[i], &c, &rad);
+				cap_merge(*center, *radius, c, rad, center, radius);
+			}
+			return;
+		case SC_REGION_INTERSECTION:
+			sc_region_bounding_cap(&r->kids[0], center, radius);
+			for (int i = 1; i < r->nkids; i++)
+			{
+				sc_region_bounding_cap(&r->kids[i], &c, &rad);
+				if (rad < *radius)
+				{
+					*center = c;
+					*radius = rad;
+				}
+			}
+			return;
+		case SC_REGION_DIFFERENCE:
+			sc_region_bounding_cap(&r->kids[0], center, radius);
+			return;
+		default:
+			center->x = 0;
+			center->y = 0;
+			center->z = 1;
+			*radius = M_PI;
+			return;
+	}
+}
+
 void
 sc_region_bounding_cap(const sc_region *r, sc_vec3 *center, double *radius)
 {
+	if (SC_REGION_IS_COMPOSITE(r))
+	{
+		composite_bounding_cap(r, center, radius);
+		return;
+	}
 	*center = sc_region_centroid(r);
 	*radius = (r->kind == SC_REGION_CONE) ? r->radius : region_farthest(r, *center);
 }

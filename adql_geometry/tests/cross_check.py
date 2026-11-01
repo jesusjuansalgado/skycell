@@ -5,7 +5,7 @@ import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(HERE, "..", "python"))
-from skycell_adql_geometry import translate  # noqa: E402
+from skycell_adql_geometry import TranslationError, translate  # noqa: E402
 
 CLASSES = os.environ.get("SKYCELL_JAVA_CLASSES", "/tmp/jb")
 
@@ -18,10 +18,16 @@ def main() -> int:
             if not q.strip():
                 continue
             for dialect in ("skycell", "pgsphere"):
-                py = translate(q, dialect)
-                java = subprocess.run(
+                # a refusal must be a refusal in both, with the same message
+                try:
+                    py = translate(q, dialect)
+                except TranslationError as e:
+                    py = f"error: {e}"
+                run = subprocess.run(
                     ["java", "-cp", CLASSES, "skycell.adqlgeometry.SkycellAdqlGeometry", q, dialect],
-                    capture_output=True, text=True, check=True).stdout.strip()
+                    capture_output=True, text=True)
+                java = (run.stdout.strip() if run.returncode == 0
+                        else run.stderr.strip().splitlines()[-1])
                 if py != java:
                     bad += 1
                     print(f"MISMATCH [{dialect}] {q}\n  python: {py}\n  java:   {java}")

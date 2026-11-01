@@ -31,8 +31,15 @@ typedef enum
 typedef enum
 {
 	SC_REGION_CONE = 1,
-	SC_REGION_POLY = 2
+	SC_REGION_POLY = 2,
+	/* composites, of the regions in kids[] (STC-S Union, Intersection, ...) */
+	SC_REGION_UNION = 3,		/* two or more */
+	SC_REGION_INTERSECTION = 4, /* two or more */
+	SC_REGION_DIFFERENCE = 5,	/* kids[0] less kids[1] */
+	SC_REGION_NOT = 6			/* the sky less kids[0] */
 } sc_region_kind;
+
+#define SC_REGION_IS_COMPOSITE(r) ((r)->kind >= SC_REGION_UNION)
 
 typedef struct sc_region
 {
@@ -63,6 +70,13 @@ typedef struct sc_region
 	int			nparts;
 	struct sc_region *parts;
 	sc_vec3		frame[3];
+
+	/*
+	 * composite: the regions combined.  area is an estimate -- exact for
+	 * NOT, an upper bound otherwise -- for the covering's cost model only.
+	 */
+	int			nkids;
+	struct sc_region *kids;
 } sc_region;
 
 typedef struct sc_density
@@ -180,6 +194,13 @@ const char *sc_region_cone(sc_region *r, double ra_deg, double dec_deg, double r
 const char *sc_region_poly(sc_region *r, int nv, const double *ra_deg, const double *dec_deg,
 							bool need_covering);
 void		sc_region_free(sc_region *r);
+
+/*
+ * A composite of n regions (UNION, INTERSECTION: n >= 2; DIFFERENCE: 2; NOT:
+ * 1).  The kids are moved into r, which then owns them; they must have been
+ * built for a covering (need_covering) if r will be.
+ */
+const char *sc_region_combine(sc_region *r, sc_region_kind op, const sc_region *kids, int n);
 
 /* exact point-in-region test */
 int			sc_region_contains(const sc_region *r, sc_vec3 p);

@@ -32,6 +32,15 @@ extern Oid	cell_ops_opfamily(void);
 extern void cover_cached(const sc_region *reg, const sc_density *d,
 						 const sc_cover_params *p, Oid statrel,
 						 double ra0, double dec0, double radius, sc_cover *out);
+/*
+ * pull_var_clause() for planner support code: the same list, except that an
+ * outer query's Var (varlevelsup > 0), Aggref or PlaceHolderVar is a
+ * parameter at this level and is left out, where pull_var_clause() raises
+ * "Upper-level Var found where not expected". Without a PVC_INCLUDE_* flag,
+ * aggregates, window functions and placeholders are recursed into.
+ */
+extern List *sc_pull_local_vars(Node *node, int flags);
+
 extern bool density_for_expr(PlannerInfo *root, Node *arg, sc_density *d, Oid *statrel,
 							  bool *uses_cell_ops);
 extern bool region_area_histogram(Oid selfid, PlannerInfo *root, Node *region_expr,

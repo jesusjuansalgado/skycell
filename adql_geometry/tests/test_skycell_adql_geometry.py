@@ -187,6 +187,16 @@ def test_centroid_has_no_pgsphere_form():
         translate(q, "pgsphere")
 
 
+def test_region_reads_stcs_in_skycell_only():
+    q = ("SELECT * FROM t WHERE CONTAINS(POINT('ICRS', ra, dec), "
+         "REGION('DIFFERENCE ICRS (CIRCLE 10 20 1 CIRCLE 10 20 0.5)')) = 1")
+    assert translate(q) == (
+        "SELECT * FROM t WHERE (point('ICRS', ra, dec) <@ "
+        "region('DIFFERENCE ICRS (CIRCLE 10 20 1 CIRCLE 10 20 0.5)'))")
+    with pytest.raises(TranslationError, match="REGION has no pgSphere"):
+        translate(q, "pgsphere")
+
+
 def test_version_2_0_requires_a_frame():
     q = "SELECT * FROM t WHERE CONTAINS(POINT(ra, dec), CIRCLE(1, 2, 3)) = 1"
     assert "point('ICRS', ra, dec)" in translate(q, version="2.1")

@@ -33,6 +33,7 @@
 #include "catalog/pg_type_d.h"
 #include "fmgr.h"
 #include "libpq/pqformat.h"
+#include "miscadmin.h"
 #include "nodes/makefuncs.h"
 #include "nodes/nodeFuncs.h"
 #include "nodes/supportnodes.h"
@@ -70,12 +71,23 @@ typedef struct
 
 #define SKY_CONE 1
 #define SKY_POLY 2
+/* composites, numbered as sc_region_kind numbers them */
+#define SKY_UNION 3
+#define SKY_INTERSECTION 4
+#define SKY_DIFFERENCE 5
+#define SKY_NOT 6
+#define SKY_IS_COMPOSITE(k) ((k) >= SKY_UNION && (k) <= SKY_NOT)
 
 typedef struct
 {
 	int32		vl_len_;
 	int32		kind;
-	/* cone: ra, dec, radius (degrees); polygon: ra, dec per vertex */
+
+	/*
+	 * cone: ra, dec, radius (degrees); polygon: ra, dec per vertex; a
+	 * composite: its regions, each a whole SkyRegion, one after another and
+	 * each padded to MAXALIGN
+	 */
 	double		v[FLEXIBLE_ARRAY_MEMBER];
 } SkyRegion;
 
@@ -151,6 +163,93 @@ region_poly(int nv, const double *coords)
 	return r;
 }
 
+static const char *const sky_kind_name[] = {
+	"", "CIRCLE", "POLYGON", "UNION", "INTERSECTION", "DIFFERENCE", "NOT"
+};
+
+/* the regions of a composite, in order; their count */
+static int
+region_kids(const SkyRegion *r, const SkyRegion **kids, int max)
+{
+	const char *p = (const char *) r->v;
+	const char *end = (const char *) r + VARSIZE(r);
+	int			n = 0;
+
+	while (p < end)
+	{
+		const SkyRegion *k = (const SkyRegion *) p;
+
+		if (n < max)
+			kids[n] = k;
+		n++;
+		p += MAXALIGN(VARSIZE(k));
+	}
+	return n;
+}
+
+#define SKY_MAX_KIDS 1024
+
+static int
+region_depth(const SkyRegion *r)
+{
+	const SkyRegion *kids[SKY_MAX_KIDS];
+	int			n,
+				d = 0;
+
+	if (!SKY_IS_COMPOSITE(r->kind))
+		return 0;
+	check_stack_depth();
+	n = region_kids(r, kids, SKY_MAX_KIDS);
+	for (int i = 0; i < Min(n, SKY_MAX_KIDS); i++)
+	{
+		int			k = region_depth(kids[i]);	/* not inside Max(): it evaluates twice */
+
+		d = Max(d, k);
+	}
+	return d + 1;
+}
+
+/*
+ * A composite of n regions: STC-S Union and Intersection of two or more,
+ * Difference of two (the first less the second), Not of one.  The regions
+ * may be composites themselves, to the depth the geometry allows.
+ */
+static SkyRegion *
+region_combine(int kind, SkyRegion *const *kids, int n)
+{
+	Size		sz = offsetof(SkyRegion, v);
+	SkyRegion  *r;
+	char	   *p;
+
+	if ((kind == SKY_UNION || kind == SKY_INTERSECTION) && n < 2)
+		ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+						errmsg("%s needs two regions or more", sky_kind_name[kind])));
+	if (kind == SKY_DIFFERENCE && n != 2)
+		ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+						errmsg("DIFFERENCE takes two regions: the first less the second")));
+	if (kind == SKY_NOT && n != 1)
+		ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+						errmsg("NOT takes one region")));
+	if (n > SKY_MAX_KIDS)
+		ereport(ERROR, (errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+						errmsg("too many regions in a %s", sky_kind_name[kind])));
+	for (int i = 0; i < n; i++)
+		sz += MAXALIGN(VARSIZE(kids[i]));
+	r = (SkyRegion *) palloc0(sz);
+	SET_VARSIZE(r, sz);
+	r->kind = kind;
+	p = (char *) r->v;
+	for (int i = 0; i < n; i++)
+	{
+		memcpy(p, kids[i], VARSIZE(kids[i]));
+		p += MAXALIGN(VARSIZE(kids[i]));
+	}
+	if (region_depth(r) > 32)
+		ereport(ERROR, (errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+						errmsg("regions nested more than 32 deep")));
+	return r;
+}
+
 /* a skypos datum as the covering code understands it: a unit vector */
 sc_vec3
 skycell_pos_from_datum(Datum d)
@@ -176,11 +275,30 @@ skycell_pos_from_datum_cached(Datum d, skycell_pos_cache *c)
 }
 
 /* a skyregion datum as the covering code understands it */
+static void region_decode(const SkyRegion *r, sc_region *out, bool need_covering);
+
 static void
 region_from_datum_ex(Datum d, sc_region *out, bool need_covering)
 {
-	SkyRegion  *r = DatumGetSkyRegion(d);
+	region_decode(DatumGetSkyRegion(d), out, need_covering);
+}
 
+static void
+region_decode(const SkyRegion *r, sc_region *out, bool need_covering)
+{
+	if (SKY_IS_COMPOSITE(r->kind))
+	{
+		const SkyRegion *kids[SKY_MAX_KIDS];
+		int			n = region_kids(r, kids, SKY_MAX_KIDS);
+		sc_region  *sk = palloc(sizeof(sc_region) * Max(n, 1));
+
+		check_stack_depth();
+		for (int i = 0; i < n; i++)
+			region_decode(kids[i], &sk[i], need_covering);
+		check_err(sc_region_combine(out, (sc_region_kind) r->kind, sk, n));
+		pfree(sk);
+		return;
+	}
 	if (r->kind == SKY_CONE)
 		check_err(sc_region_cone(out, r->v[0], r->v[1], r->v[2], need_covering));
 	else
@@ -290,78 +408,189 @@ stcs_match_word(const char *s, const char *word)
 	return stcs_skip_ws(s + len);
 }
 
-PG_FUNCTION_INFO_V1(skyregion_in);
-Datum
-skyregion_in(PG_FUNCTION_ARGS)
+/*
+ * The composites are STC-S's own: "UNION ICRS (CIRCLE 10 20 1 POLYGON ...)",
+ * INTERSECTION likewise, "DIFFERENCE ICRS (r1 r2)" -- r1 less r2 -- and "NOT
+ * ICRS (r)", nested freely.  The frame is required at the top, as it is for a
+ * plain region, and may be repeated inside, where STC-S leaves it out.
+ */
+typedef struct stcs_parser
 {
-	char	   *str = PG_GETARG_CSTRING(0);
-	const char *s = stcs_skip_ws(str);
-	const char *t;
-	double		vals[512];
-	int			n = 0;
-	bool		cone;
+	const char *str;			/* the whole input, for messages */
+	const char *s;				/* where parsing is */
+} stcs_parser;
 
-	if ((t = stcs_match_word(s, "CIRCLE")) != NULL)
-		cone = true;
-	else if ((t = stcs_match_word(s, "POLYGON")) != NULL)
-		cone = false;
-	else
-		ereport(ERROR, (errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
-						errmsg("invalid input syntax for type skyregion: \"%s\"", str),
-						errhint("Write STC-S: \"CIRCLE ICRS ra dec radius\" or "
-								"\"POLYGON ICRS ra1 dec1 ra2 dec2 ...\", degrees.")));
-	s = t;
+static void
+stcs_error(stcs_parser *ps, const char *detail)
+{
+	ereport(ERROR, (errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
+					errmsg("invalid input syntax for type skyregion: \"%s\"", ps->str),
+					errdetail("%s", detail),
+					errhint("Write STC-S: \"CIRCLE ICRS ra dec radius\", "
+							"\"POLYGON ICRS ra1 dec1 ra2 dec2 ...\" (degrees), or "
+							"\"UNION ICRS (...)\", \"INTERSECTION ICRS (...)\", "
+							"\"DIFFERENCE ICRS (a b)\", \"NOT ICRS (a)\".")));
+}
 
-	if ((t = stcs_match_word(s, "ICRS")) == NULL)
-		ereport(ERROR, (errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
-						errmsg("invalid input syntax for type skyregion: \"%s\"", str),
-						errhint("The coordinate frame must be ICRS; convert with "
-								"gal2icrs() or ecl2icrs() first.")));
-	s = t;
+static int
+stcs_kind_at(const char *s, const char **after)
+{
+	for (int k = SKY_CONE; k <= SKY_NOT; k++)
+		if ((*after = stcs_match_word(s, sky_kind_name[k])) != NULL)
+			return k;
+	return 0;
+}
 
+/* the frame, ICRS, and any further words before the numbers or '(' */
+static void
+stcs_frame(stcs_parser *ps, bool required)
+{
+	const char *t = stcs_match_word(ps->s, "ICRS");
+	const char *after;
+
+	if (t == NULL)
+	{
+		if (required)
+			ereport(ERROR, (errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
+							errmsg("invalid input syntax for type skyregion: \"%s\"", ps->str),
+							errhint("The coordinate frame must be ICRS; convert with "
+									"gal2icrs() or ecl2icrs() first.")));
+		return;
+	}
+	ps->s = t;
 	/* skip any further non-numeric STC-S tokens (flavor, refpos, ...) */
 	for (;;)
 	{
 		char	   *end;
 
-		strtod(s, &end);
-		if (end != s)
-			break;				/* a number starts here: done skipping */
-		if (!isalpha((unsigned char) *s))
-			break;				/* not a token either: let the loop below report it */
-		while (isalnum((unsigned char) *s))
-			s++;
-		s = stcs_skip_ws(s);
-	}
-
-	for (;;)
-	{
-		char	   *end;
-
-		s = stcs_skip_ws(s);
-		if (*s == '\0')
+		strtod(ps->s, &end);
+		if (end != ps->s || !isalpha((unsigned char) *ps->s) || stcs_kind_at(ps->s, &after))
 			break;
-		if (n >= (int) (sizeof(vals) / sizeof(vals[0])))
-			ereport(ERROR, (errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
-							errmsg("too many coordinates in skyregion")));
-		vals[n] = strtod(s, &end);
-		if (end == s)
-			ereport(ERROR, (errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
-							errmsg("invalid input syntax for type skyregion: \"%s\"", str)));
-		n++;
-		s = end;
+		while (isalnum((unsigned char) *ps->s))
+			ps->s++;
+		ps->s = stcs_skip_ws(ps->s);
 	}
-	if (cone)
+}
+
+static SkyRegion *
+stcs_region(stcs_parser *ps, bool top)
+{
+	const char *t;
+	int			kind;
+
+	check_stack_depth();
+	ps->s = stcs_skip_ws(ps->s);
+	kind = stcs_kind_at(ps->s, &t);
+	if (kind == 0)
+		stcs_error(ps, "Expected CIRCLE, POLYGON, UNION, INTERSECTION, DIFFERENCE or NOT.");
+	ps->s = t;
+	stcs_frame(ps, top);
+
+	if (SKY_IS_COMPOSITE(kind))
 	{
-		if (n != 3)
-			ereport(ERROR, (errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
-							errmsg("CIRCLE takes ra, dec and radius")));
-		PG_RETURN_POINTER(region_cone(vals[0], vals[1], vals[2]));
+		SkyRegion **kids = palloc(sizeof(SkyRegion *) * 4);
+		int			n = 0,
+					cap = 4;
+
+		if (*ps->s != '(')
+			stcs_error(ps, "A UNION, INTERSECTION, DIFFERENCE or NOT takes its regions in parentheses.");
+		ps->s = stcs_skip_ws(ps->s + 1);
+		while (*ps->s != ')')
+		{
+			if (*ps->s == '\0')
+				stcs_error(ps, "Unbalanced parentheses.");
+			if (n == cap)
+				kids = repalloc(kids, sizeof(SkyRegion *) * (cap *= 2));
+			kids[n++] = stcs_region(ps, false);
+			ps->s = stcs_skip_ws(ps->s);
+		}
+		ps->s = stcs_skip_ws(ps->s + 1);
+		if (n < 2 && kind != SKY_NOT && *ps->s == '(')
+			stcs_error(ps, "Write all the regions of a UNION, INTERSECTION or DIFFERENCE inside one pair of parentheses: \"UNION ICRS (CIRCLE ... POLYGON ...)\".");
+		return region_combine(kind, kids, n);
 	}
-	if (n < 6 || n % 2 != 0)
-		ereport(ERROR, (errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
-						errmsg("POLYGON takes at least three ra, dec pairs")));
-	PG_RETURN_POINTER(region_poly(n / 2, vals));
+
+	{
+		double		vals[512];
+		int			n = 0;
+
+		for (;;)
+		{
+			char	   *end;
+			double		v;
+
+			ps->s = stcs_skip_ws(ps->s);
+			v = strtod(ps->s, &end);
+			if (end == ps->s)
+				break;			/* the next region, ')' or the end */
+			if (n >= (int) (sizeof(vals) / sizeof(vals[0])))
+				ereport(ERROR, (errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+								errmsg("too many coordinates in skyregion")));
+			vals[n++] = v;
+			ps->s = end;
+		}
+		if (kind == SKY_CONE)
+		{
+			if (n != 3)
+				ereport(ERROR, (errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
+								errmsg("CIRCLE takes ra, dec and radius")));
+			return region_cone(vals[0], vals[1], vals[2]);
+		}
+		if (n < 6 || n % 2 != 0)
+			ereport(ERROR, (errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
+							errmsg("POLYGON takes at least three ra, dec pairs")));
+		return region_poly(n / 2, vals);
+	}
+}
+
+PG_FUNCTION_INFO_V1(skyregion_in);
+Datum
+skyregion_in(PG_FUNCTION_ARGS)
+{
+	stcs_parser ps;
+	SkyRegion  *r;
+
+	ps.str = PG_GETARG_CSTRING(0);
+	ps.s = ps.str;
+	r = stcs_region(&ps, true);
+	if (*stcs_skip_ws(ps.s) != '\0')
+		stcs_error(&ps, "Unexpected text after the region.");
+	PG_RETURN_POINTER(r);
+}
+
+/* STC-S, the frame written once, at the top */
+static void
+stcs_print(StringInfo buf, const SkyRegion *r, bool top)
+{
+	appendStringInfoString(buf, sky_kind_name[r->kind]);
+	if (top)
+		appendStringInfoString(buf, " ICRS");
+	if (SKY_IS_COMPOSITE(r->kind))
+	{
+		const SkyRegion *kids[SKY_MAX_KIDS];
+		int			n = region_kids(r, kids, SKY_MAX_KIDS);
+
+		n = Min(n, SKY_MAX_KIDS);
+
+		check_stack_depth();
+		appendStringInfoString(buf, " (");
+		for (int i = 0; i < n; i++)
+		{
+			if (i > 0)
+				appendStringInfoChar(buf, ' ');
+			stcs_print(buf, kids[i], false);
+		}
+		appendStringInfoChar(buf, ')');
+	}
+	else if (r->kind == SKY_CONE)
+		appendStringInfo(buf, " %.15g %.15g %.15g", r->v[0], r->v[1], r->v[2]);
+	else
+	{
+		int			nv = SKYREGION_NVERT(r);
+
+		for (int i = 0; i < nv; i++)
+			appendStringInfo(buf, " %.15g %.15g", r->v[2 * i], r->v[2 * i + 1]);
+	}
 }
 
 PG_FUNCTION_INFO_V1(skyregion_out);
@@ -372,16 +601,7 @@ skyregion_out(PG_FUNCTION_ARGS)
 	StringInfoData buf;
 
 	initStringInfo(&buf);
-	if (r->kind == SKY_CONE)
-		appendStringInfo(&buf, "CIRCLE ICRS %.15g %.15g %.15g", r->v[0], r->v[1], r->v[2]);
-	else
-	{
-		int			nv = SKYREGION_NVERT(r);
-
-		appendStringInfoString(&buf, "POLYGON ICRS");
-		for (int i = 0; i < nv; i++)
-			appendStringInfo(&buf, " %.15g %.15g", r->v[2 * i], r->v[2 * i + 1]);
-	}
+	stcs_print(&buf, r, true);
 	PG_RETURN_CSTRING(buf.data);
 }
 
@@ -484,6 +704,77 @@ skycell_box_cs(PG_FUNCTION_ARGS)
 	check_coordsys(PG_GETARG_TEXT_PP(0));
 	PG_RETURN_POINTER(box_region(PG_GETARG_FLOAT8(1), PG_GETARG_FLOAT8(2),
 								 PG_GETARG_FLOAT8(3), PG_GETARG_FLOAT8(4)));
+}
+
+/* ADQL REGION('...'): a region from its STC-S, composites included */
+PG_FUNCTION_INFO_V1(skycell_region_stcs);
+Datum
+skycell_region_stcs(PG_FUNCTION_ARGS)
+{
+	PG_RETURN_DATUM(DirectFunctionCall1(skyregion_in,
+										CStringGetDatum(text_to_cstring(PG_GETARG_TEXT_PP(0)))));
+}
+
+/* the regions of a skyregion[], detoasted; NULL elements refused */
+static SkyRegion **
+regions_from_array(ArrayType *arr, int *n)
+{
+	Datum	   *elems;
+	bool	   *nulls;
+	SkyRegion **r;
+	int16		typlen;
+	bool		typbyval;
+	char		typalign;
+
+	get_typlenbyvalalign(ARR_ELEMTYPE(arr), &typlen, &typbyval, &typalign);
+	deconstruct_array(arr, ARR_ELEMTYPE(arr), typlen, typbyval, typalign, &elems, &nulls, n);
+	r = palloc(sizeof(SkyRegion *) * Max(*n, 1));
+	for (int i = 0; i < *n; i++)
+	{
+		if (nulls[i])
+			ereport(ERROR, (errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
+							errmsg("a region of a UNION or INTERSECTION is NULL")));
+		r[i] = DatumGetSkyRegion(elems[i]);
+	}
+	return r;
+}
+
+PG_FUNCTION_INFO_V1(skycell_union);
+Datum
+skycell_union(PG_FUNCTION_ARGS)
+{
+	int			n;
+	SkyRegion **kids = regions_from_array(PG_GETARG_ARRAYTYPE_P(0), &n);
+
+	PG_RETURN_POINTER(region_combine(SKY_UNION, kids, n));
+}
+
+PG_FUNCTION_INFO_V1(skycell_intersection);
+Datum
+skycell_intersection(PG_FUNCTION_ARGS)
+{
+	int			n;
+	SkyRegion **kids = regions_from_array(PG_GETARG_ARRAYTYPE_P(0), &n);
+
+	PG_RETURN_POINTER(region_combine(SKY_INTERSECTION, kids, n));
+}
+
+PG_FUNCTION_INFO_V1(skycell_difference);
+Datum
+skycell_difference(PG_FUNCTION_ARGS)
+{
+	SkyRegion  *kids[2] = {PG_GETARG_SKYREGION(0), PG_GETARG_SKYREGION(1)};
+
+	PG_RETURN_POINTER(region_combine(SKY_DIFFERENCE, kids, 2));
+}
+
+PG_FUNCTION_INFO_V1(skycell_not);
+Datum
+skycell_not(PG_FUNCTION_ARGS)
+{
+	SkyRegion  *kids[1] = {PG_GETARG_SKYREGION(0)};
+
+	PG_RETURN_POINTER(region_combine(SKY_NOT, kids, 1));
 }
 
 static SkyRegion *
@@ -661,12 +952,32 @@ skycell_contains(PG_FUNCTION_ARGS)
 	PG_RETURN_INT32(pos_in_region(fcinfo, PG_GETARG_SKYPOS(0), PG_GETARG_DATUM(1)) ? 1 : 0);
 }
 
+/*
+ * Whether one region holds or meets another is answered exactly for cones and
+ * polygons only.  For a composite it can turn on its regions together -- a
+ * circle can lie in a union without lying in either of its parts -- so rather
+ * than answer approximately it is refused; a position in a composite is
+ * answered exactly, and is what an index serves.
+ */
+static void
+refuse_composite(const sc_region *r, const char *what)
+{
+	if (SC_REGION_IS_COMPOSITE(r))
+		ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						errmsg("%s is not computed for a UNION, INTERSECTION, DIFFERENCE or NOT", what),
+						errhint("A position in one is: CONTAINS(POINT(...), region) = 1.")));
+}
+
 static int
 region_region(PG_FUNCTION_ARGS, bool contains)
 {
 	sc_region  *a = cached_region_arg(fcinfo, 0, PG_GETARG_DATUM(0));
 	sc_region  *b = cached_region_arg(fcinfo, 1, PG_GETARG_DATUM(1));
-	int			res = contains ? sc_region_contains_region(a, b) : sc_region_overlaps(a, b);
+	int			res;
+
+	refuse_composite(a, contains ? "Containment between regions" : "Intersection between regions");
+	refuse_composite(b, contains ? "Containment between regions" : "Intersection between regions");
+	res = contains ? sc_region_contains_region(a, b) : sc_region_overlaps(a, b);
 
 	return res ? 1 : 0;
 }
@@ -719,7 +1030,11 @@ skycell_region_covers(PG_FUNCTION_ARGS)
 	 * reversed argument order. */
 	sc_region  *a = cached_region_arg(fcinfo, 0, PG_GETARG_DATUM(0));
 	sc_region  *b = cached_region_arg(fcinfo, 1, PG_GETARG_DATUM(1));
-	int			res = sc_region_contains_region(b, a);
+	int			res;
+
+	refuse_composite(a, "Containment between regions");
+	refuse_composite(b, "Containment between regions");
+	res = sc_region_contains_region(b, a);
 
 	PG_RETURN_BOOL(res != 0);
 }
@@ -754,6 +1069,18 @@ skycell_area(PG_FUNCTION_ARGS)
 	double		a;
 
 	skycell_region_from_datum(PG_GETARG_DATUM(0), &r);
+
+	/*
+	 * The area kept for a composite is the cost model's estimate; it is the
+	 * area only for a NOT (of a NOT ...) of a cone or a polygon.
+	 */
+	{
+		const sc_region *x = &r;
+
+		while (x->kind == SC_REGION_NOT)
+			x = &x->kids[0];
+		refuse_composite(x, "AREA");
+	}
 	a = r.area * RAD2DEG * RAD2DEG;
 	sc_region_free(&r);
 	PG_RETURN_FLOAT8(a);
@@ -783,6 +1110,7 @@ skycell_centroid(PG_FUNCTION_ARGS)
 				dec;
 
 	skycell_region_from_datum(PG_GETARG_DATUM(0), &r);
+	refuse_composite(&r, "CENTROID");
 	c = sc_region_centroid(&r);
 	sc_region_free(&r);
 	dec = asin(fmax(-1.0, fmin(1.0, c.z))) * RAD2DEG;
@@ -995,7 +1323,7 @@ circle_as_cone(SupportRequestSimplify *req, Oid funcid, Node *pt, Node *rg, Node
 static int
 single_varno(Node *node)
 {
-	List	   *vars = pull_var_clause(node, PVC_RECURSE_AGGREGATES |
+	List	   *vars = sc_pull_local_vars(node, PVC_RECURSE_AGGREGATES |
 									   PVC_RECURSE_WINDOWFUNCS |
 									   PVC_RECURSE_PLACEHOLDERS);
 	ListCell   *lc;

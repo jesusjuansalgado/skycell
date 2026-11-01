@@ -1045,11 +1045,71 @@ stored_cell_column(Relation rel, List *indexes, Node *key, bool *cell_ops)
 	return 0;
 }
 
+typedef struct
+{
+	List	   *vars;
+	int			flags;
+} local_vars_ctx;
+
+static bool
+local_vars_walker(Node *node, local_vars_ctx *cx)
+{
+	if (node == NULL)
+		return false;
+	if (IsA(node, Var))
+	{
+		if (((Var *) node)->varlevelsup == 0)
+			cx->vars = lappend(cx->vars, node);
+		return false;
+	}
+	if (IsA(node, Aggref) || IsA(node, GroupingFunc))
+	{
+		Index		up = IsA(node, Aggref) ? ((Aggref *) node)->agglevelsup
+			: ((GroupingFunc *) node)->agglevelsup;
+
+		if (up > 0)
+			return false;
+		if (cx->flags & PVC_INCLUDE_AGGREGATES)
+		{
+			cx->vars = lappend(cx->vars, node);
+			return false;
+		}
+	}
+	else if (IsA(node, WindowFunc))
+	{
+		if (cx->flags & PVC_INCLUDE_WINDOWFUNCS)
+		{
+			cx->vars = lappend(cx->vars, node);
+			return false;
+		}
+	}
+	else if (IsA(node, PlaceHolderVar))
+	{
+		if (((PlaceHolderVar *) node)->phlevelsup > 0)
+			return false;
+		if (cx->flags & PVC_INCLUDE_PLACEHOLDERS)
+		{
+			cx->vars = lappend(cx->vars, node);
+			return false;
+		}
+	}
+	return expression_tree_walker(node, local_vars_walker, (void *) cx);
+}
+
+List *
+sc_pull_local_vars(Node *node, int flags)
+{
+	local_vars_ctx cx = {NIL, flags};
+
+	local_vars_walker(node, &cx);
+	return cx.vars;
+}
+
 bool
 density_for_expr(PlannerInfo *root, Node *arg, sc_density *d, Oid *statrel,
 				  bool *uses_cell_ops)
 {
-	List	   *vars = pull_var_clause(arg, 0);
+	List	   *vars = sc_pull_local_vars(arg, 0);
 	ListCell   *lc;
 	Index		varno = 0;
 	RangeTblEntry *rte;
@@ -1203,7 +1263,7 @@ skycell_cell_density(PlannerInfo *root, Node **cell, sc_density *d, Oid *statrel
 		return false;
 	if (density_for_expr(root, *cell, d, statrel, uses_cell_ops))
 		return true;
-	vars = pull_var_clause(*cell, 0);
+	vars = sc_pull_local_vars(*cell, 0);
 	foreach(lc, vars)
 	{
 		Var		   *v = (Var *) lfirst(lc);
@@ -1281,7 +1341,7 @@ bool
 region_area_histogram(Oid selfid, PlannerInfo *root, Node *region_expr,
 					   double **areas, int *n)
 {
-	List	   *vars = pull_var_clause(region_expr, 0);
+	List	   *vars = sc_pull_local_vars(region_expr, 0);
 	ListCell   *lc;
 	Index		varno = 0;
 	RangeTblEntry *rte;
@@ -1403,7 +1463,7 @@ region_area_histogram(Oid selfid, PlannerInfo *root, Node *region_expr,
 bool
 gin_moc_index_for_region(PlannerInfo *root, Node *rg, Node **moc_expr, int *max_order)
 {
-	List	   *vars = pull_var_clause(rg, 0);
+	List	   *vars = sc_pull_local_vars(rg, 0);
 	ListCell   *lc;
 	Index		varno = 0;
 	RangeTblEntry *rte;

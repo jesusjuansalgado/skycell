@@ -49,8 +49,9 @@ works whichever way round the query is written: a constant point inside a
 circle around each row is planned as the cone around that point, and a
 cross-match probes the larger indexed table whichever side is the point and
 whichever the circle. With pgSphere and Q3C the reversed form is a full table
-scan, or a cross-match that probes the wrong table. Stored regions read and write as IVOA STC-S, and one
-column can hold circles and polygons together.
+scan, or a cross-match that probes the wrong table. Regions read and write as IVOA STC-S, including
+`UNION`, `INTERSECTION`, `DIFFERENCE` and `NOT` of them (since 0.38), and one
+column can hold circles, polygons and their combinations together.
 
 The numbers come from randomized paired trials on PostgreSQL 18.6, on 10M-row
 catalogues (synthetic, resampled from the Gaia DR3 density field, and real DR3
@@ -196,7 +197,7 @@ docker exec -w /work/ext skycell-pg make with_llvm=no install
 [`adql_geometry/`](adql_geometry/) holds reference translators in Python and Java
 that turn the geometry in ADQL into SQL — for skycell, or for the pgSphere+Q3C
 pair, so you can compare the two on your own queries. They rewrite only the
-geometry (`CONTAINS`, `POINT`, `CIRCLE`, `DISTANCE`, …); the rest of ADQL, such
+geometry (`CONTAINS`, `POINT`, `CIRCLE`, `DISTANCE`, `REGION`, …); the rest of ADQL, such
 as `TOP n` → `LIMIT n`, is the job of the TAP service's own ADQL parser:
 
 ```bash
@@ -334,7 +335,8 @@ and a per-row polygon or stored region by the rewrite's run-time range slots.
 ## Operators and functions
 
 Every function skycell installs, one by one. Types are `skypos` (a position) and
-`skyregion` (a cone, box or polygon). The `coordsys` argument is accepted
+`skyregion` (a cone, box or polygon, or since 0.38 a union, intersection,
+difference or complement of regions). The `coordsys` argument is accepted
 for ADQL compatibility and must be `'ICRS'`; convert other frames first with
 `gal2icrs()` / `ecl2icrs()`.
 
@@ -349,14 +351,38 @@ for ADQL compatibility and must be `'ICRS'`; convert other frames first with
 | `contains(p skypos, r skyregion)`<br>`contains(a skyregion, b skyregion)` | `integer` (1/0) | ADQL `CONTAINS`. Compared with 1 (`contains(…) = 1`, or `1 = …`) in a `WHERE` or `JOIN ON` it is planned as the `<@` operator below, so it is indexed |
 | `intersects(p skypos, r skyregion)`<br>`intersects(a skyregion, b skyregion)` | `integer` (1/0) | ADQL `INTERSECTS`. Compared with 1 it is planned as `<@` (point-region) or `&&` (region-region) below, so it is indexed |
 | `distance(a skypos, b skypos)`<br>`distance(ra1, dec1, ra2, dec2)` | `float8` | degrees. ADQL `DISTANCE`, both forms. `distance(…) < r` (or `<=`) in a `WHERE` or `JOIN ON` is planned as the cone, like `<@` below |
-| `area(r skyregion)` | `float8` | square degrees. ADQL `AREA` |
+| `area(r skyregion)` | `float8` | square degrees. ADQL `AREA`. Not computed for a composite region (it errors), except a `NOT` of a cone or polygon |
 | `coord1(p)` / `coord2(p)` | `float8` | right ascension / declination, degrees |
-| `centroid(r skyregion)` | `skypos` | ADQL `CENTROID`: a cone's centre, a polygon's centre of mass, which may lie outside a non-convex one, as a U's does. Before 0.35 a polygon's was the mean of its vertices |
+| `centroid(r skyregion)` | `skypos` | ADQL `CENTROID`: a cone's centre, a polygon's centre of mass, which may lie outside a non-convex one, as a U's does. Before 0.35 a polygon's was the mean of its vertices. Not computed for a composite region (it errors) |
+| `region(stcs text)` | `skyregion` | ADQL `REGION`: any region written in STC-S, e.g. `region('DIFFERENCE ICRS (CIRCLE 10 20 2 CIRCLE 10 20 1)')`. The same as casting the text to `skyregion` |
+| `skycell_union(VARIADIC skyregion[])`<br>`skycell_intersection(VARIADIC skyregion[])` | `skyregion` | two regions or more; STC-S `UNION` / `INTERSECTION` |
+| `skycell_difference(a, b)` | `skyregion` | `a` less `b`; STC-S `DIFFERENCE` |
+| `skycell_not(r)` | `skyregion` | the rest of the sky; STC-S `NOT` |
 
 If a bare name collides with `pg_catalog` (`point`, `circle`, `box`, `polygon`
 all exist there), either install into a schema that precedes it in
 `search_path`, or use the prefixed aliases: `skycell_point`, `skycell_circle`,
 `skycell_box`, `skycell_polygon`.
+
+**Composite regions** (0.38). In STC-S the operands go inside one pair of
+parentheses, the frame is written once at the top, and composites nest up to
+32 deep:
+
+```sql
+SELECT * FROM gaia WHERE pos <@ region(
+  'UNION ICRS (CIRCLE 10 20 1 DIFFERENCE (CIRCLE 12 20 2 POLYGON 11 19 13 19 12 21))');
+SELECT 'NOT ICRS (CIRCLE 0 90 30)'::skyregion;        -- everything south of +60°
+```
+
+A position inside one is indexed like any other region: `pos <@ r`,
+`contains(pos, r) = 1` and `r @> pos` read the catalogue's cell index through
+the composite's covering, and a column of stored composites is served by every
+region index (the default GiST, `skyregion_box4_gist_ops` and the MOC GIN). The
+covering is built from the pieces' own cell classification (inside, outside,
+straddling) combined by the operator, so it never misses a row; the exact
+membership test runs on what it keeps. Region-to-region operators (`&&`,
+`@>` and `<@` between regions, `INTERSECTS` of two regions), `AREA` and
+`CENTROID` are not computed for a composite and say so.
 
 ### Operators — the indexable spelling
 
@@ -703,7 +729,11 @@ Two layers, both in [`ext/test/`](ext/test/).
   point's membership and covering, the area, the centroid (against brute-force
   quadrature, every quarter of the shapes) and CONTAINS and INTERSECTS for
   14,400 small triangles around the notches. It also prints ranges, cells examined, false-positive
-  fraction and µs per covering. Current run: **0 false negatives**.
+  fraction and µs per covering. Then 1,500 random composites (unions,
+  intersections, differences and NOTs, up to four deep, of cones and convex and
+  non-convex polygons): every catalogue point inside must be covered, and every
+  cell class must be honest for 128 sampled points per cell, half on cell edges.
+  Current run: **0 false negatives**.
 
 **SQL regression** — `make installcheck` in `ext/`, against a running server:
 
@@ -761,6 +791,18 @@ Two layers, both in [`ext/test/`](ext/test/).
   not when the `CHECK` lacks `NOT NULL`, is not validated, not enforced or
   names another expression, or once it is dropped.
 
+- `composite`: unions, intersections, differences and NOTs. STC-S in and
+  out (every malformed form errors with a reason), the constructors, each
+  composite's membership against the boolean combination of its pieces, and
+  the refusals. A constant composite on the catalogue index (eight fixed
+  shapes and 40 random ones) must give the exact test's and the sequential
+  scan's rows; stored composites must give the sequential answer under each
+  region index, for a point, a join, ADQL `CONTAINS` and a correlated
+  sub-select.
+- Correlated sub-selects (in `adql`): an outer query's column used as the
+  point, the centre or a polygon vertex in a sub-select must plan, use the
+  index and give the join's answer.
+
 **Reference translators** — [`adql_geometry/tests/`](adql_geometry/tests/): the
 Python translator's tests (pytest), and `cross_check.py`, which requires the
 Python and Java translators to produce identical SQL for every case.
@@ -774,8 +816,13 @@ locally), the standalone selftests, and the reference translators.
 ## Limitations
 
 - **Geometry.** A polygon must be simple, with no crossing or touching edges,
-  and every vertex must lie within 90° of the vertices' mean. There is no
-  `REGION` and no union of regions. A non-convex polygon costs more than a
+  and every vertex must lie within 90° of the vertices' mean. STC-S `BOX`
+  is not read (write a `POLYGON`, or call `box()`). A composite region
+  (`UNION`, `INTERSECTION`, `DIFFERENCE`, `NOT`) supports position tests only:
+  region-to-region operators, `AREA` and `CENTROID` error for it, and its
+  covering is as tight as its pieces' cell classes allow, so a deep
+  `DIFFERENCE` of nearly equal regions reads more candidate rows than its
+  area suggests. A non-convex polygon costs more than a
   convex one. Parsing a U or a comb takes 2–6 µs against 0.6 µs for a convex
   quadrilateral, and each step of its covering is 2–3× dearer. The ranges it
   yields are as few, so the rows read do not change. Setting one up is

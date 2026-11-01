@@ -161,3 +161,59 @@ SELECT ivo_healpix_index(0, 1, 1) AS i0, ivo_healpix_index(17, 1, 1) AS i17,
        coord1(ivo_healpix_center(0, 6)) AS c0_ra, coord2(ivo_healpix_center(0, 6)) AS c0_dec,
        round((3.6e9 * distance(ivo_healpix_center(17, ivo_healpix_index(17, 23.4, 56.7)),
                                point('ICRS', 23.399843462947466, 56.70016214363192)))::numeric, 1) AS c17_off_uas;
+
+-- correlated sub-selects ---------------------------------------------
+-- an outer query's column is a parameter for the sub-select: the region and
+-- cone support functions must treat it as one (it used to raise "Upper-level
+-- Var found where not expected"), and the answer must match the join and the
+-- sequential scan
+CREATE TABLE corr_cat AS
+SELECT i AS id, ra, dec, skycell_ang2cell(ra, dec) AS cell, point('ICRS', ra, dec) AS pos
+FROM (SELECT i, 30 + 4 * random() AS ra, 10 + 4 * random() AS dec FROM generate_series(1, 20000) i) s;
+CREATE INDEX corr_cat_cell ON corr_cat (cell);
+CREATE INDEX corr_cat_pos ON corr_cat (skycell_cell(pos));
+CREATE TABLE corr_reg AS
+SELECT i AS fid, CASE WHEN i % 2 = 0 THEN circle('ICRS', ra, dec, 0.3)
+                      ELSE polygon('ICRS', ra - 0.3, dec - 0.3, ra + 0.3, dec - 0.3, ra, dec + 0.3) END AS r
+FROM (SELECT i, 30 + 4 * random() AS ra, 10 + 4 * random() AS dec FROM generate_series(1, 300) i) s;
+CREATE INDEX corr_reg_r ON corr_reg USING gist (r);
+CREATE TABLE corr_probe AS
+SELECT i AS pid, 30.5 + 3 * random() AS ra, 10.5 + 3 * random() AS dec FROM generate_series(1, 25) i;
+ALTER TABLE corr_probe ADD COLUMN p skypos;
+UPDATE corr_probe SET p = point('ICRS', ra, dec);
+ANALYZE corr_cat; ANALYZE corr_reg; ANALYZE corr_probe;
+
+CREATE FUNCTION corr_counts(OUT name text, OUT idx bigint, OUT seq bigint) RETURNS SETOF record
+LANGUAGE plpgsql AS $$
+DECLARE q text;
+BEGIN
+  FOR name, q IN VALUES
+    ('region @> point',  'SELECT sum((SELECT count(*) FROM corr_reg WHERE r @> pr.p)) FROM corr_probe pr'),
+    ('point <@ region',  'SELECT sum((SELECT count(*) FROM corr_reg WHERE pr.p <@ r)) FROM corr_probe pr'),
+    ('CONTAINS region',  'SELECT sum((SELECT count(*) FROM corr_reg WHERE contains(pr.p, r) = 1)) FROM corr_probe pr'),
+    ('pos <@ circle',    'SELECT sum((SELECT count(*) FROM corr_cat WHERE pos <@ circle(''ICRS'', pr.ra, pr.dec, 0.2))) FROM corr_probe pr'),
+    ('CONTAINS circle',  'SELECT sum((SELECT count(*) FROM corr_cat WHERE contains(point(''ICRS'', ra, dec), circle(''ICRS'', pr.ra, pr.dec, 0.2)) = 1)) FROM corr_probe pr'),
+    ('skycell_cone',     'SELECT sum((SELECT count(*) FROM corr_cat WHERE skycell_cone(cell, ra, dec, pr.ra, pr.dec, 0.2))) FROM corr_probe pr'),
+    ('in polygon',       'SELECT sum((SELECT count(*) FROM corr_cat WHERE pos <@ polygon(''ICRS'', pr.ra - 0.2, pr.dec - 0.2, pr.ra + 0.2, pr.dec - 0.2, pr.ra, pr.dec + 0.2))) FROM corr_probe pr')
+  LOOP
+    SET LOCAL enable_seqscan = off;
+    SET LOCAL enable_indexscan = on;
+    SET LOCAL enable_bitmapscan = on;
+    EXECUTE q INTO idx;
+    SET LOCAL enable_seqscan = on;
+    SET LOCAL enable_indexscan = off;
+    SET LOCAL enable_bitmapscan = off;
+    EXECUTE q INTO seq;
+    RETURN NEXT;
+  END LOOP;
+END $$;
+SELECT name, idx = seq AS agree, idx > 0 AS nonempty FROM corr_counts() ORDER BY name;
+SELECT (SELECT count(*) FROM corr_probe pr JOIN corr_reg ON r @> pr.p)
+     = (SELECT sum((SELECT count(*) FROM corr_reg WHERE r @> pr.p)) FROM corr_probe pr) AS region_join_agrees,
+       (SELECT count(*) FROM corr_probe pr JOIN corr_cat ON skycell_cone(cell, corr_cat.ra, corr_cat.dec, pr.ra, pr.dec, 0.2))
+     = (SELECT sum((SELECT count(*) FROM corr_cat WHERE skycell_cone(cell, ra, dec, pr.ra, pr.dec, 0.2))) FROM corr_probe pr) AS cone_join_agrees;
+-- and a lateral sub-select, the other spelling of the same thing
+SELECT count(*) = (SELECT count(*) FROM corr_probe pr JOIN corr_reg ON r @> pr.p) AS lateral_agrees
+FROM corr_probe pr, LATERAL (SELECT fid FROM corr_reg WHERE r @> pr.p) l;
+DROP FUNCTION corr_counts();
+DROP TABLE corr_cat, corr_reg, corr_probe;

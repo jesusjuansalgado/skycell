@@ -739,18 +739,42 @@ region_to_multicap(sc_region *r, GistMultiCap *out)
 		int			n;
 
 		deconstruct_array(moc, INT8OID, sizeof(int64), true, TYPALIGN_DOUBLE, &elems, &nulls, &n);
-		for (int i = 0; i < MAX_SUBCAPS; i++)
+
+		/*
+		 * moc_for_region() keeps every base cell the region touches, so a
+		 * region spanning more than MAX_SUBCAPS of the twelve (a NOT, a wide
+		 * union, a big polygon) comes back with more cells than there are
+		 * sub-caps. Merge them down instead of dropping the extra cells:
+		 * dropping them left points in the region outside every sub-cap.
+		 */
+		if (n > MAX_SUBCAPS)
 		{
-			if (i < n)
+			GistCap    *cells = palloc(sizeof(GistCap) * n);
+			int			nout;
+
+			for (int i = 0; i < n; i++)
 			{
 				int64		pix;
 				int			order = sc_nuniq_decode(DatumGetInt64(elems[i]), &pix);
 
-				out->sub[i] = cap_make(sc_pix2vec(order, pix), sc_pixrad(order));
+				cells[i] = cap_make(sc_pix2vec(order, pix), sc_pixrad(order));
 			}
-			else
-				out->sub[i].radius = -1;
+			merge_caps_greedy_fp(cells, n, out->sub, &nout);
+			pfree(cells);
 		}
+		else
+			for (int i = 0; i < MAX_SUBCAPS; i++)
+			{
+				if (i < n)
+				{
+					int64		pix;
+					int			order = sc_nuniq_decode(DatumGetInt64(elems[i]), &pix);
+
+					out->sub[i] = cap_make(sc_pix2vec(order, pix), sc_pixrad(order));
+				}
+				else
+					out->sub[i].radius = -1;
+			}
 		pfree(elems);
 		pfree(nulls);
 		pfree(moc);
