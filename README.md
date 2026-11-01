@@ -378,9 +378,11 @@ A position inside one is indexed like any other region: `pos <@ r`,
 `contains(pos, r) = 1` and `r @> pos` read the catalogue's cell index through
 the composite's covering, and a column of stored composites is served by every
 region index (the default GiST, `skyregion_box4_gist_ops` and the MOC GIN). The
-covering is built from the pieces' own cell classification (inside, outside,
-straddling) combined by the operator, so it never misses a row; the exact
-membership test runs on what it keeps. Region-to-region operators (`&&`,
+covering comes from the operands' own coverings where that is sound (a union's,
+an intersection's, a difference's first operand), and otherwise from the
+operands' cell classes (inside, outside, straddling) combined by the operator.
+Either way it never misses a row, and the exact membership test runs on what
+it keeps. Region-to-region operators (`&&`,
 `@>` and `<@` between regions, `INTERSECTS` of two regions), `AREA` and
 `CENTROID` are not computed for a composite and say so.
 
@@ -670,26 +672,34 @@ DR3 scale that is one 38 GiB index where an archive running pgSphere for cones
 and Q3C for cross-matching keeps 160 GiB.
 
 **Composite regions** (0.38, [`bench/results-composite/`](bench/results-composite/)).
-Five shapes on 60 centres on the 10M real Gaia DR3 positions, 0.05°–2° across,
-each written three ways: one `REGION`, the same pieces as a boolean of ADQL
-`CONTAINS` predicates in skycell, and pgSphere's boolean of `<@`. All three
-count the same rows. Median ms per query, and the `REGION`'s summed time over
-pgSphere's:
+Five shapes on 60 centres on the 10M real Gaia DR3 positions, 0.05°–2° across.
+Each is written three ways: one `REGION`, the same pieces as a boolean of ADQL
+`CONTAINS` predicates in skycell, and pgSphere's boolean of `<@`. pgSphere has
+no composite region type. Its MOC type, `smoc`, has union and intersection, but
+it is approximate to its cells and no index serves `spoint <@ smoc`, so the
+boolean is how a query gets exact answers there. All three spellings count the
+same rows. Median ms per query, and the `REGION`'s summed time over the others':
 
-| shape | `REGION` | skycell boolean | pgSphere boolean | `REGION` ÷ pgSphere |
-|---|---|---|---|---|
-| annulus (circle less circle) | 0.34 | 0.16 | 0.13 | 1.66 |
-| two circles, union | 0.37 | 0.44 | 0.12 | 2.36 |
-| lens (intersection of two circles) | 0.23 | 0.12 | 0.11 | 1.13 |
-| square less a circle | 0.28 | 0.31 | 0.47 | 0.23 |
-| five circles, union | 0.65 | 1.22 | 0.27 | 2.29 |
+| shape | `REGION` | skycell boolean | pgSphere boolean | `REGION` ÷ skycell boolean | `REGION` ÷ pgSphere |
+|---|---|---|---|---|---|
+| annulus (circle less circle) | 0.21 | 0.14 | 0.10 | 1.26 | 1.33 |
+| two circles, union | 0.15 | 0.37 | 0.11 | 0.34 | 1.39 |
+| lens (intersection of two circles) | 0.12 | 0.11 | 0.09 | 1.09 | 0.76 |
+| square less a circle | 0.18 | 0.21 | 0.36 | 0.88 | 0.21 |
+| five circles, union | 0.16 | 0.75 | 0.21 | 0.19 | 0.84 |
 
-A composite of circles costs 1.1–2.4× pgSphere's boolean of circles. Most of
-the gap is planning: the composite's covering is computed by the generic
-descent, where a cone has a direct path and a cache. With a polygon in it, the
-composite takes 0.23 of pgSphere's time, as polygons do. Before this
-measurement, an ADQL `OR` of `CONTAINS` predicates was a sequential scan in
-skycell, 2.4 s for two circles. Since 0.38 it is indexed like `<@ OR <@`.
+A composite is covered from its operands' own coverings: the union of theirs
+for a `UNION`, their intersection for an `INTERSECTION`, the first operand's
+for a `DIFFERENCE` that takes away at most half of it. A circle operand then
+takes the cone's direct path. A `NOT`, and a difference with a large hole, are
+covered by classifying cells against the whole composite, which keeps a thin
+ring from reading its hole. A union of circles still costs up to 1.4×
+pgSphere's boolean, most of it in planning, where pgSphere does little work per
+circle.
+
+Before 0.38, an ADQL `OR` of `CONTAINS` predicates was a sequential scan in
+skycell: 2.4 s for two circles and 4.9 s for five on these 10M rows. It is now
+indexed like `<@ OR <@`, which is the skycell boolean column above.
 
 **Parallel cross-matching.** The comparisons above, like the paper's, are
 serial. They run with `max_parallel_workers_per_gather = 0` for every method.

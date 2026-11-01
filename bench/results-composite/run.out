@@ -46,6 +46,10 @@ psql:../34_composite.sql:126: NOTICE:                ->  Bitmap Index Scan on ga
 psql:../34_composite.sql:126: NOTICE:                      Index Cond: ((skycell_ang2cell(ra, "dec") >= '1517150124470435840'::bigint) AND (skycell_ang2cell(ra, "dec") <= '1517220
 psql:../34_composite.sql:126: NOTICE:                ->  Bitmap Index Scan on gaia_realc_cell
 psql:../34_composite.sql:126: NOTICE:                      Index Cond: ((skycell_ang2cell(ra, "dec") >= '1517290861958791168'::bigint) AND (skycell_ang2cell(ra, "dec") <= '1517361
+psql:../34_composite.sql:126: NOTICE:                ->  Bitmap Index Scan on gaia_realc_cell
+psql:../34_composite.sql:126: NOTICE:                      Index Cond: ((skycell_ang2cell(ra, "dec") >= '1522586109958160384'::bigint) AND (skycell_ang2cell(ra, "dec") <= '1522603
+psql:../34_composite.sql:126: NOTICE:                ->  Bitmap Index Scan on gaia_realc_cell
+psql:../34_composite.sql:126: NOTICE:                      Index Cond: ((skycell_ang2cell(ra, "dec") >= '1523342573958070272'::bigint) AND (skycell_ang2cell(ra, "dec") <= '1523360
 psql:../34_composite.sql:126: NOTICE:  --- annulus boolean
 psql:../34_composite.sql:126: NOTICE:  Aggregate
 psql:../34_composite.sql:126: NOTICE:    ->  Custom Scan (SkycellCone) on gaia_realc
@@ -61,17 +65,17 @@ psql:../34_composite.sql:126: NOTICE:          Filter: (pos !<@ '<(1.92259029773
 psql:../34_composite.sql:126: NOTICE:  --- pair region
 psql:../34_composite.sql:126: NOTICE:  Aggregate
 psql:../34_composite.sql:126: NOTICE:    ->  Bitmap Heap Scan on gaia_realc
-psql:../34_composite.sql:126: NOTICE:          Recheck Cond: (((skycell_ang2cell(ra, "dec") >= '1516435991668195328'::bigint) AND (skycell_ang2cell(ra, "dec") <= '1516446437028659
+psql:../34_composite.sql:126: NOTICE:          Recheck Cond: (((skycell_ang2cell(ra, "dec") >= '1516428844842614784'::bigint) AND (skycell_ang2cell(ra, "dec") <= '1516446437028659
 psql:../34_composite.sql:126: NOTICE:          Filter: skycell_in_region(point('ICRS'::text, ra, "dec"), 'UNION ICRS (CIRCLE 109.891023118109 -12.5653672722353 0.345243527665956 C
 psql:../34_composite.sql:126: NOTICE:          ->  BitmapOr
 psql:../34_composite.sql:126: NOTICE:                ->  Bitmap Index Scan on gaia_realc_cell
-psql:../34_composite.sql:126: NOTICE:                      Index Cond: ((skycell_ang2cell(ra, "dec") >= '1516435991668195328'::bigint) AND (skycell_ang2cell(ra, "dec") <= '1516446
+psql:../34_composite.sql:126: NOTICE:                      Index Cond: ((skycell_ang2cell(ra, "dec") >= '1516428844842614784'::bigint) AND (skycell_ang2cell(ra, "dec") <= '1516446
 psql:../34_composite.sql:126: NOTICE:                ->  Bitmap Index Scan on gaia_realc_cell
 psql:../34_composite.sql:126: NOTICE:                      Index Cond: ((skycell_ang2cell(ra, "dec") >= '1516516805772836864'::bigint) AND (skycell_ang2cell(ra, "dec") <= '1516587
 psql:../34_composite.sql:126: NOTICE:                ->  Bitmap Index Scan on gaia_realc_cell
 psql:../34_composite.sql:126: NOTICE:                      Index Cond: ((skycell_ang2cell(ra, "dec") >= '1517185308842524672'::bigint) AND (skycell_ang2cell(ra, "dec") <= '1517202
 psql:../34_composite.sql:126: NOTICE:                ->  Bitmap Index Scan on gaia_realc_cell
-psql:../34_composite.sql:126: NOTICE:                      Index Cond: ((skycell_ang2cell(ra, "dec") >= '1517290861958791168'::bigint) AND (skycell_ang2cell(ra, "dec") <= '1517330
+psql:../34_composite.sql:126: NOTICE:                      Index Cond: ((skycell_ang2cell(ra, "dec") >= '1517290861958791168'::bigint) AND (skycell_ang2cell(ra, "dec") <= '1517343
 psql:../34_composite.sql:126: NOTICE:  --- pair boolean
 psql:../34_composite.sql:126: NOTICE:  Aggregate
 psql:../34_composite.sql:126: NOTICE:    ->  Bitmap Heap Scan on gaia_realc
@@ -106,15 +110,15 @@ psql:../34_composite.sql:126: NOTICE:                      Index Cond: (pos <@ '
 psql:../34_composite.sql:126: NOTICE:  --- lens region
 psql:../34_composite.sql:126: NOTICE:  Aggregate
 psql:../34_composite.sql:126: NOTICE:    ->  Bitmap Heap Scan on gaia_realc
-psql:../34_composite.sql:126: NOTICE:          Recheck Cond: (((skycell_ang2cell(ra, "dec") >= '1516441489226334208'::bigint) AND (skycell_ang2cell(ra, "dec") <= '1516445337517031
+psql:../34_composite.sql:126: NOTICE:          Recheck Cond: (((skycell_ang2cell(ra, "dec") >= '1516428844842614784'::bigint) AND (skycell_ang2cell(ra, "dec") <= '1516446437028659
 psql:../34_composite.sql:126: NOTICE:          Filter: skycell_in_region(point('ICRS'::text, ra, "dec"), 'INTERSECTION ICRS (CIRCLE 109.979452009803 -12.5653672722353 0.3452435276
 psql:../34_composite.sql:126: NOTICE:          ->  BitmapOr
 psql:../34_composite.sql:126: NOTICE:                ->  Bitmap Index Scan on gaia_realc_cell
-psql:../34_composite.sql:126: NOTICE:                      Index Cond: ((skycell_ang2cell(ra, "dec") >= '1516441489226334208'::bigint) AND (skycell_ang2cell(ra, "dec") <= '1516445
+psql:../34_composite.sql:126: NOTICE:                      Index Cond: ((skycell_ang2cell(ra, "dec") >= '1516428844842614784'::bigint) AND (skycell_ang2cell(ra, "dec") <= '1516446
 psql:../34_composite.sql:126: NOTICE:                ->  Bitmap Index Scan on gaia_realc_cell
-psql:../34_composite.sql:126: NOTICE:                      Index Cond: ((skycell_ang2cell(ra, "dec") >= '1516534397958881280'::bigint) AND (skycell_ang2cell(ra, "dec") <= '1516551
+psql:../34_composite.sql:126: NOTICE:                      Index Cond: ((skycell_ang2cell(ra, "dec") >= '1516534397958881280'::bigint) AND (skycell_ang2cell(ra, "dec") <= '1516587
 psql:../34_composite.sql:126: NOTICE:                ->  Bitmap Index Scan on gaia_realc_cell
-psql:../34_composite.sql:126: NOTICE:                      Index Cond: ((skycell_ang2cell(ra, "dec") >= '1517290861958791168'::bigint) AND (skycell_ang2cell(ra, "dec") <= '1517308
+psql:../34_composite.sql:126: NOTICE:                      Index Cond: ((skycell_ang2cell(ra, "dec") >= '1517290861958791168'::bigint) AND (skycell_ang2cell(ra, "dec") <= '1517343
 psql:../34_composite.sql:126: NOTICE:  --- lens boolean
 psql:../34_composite.sql:126: NOTICE:  Aggregate
 psql:../34_composite.sql:126: NOTICE:    ->  Custom Scan (SkycellCone) on gaia_realc
@@ -170,11 +174,11 @@ psql:../34_composite.sql:126: NOTICE:          ->  BitmapOr
 psql:../34_composite.sql:126: NOTICE:                ->  Bitmap Index Scan on gaia_realc_cell
 psql:../34_composite.sql:126: NOTICE:                      Index Cond: ((skycell_ang2cell(ra, "dec") >= '1516424446796103680'::bigint) AND (skycell_ang2cell(ra, "dec") <= '1516446
 psql:../34_composite.sql:126: NOTICE:                ->  Bitmap Index Scan on gaia_realc_cell
-psql:../34_composite.sql:126: NOTICE:                      Index Cond: ((skycell_ang2cell(ra, "dec") >= '1516516805772836864'::bigint) AND (skycell_ang2cell(ra, "dec") <= '1516587
+psql:../34_composite.sql:126: NOTICE:                      Index Cond: ((skycell_ang2cell(ra, "dec") >= '1516521203819347968'::bigint) AND (skycell_ang2cell(ra, "dec") <= '1516578
 psql:../34_composite.sql:126: NOTICE:                ->  Bitmap Index Scan on gaia_realc_cell
-psql:../34_composite.sql:126: NOTICE:                      Index Cond: ((skycell_ang2cell(ra, "dec") >= '1517194104935546880'::bigint) AND (skycell_ang2cell(ra, "dec") <= '1517201
+psql:../34_composite.sql:126: NOTICE:                      Index Cond: ((skycell_ang2cell(ra, "dec") >= '1517194104935546880'::bigint) AND (skycell_ang2cell(ra, "dec") <= '1517202
 psql:../34_composite.sql:126: NOTICE:                ->  Bitmap Index Scan on gaia_realc_cell
-psql:../34_composite.sql:126: NOTICE:                      Index Cond: ((skycell_ang2cell(ra, "dec") >= '1517290861958791168'::bigint) AND (skycell_ang2cell(ra, "dec") <= '1517331
+psql:../34_composite.sql:126: NOTICE:                      Index Cond: ((skycell_ang2cell(ra, "dec") >= '1517290861958791168'::bigint) AND (skycell_ang2cell(ra, "dec") <= '1517334
 psql:../34_composite.sql:126: NOTICE:  --- mosaic boolean
 psql:../34_composite.sql:126: NOTICE:  Aggregate
 psql:../34_composite.sql:126: NOTICE:    ->  Bitmap Heap Scan on gaia_realc

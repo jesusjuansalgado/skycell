@@ -3,4 +3,4 @@ pg_sphere 1.5.2
 plpgsql 1.0
 q3c 2.0.5
 skycell 0.38
-68ff29c25edd8cf694178e00586fa601  /home/user/pg18/lib/postgresql/skycell.so
+02af87ff350ca429f6a2191bb70ff6bc  /home/user/pg18/lib/postgresql/skycell.so

@@ -2458,10 +2458,120 @@ rlist_score(rlist_t *l, const sc_density *d, const sc_cover_params *p, int steps
 	return l->n * p->range_cost + rows + steps * step_cost;
 }
 
+/*
+ * The covering of a composite from its operands' own coverings, where that is
+ * sound: the union of the operands' coverings covers their union, the
+ * intersection of any of them covers the intersection, and the first
+ * operand's covers a difference (used while the part taken away is at most
+ * half of it).  A circle operand then takes the direct cone
+ * path instead of being classified cell by cell through the composite, which
+ * the descent below would do (64% of a two-circle union's planning, under
+ * callgrind).  NOT has no such covering -- the complement of a covering is
+ * not one -- so a NOT, and an intersection whose every operand is a NOT,
+ * are left to the descent: returns false for those, with nothing added.
+ */
+static bool
+cover_composite(const sc_region *r, const sc_density *d, const sc_cover_params *p,
+				rlist_t *out, int *steps)
+{
+	switch (r->kind)
+	{
+		case SC_REGION_UNION:
+			for (int i = 0; i < r->nkids; i++)
+			{
+				sc_cover	kc;
+
+				sc_cover_compute(&r->kids[i], d, p, &kc);
+				*steps += kc.steps;
+				for (int j = 0; j < kc.n; j++)
+					rlist_add(out, kc.r[j].lo, kc.r[j].hi);
+				sc_cover_free(&kc);
+			}
+			return true;
+
+		case SC_REGION_DIFFERENCE:
+			{
+				sc_cover	kc;
+
+				/*
+				 * The first operand's covering keeps the hole.  Worth it while
+				 * the hole is small; a thin ring would read many times its own
+				 * rows, where the descent drops the cells inside the hole.
+				 */
+				if (r->kids[1].area > 0.5 * r->kids[0].area)
+					return false;
+
+				sc_cover_compute(&r->kids[0], d, p, &kc);
+				*steps += kc.steps;
+				for (int j = 0; j < kc.n; j++)
+					rlist_add(out, kc.r[j].lo, kc.r[j].hi);
+				sc_cover_free(&kc);
+				return true;
+			}
+
+		case SC_REGION_INTERSECTION:
+			{
+				rlist_t		acc = {0};
+				bool		first = true;
+
+				for (int i = 0; i < r->nkids; i++)
+				{
+					sc_cover	kc;
+					rlist_t		nx = {0};
+					int			a = 0,
+								b = 0;
+
+					if (r->kids[i].kind == SC_REGION_NOT)
+						continue;	/* most of the sky: it narrows nothing */
+					sc_cover_compute(&r->kids[i], d, p, &kc);
+					*steps += kc.steps;
+					if (first)
+					{
+						for (int j = 0; j < kc.n; j++)
+							rlist_add(&acc, kc.r[j].lo, kc.r[j].hi);
+						first = false;
+						sc_cover_free(&kc);
+						continue;
+					}
+					/* both sorted, disjoint: intersect them */
+					while (a < acc.n && b < kc.n)
+					{
+						int64_t		lo = Max(acc.a[a].lo, kc.r[b].lo),
+									hi = Min(acc.a[a].hi, kc.r[b].hi);
+
+						if (lo <= hi)
+							rlist_add(&nx, lo, hi);
+						if (acc.a[a].hi < kc.r[b].hi)
+							a++;
+						else
+							b++;
+					}
+					sc_cover_free(&kc);
+					if (acc.a)
+						SC_FREE(acc.a);
+					acc = nx;
+					if (acc.n == 0)
+						break;	/* empty: nothing to intersect further */
+				}
+				if (first)
+					return false;
+				for (int j = 0; j < acc.n; j++)
+					rlist_add(out, acc.a[j].lo, acc.a[j].hi);
+				if (acc.a)
+					SC_FREE(acc.a);
+				return true;
+			}
+
+		default:
+			return false;
+	}
+}
+
 void
 sc_cover_compute(const sc_region *r, const sc_density *d,
 				 const sc_cover_params *p, sc_cover *out)
 {
+
 	heap_t		h = {0};
 	rlist_t		kept = {0};
 	int			nr = 0;			/* approximate number of ranges */
@@ -2473,6 +2583,10 @@ sc_cover_compute(const sc_region *r, const sc_density *d,
 		? p->max_area_ratio * fmax(r->area, order_area(SC_MAX_ORDER)) : INFINITY;
 
 	memset(out, 0, sizeof(*out));
+
+	if (SC_REGION_IS_COMPOSITE(r) && p->force_order < 0 &&
+		cover_composite(r, d, p, &kept, &steps))
+		goto finish;
 
 	if (p->direct && r->kind == SC_REGION_CONE && r->radius >= 0 &&
 		r->radius <= 10.0 * M_PI / 180)
