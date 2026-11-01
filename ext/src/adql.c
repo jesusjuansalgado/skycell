@@ -201,7 +201,11 @@ region_depth(const SkyRegion *r)
 	check_stack_depth();
 	n = region_kids(r, kids, SKY_MAX_KIDS);
 	for (int i = 0; i < Min(n, SKY_MAX_KIDS); i++)
-		d = Max(d, region_depth(kids[i]));
+	{
+		int			k = region_depth(kids[i]);	/* not inside Max(): it evaluates twice */
+
+		d = Max(d, k);
+	}
 	return d + 1;
 }
 
@@ -564,7 +568,9 @@ stcs_print(StringInfo buf, const SkyRegion *r, bool top)
 	if (SKY_IS_COMPOSITE(r->kind))
 	{
 		const SkyRegion *kids[SKY_MAX_KIDS];
-		int			n = Min(region_kids(r, kids, SKY_MAX_KIDS), SKY_MAX_KIDS);
+		int			n = region_kids(r, kids, SKY_MAX_KIDS);
+
+		n = Min(n, SKY_MAX_KIDS);
 
 		check_stack_depth();
 		appendStringInfoString(buf, " (");
