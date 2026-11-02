@@ -750,6 +750,7 @@ skycell_dist(…)` with a `LIMIT` is indexed ([Nearest neighbours](#nearest-neig
 | Function | Returns | Notes |
 |---|---|---|
 | `skycell_cone_ranges(ra0, dec0, radius [, tbl, col])` | `SETOF (lo, hi)` | the covering as index ranges, for hand-built plans (a `LATERAL` cross-match); the plain join through the custom scan is faster. Index with `skycell_cell_ops` (`CREATE INDEX ON t (skycell_ang2cell(ra, dec) skycell_cell_ops)`) so the planner can estimate such a range join |
+| `skycell_cone_cell_lo(ra0, dec0, radius)`<br>`skycell_cone_cell_hi(ra0, dec0, radius)` | `int8` | the lowest and highest order-29 cell the cone can hold (since SQL 0.40). The planner adds `cell >= lo AND cell <= hi` next to a cone on a catalogue range-partitioned by its cell, so PostgreSQL prunes the partitions the cone cannot reach; the custom scan leaves them out of its filter. The whole sky for a cone over 10° or an invalid centre |
 | `skycell_poly_ranges(poly [, tbl, col])` | `SETOF (lo, hi)` | the same for a polygon |
 | `skycell_cone_moc(ra0, dec0, radius [, max_cells, max_order])` | `int8[]` | the covering as IVOA MOC `NUNIQ` cells — store these to index a region |
 | `skycell_poly_moc(poly [, max_cells, max_order])` | `int8[]` | likewise |
@@ -853,6 +854,43 @@ and its row estimates stay within 1.4× of the truth where pgSphere's are off
 by up to 7.1× and Q3C's by up to 2.6×. At Gaia
 DR3 scale that is one 38 GiB index where an archive running pgSphere for cones
 and Q3C for cross-matching keeps 160 GiB.
+
+**Partitioned catalogues** (0.44, SQL 0.40, [`bench/results-partition/`](bench/results-partition/)).
+5M real Gaia DR3 positions, once in one table and once in 16 partitions by cell
+range (as by HEALPix index or Gaia `source_id`), cross-matched with 10³–10⁵
+probes at 1″–30″. A cross-match is a nested loop that rescans the partitioned
+table, and so every partition, for each probe. Two changes cut that down:
+
+- Each partition's scan tests a cone against its index's lowest and highest
+  key before covering it, so a partition that cannot hold the cone answers in
+  about 0.3 µs.
+- On a catalogue partitioned by its cell, the planner adds the cone's cell
+  interval next to it (`skycell_cone_cell_lo/hi`), and PostgreSQL prunes at
+  every probe the partitions it cannot reach. Only one partition runs.
+
+Partitioned time over unpartitioned, both tables matching the same rows:
+
+| probes, radius | 0.43 | key test | with pruning | unpartitioned ms |
+|---|---|---|---|---|
+| 10³, 5″ | 4.14 | 1.85 | 1.44 | 8.5 |
+| 10⁴, 5″ | 6.34 | 2.39 | 1.74 | 47.0 |
+| 10⁵, 1″ | 8.11 | 2.37 | 1.51 | 387.7 |
+| 10⁵, 30″ | 5.06 | 1.77 | 1.21 | 759.1 |
+
+The 1.2–1.7 left is PostgreSQL's own work at each rescan: evaluating the bounds,
+finding the partition, restarting its scan, about 2 µs a probe. A constant cone
+on such a catalogue is pruned at plan time to the partitions it touches.
+Polygons and composites take the custom scan on each partition but are not
+pruned yet.
+
+Partitioning brings no parallel gain of its own. A parallel cross-match
+shares out its probes, each worker rescanning the partitioned table as above:
+100k probes at 5″ took 175 ms with three workers against 146 ms unpartitioned.
+A wide cone gets a Parallel Append over the partitions it reaches, but the
+unpartitioned table's parallel cone scan (0.42) is faster still: a 10° cone
+took 49 ms against 36, a 30° cone 89 against 73. Partition a sky catalogue to
+load, index, vacuum or archive it by region, not for speed: cones cost the
+same, cross-matches 1.2–1.7 times as much.
 
 **Polygons through the custom scan** (0.43, [`bench/results-polyscan/`](bench/results-polyscan/)).
 Since 0.43 a constant polygon or box takes the custom scan that cones have.
@@ -1110,6 +1148,16 @@ Two layers, both in [`ext/test/`](ext/test/).
   one band without the index) must give the sort's answer through a Merge
   Append of the partitions' nearest scans, pruned or not.
 
+- `partition`: catalogues partitioned by cell range (with an empty partition)
+  and by declination band (sub-partitioned, a default partition, a partition
+  without the index), and a table holding one patch of sky. Constant cones,
+  polygons, boxes, composites, distance comparisons and cross-matches must
+  give the unpartitioned table's answers (the patch's, with the custom scan
+  off), and every indexed partition must offer the custom scan. On the
+  catalogue partitioned by cell range (and on one partitioned by a stored cell
+  column), a constant cone must be pruned at plan time to its partition and a
+  cross-match must run only the partition holding its probes; every cell of a
+  cone must lie within `skycell_cone_cell_lo/hi`.
 - `composite`: unions, intersections, differences and NOTs. STC-S in and
   out (every malformed form errors with a reason), the constructors, each
   composite's membership against the boolean combination of its pieces,
@@ -1175,7 +1223,19 @@ locally), the standalone selftests, and the reference translators.
   use the range rewrite and the region indexes. The search must be a top-level
   `AND` term of a `WHERE` or `JOIN ON`: one under an `OR` is rewritten instead
   and stays indexable through a `BitmapOr`. It reads heap
-  tables only; on a partitioned table each partition keeps the rewrite.
+  tables only. On a partitioned table each partition gets the scan (since
+  0.44; constant searches kept the rewrite before), and a partition without
+  the cell index a sequential scan. A cross-match against a partitioned
+  catalogue rescans the partitioned table for every probe. Partitioned by its
+  cell (`skycell_ang2cell(ra, dec)` or a stored cell column, range
+  partitioning), the partitions a cone cannot reach are pruned at each probe
+  (SQL 0.40), and 16 partitions cost 1.2–1.7 times the unpartitioned table,
+  against 3.4–8.1 with 0.43. Partitioned otherwise (by declination band, say)
+  every partition is rescanned, each one whose keys cannot hold the cone
+  answering in about 0.3 µs; bands hold cells all over the key space, so
+  there it is the covering that costs. A partition left without the index
+  stops a cross-match from using the others' scans at all. Polygons and
+  composites are not pruned; a cone over 10° prunes nothing.
   Nearest neighbours on a partitioned table are answered partition by
   partition and merged (since 0.40), so every partition finds its own nearest
   row before the first is returned: one far from the point costs a cell walk

@@ -11,3 +11,4 @@ ext/test/results/
 ext/test/regression.*
 ext/results/
 ext/regression.*
+*.bc.tmp

@@ -2000,7 +2000,7 @@ simplify_cone5(PlannerInfo *root, FuncExpr *fexpr)
 										 COERCE_EXPLICIT_CALL);
 
 		if (cone_scan_keep_as(root, fexpr, cone6))
-			return (Node *) cone6;
+			return cone_with_partition_bounds(root, cone6);
 	}
 	return simplify_cone(root, six);
 }
@@ -2214,7 +2214,12 @@ skycell_support(PG_FUNCTION_ARGS)
 		{
 			/* left as is for the custom scan (cone_scan.c), if it can take it */
 			if (cone_scan_keep(req->root, req->fcall))
-				PG_RETURN_POINTER(NULL);
+			{
+				/* with partition bounds (0.44), or left as is */
+				Node	   *n = cone_with_partition_bounds(req->root, copyObject(req->fcall));
+
+				PG_RETURN_POINTER(IsA(n, BoolExpr) ? n : NULL);
+			}
 			PG_RETURN_POINTER(simplify_cone(req->root, req->fcall));
 		}
 		if (nargs == 3)
