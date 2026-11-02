@@ -122,7 +122,10 @@ a cross-match is weighed fairly against a parallel sequential scan. Since 0.36
 the node is parallel safe: with enough probes the cross-match runs in parallel
 workers, as a Gather over the nested loop with a Parallel Seq Scan of the probes
 on its outer side, each worker covering and scanning the cones of its own
-probes. A query ordered by the distance to a point, with a `LIMIT`, gets a
+probes. Since 0.42 a single wide cone or composite search is parallel aware
+too: its covering is cut into chunks that the leader and the workers claim from
+a shared counter, so a cone over a crowded field is read by several processes
+at once. A query ordered by the distance to a point, with a `LIMIT`, gets a
 second node, `SkycellNearest`, which reads widening rings round the point from
 the same index ([Nearest neighbours](#nearest-neighbours)).
 
@@ -814,6 +817,25 @@ workers use the four cores. Q3C's and pgSphere's cross-matches can run under a
 parallel nested loop too. They were not measured that way, so these figures
 compare skycell with itself only.
 
+**Parallel cone searches.** A single cone with many rows behind it is split
+among processes since 0.42. On `gaia_realc` (10M Gaia DR3 positions, heap in
+cell order, 4 cores), cones centred on the Galactic centre, best of 5 warm runs,
+counts identical to the serial ones:
+
+| search | rows | serial | 2 workers allowed | 4 workers allowed |
+|---|---|---|---|---|
+| 1° cone | 2.8k | 0.6 ms | planned serial | planned serial |
+| 3° | 90k | 14.2 ms | 1 worker: 11.0 ms | 1 worker: 13.1 ms |
+| 5° | 294k | 45.5 ms | 2 workers: 20.9 ms | 2 workers: 20.7 ms |
+| 10° | 1.29M | 189.5 ms | 2 workers: 71.2 ms | 3 workers: 71.9 ms |
+| 15° | 2.20M | 286.8 ms | 2 workers: 136.8 ms | 3 workers: 123.9 ms |
+| annulus 5°–10° (`DIFFERENCE`) | 1.00M | 209.9 ms | 2 workers: 95.9 ms | 3 workers: 124.8 ms |
+
+PostgreSQL picks the workers by the heap pages the search is expected to read,
+as it would for a parallel scan of that many pages, so small cones, which are
+the common case, keep their serial plan and their planning cost. Away from the
+Galactic plane the same 15° cone holds 33k rows and stays serial.
+
 The benchmark scripts behind the paper describing skycell, and the
 documentation of every measurement it quotes, are in [`bench/`](bench/):
 [`bench/README.md`](bench/README.md) maps each table to its directory, and
@@ -910,6 +932,9 @@ Two layers, both in [`ext/test/`](ext/test/).
   - Under `debug_parallel_query` a whole cone search runs inside a worker, in
     both modes, with the index filter, as a cross-match and as a generic plan's
     run-time cone, and returns the serial answer.
+  - A single cone, a 40° cone and a composite are planned parallel aware
+    under a Gather, in both modes, and give the serial answer, also when a
+    nested loop rescans the Gather.
 - `nearest`: the nearest-neighbour scan. Every query must return what
   PostgreSQL's sort returns, the same distances in the same order and the same
   rows (ties aside): on a catalogue with duplicated positions, NULL
@@ -1002,9 +1027,11 @@ locally), the standalone selftests, and the reference translators.
   and a few rings, about 30 ms a query on 3M rows in four declination bands,
   where partitions by cell range, each holding its own part of the sky, take
   2.3 ms. Before PostgreSQL 18 its bitmap mode does not prefetch.
-- **Parallel queries.** The custom scans are parallel safe but not parallel
-  aware. A cross-match's probes are shared out among workers, but a single cone
-  search or nearest-neighbour query is not split among them. PostgreSQL gives
+- **Parallel queries.** A cross-match's probes are shared out among workers,
+  and since 0.42 a single cone or composite search with a fixed region is
+  split among them (its covering in chunks). A cone whose region is known only
+  at run time (a generic plan's parameters) and a nearest-neighbour query are
+  not split. PostgreSQL gives
   the probe table workers by its size: none below 8 MB
   (`min_parallel_table_scan_size`), one at 10 MB, two at 50 MB. A smaller target
   list runs serially unless told otherwise: `ALTER TABLE targets SET

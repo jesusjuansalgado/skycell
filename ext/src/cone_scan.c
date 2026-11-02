@@ -66,6 +66,8 @@
 #include "optimizer/optimizer.h"
 #include "optimizer/pathnode.h"
 #include "optimizer/paths.h"
+#include "port/atomics.h"
+#include "access/parallel.h"
 #include "optimizer/restrictinfo.h"
 #include "parser/parsetree.h"
 #include "utils/array.h"
@@ -106,6 +108,10 @@ static TupleTableSlot *cone_exec(CustomScanState *node);
 static void cone_end(CustomScanState *node);
 static void cone_rescan(CustomScanState *node);
 static void cone_explain(CustomScanState *node, List *ancestors, ExplainState *es);
+static Size cone_estimate_dsm(CustomScanState *node, ParallelContext *pcxt);
+static void cone_initialize_dsm(CustomScanState *node, ParallelContext *pcxt, void *coordinate);
+static void cone_reinitialize_dsm(CustomScanState *node, ParallelContext *pcxt, void *coordinate);
+static void cone_initialize_worker(CustomScanState *node, shm_toc *toc, void *coordinate);
 
 static void add_nearest_path(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte);
 static Plan *nearest_plan(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
@@ -152,6 +158,10 @@ static const CustomExecMethods cone_exec_methods = {
 	.ExecCustomScan = cone_exec,
 	.EndCustomScan = cone_end,
 	.ReScanCustomScan = cone_rescan,
+	.EstimateDSMCustomScan = cone_estimate_dsm,
+	.InitializeDSMCustomScan = cone_initialize_dsm,
+	.ReInitializeDSMCustomScan = cone_reinitialize_dsm,
+	.InitializeWorkerCustomScan = cone_initialize_worker,
 	.ExplainCustomScan = cone_explain,
 };
 
@@ -167,6 +177,18 @@ typedef struct ConeScanState
 	ScanKeyData keys[2];
 	bool		bitmap;			/* bitmap mode, else ordered */
 	TableScanDesc hscan;		/* bitmap: heap scan over the TID bitmap */
+
+	/*
+	 * Parallel (a constant cone or composite under a Gather): the ranges are
+	 * cut into chunks, the same in every process, which the leader and the
+	 * workers claim from a shared counter, each scanning the chunks it
+	 * claims.  Without the shared counter (no parallel context) the chunks
+	 * are taken in turn, as a serial scan takes its ranges.
+	 */
+	bool		parallel;
+	pg_atomic_uint32 *next;		/* the next chunk to claim, in shared memory */
+	uint32		local_next;
+	int			plan_nranges;	/* the covering's ranges, for EXPLAIN */
 	TIDBitmap  *tbm;			/* bitmap: NULL until the first fetch */
 #if PG_VERSION_NUM < 180000
 	TBMIterator *it;
@@ -1350,7 +1372,8 @@ cone_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, Index rti, RangeTblEnt
 		sc_region	reg;
 		sc_cover	cov;
 		sc_density	dens;
-		CustomPath *cp;
+		CustomPath *cp,
+				   *pp;
 		Datum	   *b;
 		Const	   *bounds;
 		bool		bitmap;
@@ -1413,7 +1436,41 @@ cone_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, Index rti, RangeTblEnt
 												  ObjectIdGetDatum(ix->indexoid), false, true),
 										bounds, makeBoolConst(bitmap, false), f);
 		cp->methods = &cone_path_methods;
+		/*
+		 * A wide cone or composite reads many pages: offer it in parallel too,
+		 * its chunks shared out among the processes (cone_claim()), with as
+		 * many workers as PostgreSQL gives a scan of the pages it expects to
+		 * read, and its cost and rows divided as PostgreSQL divides its own.
+		 * The copy is made before add_path(), which frees a path it rejects.
+		 */
+		pp = NULL;
+		if (rel->consider_parallel && max_parallel_workers_per_gather > 0 &&
+			rel->tuples > 0 && rel->pages > 0)
+		{
+			double		heap_pages = fmin((double) rel->pages,
+										  cov.exp_rows * (double) rel->pages / rel->tuples);
+			int			workers = compute_parallel_worker(rel, heap_pages, -1,
+														  max_parallel_workers_per_gather);
+
+			if (workers > 0)
+			{
+				double		divisor = workers;
+
+				if (parallel_leader_participation && 1.0 - 0.3 * workers > 0)
+					divisor += 1.0 - 0.3 * workers;
+				pp = makeNode(CustomPath);
+				*pp = *cp;
+				pp->path.parallel_aware = true;
+				pp->path.parallel_safe = true;
+				pp->path.parallel_workers = workers;
+				pp->path.rows = clamp_row_est(rel->rows / divisor);
+				pp->path.total_cost = cp->path.startup_cost +
+					(cp->path.total_cost - cp->path.startup_cost) / divisor;
+			}
+		}
 		add_path(rel, &cp->path);
+		if (pp != NULL)
+			add_partial_path(rel, &pp->path);
 	}
 
 	/*
@@ -1932,6 +1989,66 @@ cone_create_state(CustomScan *cscan)
 	return (Node *) st;
 }
 
+static void cone_release_bitmap(ConeScanState *st, bool end);
+
+/* about this many chunks to share out among a parallel scan's processes */
+#define CONE_PARALLEL_CHUNKS 64
+
+/*
+ * The covering's ranges cut into about CONE_PARALLEL_CHUNKS chunks, each range
+ * into pieces in proportion to its width in cells, so that a process that
+ * claims a chunk has a share of the work and the last ones to finish do not
+ * wait on one long range.  The same in every process.
+ */
+static void
+cone_make_chunks(ConeScanState *st)
+{
+	double		total = 0;
+	int			n = 0,
+				cap = CONE_PARALLEL_CHUNKS + st->nranges;
+	int64	   *c = MemoryContextAlloc(st->css.ss.ps.state->es_query_cxt,
+									   sizeof(int64) * 2 * cap);
+
+	for (int i = 0; i < st->nranges; i++)
+		total += (double) (st->bounds[2 * i + 1] - st->bounds[2 * i]) + 1.0;
+	for (int i = 0; i < st->nranges; i++)
+	{
+		int64		lo = st->bounds[2 * i],
+					hi = st->bounds[2 * i + 1];
+		uint64		w = (uint64) (hi - lo) + 1;
+		int			k = (int) Max(1.0, floor(CONE_PARALLEL_CHUNKS * (double) w / Max(total, 1.0)));
+
+		if ((uint64) k > w)
+			k = (int) w;
+		for (int j = 0; j < k; j++)
+		{
+			int64		a = lo + (int64) (w / k * j),
+						b = (j == k - 1) ? hi : lo + (int64) (w / k * (j + 1)) - 1;
+
+			if (n == cap)
+			{
+				cap *= 2;
+				c = repalloc(c, sizeof(int64) * 2 * cap);
+			}
+			c[2 * n] = a;
+			c[2 * n + 1] = b;
+			n++;
+		}
+	}
+	st->plan_nranges = st->nranges;
+	st->bounds = c;
+	st->nranges = n;
+}
+
+/* the next chunk this process scans: from the shared counter, or in turn */
+static int
+cone_claim(ConeScanState *st)
+{
+	uint32		i = (st->next != NULL) ? pg_atomic_fetch_add_u32(st->next, 1) : st->local_next++;
+
+	return (i >= (uint32) st->nranges) ? st->nranges : (int) i;
+}
+
 static void
 cone_begin(CustomScanState *node, EState *estate, int eflags)
 {
@@ -1963,6 +2080,12 @@ cone_begin(CustomScanState *node, EState *estate, int eflags)
 
 		st->nranges = ArrayGetNItems(ARR_NDIM(arr), ARR_DIMS(arr)) / 2;
 		st->bounds = (const int64 *) ARR_DATA_PTR(arr);
+		st->plan_nranges = st->nranges;
+		if (cscan->scan.plan.parallel_aware)
+		{
+			st->parallel = true;
+			cone_make_chunks(st);
+		}
 	}
 	st->args = ExecInitExprList(cscan->custom_exprs, &node->ss.ps);
 	st->ira = DatumGetInt16(list_nth_node(Const, cscan->custom_private, 3)->constvalue);
@@ -2220,7 +2343,8 @@ cone_next_ordered(ConeScanState *st, TupleTableSlot *slot)
 			(st->ira != 0 ? cone_next_filtered(st, slot)
 			 : index_getnext_slot(st->iscan, ForwardScanDirection, slot)))
 			return slot;
-		if (++st->cur >= st->nranges)
+		st->cur = st->parallel ? cone_claim(st) : st->cur + 1;
+		if (st->cur >= st->nranges)
 			return ExecClearTuple(slot);
 		cone_range(st, st->cur);
 	}
@@ -2233,10 +2357,10 @@ cone_next_ordered(ConeScanState *st, TupleTableSlot *slot)
  * test alone decides -- no range condition needs rechecking.
  */
 static void
-cone_build_bitmap(ConeScanState *st)
+cone_build_bitmap_of(ConeScanState *st, int from, int to)
 {
 	st->tbm = tbm_create(work_mem * (Size) 1024, NULL);
-	for (int i = 0; i < st->nranges; i++)
+	for (int i = from; i < to; i++)
 	{
 		cone_range(st, i);
 		if (st->ira == 0)
@@ -2251,6 +2375,26 @@ cone_build_bitmap(ConeScanState *st)
 	}
 }
 
+/*
+ * The ranges' TIDs into a bitmap: all of them, or in a parallel scan the next
+ * chunk this process claims (false when none is left).
+ */
+static bool
+cone_build_bitmap(ConeScanState *st)
+{
+	if (st->parallel)
+	{
+		int			c = cone_claim(st);
+
+		if (c >= st->nranges)
+			return false;
+		cone_build_bitmap_of(st, c, c + 1);
+	}
+	else
+		cone_build_bitmap_of(st, 0, st->nranges);
+	return true;
+}
+
 #if PG_VERSION_NUM >= 180000
 /* PostgreSQL 18: the table AM walks the bitmap itself, through a read stream */
 static TupleTableSlot *
@@ -2260,37 +2404,49 @@ cone_next_bitmap(ConeScanState *st, TupleTableSlot *slot)
 	uint64		lossy = 0,
 				exact = 0;
 
-	if (st->tbm == NULL)
+	for (;;)
 	{
-		TBMIterator it;
+		if (st->tbm == NULL)
+		{
+			TBMIterator it;
 
-		cone_build_bitmap(st);
-		it = tbm_begin_iterate(st->tbm, NULL, InvalidDsaPointer);
-		if (st->hscan == NULL)
-			st->hscan = table_beginscan_bm(st->css.ss.ss_currentRelation,
-										   st->css.ss.ps.state->es_snapshot, 0, NULL);
-		st->hscan->st.rs_tbmiterator = it;
+			if (!cone_build_bitmap(st))
+				return ExecClearTuple(slot);
+			it = tbm_begin_iterate(st->tbm, NULL, InvalidDsaPointer);
+			if (st->hscan == NULL)
+				st->hscan = table_beginscan_bm(st->css.ss.ss_currentRelation,
+											   st->css.ss.ps.state->es_snapshot, 0, NULL);
+			st->hscan->st.rs_tbmiterator = it;
+		}
+		if (table_scan_bitmap_next_tuple(st->hscan, slot, &recheck, &lossy, &exact))
+			return slot;
+		if (!st->parallel)
+			return ExecClearTuple(slot);
+		cone_release_bitmap(st, false);	/* this chunk done: claim the next */
 	}
-	if (table_scan_bitmap_next_tuple(st->hscan, slot, &recheck, &lossy, &exact))
-		return slot;
-	return ExecClearTuple(slot);
 }
 #else
 static TupleTableSlot *
 cone_next_bitmap(ConeScanState *st, TupleTableSlot *slot)
 {
-	if (st->tbm == NULL)
-	{
-		cone_build_bitmap(st);
-		st->it = tbm_begin_iterate(st->tbm);
-		st->tbmres = NULL;
-	}
 	for (;;)
 	{
+		if (st->tbm == NULL)
+		{
+			if (!cone_build_bitmap(st))
+				return ExecClearTuple(slot);
+			st->it = tbm_begin_iterate(st->tbm);
+			st->tbmres = NULL;
+		}
 		if (st->tbmres == NULL)
 		{
 			if ((st->tbmres = tbm_iterate(st->it)) == NULL)
-				return ExecClearTuple(slot);
+			{
+				if (!st->parallel)
+					return ExecClearTuple(slot);
+				cone_release_bitmap(st, false);	/* this chunk done: claim the next */
+				continue;
+			}
 			if (!table_scan_bitmap_next_block(st->hscan, st->tbmres))
 			{
 				st->tbmres = NULL;
@@ -2406,8 +2562,37 @@ cone_rescan(CustomScanState *node)
 
 	st->cur = -1;
 	st->need_cover = st->runtime;	/* new outer row, new covering */
+	st->local_next = 0;
 	cone_release_bitmap(st, false);
 	ExecScanReScan(&node->ss);
+}
+
+/* a parallel scan's shared state: the next chunk to claim */
+static Size
+cone_estimate_dsm(CustomScanState *node, ParallelContext *pcxt)
+{
+	return MAXALIGN(sizeof(pg_atomic_uint32));
+}
+
+static void
+cone_initialize_dsm(CustomScanState *node, ParallelContext *pcxt, void *coordinate)
+{
+	ConeScanState *st = (ConeScanState *) node;
+
+	pg_atomic_init_u32((pg_atomic_uint32 *) coordinate, 0);
+	st->next = (pg_atomic_uint32 *) coordinate;
+}
+
+static void
+cone_reinitialize_dsm(CustomScanState *node, ParallelContext *pcxt, void *coordinate)
+{
+	pg_atomic_write_u32((pg_atomic_uint32 *) coordinate, 0);
+}
+
+static void
+cone_initialize_worker(CustomScanState *node, shm_toc *toc, void *coordinate)
+{
+	((ConeScanState *) node)->next = (pg_atomic_uint32 *) coordinate;
 }
 
 static void
@@ -2417,7 +2602,7 @@ cone_explain(CustomScanState *node, List *ancestors, ExplainState *es)
 
 	ExplainPropertyText("Index", RelationGetRelationName(st->index), es);
 	if (!st->runtime)
-		ExplainPropertyInteger("Ranges", NULL, st->nranges, es);
+		ExplainPropertyInteger("Ranges", NULL, st->parallel ? st->plan_nranges : st->nranges, es);
 	else if (es->analyze && st->ncoverings > 0)
 	{
 		/*

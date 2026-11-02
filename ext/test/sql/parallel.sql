@@ -1,8 +1,8 @@
--- Parallel queries. The custom scan is parallel safe but not parallel aware:
--- under a Parallel Seq Scan of the probes, each worker covers and scans the
--- cones of its own probes, as it would an inner index scan, and under
--- debug_parallel_query a whole cone search runs in a worker. Every answer
--- must be the serial one.
+-- Parallel queries. Under a Parallel Seq Scan of the probes, each worker
+-- covers and scans the cones of its own probes, as it would an inner index
+-- scan; a single wide search is parallel aware, its ranges shared out among
+-- the processes; and under debug_parallel_query a whole cone search runs in a
+-- worker. Every answer must be the serial one.
 CREATE EXTENSION IF NOT EXISTS skycell;
 SET extra_float_digits = 0;
 SELECT setseed(0.31);
@@ -144,6 +144,25 @@ EXPLAIN (COSTS OFF) EXECUTE par_q(10, 20, 1);
 RESET debug_parallel_query;
 RESET plan_cache_mode;
 DEALLOCATE par_q;
+
+-- a single wide search shared out among the processes (0.42): the cone's
+-- or the composite's covering cut into chunks that the leader and the
+-- workers claim from a shared counter, in either mode, and again from the
+-- start when an outer query rescans the Gather (a nested loop over it)
+SET enable_hashjoin = off;
+SET enable_mergejoin = off;
+SET enable_material = off;
+SELECT name, tbl, (par_both(format(q, tbl))).*
+FROM (VALUES
+  ('cone',      'SELECT count(*) || '':'' || sum(id) FROM %s WHERE 1 = contains(point(''ICRS'', ra, dec), circle(''ICRS'', 10, 20, 2))'),
+  ('wide cone', 'SELECT count(*) || '':'' || sum(id) FROM %s WHERE point(''ICRS'', ra, dec) <@ circle(''ICRS'', 30, 10, 40)'),
+  ('composite', 'SELECT count(*) || '':'' || sum(id) FROM %s WHERE 1 = contains(point(''ICRS'', ra, dec), region(''UNION ICRS (CIRCLE 10 20 1 CIRCLE 11 21 1)''))'),
+  ('rescanned', 'SELECT string_agg(c::text, '','' ORDER BY g) FROM (SELECT g, count(*) AS c FROM generate_series(0, 2) g, %s WHERE 1 = contains(point(''ICRS'', ra, dec), circle(''ICRS'', 10, 20, 2)) AND g >= 0 GROUP BY g) s')
+) v(name, q), unnest(ARRAY['par_cat', 'par_sorted']) tbl
+ORDER BY 1, 2;
+RESET enable_hashjoin;
+RESET enable_mergejoin;
+RESET enable_material;
 
 DROP FUNCTION par_both(text), par_analyze(text), par_worker(text);
 DROP TABLE par_probe, par_cat, par_sorted, par_fcat;
