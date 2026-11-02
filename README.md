@@ -835,7 +835,8 @@ defaults throughout (ratio below 1 = skycell faster):
 | cross-matching, 1″–10″ | 0.26–0.33 | 0.73–0.84 |
 | convex polygons, 0.05°–2° | 0.21–0.23 | |
 | non-convex polygons (U, L, comb, star), 0.05°–2°, real Gaia DR3 positions | 0.13–0.29 | |
-| nearest neighbours, k = 10–1000, real Gaia DR3 positions | 0.47–0.69 | |
+| nearest neighbours, k = 10–1000, real Gaia DR3 positions | 0.48–0.67 | |
+| nearest neighbours beyond a distance (10 beyond 2°), real Gaia DR3 positions | 0.25 (since 0.45) | |
 | stored regions: overlap and region-in-region (`&&`, `@>`, `<@` between regions) | 0.12–0.70 | |
 | stored regions: footprints that contain a position (`@>` a point) | 0.57 on x86; 0.75–0.93 on an Apple M3 with 0.6 | |
 
@@ -1216,10 +1217,15 @@ locally), the standalone selftests, and the reference translators.
   (`ctid`, `FOR UPDATE`) keeps the sort too, since the scan returns rows from
   its own buffer. Against pgSphere's GiST ordering on a clustered relation (an
   ObsCore table, observations grouped in fields, its heap out of cell order)
-  it is level for a few rows and slower for hundreds or more: it reads about
-  twice the rows it returns (the ring's margin and the cells its edge
-  crosses), each through a bitmap over an unordered heap, where pgSphere's
-  GiST reads close to exactly the rows it returns.
+  it is level for a few rows and slower for hundreds or more (1.15 times
+  pgSphere's time at k = 100, 1.55 at 1000): it reads about 2.5 times the rows
+  it returns, the first ring sized from a cell's density holding more where
+  observations cluster in fields, each through a bitmap over an unordered
+  heap, where pgSphere's GiST reads close to exactly the rows it returns.
+  Testing index entries by their key before the heap read cut the rows read,
+  but cost more than it saved on a table in memory, and was dropped
+  ([`bench/results-nearest/`](bench/results-nearest/)). A condition `distance
+  > x` starts the rings at x (since 0.45).
 - **Where the custom scan applies.** It answers cones, cross-matches and
   constant polygons, boxes and composites; per-row polygons and stored regions
   use the range rewrite and the region indexes. The search must be a top-level
