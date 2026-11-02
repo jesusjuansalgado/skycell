@@ -67,7 +67,8 @@ ANALYZE pt_probe;
 
 -- the answer on a partitioned table against the unpartitioned one's (on the
 -- patch, against its own with the custom scan off), and how many of the
--- relation's scans are the custom scan
+-- relation's scans can be the custom scan (sequential scans off for that
+-- count only: wide cones on these small tables are near a tie with them)
 CREATE FUNCTION pt_cmp(q text, tbl text, OUT same bool, OUT custom int, OUT scans int)
 LANGUAGE plpgsql AS $$
 DECLARE a text; b text; l text;
@@ -82,10 +83,12 @@ BEGIN
   EXECUTE 'SELECT (' || replace(q, 'CAT', tbl) || ')::text' INTO b;
   same := a IS NOT DISTINCT FROM b;
   custom := 0; scans := 0;
+  PERFORM set_config('enable_seqscan', 'off', true);
   FOR l IN EXECUTE 'EXPLAIN (COSTS OFF) ' || replace(q, 'CAT', tbl) LOOP
     IF l ~ ('Custom Scan \(SkycellCone\) on ' || tbl) THEN custom := custom + 1; END IF;
     IF l ~ ('Scan.* on ' || tbl) THEN scans := scans + 1; END IF;
   END LOOP;
+  PERFORM set_config('enable_seqscan', 'on', true);
 END $$;
 
 SELECT name, tbl, (pt_cmp(q, tbl)).*
