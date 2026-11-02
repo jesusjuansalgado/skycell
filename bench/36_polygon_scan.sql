@@ -16,7 +16,10 @@
 --   box    an axis-aligned box s by s/2 (ADQL BOX's four corners)
 --   ushape a non-convex U, 8 vertices, s across
 -- Per shape the methods in random order, :n executions each (planned and
--- run), each shifted 1e-9 deg so that nothing planned or covered is reused.
+-- run), each shifted 1e-9 deg so that nothing planned or covered is reused,
+-- and each method by its own 1e-12 deg more, so that one method never finds
+-- the covering another planned for the same polygon (the scan and the ADQL
+-- spelling share skycell's covering cache).
 \set ON_ERROR_STOP 1
 
 SELECT setseed(0.36);
@@ -61,7 +64,9 @@ BEGIN
         EXECUTE pc_sql(m, pc_poly(p.shape, p.ra, p.dec, p.s)) INTO x;      -- warm its pages
         t0 := clock_timestamp();
         FOR i IN 1 .. n LOOP
-          EXECUTE pc_sql(m, pc_poly(p.shape, p.ra + 1e-9 * (i + n * rep), p.dec, p.s)) INTO x;
+          EXECUTE pc_sql(m, pc_poly(p.shape, p.ra + 1e-9 * (i + n * rep)
+                                    + 1e-12 * array_position(ARRAY['scan', 'rewrite', 'adql', 'pgsphere', 'q3c'], m),
+                                    p.dec, p.s)) INTO x;
         END LOOP;
         INSERT INTO pc_time VALUES (rep, p.c, p.shape, p.s, m,
           extract(epoch FROM clock_timestamp() - t0) * 1e6 / n, x);
