@@ -1,0 +1,52 @@
+ setseed 
+---------
+ 
+(1 row)
+
+CREATE FUNCTION
+CREATE FUNCTION
+DROP TABLE
+SELECT 50000
+SELECT 162500
+SELECT 12500
+SELECT 50000
+CREATE INDEX
+ALTER TABLE
+UPDATE 162500
+CREATE INDEX
+ALTER TABLE
+UPDATE 12500
+CREATE INDEX
+ANALYZE
+ANALYZE
+ANALYZE
+ANALYZE
+SELECT 300
+SELECT 600
+CREATE FUNCTION
+CREATE TABLE
+CREATE FUNCTION
+ setseed 
+---------
+ 
+(1 row)
+
+ fc_run 
+--------
+ 
+(1 row)
+
+COPY 5400
+ workload | queries | methods_disagree | observations_found 
+----------+---------+------------------+--------------------
+ overlap  |     300 |                0 |              45952
+ position |     600 |                0 |               8058
+(2 rows)
+
+          index          |   size   
+-------------------------+----------
+ skycell s_region GiST   | 2952 kB
+ pgSphere detectors GiST | 10120 kB
+ pgSphere masks GiST     | 728 kB
+(3 rows)
+
