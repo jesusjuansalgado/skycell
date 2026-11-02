@@ -224,25 +224,6 @@ typedef struct ConeScanState
 	int64		kmin,
 				kmax;
 	bool		keys_partial;	/* the keys span part of the sky: test cones */
-
-	/*
-	 * A nearest-neighbour ring in bitmap mode (0.45): its index entries are
-	 * read with their keys, and an entry whose cell is farther from the
-	 * centre than kf_rmax plus a cell's radius is not fetched from the heap.
-	 * With kf_target > 0 the ring is first cut down to the kf_target nearest
-	 * keys: its radius, written to *kf_rout, shrinks to the kf_target-th
-	 * key's distance plus a cell's radius, which every row nearer than it
-	 * is within.  An order-29 cell is under a milliarcsecond across, so the
-	 * heap is read for the rows the ring needs and hardly any more.
-	 */
-	bool		kf_active;
-	sc_vec3		kf_centre;
-	double		kf_rmin,		/* degrees; < 0 for the first ring */
-				kf_rmax,
-				kf_target;
-	double	   *kf_rout;
-	IndexScanDesc kscan;
-	double		kf_entries;		/* entries tested, for EXPLAIN ANALYZE */
 	double		ncoverings,		/* for EXPLAIN ANALYZE: this process's own */
 				nranges_total;
 
@@ -2898,112 +2879,9 @@ cone_next_ordered(ConeScanState *st, TupleTableSlot *slot)
  * plan's quals hold the exact test, and the ranges cover the cone, so that
  * test alone decides -- no range condition needs rechecking.
  */
-typedef struct
-{
-	ItemPointerData tid;
-	double		d;				/* the key's distance from the centre, degrees */
-} key_entry;
-
-static int
-key_entry_cmp(const void *a, const void *b)
-{
-	double		x = ((const key_entry *) a)->d,
-				y = ((const key_entry *) b)->d;
-
-	return (x > y) - (x < y);
-}
-
-/*
- * The ring's bitmap from its index entries' keys (kf_active above): every
- * entry of ranges [from, to) whose cell centre lies within kf_rmax plus one
- * cell's radius -- or, with kf_target, within the cut -- goes into the
- * bitmap; the others are never fetched.
- */
-static void
-cone_build_bitmap_keys(ConeScanState *st, int from, int to)
-{
-	Relation	heap = st->css.ss.ss_currentRelation;
-	EState	   *estate = st->css.ss.ps.state;
-	double		pr = sc_pixrad(SC_MAX_ORDER) * (180.0 / M_PI) * (1.0 + 1e-6) + 1e-12;
-	double		lim = st->kf_rmax + pr;
-	int			n = 0,
-				cap = 256;
-	key_entry  *e = palloc(sizeof(key_entry) * cap);
-
-	if (st->kscan == NULL)
-	{
-#if PG_VERSION_NUM >= 180000
-		st->kscan = index_beginscan(heap, st->index, estate->es_snapshot, NULL, 2, 0);
-#else
-		st->kscan = index_beginscan(heap, st->index, estate->es_snapshot, 2, 0);
-#endif
-		st->kscan->xs_want_itup = true;
-	}
-	for (int i = from; i < to; i++)
-	{
-		ItemPointer tid;
-
-		st->keys[0].sk_argument = Int64GetDatum(st->bounds[2 * i]);
-		st->keys[1].sk_argument = Int64GetDatum(st->bounds[2 * i + 1]);
-		index_rescan(st->kscan, st->keys, 2, NULL, 0);
-		while ((tid = index_getnext_tid(st->kscan, ForwardScanDirection)) != NULL)
-		{
-			bool		isnull;
-			Datum		k = index_getattr(st->kscan->xs_itup, 1, st->kscan->xs_itupdesc, &isnull);
-			double		d;
-
-			st->kf_entries += 1;
-			if (isnull)
-				continue;
-			d = sc_angle(st->kf_centre, sc_pix2vec(SC_MAX_ORDER, DatumGetInt64(k))) * (180.0 / M_PI);
-			if (d > lim)
-				continue;
-			/* a row an inner ring returned: nearer than it by more than its cell */
-			if (st->kf_rmin >= 0 && d + pr < st->kf_rmin)
-				continue;
-			if (n == cap)
-			{
-				cap *= 2;
-				e = repalloc(e, sizeof(key_entry) * cap);
-			}
-			e[n].tid = *tid;
-			e[n].d = d;
-			n++;
-		}
-	}
-
-	/*
-	 * Cut to the kf_target nearest: rows nearer than the target-th key's
-	 * distance plus a cell's radius are all among the entries within it
-	 * plus two cells' radii, and there are target of them at least.
-	 */
-	if (st->kf_target > 0 && n > st->kf_target)
-	{
-		double		rnew;
-
-		qsort(e, n, sizeof(key_entry), key_entry_cmp);
-		rnew = e[(int) st->kf_target - 1].d + pr;
-		if (rnew < st->kf_rmax)
-		{
-			lim = rnew + pr;
-			*st->kf_rout = rnew;
-		}
-	}
-	st->tbm = tbm_create(work_mem * (Size) 1024, NULL);
-	for (int j = 0; j < n; j++)
-		if (e[j].d <= lim)
-			tbm_add_tuples(st->tbm, &e[j].tid, 1, false);
-	pfree(e);
-}
-
 static void
 cone_build_bitmap_of(ConeScanState *st, int from, int to)
 {
-	if (st->kf_active)
-	{
-		cone_build_bitmap_keys(st, from, to);
-		return;
-	}
 	st->tbm = tbm_create(work_mem * (Size) 1024, NULL);
 	for (int i = from; i < to; i++)
 	{
@@ -3194,8 +3072,6 @@ cone_end(CustomScanState *node)
 	ConeScanState *st = (ConeScanState *) node;
 
 	cone_release_bitmap(st, true);
-	if (st->kscan)
-		index_endscan(st->kscan);
 	if (st->iscan)
 		index_endscan(st->iscan);
 	if (st->index)
@@ -3309,7 +3185,6 @@ typedef struct NearestScanState
 	double		bound;			/* no ring reads past this radius; < 0: none */
 	bool		last;			/* the current ring reaches the bound */
 	int			nupper;			/* bounds among the args: the upper ones first */
-	bool		first_ring;		/* the next ring is the scan's first */
 
 	/*
 	 * The current ring's rows: copies of their heap tuples with their
@@ -3881,7 +3756,6 @@ nearest_ring(NearestScanState *ns)
 		 */
 		ns->bound = -1.0;
 		lower = -1.0;
-		ns->first_ring = true;
 		for (int i = 3; i < list_length(st->args); i++)
 		{
 			bool		isnull;
@@ -3991,38 +3865,6 @@ nearest_ring(NearestScanState *ns)
 		}
 		st->cur = -1;
 		cone_release_bitmap(st, false);
-
-		/*
-		 * In bitmap mode the ring's index entries are tested by their keys
-		 * before the heap is read, and the first ring is cut to the k0
-		 * nearest keys (cone_build_bitmap_keys()): a ring sized from the
-		 * density can hold twice the rows wanted where the rows cluster.
-		 * Not a ring ending at the conditions' bound, which must reach it.
-		 */
-		st->kf_active = st->bitmap && st->ira == 0;
-		if (st->kf_active)
-		{
-			st->kf_centre = sc_radec2vec(ns->ra0, ns->dec0);
-			st->kf_rmin = ns->rprev;
-			st->kf_rmax = fmin(180.0, ns->r * (1.0 + 1e-9) + 1e-12);
-			st->kf_rout = &ns->r;
-
-			/*
-			 * The rows still wanted, with the margin, and as many more as the
-			 * conditions have rejected in proportion; none to cut to while
-			 * they have kept nothing, which says nothing about how many more
-			 * to read.
-			 */
-			if (ns->last)
-				st->kf_target = 0;
-			else if (ns->first_ring)
-				st->kf_target = ceil(ns->k0);
-			else if (ns->n_passed > 0)
-				st->kf_target = ceil(fmax(NEAREST_MIN_ROWS, NEAREST_MARGIN * ns->want - ns->n_passed) *
-									 ns->n_inside / ns->n_passed);
-			else
-				st->kf_target = 0;
-		}
 		for (;;)
 		{
 			TupleTableSlot *row = st->bitmap ? cone_next_bitmap(st, ns->fetch)
@@ -4096,7 +3938,6 @@ nearest_ring(NearestScanState *ns)
 			ns->last = true;
 		}
 	}
-	ns->first_ring = false;
 	ExecClearTuple(ns->fetch);
 	ResetExprContext(econtext);
 	if (ns->sort)
@@ -4184,8 +4025,6 @@ nearest_explain(CustomScanState *node, List *ancestors, ExplainState *es)
 
 		ExplainPropertyFloat("Rings", NULL, ns->nrings / loops, 1, es);
 		ExplainPropertyFloat("Rows Read by Rings", NULL, ns->nread / loops, 0, es);
-		if (ns->cone.kf_entries > 0)
-			ExplainPropertyFloat("Index Entries Tested", NULL, ns->cone.kf_entries / loops, 0, es);
 		if (ns->nprobes > 0)
 			ExplainPropertyFloat("Cells Probed", NULL, ns->nprobes / loops, 0, es);
 	}

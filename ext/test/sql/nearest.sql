@@ -191,14 +191,6 @@ FROM (SELECT format('SELECT id, skycell_dist(ra, dec, %s, %s) d FROM nn_cat WHER
 SELECT nn_same('SELECT id, skycell_dist(ra, dec, 10, 20) d FROM nn_cat WHERE skycell_dist(ra, dec, 10, 20) < NULL::float8 ORDER BY 2 LIMIT 10') AS null_radius;
 RESET enable_sort;
 
--- the heap out of cell order (the bitmap mode): a ring's index entries are
--- tested by their keys, and the first ring cut to the nearest ones (0.45),
--- so it reads hardly more rows than it returns
-SET enable_sort = off;
-SELECT nn_read('SELECT id FROM nn_cat ORDER BY skycell_dist(ra, dec, 180, 0) LIMIT 100') < 160 AS key_cut,
-       nn_read('SELECT id FROM nn_cat WHERE skycell_dist(ra, dec, 180, 0) > 3
-                ORDER BY skycell_dist(ra, dec, 180, 0) LIMIT 100') < 400 AS key_cut_past;
-RESET enable_sort;
 
 -- past the relation: every row, NULL distances last, through the final ring
 -- (forced: a sort is cheaper); OFFSET into the tail; a tiny work_mem, so that

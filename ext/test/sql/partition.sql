@@ -140,7 +140,8 @@ JOIN pt_cell c ON 1 = contains(point('ICRS', c.ra, c.dec), circle('ICRS', p.ra, 
 $q$, 'Actual Loops');
 RESET enable_hashjoin;
 RESET enable_mergejoin;
--- a constant cone within one partition (pt_cell4): the others are pruned
+-- a constant cone within one partition (pt_cell4): the others are pruned;
+-- polygons and composites by their bounding cap (0.45), the box above too
 EXPLAIN (COSTS OFF)
 SELECT count(*) FROM pt_cell WHERE 1 = contains(point('ICRS', ra, dec), circle('ICRS', 300, -40, 1));
 
@@ -165,6 +166,15 @@ SELECT count(*) FILTER (WHERE skycell_ang2cell(ra, dec) NOT BETWEEN skycell_cone
                                                         AND skycell_cone_cell_hi(120, 30, 2)) AS outside,
        count(*) AS inside
 FROM pt_flat WHERE skycell_in_cone(ra, dec, 120, 30, 2);
+-- and so for cones of every size, 0.07 to 88 deg, the poles and RA 0 among
+-- the centres (wide ones are bounded by a coarser seed, 0.45)
+SELECT count(*) FILTER (WHERE skycell_ang2cell(f.ra, f.dec) NOT BETWEEN skycell_cone_cell_lo(c.ra0, c.dec0, c.r)
+                                                            AND skycell_cone_cell_hi(c.ra0, c.dec0, c.r)) AS outside,
+       count(*) > 20000 AS many_checked
+FROM (SELECT i, mod(i * 97.3, 360.0) ra0, CASE WHEN i % 10 = 0 THEN 89.9 ELSE 80 * sin(i * 1.3) END dec0,
+             power(10, -1.2 + 3.15 * ((i * 0.618034) - floor(i * 0.618034))) r
+      FROM generate_series(1, 60) i) c
+JOIN pt_flat f ON skycell_in_cone(f.ra, f.dec, c.ra0, c.dec0, c.r);
 SELECT skycell_cone_cell_lo(10, 20, -1) > skycell_cone_cell_hi(10, 20, -1) AS empty,
        skycell_cone_cell_lo(10, 20, 90) = 0 AS sky_lo,
        skycell_cone_cell_hi(10, 95, 1) = 12 * 4::int8 ^ 29 - 1 AS invalid_is_sky;
