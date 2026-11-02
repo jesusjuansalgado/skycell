@@ -208,6 +208,18 @@ typedef struct ConeScanState
 	sc_density	dens;
 	int64	   *rt_bounds;		/* bounds' storage, rt_cap ranges */
 	int			rt_cap;
+
+	/*
+	 * The lowest and highest key in the index (0.44), read once, on the
+	 * first covering: a covering is clipped to them, so a cone that falls
+	 * outside the cells the relation holds -- another partition's part of
+	 * the sky, under partitioning by cell or by source_id -- reads no index
+	 * page.  kmin > kmax for an index with no key.
+	 */
+	bool		have_keyrange;
+	int64		kmin,
+				kmax;
+	bool		keys_partial;	/* the keys span part of the sky: test cones */
 	double		ncoverings,		/* for EXPLAIN ANALYZE: this process's own */
 				nranges_total;
 
@@ -448,6 +460,20 @@ jointree_has_term(PlannerInfo *root, Node *jt, FuncExpr *fcall)
  * index can serve it is only known once the planner has the relation's index
  * list, and a relation without one gets a sequential scan either way.
  */
+/*
+ * Whether varno is a partition (or inheritance child) being planned for its
+ * parent: PostgreSQL simplifies a partition's copy of the parent's quals
+ * again (apply_child_basequals()), and a call the parent kept for the scan
+ * was a top-level term there, though the partition, absent from the join
+ * tree, cannot show it.  The partition keeps it too (0.44), and gets the scan.
+ */
+static bool
+is_child_rel(PlannerInfo *root, Index varno)
+{
+	return root->append_rel_array != NULL && varno < (Index) root->simple_rel_array_size &&
+		root->append_rel_array[varno] != NULL;
+}
+
 static bool
 keep_cone(PlannerInfo *root, FuncExpr *written, FuncExpr *fcall)
 {
@@ -490,7 +516,8 @@ keep_cone(PlannerInfo *root, FuncExpr *written, FuncExpr *fcall)
 		else if (rte->relkind != RELKIND_PARTITIONED_TABLE)
 			return false;
 	}
-	if (!jointree_has_term(root, (Node *) root->parse->jointree, written))
+	if (!is_child_rel(root, varno) &&
+		!jointree_has_term(root, (Node *) root->parse->jointree, written))
 		return false;
 	cone_funcid = fcall->funcid;
 	return true;
@@ -530,8 +557,10 @@ region_scan_keep(PlannerInfo *root, FuncExpr *written, FuncExpr *fcall)
 		return false;
 	rte = rt_fetch(varno, root->parse->rtable);
 	if (rte->rtekind != RTE_RELATION ||
-		(rte->relkind != RELKIND_RELATION && rte->relkind != RELKIND_MATVIEW))
+		(rte->relkind != RELKIND_RELATION && rte->relkind != RELKIND_MATVIEW &&
+		 rte->relkind != RELKIND_PARTITIONED_TABLE))
 		return false;
+	if (rte->relkind != RELKIND_PARTITIONED_TABLE)
 	{
 		Relation	r = table_open(rte->relid, NoLock);	/* locked by the parser */
 		bool		heap = table_slot_callbacks(r) == &TTSOpsBufferHeapTuple;
@@ -540,7 +569,8 @@ region_scan_keep(PlannerInfo *root, FuncExpr *written, FuncExpr *fcall)
 		if (!heap)
 			return false;
 	}
-	if (!jointree_has_term(root, (Node *) root->parse->jointree, written))
+	if (!is_child_rel(root, varno) &&
+		!jointree_has_term(root, (Node *) root->parse->jointree, written))
 		return false;
 	region_scan_funcid = fcall->funcid;
 	return true;
@@ -1990,6 +2020,7 @@ cone_create_state(CustomScan *cscan)
 }
 
 static void cone_release_bitmap(ConeScanState *st, bool end);
+static void cone_key_range(ConeScanState *st);
 
 /* about this many chunks to share out among a parallel scan's processes */
 #define CONE_PARALLEL_CHUNKS 64
@@ -2035,7 +2066,6 @@ cone_make_chunks(ConeScanState *st)
 			n++;
 		}
 	}
-	st->plan_nranges = st->nranges;
 	st->bounds = c;
 	st->nranges = n;
 }
@@ -2081,11 +2111,7 @@ cone_begin(CustomScanState *node, EState *estate, int eflags)
 		st->nranges = ArrayGetNItems(ARR_NDIM(arr), ARR_DIMS(arr)) / 2;
 		st->bounds = (const int64 *) ARR_DATA_PTR(arr);
 		st->plan_nranges = st->nranges;
-		if (cscan->scan.plan.parallel_aware)
-		{
-			st->parallel = true;
-			cone_make_chunks(st);
-		}
+		st->parallel = cscan->scan.plan.parallel_aware;
 	}
 	st->args = ExecInitExprList(cscan->custom_exprs, &node->ss.ps);
 	st->ira = DatumGetInt16(list_nth_node(Const, cscan->custom_private, 3)->constvalue);
@@ -2138,6 +2164,38 @@ cone_begin(CustomScanState *node, EState *estate, int eflags)
 #endif
 	if (st->ira != 0)
 		st->iscan->xs_want_itup = true;
+
+	/*
+	 * A constant covering on a partition is clipped to the keys the
+	 * partition holds (0.44), so that a cone over another part of the sky
+	 * descends none of its index; a plain table, all of whose keys a
+	 * covering of its own rows meets, is not.  A parallel scan is not: its
+	 * processes must cut identical chunks, and the keys are read whatever
+	 * their visibility, so a row inserted meanwhile could move one process's
+	 * interval and not another's.
+	 */
+	if (!st->runtime && !st->parallel && heap->rd_rel->relispartition && st->nranges > 0)
+	{
+		int64	   *c = MemoryContextAlloc(estate->es_query_cxt, sizeof(int64) * 2 * st->nranges);
+		int			n = 0;
+
+		cone_key_range(st);
+		for (int i = 0; i < st->nranges; i++)
+		{
+			int64		lo = st->bounds[2 * i],
+						hi = st->bounds[2 * i + 1];
+
+			if (hi < st->kmin || lo > st->kmax)
+				continue;
+			c[2 * n] = Max(lo, st->kmin);
+			c[2 * n + 1] = Min(hi, st->kmax);
+			n++;
+		}
+		st->bounds = c;
+		st->nranges = n;
+	}
+	if (st->parallel)
+		cone_make_chunks(st);
 }
 
 /* the cone the index filter tests, from its centre and radius in degrees */
@@ -2230,6 +2288,70 @@ cone_load_density(ConeScanState *st)
 }
 
 /*
+ * The index's lowest and highest non-NULL key, into kmin and kmax (kmin >
+ * kmax when it has none).  index_getnext_tid() returns entries whatever
+ * their visibility, so the interval holds every key the scan's snapshot can
+ * see, and the snapshot is the statement's, so no rescan finds a key outside
+ * it.
+ */
+static void
+cone_key_range(ConeScanState *st)
+{
+	Relation	heap = st->css.ss.ss_currentRelation;
+	Snapshot	snap = st->css.ss.ps.state->es_snapshot;
+	IndexScanDesc s;
+	ScanKeyData notnull;
+	bool		isnull;
+
+	st->have_keyrange = true;
+	st->kmin = 1;
+	st->kmax = 0;
+	ScanKeyEntryInitialize(&notnull, SK_ISNULL | SK_SEARCHNOTNULL, 1,
+						   InvalidStrategy, InvalidOid, InvalidOid, InvalidOid, (Datum) 0);
+#if PG_VERSION_NUM >= 180000
+	s = index_beginscan(heap, st->index, snap, NULL, 1, 0);
+#else
+	s = index_beginscan(heap, st->index, snap, 1, 0);
+#endif
+	s->xs_want_itup = true;
+	index_rescan(s, &notnull, 1, NULL, 0);
+	if (index_getnext_tid(s, ForwardScanDirection) != NULL)
+	{
+		Datum		lo = index_getattr(s->xs_itup, 1, s->xs_itupdesc, &isnull);
+
+		index_rescan(s, &notnull, 1, NULL, 0);
+		if (!isnull && index_getnext_tid(s, BackwardScanDirection) != NULL)
+		{
+			Datum		hi = index_getattr(s->xs_itup, 1, s->xs_itupdesc, &isnull);
+
+			if (!isnull)
+			{
+				st->kmin = DatumGetInt64(lo);
+				st->kmax = DatumGetInt64(hi);
+			}
+			else
+			{
+				st->kmin = PG_INT64_MIN;	/* never: the key is NOT NULL */
+				st->kmax = PG_INT64_MAX;
+			}
+		}
+		else
+		{
+			st->kmin = PG_INT64_MIN;
+			st->kmax = PG_INT64_MAX;
+		}
+	}
+	index_endscan(s);
+
+	/*
+	 * Keys over all but 1% of the sky (an unpartitioned all-sky catalogue)
+	 * leave nothing to test a cone against.
+	 */
+	st->keys_partial = st->kmin > st->kmax ||
+		(double) st->kmax - (double) st->kmin < 0.99 * 12.0 * pow(4.0, SC_MAX_ORDER);
+}
+
+/*
  * Cover the cone (ra0, dec0, radius) into the scan state's ranges, and return
  * the rows the density expects inside the cone itself.  The covering is built
  * in the per-tuple context, which ExecScan resets before every fetch, and the
@@ -2247,6 +2369,8 @@ cone_cover_at(ConeScanState *st, double ra0, double dec0, double radius)
 	double		rows;
 
 	cone_load_density(st);
+	if (!st->have_keyrange)
+		cone_key_range(st);
 	old = MemoryContextSwitchTo(econtext->ecxt_per_tuple_memory);
 	check_err(sc_region_cone(&reg, ra0, dec0, radius, true));
 	skycell_scan_params(&p, &st->dens);
@@ -2259,15 +2383,22 @@ cone_cover_at(ConeScanState *st, double ra0, double dec0, double radius)
 			? MemoryContextAlloc(estate->es_query_cxt, sizeof(int64) * 2 * st->rt_cap)
 			: repalloc(st->rt_bounds, sizeof(int64) * 2 * st->rt_cap);
 	}
+	/* clipped to the keys the index holds (cone_key_range()) */
+	st->nranges = 0;
 	for (int r = 0; r < cov.n; r++)
 	{
-		st->rt_bounds[2 * r] = cov.r[r].lo;
-		st->rt_bounds[2 * r + 1] = cov.r[r].hi;
+		int64		lo = cov.r[r].lo,
+					hi = cov.r[r].hi;
+
+		if (hi < st->kmin || lo > st->kmax)
+			continue;
+		st->rt_bounds[2 * st->nranges] = Max(lo, st->kmin);
+		st->rt_bounds[2 * st->nranges + 1] = Min(hi, st->kmax);
+		st->nranges++;
 	}
 	st->bounds = st->rt_bounds;
-	st->nranges = cov.n;
 	st->ncoverings += 1;
-	st->nranges_total += cov.n;
+	st->nranges_total += st->nranges;
 	rows = (cov.area > 0) ? cov.exp_rows * fmin(1.0, reg.area / cov.area) : 0.0;
 	sc_cover_free(&cov);
 	return rows;
@@ -2299,6 +2430,26 @@ cone_cover_row(ConeScanState *st)
 		if (isnull)
 			return;
 		v[i++] = DatumGetFloat8(d);
+	}
+	if (!st->have_keyrange)
+		cone_key_range(st);
+
+	/*
+	 * A cone that can hold none of the index's keys -- another partition's
+	 * part of the sky -- reads nothing, and is not covered: the seed test is
+	 * a fraction of a covering's cost.  An invalid centre still raises its
+	 * error, here as in the covering.
+	 */
+	if (st->keys_partial)
+	{
+		sc_region	reg;
+
+		check_err(sc_region_cone(&reg, v[0], v[1], v[2], true));
+		if (st->kmin > st->kmax || !sc_cone_may_meet_keys(&reg, st->kmin, st->kmax))
+		{
+			st->ncoverings += 1;
+			return;
+		}
 	}
 	if (st->ira != 0)
 		cone_set_centre(st, v[0], v[1], v[2]);
@@ -2602,7 +2753,7 @@ cone_explain(CustomScanState *node, List *ancestors, ExplainState *es)
 
 	ExplainPropertyText("Index", RelationGetRelationName(st->index), es);
 	if (!st->runtime)
-		ExplainPropertyInteger("Ranges", NULL, st->parallel ? st->plan_nranges : st->nranges, es);
+		ExplainPropertyInteger("Ranges", NULL, st->plan_nranges, es);	/* the plan's covering */
 	else if (es->analyze && st->ncoverings > 0)
 	{
 		/*

@@ -2452,6 +2452,29 @@ seed_cone(const sc_region *r, seed_t *s)
 	return -1;
 }
 
+/*
+ * Whether a cone can hold an order-29 cell in [kmin, kmax]: 0 when none of
+ * the pixels its seed enumerates -- every pixel the disc can touch, at the
+ * order seed_cone() picks, about twice its radius -- overlaps the interval.
+ * Rigorous, as the seed is, and a few dozen operations: a cross-match tests
+ * it before covering a cone against an index whose keys (a partition's
+ * cells) cannot hold it.  1 when it may, or when the cone is too large to
+ * seed.
+ */
+int
+sc_cone_may_meet_keys(const sc_region *r, int64_t kmin, int64_t kmax)
+{
+	seed_t		s;
+	int			order = seed_cone(r, &s);
+
+	if (order < 0)
+		return 1;
+	for (int i = 0; i < s.n; i++)
+		if (sc_pix_hi(order, s.pix[i]) >= kmin && sc_pix_lo(order, s.pix[i]) <= kmax)
+			return 1;
+	return 0;
+}
+
 typedef struct
 {
 	int64_t		pix;

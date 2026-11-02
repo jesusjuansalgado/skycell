@@ -250,6 +250,9 @@ void		sc_cover_compute(const sc_region *r, const sc_density *d,
 							 const sc_cover_params *p, sc_cover *out);
 void		sc_cover_free(sc_cover *c);
 
+/* 0 when the cone can hold no order-29 cell in [kmin, kmax] (cover.c) */
+int			sc_cone_may_meet_keys(const sc_region *r, int64_t kmin, int64_t kmax);
+
 /* steradians per order-29 pixel */
 #define SC_PIX29_AREA (4.0 * 3.14159265358979323846 / (double) SC_NPIX29)
 
