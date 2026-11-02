@@ -27,6 +27,14 @@ rounds=${3:-4}
 work=${PERF_WORK:-$(mktemp -d)}
 pkglib=$(pg_config --pkglibdir)
 
+# Installed by rename, never by copying over the file: a backend still exiting
+# from the last workload has the old library mapped, and overwriting its pages
+# in place crashes it (and with it the server).
+install_lib() {
+  cp "$1" "$pkglib/.skycell.so.perfcheck"
+  mv -f "$pkglib/.skycell.so.perfcheck" "$pkglib/skycell.so"
+}
+
 if [ -f "$base" ]; then
   cp "$base" "$work/base.so"; label=$(basename "$base")
 else
@@ -45,12 +53,12 @@ echo lib,round,workload,c,us,n > "$work/perf.csv"
 for r in $(seq 1 "$rounds"); do
   if [ $((r % 2)) = 1 ]; then order="base cand"; else order="cand base"; fi
   for lib in $order; do
-    cp "$work/$lib.so" "$pkglib/skycell.so"
+    install_lib "$work/$lib.so"
     psql -d "$db" -X -q -c "SELECT count(*) FROM gaia_realc WHERE ra < 0" >/dev/null
     psql -d "$db" -X -q -f workloads.sql | sed "s/^/$lib,$r,/" >> "$work/perf.csv"
     echo "  round $r: $lib done"
   done
 done
-cp "$work/cand.so" "$pkglib/skycell.so"
+install_lib "$work/cand.so"
 cp "$work/perf.csv" perf.csv
 python3 report.py perf.csv "$label" "${PERF_LIMIT:-1.10}"
