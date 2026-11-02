@@ -767,6 +767,29 @@ Before 0.38, an ADQL `OR` of `CONTAINS` predicates was a sequential scan in
 skycell: 2.4 s for two circles and 4.9 s for five on these 10M rows. It is now
 indexed like `<@ OR <@`, which is the skycell boolean column above.
 
+**Stored composite footprints** ([`bench/results-footprint/`](bench/results-footprint/)).
+An ObsCore-like table of 50,000 observations whose `s_region` holds each
+footprint as it is: NIRCam-like (two modules of 2×2 detectors with gaps),
+UVIS-like (two CCDs either side of a gap), coordinated parallels (two fields 7′
+apart) and coronagraphs (a field less its mask), half over the whole sky and
+half in twenty deep fields. skycell keeps one `skyregion` per observation
+under its default GiST. pgSphere, with no composite type, keeps one `spoly` per
+detector and one `scircle` per mask, each under its GiST, and a query returns
+the distinct observations less those whose mask holds the whole field (or the
+position), which for these shapes gives the same rows. Both answered the same
+observations for all 900 queries. Median ms per query, and skycell's summed
+time over pgSphere's:
+
+| workload | skycell | pgSphere | skycell ÷ pgSphere |
+|---|---|---|---|
+| observations meeting a search polygon (1′–20′) | 0.20 | 1.40 | 0.04 |
+| observations containing a position | 0.13 | 0.27 | 0.70 |
+
+The overlap margin is widest in the deep fields, where pgSphere tests every
+detector polygon of every candidate observation (1,500 of them for one 20′
+field) and skycell one footprint each. skycell's index is 2.9 MB against
+pgSphere's 10.1 MB for the detectors and 0.7 MB for the masks.
+
 **Parallel cross-matching.** The comparisons above, like the paper's, are
 serial. They run with `max_parallel_workers_per_gather = 0` for every method.
 With parallelism on, a cross-match with enough probes runs in parallel

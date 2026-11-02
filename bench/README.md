@@ -30,6 +30,7 @@ each directory's README names the script that did it.
 | nearest neighbours, README only (not in the paper) | `results-nearest/` | main after #52 |
 | non-convex polygons, README only (not in the paper) | `results-nonconvex/` (`../27_nonconvex.sql`) | main after #52 |
 | composite regions against boolean predicates, README only | `results-composite/` (`../34_composite.sql`) | 0.39: composites through the custom scan (the 0.38 run is in the history) |
+| stored composite footprints (ObsCore-like) against pgSphere's detector rows, README only | `results-footprint/` (`../35_footprint_composite.sql`) | 0.40 |
 
 skycell 0.37 differs from 0.36 only in planning, and returns the same
 coverings, so only the cone searches were re-measured with it
