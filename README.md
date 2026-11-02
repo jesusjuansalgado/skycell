@@ -883,6 +883,15 @@ on such a catalogue is pruned at plan time to the partitions it touches.
 Polygons and composites take the custom scan on each partition but are not
 pruned yet.
 
+Partitioning brings no parallel gain of its own. A parallel cross-match
+shares out its probes, each worker rescanning the partitioned table as above:
+100k probes at 5″ took 175 ms with three workers against 146 ms unpartitioned.
+A wide cone gets a Parallel Append over the partitions it reaches, but the
+unpartitioned table's parallel cone scan (0.42) is faster still: a 10° cone
+took 49 ms against 36, a 30° cone 89 against 73. Partition a sky catalogue to
+load, index, vacuum or archive it by region, not for speed: cones cost the
+same, cross-matches 1.2–1.7 times as much.
+
 **Polygons through the custom scan** (0.43, [`bench/results-polyscan/`](bench/results-polyscan/)).
 Since 0.43 a constant polygon or box takes the custom scan that cones have.
 Before that it was rewritten into an `OR` of index ranges plus a per-row test.
