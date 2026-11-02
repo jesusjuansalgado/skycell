@@ -2461,6 +2461,40 @@ seed_cone(const sc_region *r, seed_t *s)
  * cells) cannot hold it.  1 when it may, or when the cone is too large to
  * seed.
  */
+/*
+ * The lowest and highest order-29 cell a cone can hold, from its seed (the
+ * pixels the disc can touch): an interval that every cell of the cone lies
+ * in, for partition pruning.  The whole sky when the cone is too large to
+ * seed; lo > hi when it holds nothing (a negative radius).
+ */
+void
+sc_cone_key_bounds(const sc_region *r, int64_t *lo, int64_t *hi)
+{
+	seed_t		s;
+	int			order;
+
+	*lo = 0;
+	*hi = 12 * ((int64_t) 1 << (2 * SC_MAX_ORDER)) - 1;
+	if (r->kind == SC_REGION_CONE && r->radius < 0)
+	{
+		*lo = 1;
+		*hi = 0;
+		return;
+	}
+	order = seed_cone(r, &s);
+	if (order < 0 || s.n == 0)
+		return;
+	*lo = sc_pix_lo(order, s.pix[0]);
+	*hi = sc_pix_hi(order, s.pix[0]);
+	for (int i = 1; i < s.n; i++)
+	{
+		if (sc_pix_lo(order, s.pix[i]) < *lo)
+			*lo = sc_pix_lo(order, s.pix[i]);
+		if (sc_pix_hi(order, s.pix[i]) > *hi)
+			*hi = sc_pix_hi(order, s.pix[i]);
+	}
+}
+
 int
 sc_cone_may_meet_keys(const sc_region *r, int64_t kmin, int64_t kmax)
 {

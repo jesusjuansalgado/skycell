@@ -1431,7 +1431,7 @@ circle_as_cone(SupportRequestSimplify *req, Oid funcid, Node *pt, Node *rg, Node
 						 lcons(copyObject(cell), lcons(ra, lcons(dec, c))),
 						 InvalidOid, InvalidOid, COERCE_EXPLICIT_CALL);
 	if (cone_scan_keep_as(req->root, req->fcall, cone6))
-		return (Node *) cone6;
+		return cone_with_partition_bounds(req->root, cone6);
 	return NULL;
 }
 
@@ -1760,8 +1760,10 @@ region_support_simplify(SupportRequestSimplify *req, Oid funcid, Node *pt, Node 
 	 */
 	if (req->root != NULL && (injected(pt) || injected(rg)))
 	{
-		char	   *name = (res != NULL && IsA(res, FuncExpr)) ?
-			get_func_name(((FuncExpr *) res)->funcid) : NULL;
+		/* the cone, alone or first of its partition bounds (0.44) */
+		Node	   *cone = (res != NULL && IsA(res, BoolExpr)) ? linitial(((BoolExpr *) res)->args) : res;
+		char	   *name = (cone != NULL && IsA(cone, FuncExpr)) ?
+			get_func_name(((FuncExpr *) cone)->funcid) : NULL;
 
 		/*
 		 * On a partitioned table, which may have no index of its own, the
@@ -1782,7 +1784,22 @@ region_support_simplify(SupportRequestSimplify *req, Oid funcid, Node *pt, Node 
 			res = (Node *) makeBoolConst(true, false);
 		else if (node_location(pt) == INJECTED_RAW_LOCATION ||
 				 node_location(rg) == INJECTED_RAW_LOCATION)
-			guard_centre(((FuncExpr *) res)->args);
+		{
+			guard_centre(((FuncExpr *) cone)->args);
+			/* the bounds read the guarded centre too */
+			if (IsA(res, BoolExpr))
+			{
+				ListCell   *lc;
+
+				for_each_from(lc, ((BoolExpr *) res)->args, 1)
+				{
+					OpExpr	   *b = lfirst_node(OpExpr, lc);
+
+					((FuncExpr *) lsecond(b->args))->args =
+						list_copy_tail(copyObject(((FuncExpr *) cone)->args), 3);
+				}
+			}
+		}
 	}
 	return res;
 }

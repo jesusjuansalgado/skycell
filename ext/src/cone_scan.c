@@ -81,6 +81,10 @@
 #include "utils/snapmgr.h"
 #include "utils/syscache.h"
 #include "utils/tuplesort.h"
+#include "utils/partcache.h"
+#include "catalog/partition.h"
+#include "rewrite/rewriteManip.h"
+#include "parser/parse_func.h"
 #include "catalog/pg_operator_d.h"
 
 #include "cover.h"
@@ -460,6 +464,224 @@ jointree_has_term(PlannerInfo *root, Node *jt, FuncExpr *fcall)
  * index can serve it is only known once the planner has the relation's index
  * list, and a relation without one gets a sequential scan either way.
  */
+/* ------------------------------------------------------------------ */
+/* partition pruning by a cone's cells (0.44)                          */
+/* ------------------------------------------------------------------ */
+
+static void cone_cell_bounds_uncached(double ra0, double dec0, double radius,
+									  int64 *lo, int64 *hi);
+
+/*
+ * skycell_cone_cell_lo/hi(ra0, dec0, radius): the lowest and highest order-29
+ * cell the cone can hold (sc_cone_key_bounds()).  The planner compares a
+ * catalogue partitioned by cell range with them, next to a kept cone, so that
+ * PostgreSQL prunes the partitions a cone cannot reach: at plan time for a
+ * constant cone, at every rescan for a cross-match's.  An invalid centre gives
+ * the whole sky, leaving the error to the cone.
+ */
+static void
+cone_cell_bounds(double ra0, double dec0, double radius, int64 *lo, int64 *hi)
+{
+	/* lo and hi are asked for in turn with the same cone: one seed for both */
+	static struct
+	{
+		bool		valid;
+		double		ra0,
+					dec0,
+					radius;
+		int64		lo,
+					hi;
+	}			last;
+
+	if (last.valid && last.ra0 == ra0 && last.dec0 == dec0 && last.radius == radius)
+	{
+		*lo = last.lo;
+		*hi = last.hi;
+		return;
+	}
+	cone_cell_bounds_uncached(ra0, dec0, radius, lo, hi);
+	last.valid = true;
+	last.ra0 = ra0;
+	last.dec0 = dec0;
+	last.radius = radius;
+	last.lo = *lo;
+	last.hi = *hi;
+}
+
+static void
+cone_cell_bounds_uncached(double ra0, double dec0, double radius, int64 *lo, int64 *hi)
+{
+	sc_region	reg;
+
+	if (isnan(radius) || sc_region_cone(&reg, ra0, dec0, radius, false) != NULL)
+	{
+		*lo = 0;
+		*hi = 12 * ((int64) 1 << (2 * SC_MAX_ORDER)) - 1;
+		return;
+	}
+	sc_cone_key_bounds(&reg, lo, hi);
+}
+
+PG_FUNCTION_INFO_V1(skycell_cone_cell_lo);
+Datum
+skycell_cone_cell_lo(PG_FUNCTION_ARGS)
+{
+	int64		lo,
+				hi;
+
+	cone_cell_bounds(PG_GETARG_FLOAT8(0), PG_GETARG_FLOAT8(1), PG_GETARG_FLOAT8(2), &lo, &hi);
+	PG_RETURN_INT64(lo);
+}
+
+PG_FUNCTION_INFO_V1(skycell_cone_cell_hi);
+Datum
+skycell_cone_cell_hi(PG_FUNCTION_ARGS)
+{
+	int64		lo,
+				hi;
+
+	cone_cell_bounds(PG_GETARG_FLOAT8(0), PG_GETARG_FLOAT8(1), PG_GETARG_FLOAT8(2), &lo, &hi);
+	PG_RETURN_INT64(hi);
+}
+
+static Oid
+cone_bound_fn(Oid sibling, const char *name)
+{
+	Oid			t[3] = {FLOAT8OID, FLOAT8OID, FLOAT8OID};
+	char	   *nsp = get_namespace_name(get_func_namespace(sibling));
+
+	return LookupFuncName(list_make2(makeString(nsp), makeString(pstrdup(name))), 3, t, true);
+}
+
+/*
+ * A kept cone (skycell_cone(cell, ra, dec, ra0, dec0, radius)) with, when its
+ * relation is range-partitioned on exactly its cell expression, the two
+ * comparisons cell >= skycell_cone_cell_lo(ra0, dec0, radius) and cell <=
+ * skycell_cone_cell_hi(...): an AND that PostgreSQL's partition pruning
+ * reads, and the custom scan drops again (cone_implies_clause()), as the cone
+ * implies both.  Otherwise the cone alone.  Installed SQL older than 0.40 has
+ * no bound functions and gets the cone alone too.
+ */
+Node *
+cone_with_partition_bounds(PlannerInfo *root, FuncExpr *cone6)
+{
+	List	   *args = cone6->args;
+	Node	   *cell = linitial(args);
+	List	   *vars = sc_pull_local_vars(cell, 0);
+	Index		varno;
+	RangeTblEntry *rte;
+	Relation	rel;
+	PartitionKey key;
+	bool		match = false;
+	Oid			geop = InvalidOid,
+				leop = InvalidOid,
+				lofn,
+				hifn;
+	Expr	   *lo,
+			   *hi;
+	OpExpr	   *c1,
+			   *c2;
+
+	if (root == NULL || root->parse == NULL || vars == NIL || !IsA(linitial(vars), Var))
+		return (Node *) cone6;
+	varno = ((Var *) linitial(vars))->varno;
+	if (varno < 1 || varno > (Index) list_length(root->parse->rtable))
+		return (Node *) cone6;
+	rte = rt_fetch(varno, root->parse->rtable);
+	if (rte->rtekind != RTE_RELATION || rte->relkind != RELKIND_PARTITIONED_TABLE)
+		return (Node *) cone6;
+
+	rel = table_open(rte->relid, NoLock);	/* locked by the parser */
+	key = RelationGetPartitionKey(rel);
+	if (key != NULL && key->strategy == PARTITION_STRATEGY_RANGE && key->partnatts == 1 &&
+		key->parttypid[0] == INT8OID)
+	{
+		if (key->partattrs[0] != 0)
+			match = IsA(cell, Var) && ((Var *) cell)->varno == (int) varno &&
+				((Var *) cell)->varattno == key->partattrs[0];
+		else
+		{
+			Node	   *e = copyObject(linitial(key->partexprs));
+
+			ChangeVarNodes(e, 1, varno, 0);
+			match = equal(e, cell);
+		}
+		if (match)
+		{
+			geop = get_opfamily_member(key->partopfamily[0], INT8OID, INT8OID,
+									   BTGreaterEqualStrategyNumber);
+			leop = get_opfamily_member(key->partopfamily[0], INT8OID, INT8OID,
+									   BTLessEqualStrategyNumber);
+		}
+	}
+	table_close(rel, NoLock);
+	if (!match || !OidIsValid(geop) || !OidIsValid(leop))
+		return (Node *) cone6;
+	lofn = cone_bound_fn(cone6->funcid, "skycell_cone_cell_lo");
+	hifn = cone_bound_fn(cone6->funcid, "skycell_cone_cell_hi");
+	if (!OidIsValid(lofn) || !OidIsValid(hifn))
+		return (Node *) cone6;
+
+	lo = (Expr *) makeFuncExpr(lofn, INT8OID, list_copy_tail(copyObject(args), 3),
+							   InvalidOid, InvalidOid, COERCE_EXPLICIT_CALL);
+	hi = (Expr *) makeFuncExpr(hifn, INT8OID, list_copy_tail(copyObject(args), 3),
+							   InvalidOid, InvalidOid, COERCE_EXPLICIT_CALL);
+	c1 = (OpExpr *) make_opclause(geop, BOOLOID, false, (Expr *) copyObject(cell), lo,
+								  InvalidOid, InvalidOid);
+	c2 = (OpExpr *) make_opclause(leop, BOOLOID, false, (Expr *) copyObject(cell), hi,
+								  InvalidOid, InvalidOid);
+	set_opfuncid(c1);
+	set_opfuncid(c2);
+	return (Node *) makeBoolExpr(AND_EXPR, list_make3(cone6, c1, c2), -1);
+}
+
+/*
+ * Whether a scan clause is one of the comparisons above for this cone, which
+ * the cone implies: cell >= / <= its bound function, or that function folded
+ * to a constant (a partition's copy of a constant cone's quals is simplified
+ * again).  Whoever wrote it, the scan can leave it out.
+ */
+static bool
+cone_implies_clause(FuncExpr *driving, Node *clause)
+{
+	OpExpr	   *op;
+	Node	   *r;
+	bool		ge;
+	List	   *a = list_copy_tail(driving->args, 3);
+	int64		lo,
+				hi,
+				v;
+
+	if (!IsA(clause, OpExpr) || list_length(((OpExpr *) clause)->args) != 2)
+		return false;
+	op = (OpExpr *) clause;
+	set_opfuncid(op);
+	if (op->opfuncid != F_INT8GE && op->opfuncid != F_INT8LE)
+		return false;
+	ge = op->opfuncid == F_INT8GE;
+	if (!equal(linitial(op->args), linitial(driving->args)))
+		return false;
+	r = lsecond(op->args);
+	if (IsA(r, FuncExpr))
+	{
+		char	   *name = get_func_name(((FuncExpr *) r)->funcid);
+
+		return name != NULL &&
+			strcmp(name, ge ? "skycell_cone_cell_lo" : "skycell_cone_cell_hi") == 0 &&
+			equal(((FuncExpr *) r)->args, a);
+	}
+	if (!IsA(r, Const) || ((Const *) r)->constisnull ||
+		!IsA(linitial(a), Const) || !IsA(lsecond(a), Const) || !IsA(lthird(a), Const) ||
+		((Const *) linitial(a))->constisnull || ((Const *) lsecond(a))->constisnull ||
+		((Const *) lthird(a))->constisnull)
+		return false;
+	cone_cell_bounds(DatumGetFloat8(((Const *) linitial(a))->constvalue),
+					 DatumGetFloat8(((Const *) lsecond(a))->constvalue),
+					 DatumGetFloat8(((Const *) lthird(a))->constvalue), &lo, &hi);
+	v = DatumGetInt64(((Const *) r)->constvalue);
+	return ge ? v <= lo : v >= hi;
+}
+
 /*
  * Whether varno is a partition (or inheritance child) being planned for its
  * parent: PostgreSQL simplifies a partition's copy of the parent's quals
@@ -1949,6 +2171,9 @@ cone_plan(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
 		RestrictInfo *ri = lfirst_node(RestrictInfo, lc);
 
 		if (ri->pseudoconstant)
+			continue;
+		/* a partition bound next to the cone (0.44), which the cone implies */
+		if (driving->funcid != region_scan_funcid && cone_implies_clause(driving, (Node *) ri->clause))
 			continue;
 		if ((Node *) ri->clause == (Node *) driving && driving->funcid == region_scan_funcid)
 		{

@@ -1,8 +1,11 @@
 -- Partitioned catalogues (0.44). A partition plans the custom scan as a
 -- plain table does: a constant cone, polygon or composite, and a cross-match,
--- on every partition. Each scan clips its coverings to the keys its index
--- holds, so a cone over another partition's part of the sky reads none of its
--- index; a cross-match does not even cover such a cone. Every answer must be
+-- on every partition. On a catalogue partitioned by cell range, a cone
+-- carries the interval of cells it can hold (skycell_cone_cell_lo/hi, SQL
+-- 0.40), from which PostgreSQL prunes the partitions it cannot reach: at plan
+-- time for a constant cone, at every rescan for a cross-match's. A scan that
+-- runs clips its coverings to the keys its index holds, so a cone over another
+-- partition's part of the sky reads none of its index. Every answer must be
 -- the unpartitioned table's.
 CREATE EXTENSION IF NOT EXISTS skycell;
 SET extra_float_digits = 0;
@@ -127,20 +130,44 @@ BEGIN
 END $$;
 
 -- a cross-match whose probes all lie in pt_cell1's part of the sky: the
--- other partitions' scans run once per probe but cover no cone (0 ranges)
+-- other partitions are pruned at every rescan (no loop)
 SET enable_hashjoin = off;
 SET enable_mergejoin = off;
 SELECT * FROM pt_scans($q$
 SELECT count(*) FROM (SELECT * FROM pt_probe WHERE skycell_ang2cell(ra, dec) >= 864691128455135232
                         AND skycell_ang2cell(ra, dec) < 1729382256910270464 LIMIT 30) p
 JOIN pt_cell c ON 1 = contains(point('ICRS', c.ra, c.dec), circle('ICRS', p.ra, p.dec, 0.001))
-$q$, 'Ranges per Covering');
+$q$, 'Actual Loops');
 RESET enable_hashjoin;
 RESET enable_mergejoin;
--- a constant cone within one partition (pt_cell4): the others read no page
-SELECT * FROM pt_scans($q$
-SELECT count(*) FROM pt_cell WHERE 1 = contains(point('ICRS', ra, dec), circle('ICRS', 300, -40, 1))
-$q$, 'Shared Hit Blocks');
+-- a constant cone within one partition (pt_cell4): the others are pruned
+EXPLAIN (COSTS OFF)
+SELECT count(*) FROM pt_cell WHERE 1 = contains(point('ICRS', ra, dec), circle('ICRS', 300, -40, 1));
+
+-- partitioned by a stored cell column: the same pruning, and the bounds the
+-- planner added are left out of the scan's filter
+CREATE TABLE pt_col (id int, ra float8, dec float8, cell int8) PARTITION BY RANGE (cell);
+CREATE TABLE pt_col0 PARTITION OF pt_col FOR VALUES FROM (MINVALUE) TO (1729382256910270464);
+CREATE TABLE pt_col1 PARTITION OF pt_col FOR VALUES FROM (1729382256910270464) TO (MAXVALUE);
+INSERT INTO pt_col SELECT id, ra, dec, skycell_ang2cell(ra, dec) FROM pt_flat WHERE dec IS NOT NULL;
+CREATE INDEX ON pt_col (cell);
+ANALYZE pt_col;
+EXPLAIN (COSTS OFF)
+SELECT count(*) FROM pt_col WHERE skycell_cone(cell, ra, dec, 120, 30, 0.5);
+SELECT (SELECT count(*) || ':' || sum(id) FROM pt_col WHERE skycell_cone(cell, ra, dec, 120, 30, 0.5))
+     = (SELECT count(*) || ':' || sum(id) FROM pt_flat WHERE skycell_in_cone(ra, dec, 120, 30, 0.5)) AS col_cone,
+       (SELECT count(*) || ':' || sum(c.id) FROM pt_probe p JOIN pt_col c ON skycell_cone(c.cell, c.ra, c.dec, p.ra, p.dec, 0.001))
+     = (SELECT count(*) || ':' || sum(c.id) FROM pt_probe p JOIN pt_flat c ON skycell_cone(skycell_ang2cell(c.ra, c.dec), c.ra, c.dec, p.ra, p.dec, 0.001)) AS col_xmatch;
+
+-- the bounds: every cell of a cone lies between them, and a cone holding
+-- nothing (a negative radius) gets an empty interval
+SELECT count(*) FILTER (WHERE skycell_ang2cell(ra, dec) NOT BETWEEN skycell_cone_cell_lo(120, 30, 2)
+                                                        AND skycell_cone_cell_hi(120, 30, 2)) AS outside,
+       count(*) AS inside
+FROM pt_flat WHERE skycell_in_cone(ra, dec, 120, 30, 2);
+SELECT skycell_cone_cell_lo(10, 20, -1) > skycell_cone_cell_hi(10, 20, -1) AS empty,
+       skycell_cone_cell_lo(10, 20, 90) = 0 AS sky_lo,
+       skycell_cone_cell_hi(10, 95, 1) = 12 * 4::int8 ^ 29 - 1 AS invalid_is_sky;
 
 DROP FUNCTION pt_cmp(text, text), pt_scans(text, text);
-DROP TABLE pt_flat, pt_cell, pt_dec, pt_patch, pt_probe;
+DROP TABLE pt_flat, pt_cell, pt_dec, pt_patch, pt_probe, pt_col;
