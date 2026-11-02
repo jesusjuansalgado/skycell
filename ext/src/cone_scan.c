@@ -1608,115 +1608,137 @@ add_nearest_path(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte)
 	if (!nearest_pathkey(pk) || reads_system_column(rel))
 		return;
 
-	foreach(lc, pk->pk_eclass->ec_members)
+	/*
+	 * The ORDER BY expression as this relation sees it.  For a partition
+	 * (RELOPT_OTHER_MEMBER_REL) that is the parent's expression translated to
+	 * the partition's columns, a child member of the class; offering the scan
+	 * there lets PostgreSQL merge the partitions' ordered rows under the
+	 * LIMIT (Merge Append).  PostgreSQL 18 keeps child members apart from
+	 * ec_members, reachable through an EquivalenceMemberIterator.
+	 */
 	{
-		EquivalenceMember *em = (EquivalenceMember *) lfirst(lc);
-		Node	   *expr = (Node *) em->em_expr;
-		Node	   *cell,
-				   *ra0,
-				   *dec0;
-		IndexOptInfo *ix;
-		sc_density	dens;
-		Oid			statrel = InvalidOid;
-		bool		uses_cell_ops;
-		CustomPath *cp;
-		QualCost	dist_cost;
-		double		n = fmax(rel->tuples, 1.0),
-					sel = fmin(1.0, fmax(rel->rows / n, 1e-9)),
-					want,
-					k0,
-					corr;
-		Cost		first,
-					all;
-		bool		bitmap,
-					bitmap_all;
-		List	   *bounds;
-		ListCell   *lb;
-		double		bound = -1;
+		List	   *members = NIL;
+#if PG_VERSION_NUM >= 180000
+		EquivalenceMemberIterator it;
+		EquivalenceMember *m;
 
-		if (em->em_is_const || !bms_equal(em->em_relids, rel->relids))
-			continue;
-		while (IsA(expr, RelabelType))
-			expr = (Node *) ((RelabelType *) expr)->arg;
-		/* the cell expression, or a stored column holding it (README, setup 2) */
-		if (!skycell_distance_order(expr, rel->relid, &cell, &ra0, &dec0) ||
-			!skycell_cell_density(root, &cell, &dens, &statrel, &uses_cell_ops) ||
-			(ix = cell_index(rel, cell)) == NULL)
-			continue;
-
-		/*
-		 * The first ring holds the rows the query reads -- the LIMIT, over the
-		 * fraction of rows the other conditions keep -- with a margin, so that it
-		 * usually completes the query alone; a LIMIT whose count is a
-		 * parameter is taken as NEAREST_UNKNOWN_LIMIT rows, and the rings
-		 * grow from there if it asks for more.  Without a LIMIT it is the
-		 * whole relation, read through the index and sorted: never cheaper
-		 * than the sequential scan and sort PostgreSQL plans itself.
-		 */
-		if (root->limit_tuples > 0)
-			want = root->limit_tuples;
-		else if (root->parse->limitCount != NULL &&
-				 !(IsA(root->parse->limitCount, Const) &&
-				   ((Const *) root->parse->limitCount)->constisnull))
-			want = NEAREST_UNKNOWN_LIMIT;	/* LIMIT $1: the rings will grow */
-		else
-			want = rel->rows;
-		k0 = fmin(n, fmax(NEAREST_MIN_ROWS, NEAREST_MARGIN * want / sel));
-
-		/*
-		 * A radius the conditions bound the answer to caps the first ring --
-		 * by the rows a cone of it holds at the relation's mean density, when
-		 * it is a constant -- and there is no reading past it.
-		 */
-		bounds = nearest_bounds(root, rel, expr, ra0, dec0);
-		foreach(lb, bounds)
+		setup_eclass_member_iterator(&it, pk->pk_eclass, rel->relids);
+		while ((m = eclass_member_iterator_next(&it)) != NULL)
+			members = lappend(members, m);
+#else
+		members = list_copy(pk->pk_eclass->ec_members);
+#endif
+		lc = NULL;
+		foreach(lc, members)
 		{
-			Const	   *b = (Const *) lfirst(lb);
+			EquivalenceMember *em = (EquivalenceMember *) lfirst(lc);
+			Node	   *expr = (Node *) em->em_expr;
+			Node	   *cell,
+					   *ra0,
+					   *dec0;
+			IndexOptInfo *ix;
+			sc_density	dens;
+			Oid			statrel = InvalidOid;
+			bool		uses_cell_ops;
+			CustomPath *cp;
+			QualCost	dist_cost;
+			double		n = fmax(rel->tuples, 1.0),
+						sel = fmin(1.0, fmax(rel->rows / n, 1e-9)),
+						want,
+						k0,
+						corr;
+			Cost		first,
+						all;
+			bool		bitmap,
+						bitmap_all;
+			List	   *bounds;
+			ListCell   *lb;
+			double		bound = -1;
 
-			if (IsA(b, Const) && !b->constisnull &&
-				(bound < 0 || DatumGetFloat8(b->constvalue) < bound))
-				bound = fmax(0.0, DatumGetFloat8(b->constvalue));
+			if (em->em_is_const || !bms_equal(em->em_relids, rel->relids))
+				continue;
+			while (IsA(expr, RelabelType))
+				expr = (Node *) ((RelabelType *) expr)->arg;
+			/* the cell expression, or a stored column holding it (README, setup 2) */
+			if (!skycell_distance_order(expr, rel->relid, &cell, &ra0, &dec0) ||
+				!skycell_cell_density(root, &cell, &dens, &statrel, &uses_cell_ops) ||
+				(ix = cell_index(rel, cell)) == NULL)
+				continue;
+
+			/*
+			 * The first ring holds the rows the query reads -- the LIMIT, over the
+			 * fraction of rows the other conditions keep -- with a margin, so that it
+			 * usually completes the query alone; a LIMIT whose count is a
+			 * parameter is taken as NEAREST_UNKNOWN_LIMIT rows, and the rings
+			 * grow from there if it asks for more.  Without a LIMIT it is the
+			 * whole relation, read through the index and sorted: never cheaper
+			 * than the sequential scan and sort PostgreSQL plans itself.
+			 */
+			if (root->limit_tuples > 0)
+				want = root->limit_tuples;
+			else if (root->parse->limitCount != NULL &&
+					 !(IsA(root->parse->limitCount, Const) &&
+					   ((Const *) root->parse->limitCount)->constisnull))
+				want = NEAREST_UNKNOWN_LIMIT;	/* LIMIT $1: the rings will grow */
+			else
+				want = rel->rows;
+			k0 = fmin(n, fmax(NEAREST_MIN_ROWS, NEAREST_MARGIN * want / sel));
+
+			/*
+			 * A radius the conditions bound the answer to caps the first ring --
+			 * by the rows a cone of it holds at the relation's mean density, when
+			 * it is a constant -- and there is no reading past it.
+			 */
+			bounds = nearest_bounds(root, rel, expr, ra0, dec0);
+			foreach(lb, bounds)
+			{
+				Const	   *b = (Const *) lfirst(lb);
+
+				if (IsA(b, Const) && !b->constisnull &&
+					(bound < 0 || DatumGetFloat8(b->constvalue) < bound))
+					bound = fmax(0.0, DatumGetFloat8(b->constvalue));
+			}
+			if (bound >= 0)
+				k0 = fmin(k0, fmax(NEAREST_MIN_ROWS, n * cap_area(bound) / (4.0 * M_PI)));
+			corr = cell_correlation(rte, ix, cell);
+			cost_qual_eval_node(&dist_cost, expr, root);
+			nearest_ring_cost(root, rel, ix, corr, dist_cost.per_tuple, k0, &first, &bitmap);
+			nearest_ring_cost(root, rel, ix, corr, dist_cost.per_tuple, n, &all, &bitmap_all);
+
+			cp = makeNode(CustomPath);
+			cp->path.pathtype = T_CustomScan;
+			cp->path.parent = rel;
+			cp->path.pathtarget = rel->reltarget;
+			cp->path.param_info = NULL;
+			cp->path.parallel_aware = false;
+			cp->path.parallel_safe = rel->consider_parallel && is_parallel_safe(root, expr);
+			cp->path.parallel_workers = 0;
+			cp->path.rows = rel->rows;
+			cp->path.pathkeys = list_make1(pk);
+			/*
+			 * Nothing comes out before the first ring is sorted.  Reading on
+			 * past it costs about the whole relation's ring again, twice over
+			 * for the cells each ring's edge shares with the next.
+			 */
+			cp->path.startup_cost = first;
+			cp->path.total_cost = (k0 >= n || bound >= 0) ? first : first + 2.0 * all;
+			/* ExecScan projects, so a computed target needs no Result above */
+			cp->flags = CUSTOMPATH_SUPPORT_PROJECTION;
+			cp->custom_paths = NIL;
+			cp->custom_private = list_make5(makeConst(OIDOID, -1, InvalidOid, sizeof(Oid),
+													  ObjectIdGetDatum(ix->indexoid), false, true),
+											makeConst(OIDOID, -1, InvalidOid, sizeof(Oid),
+													  ObjectIdGetDatum(statrel), false, true),
+											makeBoolConst(bitmap, false),
+											list_make3(float8_const(k0), float8_const(want),
+													   makeConst(INT2OID, -1, InvalidOid, sizeof(int16),
+																 Int16GetDatum(IsA(cell, Var) ? ((Var *) cell)->varattno : 1),
+																 false, true)),
+											list_concat(list_make3(expr, ra0, dec0), bounds));
+			cp->methods = &nearest_path_methods;
+			add_path(rel, &cp->path);
+			return;
 		}
-		if (bound >= 0)
-			k0 = fmin(k0, fmax(NEAREST_MIN_ROWS, n * cap_area(bound) / (4.0 * M_PI)));
-		corr = cell_correlation(rte, ix, cell);
-		cost_qual_eval_node(&dist_cost, expr, root);
-		nearest_ring_cost(root, rel, ix, corr, dist_cost.per_tuple, k0, &first, &bitmap);
-		nearest_ring_cost(root, rel, ix, corr, dist_cost.per_tuple, n, &all, &bitmap_all);
-
-		cp = makeNode(CustomPath);
-		cp->path.pathtype = T_CustomScan;
-		cp->path.parent = rel;
-		cp->path.pathtarget = rel->reltarget;
-		cp->path.param_info = NULL;
-		cp->path.parallel_aware = false;
-		cp->path.parallel_safe = rel->consider_parallel && is_parallel_safe(root, expr);
-		cp->path.parallel_workers = 0;
-		cp->path.rows = rel->rows;
-		cp->path.pathkeys = list_make1(pk);
-		/*
-		 * Nothing comes out before the first ring is sorted.  Reading on
-		 * past it costs about the whole relation's ring again, twice over
-		 * for the cells each ring's edge shares with the next.
-		 */
-		cp->path.startup_cost = first;
-		cp->path.total_cost = (k0 >= n || bound >= 0) ? first : first + 2.0 * all;
-		/* ExecScan projects, so a computed target needs no Result above */
-		cp->flags = CUSTOMPATH_SUPPORT_PROJECTION;
-		cp->custom_paths = NIL;
-		cp->custom_private = list_make5(makeConst(OIDOID, -1, InvalidOid, sizeof(Oid),
-												  ObjectIdGetDatum(ix->indexoid), false, true),
-										makeConst(OIDOID, -1, InvalidOid, sizeof(Oid),
-												  ObjectIdGetDatum(statrel), false, true),
-										makeBoolConst(bitmap, false),
-										list_make3(float8_const(k0), float8_const(want),
-												   makeConst(INT2OID, -1, InvalidOid, sizeof(int16),
-															 Int16GetDatum(IsA(cell, Var) ? ((Var *) cell)->varattno : 1),
-															 false, true)),
-										list_concat(list_make3(expr, ra0, dec0), bounds));
-		cp->methods = &nearest_path_methods;
-		add_path(rel, &cp->path);
-		return;
 	}
 }
 
@@ -2472,7 +2494,11 @@ typedef struct NearestScanState
 			   *got;
 
 	double		nrings,			/* for EXPLAIN ANALYZE */
-				nread;
+				nread,
+				nprobes;		/* cells probed for emptiness */
+	double		band;			/* after a lower bound: the area of the ring
+								 * beyond it, sr; 0 before one */
+	IndexScanDesc probe;		/* for those probes; created on first use */
 } NearestScanState;
 
 static Node *
@@ -2827,6 +2853,164 @@ nearest_clear_ring(NearestScanState *ns)
 	ns->mem = 0;
 }
 
+/*
+ * After a ring that held nothing, how far the rows really start.  A best-first
+ * walk over HEALPix cells, nearest first, each probed for an index entry: an
+ * empty cell is dropped, an occupied one split, until an occupied cell is
+ * small next to its distance.  Every cell nearer than it was found empty, so
+ * its least distance from the centre is a lower bound on every row's -- a
+ * proof, from the index alone, with no statistics.  A partition holding
+ * another part of the sky, or empty sky round the centre, is then crossed in
+ * one step where rings grown blindly read past the rows by up to their own
+ * growth.  The walk is capped; the least distance left in its queue is a
+ * lower bound all the same.  Returns it in degrees, with *at the cell where
+ * rows were found (the centre itself when the cap was reached).
+ */
+#define NEAREST_PROBE_BUDGET 4000
+
+typedef struct
+{
+	double		d;				/* least distance from the centre, radians */
+	int64		pix;
+	int			order;
+} probe_cell;
+
+static void
+probe_push(probe_cell **h, int *n, int *cap, probe_cell c)
+{
+	int			i;
+
+	if (*n == *cap)
+	{
+		*cap *= 2;
+		*h = repalloc(*h, sizeof(probe_cell) * *cap);
+	}
+	i = (*n)++;
+	while (i > 0 && (*h)[(i - 1) / 2].d > c.d)
+	{
+		(*h)[i] = (*h)[(i - 1) / 2];
+		i = (i - 1) / 2;
+	}
+	(*h)[i] = c;
+}
+
+static probe_cell
+probe_pop(probe_cell *h, int *n)
+{
+	probe_cell	top = h[0],
+				last = h[--(*n)];
+	int			i = 0;
+
+	for (;;)
+	{
+		int			c = 2 * i + 1;
+
+		if (c >= *n)
+			break;
+		if (c + 1 < *n && h[c + 1].d < h[c].d)
+			c++;
+		if (h[c].d >= last.d)
+			break;
+		h[i] = h[c];
+		i = c;
+	}
+	if (*n > 0)
+		h[i] = last;
+	return top;
+}
+
+/* does the index hold any entry in cell (order, pix)? */
+static bool
+nearest_cell_occupied(NearestScanState *ns, int order, int64 pix)
+{
+	ConeScanState *st = &ns->cone;
+	ScanKeyData keys[2];
+
+	if (ns->probe == NULL)
+	{
+		Relation	heap = st->css.ss.ss_currentRelation;
+		EState	   *estate = st->css.ss.ps.state;
+
+#if PG_VERSION_NUM >= 180000
+		ns->probe = index_beginscan(heap, st->index, estate->es_snapshot, NULL, 2, 0);
+#else
+		ns->probe = index_beginscan(heap, st->index, estate->es_snapshot, 2, 0);
+#endif
+	}
+	memcpy(keys, st->keys, sizeof(keys));
+	keys[0].sk_argument = Int64GetDatum(sc_pix_lo(order, pix));
+	keys[1].sk_argument = Int64GetDatum(sc_pix_hi(order, pix));
+	index_rescan(ns->probe, keys, 2, NULL, 0);
+	ns->nprobes += 1;
+	return index_getnext_tid(ns->probe, ForwardScanDirection) != NULL;
+}
+
+static double
+nearest_lower_bound(NearestScanState *ns, sc_vec3 *at)
+{
+	sc_vec3		c = sc_radec2vec(ns->ra0, ns->dec0);
+	int			n = 0,
+				cap = 256,
+				pops = 0;
+	probe_cell *h = palloc(sizeof(probe_cell) * cap);
+	double		lb = M_PI;
+
+	*at = c;
+	for (int f = 0; f < 12; f++)
+		probe_push(&h, &n, &cap, (probe_cell) {
+			fmax(0.0, sc_angle(c, sc_pix2vec(0, f)) - sc_pixrad(0) - 1e-12), f, 0});
+	while (n > 0)
+	{
+		probe_cell	p;
+
+		if (++pops > NEAREST_PROBE_BUDGET)
+		{
+			lb = h[0].d;		/* nothing nearer than the queue's nearest */
+			break;
+		}
+		p = probe_pop(h, &n);
+		if (!nearest_cell_occupied(ns, p.order, p.pix))
+			continue;
+		/* occupied, and small next to its distance: the rows start about here */
+		if (p.order >= SC_MAX_ORDER || 2.0 * sc_pixrad(p.order) <= 0.02 * fmax(p.d, sc_pixrad(SC_MAX_ORDER)))
+		{
+			lb = p.d;
+			*at = sc_pix2vec(p.order, p.pix);
+			break;
+		}
+		for (int k = 0; k < 4; k++)
+		{
+			int64		cp = 4 * p.pix + k;
+
+			probe_push(&h, &n, &cap, (probe_cell) {
+				fmax(0.0, sc_angle(c, sc_pix2vec(p.order + 1, cp)) - sc_pixrad(p.order + 1) - 1e-12),
+				cp, p.order + 1});
+		}
+	}
+	pfree(h);
+	return lb * (180.0 / M_PI);
+}
+
+/* the density round v: the finest cell round it that still holds a few times k rows */
+static double
+nearest_density_at(NearestScanState *ns, sc_vec3 v, double k, double n)
+{
+	const sc_density *d = &ns->cone.dens;
+	int64_t		pix = sc_vec2pix(SC_MAX_ORDER, v);
+	double		rho = n / (4.0 * M_PI);
+
+	for (int m = 0; m <= SC_MAX_ORDER; m++)
+	{
+		int64_t		p = pix >> (2 * (SC_MAX_ORDER - m));
+		double		rows = sc_density_rows(d, sc_pix_lo(m, p), sc_pix_hi(m, p));
+
+		if (rows < 4.0 * k)
+			break;
+		rho = rows / (4.0 * M_PI / (12.0 * pow(4.0, m)));
+	}
+	return rho;
+}
+
 /* collect and sort the next ring's rows, and choose the one after it */
 static void
 nearest_ring(NearestScanState *ns)
@@ -2848,6 +3032,7 @@ nearest_ring(NearestScanState *ns)
 
 		ns->started = true;
 		ns->rprev = -1.0;
+		ns->band = 0;
 		ns->n_inside = ns->n_passed = 0;
 		ns->last = false;
 
@@ -2962,12 +3147,47 @@ nearest_ring(NearestScanState *ns)
 		 * ring is the rest of it.
 		 */
 		if (ns->n_inside <= 0)
-			grow = 16.0;
-		else if (ns->n_passed <= 0)
-			grow = 2.0;
+		{
+			/*
+			 * Nothing yet: find where the rows start (nearest_lower_bound), and
+			 * make the next ring the band from there that holds the rows the
+			 * query was planned to read at the density found there.  The rows
+			 * nearer than the bound do not exist, so the ring starts at it.
+			 */
+			sc_vec3		at = {0, 0, 0};
+			double		lb = ns->band > 0 ? ns->r : nearest_lower_bound(ns, &at),
+						from = fmax(lb, ns->r),
+						rn;
+
+			/*
+			 * The band beyond the bound: sized for the rows at the density
+			 * found there, and eight times its area after each one that
+			 * holds nothing -- a thin annulus far from the centre meets a
+			 * partition's rows over a sliver of its area -- but not twice
+			 * the cone's area, which there would reach past the rows by tens
+			 * of degrees.  The bound is searched for once a scan: past it,
+			 * the rings themselves have shown how far there is nothing.
+			 */
+			if (ns->band <= 0)
+			{
+				double		k = fmax(NEAREST_MIN_ROWS, NEAREST_MARGIN * ns->want);
+
+				ns->band = k / fmax(nearest_density_at(ns, at, k, n), 1e-300);
+			}
+			else
+				ns->band *= 8.0;
+			rn = cap_radius(fmin(4.0 * M_PI, cap_area(from) + ns->band));
+			grow = fmax(1.0 + 1e-9, cap_area(rn) / fmax(cap_area(ns->r), 1e-300));
+			ns->rprev = fmax(ns->r, lb * (1.0 - 1e-9) - 1e-12);
+		}
 		else
-			grow = fmin(64.0, fmax(2.0, NEAREST_MARGIN * ns->want / ns->n_passed));
-		ns->rprev = ns->r;
+		{
+			if (ns->n_passed <= 0)
+				grow = 2.0;
+			else
+				grow = fmin(64.0, fmax(2.0, NEAREST_MARGIN * ns->want / ns->n_passed));
+			ns->rprev = ns->r;
+		}
 		ns->r = cap_radius(cap_area(ns->r) * grow);
 		ns->final = ns->r >= 180.0 || ns->n_inside * grow >= 0.5 * n;
 		if (ns->last)
@@ -3031,6 +3251,13 @@ nearest_reset(NearestScanState *ns)
 static void
 nearest_end(CustomScanState *node)
 {
+	NearestScanState *ns = (NearestScanState *) node;
+
+	if (ns->probe != NULL)
+	{
+		index_endscan(ns->probe);
+		ns->probe = NULL;
+	}
 	nearest_reset((NearestScanState *) node);
 	cone_end(node);
 }
@@ -3059,6 +3286,8 @@ nearest_explain(CustomScanState *node, List *ancestors, ExplainState *es)
 
 		ExplainPropertyFloat("Rings", NULL, ns->nrings / loops, 1, es);
 		ExplainPropertyFloat("Rows Read by Rings", NULL, ns->nread / loops, 0, es);
+		if (ns->nprobes > 0)
+			ExplainPropertyFloat("Cells Probed", NULL, ns->nprobes / loops, 0, es);
 	}
 }
 

@@ -564,6 +564,22 @@ for speed, though: `ORDER BY` the distance with a `LIMIT` is the fast form on
 its own. Rows with a NULL distance come last, as `ASC NULLS LAST` puts them.
 Without a `LIMIT`, or ordered `DESC`, the query keeps PostgreSQL's sort.
 
+When a ring holds no row at all — empty sky round the point, or a partition
+holding another part of the sky — the scan finds where the rows start from the
+index itself: a best-first walk over HEALPix cells, nearest first, each probed
+for an index entry, until an occupied cell is small next to its distance.
+Every nearer cell was found empty, so no row is nearer than that cell's
+closest point, and the next ring starts there.
+
+A partitioned table (0.40) gets the scan on each partition, and PostgreSQL
+merges their ordered rows under the `LIMIT` (Merge Append), however the
+partitions are laid out: by declination, by cell range, sub-partitioned, with
+their columns in another order, or with a partition left without the index
+(sorted instead). On 3M uniform rows, the 10 nearest take 2.3 ms with four
+partitions by cell range and 32 ms with four declination bands, against
+730 ms for the sort over the partitions before 0.40 and 0.35 ms on the table
+unpartitioned.
+
 On 10M real Gaia DR3 positions it takes 0.47–0.69 of the time of pgSphere's
 GiST ordering for k from 10 to 1000 (warm, a new point every query, planning
 included); see [Limitations](#limitations) for a clustered relation.
@@ -883,7 +899,11 @@ Two layers, both in [`ext/test/`](ext/test/).
   `skycell_radial_query` and `skycell_join` when it is generated or carries a
   validated `CHECK` with `NOT NULL`, with the plain predicates' answers, and
   not when the `CHECK` lacks `NOT NULL`, is not validated, not enforced or
-  names another expression, or once it is dropped.
+  names another expression, or once it is dropped. A partitioned catalogue
+  (declination bands, one attached with its columns in another order, one
+  split again by right ascension, a default partition for NULL declinations,
+  one band without the index) must give the sort's answer through a Merge
+  Append of the partitions' nearest scans, pruned or not.
 
 - `composite`: unions, intersections, differences and NOTs. STC-S in and
   out (every malformed form errors with a reason), the constructors, each
@@ -948,9 +968,13 @@ locally), the standalone selftests, and the reference translators.
   and stored regions use the range rewrite and the region indexes. The cone must
   be a top-level `AND` term of a `WHERE` or `JOIN ON`: a cone under an `OR` is
   rewritten instead and stays indexable through a `BitmapOr`. It reads heap
-  tables only; on a partitioned table each partition keeps the rewrite, and
-  the nearest-neighbour scan is not offered for the table as a whole. Before
-  PostgreSQL 18 its bitmap mode does not prefetch.
+  tables only; on a partitioned table each partition keeps the rewrite.
+  Nearest neighbours on a partitioned table are answered partition by
+  partition and merged (since 0.40), so every partition finds its own nearest
+  row before the first is returned: one far from the point costs a cell walk
+  and a few rings, about 30 ms a query on 3M rows in four declination bands,
+  where partitions by cell range, each holding its own part of the sky, take
+  2.3 ms. Before PostgreSQL 18 its bitmap mode does not prefetch.
 - **Parallel queries.** The custom scans are parallel safe but not parallel
   aware. A cross-match's probes are shared out among workers, but a single cone
   search or nearest-neighbour query is not split among them. PostgreSQL gives
