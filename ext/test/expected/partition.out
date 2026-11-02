@@ -5,6 +5,7 @@
 -- index; a cross-match does not even cover such a cone. Every answer must be
 -- the unpartitioned table's.
 CREATE EXTENSION IF NOT EXISTS skycell;
+NOTICE:  extension "skycell" already exists, skipping
 SET extra_float_digits = 0;
 SET max_parallel_workers_per_gather = 0;
 -- a deterministic Fibonacci-sphere catalogue, 30,000 rows, plus 2,000 rows
