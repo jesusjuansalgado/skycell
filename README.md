@@ -51,7 +51,9 @@ cross-match probes the larger indexed table whichever side is the point and
 whichever the circle. With pgSphere and Q3C the reversed form is a full table
 scan, or a cross-match that probes the wrong table. Regions read and write as IVOA STC-S, including
 `UNION`, `INTERSECTION`, `DIFFERENCE` and `NOT` of them (since 0.38), and one
-column can hold circles, polygons and their combinations together.
+column can hold circles, polygons and their combinations together: instrument
+footprints with detector gaps and masks, stored as they are and searched with
+a plain polygon ([Composite regions](#composite-regions-instrument-footprints)).
 
 The numbers come from randomized paired trials on PostgreSQL 18.6, on 10M-row
 catalogues (synthetic, resampled from the Gaia DR3 density field, and real DR3
@@ -122,7 +124,10 @@ a cross-match is weighed fairly against a parallel sequential scan. Since 0.36
 the node is parallel safe: with enough probes the cross-match runs in parallel
 workers, as a Gather over the nested loop with a Parallel Seq Scan of the probes
 on its outer side, each worker covering and scanning the cones of its own
-probes. A query ordered by the distance to a point, with a `LIMIT`, gets a
+probes. Since 0.42 a single wide cone or composite search is parallel aware
+too: its covering is cut into chunks that the leader and the workers claim from
+a shared counter, so a cone over a crowded field is read by several processes
+at once. A query ordered by the distance to a point, with a `LIMIT`, gets a
 second node, `SkycellNearest`, which reads widening rings round the point from
 the same index ([Nearest neighbours](#nearest-neighbours)).
 
@@ -336,6 +341,172 @@ stored `cell` column declared to hold it. Per-row regions are indexed too: a
 per-row cone (a cross-match) by the custom scan, one covering per outer row,
 and a per-row polygon or stored region by the rewrite's run-time range slots.
 
+## Composite regions: instrument footprints
+
+Many instrument footprints are not one polygon:
+
+- JWST's NIRCam records its short-wavelength light on eight detectors in two
+  modules, with gaps between them.
+- HST's WFC3/UVIS images on two CCDs, either side of a gap.
+- Gaia's focal plane holds 106 CCDs.
+- A coronagraphic observation is a field less the circle its mask blocks.
+- A survey exposure is a field less the masks round its bright stars.
+- A coordinated parallel observation is two fields arcminutes apart.
+- A radio observation can be a mosaic of overlapping beams.
+
+STC-S writes such shapes by combining regions:
+
+- a `UNION` or `INTERSECTION` of two or more;
+- the `DIFFERENCE` of two (the first less the second);
+- the `NOT` of one (the rest of the sky).
+
+They nest up to 32 deep. Since 0.38 a `skyregion` value can be any of them. An
+ObsCore `s_region` column therefore holds the footprints as they are, next to
+circles and polygons, under one index, and the archive asks its usual
+questions of them unchanged. Neither Q3C nor pgSphere has such a type.
+
+### Storing footprints
+
+A footprint is written in STC-S, the frame once at the top and the operands
+inside one pair of parentheses, or built in SQL with `skycell_union`, `skycell_intersection`,
+`skycell_difference` and `skycell_not`:
+
+```sql
+CREATE TABLE obscore (obs_id text PRIMARY KEY, s_region skyregion);
+INSERT INTO obscore VALUES
+  -- two CCDs either side of a gap (WFC3/UVIS-like)
+  ('uvis-1', 'UNION ICRS (POLYGON 53.10 -27.85 53.14 -27.85 53.14 -27.81 53.10 -27.81
+                          POLYGON 53.15 -27.85 53.19 -27.85 53.19 -27.81 53.15 -27.81)'),
+  -- a coronagraph: the field less the circle its mask blocks
+  ('coro-1', 'DIFFERENCE ICRS (BOX 150.0 2.2 0.05 0.05 CIRCLE 150.0 2.2 0.004)'),
+  -- coordinated parallels: two fields 7' apart
+  ('par-1',  skycell_union(box(210.80, 54.35, 0.036, 0.036),
+                           box(211.00, 54.35, 0.036, 0.036))),
+  -- a plain circle (a radio beam) in the same column
+  ('beam-1', circle(83.82, -5.39, 0.25));
+CREATE INDEX ON obscore USING gist (s_region);
+```
+
+Every region index takes composites: the default GiST,
+`skyregion_gist_ops` and the MOC GIN ([Operators](#operators)).
+
+### Searching them
+
+The archive's usual question, which observations meet a search field, is asked
+with a plain polygon:
+
+```sql
+SELECT obs_id FROM obscore
+WHERE INTERSECTS(s_region,
+  POLYGON('ICRS', 53.142, -27.84, 53.148, -27.84, 53.145, -27.82)) = 1;
+-- (0 rows)
+```
+
+This field falls in the gap between the two UVIS detectors, so the exposure
+is not returned, as it would be against a single polygon round both. The
+GiST index serves the query (`s_region && …`). The other questions are written
+the same way, all indexed:
+
+```sql
+-- the observations that saw a source (not the coronagraph, whose mask hides it)
+SELECT obs_id FROM obscore WHERE CONTAINS(POINT('ICRS', 150.0, 2.2), s_region) = 1;
+
+-- the observations a search region lies wholly inside
+SELECT obs_id FROM obscore WHERE CONTAINS(CIRCLE('ICRS', 53.12, -27.83, 0.005), s_region) = 1;
+
+-- the sky an observation exposed, gaps and masks excluded
+SELECT obs_id, AREA(s_region) * 3600 AS arcmin2 FROM obscore;
+
+-- the catalogue sources that fell on an observation's detectors
+SELECT g.* FROM gaia g JOIN obscore o ON CONTAINS(POINT('ICRS', g.ra, g.dec), o.s_region) = 1
+WHERE o.obs_id = 'uvis-1';
+```
+
+The last one uses the stored footprint as the search region on the
+catalogue's cell index. A constant composite works the same way, through
+ADQL's `REGION`. For example, the sources in a field away from its bright
+stars:
+
+```sql
+SELECT * FROM gaia WHERE CONTAINS(POINT('ICRS', ra, dec), REGION(
+  'DIFFERENCE ICRS (BOX 266.4 -28.9 1 1 UNION (CIRCLE 266.3 -28.8 0.05 CIRCLE 266.55 -29.1 0.08))')) = 1;
+```
+
+### Against the alternatives
+
+Without a composite type, a footprint is kept as one polygon per detector and
+one circle per mask. A query then returns the distinct observations among
+them, less those whose mask holds the whole field. pgSphere's MOC type,
+`smoc`, has a union and an intersection, but it is approximate to its cells,
+and no index serves a position test against it. So a query that needs an exact
+answer spells the shape out as a boolean of predicates. On an ObsCore-like
+table of 50,000 NIRCam-, UVIS-, parallel- and coronagraph-like footprints
+([Performance](#performance)):
+
+| workload | skycell, one `skyregion` per observation | pgSphere, one `spoly` per detector | skycell ÷ pgSphere |
+|---|---|---|---|
+| observations meeting a search polygon (1′–20′) | 0.20 ms | 1.40 ms | 0.04 |
+| observations containing a position | 0.13 ms | 0.27 ms | 0.70 |
+
+Both answered the same observations for all 900 queries. skycell's index is
+2.9 MB against pgSphere's 10.8 MB. A composite used as the search region on a
+catalogue (an annulus, two circles, a field less a hole) is at or below
+pgSphere's boolean of predicates on every shape measured.
+
+### How it works
+
+A position lies in a composite when the boolean combination of its operands'
+exact tests says so. The covering of the catalogue's cells comes from the
+operands' own coverings where that is sound: the union of theirs for a
+`UNION`, their intersection for an `INTERSECTION`, the first operand's for a
+`DIFFERENCE` that takes away at most half of it. Otherwise it comes from the
+operands' cell classes (inside, outside, straddling) combined by the operator:
+
+- A cell is inside a union if it is inside one operand, and outside it if it is
+  outside all of them; an intersection is the other way round.
+- `A − B` is outside where `A` is outside or `B` inside.
+- `NOT` exchanges inside and outside.
+
+Each operand is classified with a test that is sound in the direction the
+operators above it need, so a covering never misses a row. The exact
+membership test runs on what it keeps. A constant composite written as a
+top-level condition is answered by the custom scan (since 0.39), as a cone is.
+It is covered once at plan time, and the scan reads the ranges in cell order,
+testing each row from its `ra` and `dec`. Under an `OR`, or with
+`skycell.custom_scan` off, it is rewritten into range conditions, as a polygon
+is.
+
+Regions are compared with composites too, stored or constant: `&&`, `@>`
+and `<@` between regions, and ADQL `INTERSECTS` and `CONTAINS` of two
+regions, through every region index. Where the operator decides it the
+answer comes from the operands, by identities of sets: a union meets a region
+if one of its operands does, `NOT A` meets `B` unless `B` lies inside `A`,
+`X` lies in `A − B` if it lies in `A` and misses `B`. Otherwise the combined
+region (`X ∩ Y` for an overlap, `X ∩ NOT Y` for containment) is tested for a
+point by refining cells: a cell soundly inside it, or a cell centre the exact
+test puts inside, is a point, and cells soundly outside hold none. What is
+still undecided at cells of 10⁻⁴ of the smallest circle or polygon involved
+(never finer than about 0.01″) counts as empty. So two regions that meet in
+less than that, or that only share a boundary, do not overlap. A composite
+can be empty, such as an intersection of pieces that do not meet. As in
+PostGIS for an empty geometry, it meets nothing, holds nothing and is held by
+nothing; otherwise it would lie inside every region, which no index on the
+regions could find. A comparison takes 0.25 ms on average against random
+composites up to three deep, and up to about 10 ms where long boundaries
+nearly coincide.
+
+`AREA` and `CENTROID` of a composite integrate over cells. Cells inside it count
+whole (HEALPix cells have equal areas), cells outside it not at all, and cells
+on its boundary are refined to 3·10⁻³ of its size and then counted by their
+centre. A composite larger than a hemisphere is integrated through the rest of
+the sky. Against exact values (circles, annuli, inclusion–exclusion with
+polygons), the area is within 2·10⁻⁴ of the true one and the centroid within
+2·10⁻⁴ of the region's size, at about 3 ms per region. A `NOT` of a cone or
+polygon is exact.
+
+STC-S `BOX ICRS ra dec width height` is read as the four-corner polygon
+`box()` makes, alone or inside a composite, and prints as that `POLYGON`.
+
 ## Operators and functions
 
 Every function skycell installs, one by one. Types are `skypos` (a position) and
@@ -368,56 +539,8 @@ all exist there), either install into a schema that precedes it in
 `search_path`, or use the prefixed aliases: `skycell_point`, `skycell_circle`,
 `skycell_box`, `skycell_polygon`.
 
-**Composite regions** (0.38). In STC-S the operands go inside one pair of
-parentheses, the frame is written once at the top, and composites nest up to
-32 deep:
-
-```sql
-SELECT * FROM gaia WHERE pos <@ region(
-  'UNION ICRS (CIRCLE 10 20 1 DIFFERENCE (CIRCLE 12 20 2 POLYGON 11 19 13 19 12 21))');
-SELECT 'NOT ICRS (CIRCLE 0 90 30)'::skyregion;        -- everything south of +60°
-```
-
-A position inside one is indexed like any other region: `pos <@ r`,
-`contains(pos, r) = 1` and `r @> pos` read the catalogue's cell index through
-the composite's covering, and a column of stored composites is served by every
-region index (the default GiST, `skyregion_box4_gist_ops` and the MOC GIN). The
-covering comes from the operands' own coverings where that is sound (a union's,
-an intersection's, a difference's first operand), and otherwise from the
-operands' cell classes (inside, outside, straddling) combined by the operator.
-Either way it never misses a row, and the exact membership test runs on what
-it keeps.
-
-Regions are compared with composites too, stored or constant: `&&`, `@>`
-and `<@` between regions, and ADQL `INTERSECTS` and `CONTAINS` of two
-regions, through every region index. Where the operator decides it the
-answer comes from the operands, by identities of sets: a union meets a region
-if one of its operands does, `NOT A` meets `B` unless `B` lies inside `A`,
-`X` lies in `A − B` if it lies in `A` and misses `B`. Otherwise the combined
-region (`X ∩ Y` for an overlap, `X ∩ NOT Y` for containment) is tested for a
-point by refining cells: a cell soundly inside it, or a cell centre the exact
-test puts inside, is a point, and cells soundly outside hold none. What is
-still undecided at cells of 10⁻⁴ of the smallest circle or polygon involved
-(never finer than about 0.01″) counts as empty. So two regions that meet in
-less than that, or that only share a boundary, do not overlap. A composite
-can be empty, such as an intersection of pieces that do not meet. As in
-PostGIS for an empty geometry, it meets nothing, holds nothing and is held by
-nothing; otherwise it would lie inside every region, which no index on the
-regions could find. A comparison takes 0.25 ms on average against random
-composites up to three deep, and up to about 10 ms where long boundaries
-nearly coincide.
-
-`AREA` and `CENTROID` of a composite integrate over cells. Cells inside it count
-whole (HEALPix cells have equal areas), cells outside it not at all, and cells
-on its boundary are refined to 3·10⁻³ of its size and then counted by their
-centre. A composite larger than a hemisphere is integrated through the rest of
-the sky. Against exact values (circles, annuli, inclusion–exclusion with
-polygons), the area is within 2·10⁻⁴ of the true one and the centroid within
-2·10⁻⁴ of the region's size, at about 3 ms per region. A `NOT` of a cone or
-polygon is exact.
-
-STC-S `BOX ICRS ra dec width height` is read as the four-corner polygon
-`box()` makes, alone or inside a composite, and prints as that `POLYGON`.
+Composite regions are described, with examples, in
+[Composite regions: instrument footprints](#composite-regions-instrument-footprints).
 
 ### Operators
 
@@ -814,6 +937,25 @@ workers use the four cores. Q3C's and pgSphere's cross-matches can run under a
 parallel nested loop too. They were not measured that way, so these figures
 compare skycell with itself only.
 
+**Parallel cone searches.** A single cone with many rows behind it is split
+among processes since 0.42. On `gaia_realc` (10M Gaia DR3 positions, heap in
+cell order, 4 cores), cones centred on the Galactic centre, best of 5 warm runs,
+counts identical to the serial ones:
+
+| search | rows | serial | 2 workers allowed | 4 workers allowed |
+|---|---|---|---|---|
+| 1° cone | 2.8k | 0.6 ms | planned serial | planned serial |
+| 3° | 90k | 14.2 ms | 1 worker: 11.0 ms | 1 worker: 13.1 ms |
+| 5° | 294k | 45.5 ms | 2 workers: 20.9 ms | 2 workers: 20.7 ms |
+| 10° | 1.29M | 189.5 ms | 2 workers: 71.2 ms | 3 workers: 71.9 ms |
+| 15° | 2.20M | 286.8 ms | 2 workers: 136.8 ms | 3 workers: 123.9 ms |
+| annulus 5°–10° (`DIFFERENCE`) | 1.00M | 209.9 ms | 2 workers: 95.9 ms | 3 workers: 124.8 ms |
+
+PostgreSQL picks the workers by the heap pages the search is expected to read,
+as it would for a parallel scan of that many pages, so small cones, which are
+the common case, keep their serial plan and their planning cost. Away from the
+Galactic plane the same 15° cone holds 33k rows and stays serial.
+
 The benchmark scripts behind the paper describing skycell, and the
 documentation of every measurement it quotes, are in [`bench/`](bench/):
 [`bench/README.md`](bench/README.md) maps each table to its directory, and
@@ -910,6 +1052,9 @@ Two layers, both in [`ext/test/`](ext/test/).
   - Under `debug_parallel_query` a whole cone search runs inside a worker, in
     both modes, with the index filter, as a cross-match and as a generic plan's
     run-time cone, and returns the serial answer.
+  - A single cone, a 40° cone and a composite are planned parallel aware
+    under a Gather, in both modes, and give the serial answer, also when a
+    nested loop rescans the Gather.
 - `nearest`: the nearest-neighbour scan. Every query must return what
   PostgreSQL's sort returns, the same distances in the same order and the same
   rows (ties aside): on a catalogue with duplicated positions, NULL
@@ -1002,9 +1147,11 @@ locally), the standalone selftests, and the reference translators.
   and a few rings, about 30 ms a query on 3M rows in four declination bands,
   where partitions by cell range, each holding its own part of the sky, take
   2.3 ms. Before PostgreSQL 18 its bitmap mode does not prefetch.
-- **Parallel queries.** The custom scans are parallel safe but not parallel
-  aware. A cross-match's probes are shared out among workers, but a single cone
-  search or nearest-neighbour query is not split among them. PostgreSQL gives
+- **Parallel queries.** A cross-match's probes are shared out among workers,
+  and since 0.42 a single cone or composite search with a fixed region is
+  split among them (its covering in chunks). A cone whose region is known only
+  at run time (a generic plan's parameters) and a nearest-neighbour query are
+  not split. PostgreSQL gives
   the probe table workers by its size: none below 8 MB
   (`min_parallel_table_scan_size`), one at 10 MB, two at 50 MB. A smaller target
   list runs serially unless told otherwise: `ALTER TABLE targets SET
