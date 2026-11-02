@@ -93,6 +93,8 @@ extern void skycell_region_from_datum(Datum d, sc_region *r);
 extern bool skycell_const_region_cover(PlannerInfo *root, List *args, sc_region *reg,
 									   sc_cover *cov, sc_density *dens);
 extern bool region_scan_keep(PlannerInfo *root, FuncExpr *written, FuncExpr *fcall);
+extern FuncExpr *skycell_poly_region_scan(Oid sibling, Node *cell, Node *ra, Node *dec,
+										  ArrayType *arr);
 extern void skycell_region_from_datum_lite(Datum d, sc_region *r);
 
 #endif

@@ -1,0 +1,92 @@
+ setseed 
+---------
+ 
+(1 row)
+
+ setseed 
+---------
+ 
+(1 row)
+
+ pc_run 
+--------
+ 
+(1 row)
+
+ shapes | methods_disagree 
+--------+------------------
+    180 |                0
+(1 row)
+
+ shape  |  method  | runs | median_us | sum_over_scan 
+--------+----------+------+-----------+---------------
+ box    | adql     |  180 |       177 |          0.97
+ box    | scan     |  180 |       209 |          1.00
+ box    | rewrite  |  180 |       225 |          1.12
+ box    | pgsphere |  180 |       493 |         11.57
+ box    | q3c      |  180 |      5167 |         14.12
+ quad   | adql     |  180 |       244 |          0.99
+ quad   | scan     |  180 |       272 |          1.00
+ quad   | rewrite  |  180 |       305 |          1.07
+ quad   | q3c      |  180 |      5848 |          9.15
+ quad   | pgsphere |  180 |      1282 |         20.04
+ ushape | adql     |  180 |       290 |          0.96
+ ushape | scan     |  180 |       319 |          1.00
+ ushape | rewrite  |  180 |       352 |          1.08
+ ushape | pgsphere |  180 |      1811 |         28.64
+(14 rows)
+
+psql:../36_polygon_scan.sql:107: NOTICE:  --- quad scan
+psql:../36_polygon_scan.sql:107: NOTICE:  Aggregate
+psql:../36_polygon_scan.sql:107: NOTICE:    ->  Custom Scan (SkycellCone) on gaia_realc
+psql:../36_polygon_scan.sql:107: NOTICE:          Filter: skycell_region_scan('0'::bigint, ra, "dec", 'POLYGON ICRS 292.071753470685 23.8229279037885 292.256992850093 23.822927903788
+psql:../36_polygon_scan.sql:107: NOTICE:          Index: gaia_realc_cell
+psql:../36_polygon_scan.sql:107: NOTICE:          Ranges: 2
+psql:../36_polygon_scan.sql:107: NOTICE:          Mode: ordered
+psql:../36_polygon_scan.sql:107: NOTICE:  --- quad rewrite
+psql:../36_polygon_scan.sql:107: NOTICE:  Aggregate
+psql:../36_polygon_scan.sql:107: NOTICE:    ->  Index Scan using gaia_realc_cell on gaia_realc
+psql:../36_polygon_scan.sql:107: NOTICE:          Index Cond: ((skycell_ang2cell(ra, "dec") >= '1009897032065744896'::bigint) AND (skycell_ang2cell(ra, "dec") <= '1009905828158767103
+psql:../36_polygon_scan.sql:107: NOTICE:          Filter: skycell_in_poly(ra, "dec", '{292.0717534706853,23.822927903788514,292.25699285009273,23.822927903788514,292.21068300524087,2
+psql:../36_polygon_scan.sql:107: NOTICE:  --- quad pgsphere
+psql:../36_polygon_scan.sql:107: NOTICE:  Aggregate
+psql:../36_polygon_scan.sql:107: NOTICE:    ->  Bitmap Heap Scan on gaia_realc
+psql:../36_polygon_scan.sql:107: NOTICE:          Recheck Cond: (pos <@ '{(5.097613750136634 , 0.4157885293863405),(5.100846787211644 , 0.4157885293863405),(5.100038527942892 , 0.417
+psql:../36_polygon_scan.sql:107: NOTICE:          ->  Bitmap Index Scan on gaia_realc_gist
+psql:../36_polygon_scan.sql:107: NOTICE:                Index Cond: (pos <@ '{(5.097613750136634 , 0.4157885293863405),(5.100846787211644 , 0.4157885293863405),(5.100038527942892 , 0
+psql:../36_polygon_scan.sql:107: NOTICE:  --- box scan
+psql:../36_polygon_scan.sql:107: NOTICE:  Aggregate
+psql:../36_polygon_scan.sql:107: NOTICE:    ->  Custom Scan (SkycellCone) on gaia_realc
+psql:../36_polygon_scan.sql:107: NOTICE:          Filter: skycell_region_scan('0'::bigint, ra, "dec", 'POLYGON ICRS 292.118063315537 23.8441030642986 292.210683005241 23.844103064298
+psql:../36_polygon_scan.sql:107: NOTICE:          Index: gaia_realc_cell
+psql:../36_polygon_scan.sql:107: NOTICE:          Ranges: 1
+psql:../36_polygon_scan.sql:107: NOTICE:          Mode: ordered
+psql:../36_polygon_scan.sql:107: NOTICE:  --- box rewrite
+psql:../36_polygon_scan.sql:107: NOTICE:  Aggregate
+psql:../36_polygon_scan.sql:107: NOTICE:    ->  Index Scan using gaia_realc_cell on gaia_realc
+psql:../36_polygon_scan.sql:107: NOTICE:          Index Cond: ((skycell_ang2cell(ra, "dec") >= '1009897032065744896'::bigint) AND (skycell_ang2cell(ra, "dec") <= '1009905828158767103
+psql:../36_polygon_scan.sql:107: NOTICE:          Filter: skycell_in_poly(ra, "dec", '{292.11806331553714,23.84410306429858,292.21068300524087,23.84410306429858,292.21068300524087,23
+psql:../36_polygon_scan.sql:107: NOTICE:  --- box pgsphere
+psql:../36_polygon_scan.sql:107: NOTICE:  Aggregate
+psql:../36_polygon_scan.sql:107: NOTICE:    ->  Bitmap Heap Scan on gaia_realc
+psql:../36_polygon_scan.sql:107: NOTICE:          Recheck Cond: (pos <@ '{(5.098422009405387 , 0.4161581056568794),(5.100038527942892 , 0.4161581056568794),(5.100038527942892 , 0.416
+psql:../36_polygon_scan.sql:107: NOTICE:          ->  Bitmap Index Scan on gaia_realc_gist
+psql:../36_polygon_scan.sql:107: NOTICE:                Index Cond: (pos <@ '{(5.098422009405387 , 0.4161581056568794),(5.100038527942892 , 0.4161581056568794),(5.100038527942892 , 0
+psql:../36_polygon_scan.sql:107: NOTICE:  --- ushape scan
+psql:../36_polygon_scan.sql:107: NOTICE:  Aggregate
+psql:../36_polygon_scan.sql:107: NOTICE:    ->  Custom Scan (SkycellCone) on gaia_realc
+psql:../36_polygon_scan.sql:107: NOTICE:          Filter: skycell_region_scan('0'::bigint, ra, "dec", 'POLYGON ICRS 292.118063315537 23.8229279037885 292.210683005241 23.822927903788
+psql:../36_polygon_scan.sql:107: NOTICE:          Index: gaia_realc_cell
+psql:../36_polygon_scan.sql:107: NOTICE:          Ranges: 2
+psql:../36_polygon_scan.sql:107: NOTICE:          Mode: ordered
+psql:../36_polygon_scan.sql:107: NOTICE:  --- ushape rewrite
+psql:../36_polygon_scan.sql:107: NOTICE:  Aggregate
+psql:../36_polygon_scan.sql:107: NOTICE:    ->  Index Scan using gaia_realc_cell on gaia_realc
+psql:../36_polygon_scan.sql:107: NOTICE:          Index Cond: ((skycell_ang2cell(ra, "dec") >= '1009897032065744896'::bigint) AND (skycell_ang2cell(ra, "dec") <= '1009905828158767103
+psql:../36_polygon_scan.sql:107: NOTICE:          Filter: skycell_in_poly(ra, "dec", '{292.11806331553714,23.822927903788514,292.21068300524087,23.822927903788514,292.21068300524087,
+psql:../36_polygon_scan.sql:107: NOTICE:  --- ushape pgsphere
+psql:../36_polygon_scan.sql:107: NOTICE:  Aggregate
+psql:../36_polygon_scan.sql:107: NOTICE:    ->  Bitmap Heap Scan on gaia_realc
+psql:../36_polygon_scan.sql:107: NOTICE:          Recheck Cond: (pos <@ '{(5.098422009405387 , 0.4157885293863405),(5.100038527942892 , 0.4157885293863405),(5.100038527942892 , 0.417
+psql:../36_polygon_scan.sql:107: NOTICE:          ->  Bitmap Index Scan on gaia_realc_gist
+psql:../36_polygon_scan.sql:107: NOTICE:                Index Cond: (pos <@ '{(5.098422009405387 , 0.4157885293863405),(5.100038527942892 , 0.4157885293863405),(5.100038527942892 , 0

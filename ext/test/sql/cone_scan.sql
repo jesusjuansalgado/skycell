@@ -185,7 +185,8 @@ ORDER BY tbl, t.name;
 -- ADQL's own spelling, the operator a translator emits for CONTAINS, is the
 -- same cone: a circle (constant, STC-S or built per row) goes to the custom
 -- scan exactly as skycell_cone would, and returns what the rewrite returns;
--- a polygon, or a circle under an OR, keeps the rewrite
+-- so does a constant polygon or box, convex or not, in either spelling (since
+-- 0.43); a circle or a polygon under an OR keeps the rewrite
 CREATE TABLE cs_spos AS SELECT id, skycell_point(ra, dec) AS pos FROM cs_cat;
 CREATE INDEX cs_spos_cell ON cs_spos (skycell_cell(pos));
 ANALYZE cs_spos;
@@ -200,6 +201,11 @@ FROM unnest(ARRAY['cs_cat', 'cs_sorted']) tbl, (VALUES
   ('adql left',     'SELECT count(*) || '':'' || count(c.id) FROM cs_probe p LEFT JOIN cs_cat c ON point(''ICRS'', c.ra, c.dec) <@ circle(''ICRS'', p.ra, p.dec, 0.3)'),
   ('adql or',       'SELECT count(*) || '':'' || sum(id) FROM cs_cat WHERE point(''ICRS'', ra, dec) <@ circle(''ICRS'', 10, 20, 1) OR id = 7'),
   ('adql polygon',  'SELECT count(*) || '':'' || sum(id) FROM cs_cat WHERE point(''ICRS'', ra, dec) <@ polygon(''ICRS'', 10, 20, 12, 20, 11, 22)'),
+  ('adql box',      'SELECT count(*) || '':'' || sum(id) FROM cs_cat WHERE 1 = contains(point(''ICRS'', ra, dec), box(''ICRS'', 10, 20, 2, 1.5))'),
+  ('adql u-shape',  'SELECT count(*) || '':'' || sum(id) FROM cs_cat WHERE point(''ICRS'', ra, dec) <@ polygon(''ICRS'', 9, 19, 13, 19, 13, 23, 12, 23, 12, 20, 10, 20, 10, 23, 9, 23)'),
+  ('adql poly or',  'SELECT count(*) || '':'' || sum(id) FROM cs_cat WHERE point(''ICRS'', ra, dec) <@ polygon(''ICRS'', 10, 20, 12, 20, 11, 22) OR id = 7'),
+  ('native poly',   'SELECT count(*) || '':'' || sum(id) FROM cs_cat WHERE skycell_poly(cell, ra, dec, ARRAY[10, 20, 12, 20, 11, 22]::float8[])'),
+  ('native u-shape','SELECT count(*) || '':'' || sum(id) FROM cs_cat WHERE skycell_poly(cell, ra, dec, ARRAY[9, 19, 13, 19, 13, 23, 12, 23, 12, 20, 10, 20, 10, 23, 9, 23]::float8[])'),
   -- written the other way round, as the Gaia archive's examples do: a constant
   -- point inside a circle drawn around each row is the same cone
   ('adql reversed', 'SELECT count(*) || '':'' || sum(id) FROM cs_cat WHERE point(''ICRS'', 10, 20) <@ circle(''ICRS'', ra, dec, 1)'),
@@ -358,10 +364,13 @@ DROP FUNCTION cs_adql(text);
 -- the range rewrite's waste gate declines only in favour of a GiST-family
 -- index on the position (none can be built on skypos since 0.38); with none
 -- there is nothing to decline for, and the rewrite stays (here the gate is
--- forced to trigger)
+-- forced to trigger; a top-level polygon goes to the custom scan since 0.43,
+-- so the custom scan is off to reach the rewrite)
 SET skycell.rewrite_max_waste = 0;
+SET skycell.custom_scan = off;
 EXPLAIN (COSTS OFF)
 SELECT count(*) FROM cs_cat WHERE point('ICRS', ra, dec) <@ polygon('ICRS', 10, 20, 12, 20, 12, 22, 10, 22);
+RESET skycell.custom_scan;
 RESET skycell.rewrite_max_waste;
 DROP TABLE cs_dprobe;
 -- the first query of a session: distance()'s support function loads the
