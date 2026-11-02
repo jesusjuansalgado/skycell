@@ -24,6 +24,15 @@ SELECT polygon('ICRS', 0,0, 10,10, 10,0, 0,10);           -- error: a bow tie
 SELECT polygon('ICRS', 0,0, 4,0, 4,4, 2,0.0);             -- error: touches its own edge
 SELECT polygon('ICRS', 0,0, 4,0, 2,0, 2,3);               -- error: doubles back
 SELECT polygon('ICRS', 0,0, 120,0, 120,10, 60,-5, 0,10, 240,0);  -- error: hemisphere
+-- a wide polygon whose vertices bunch at one end: 41 of them along RA 0-4,
+-- so their mean is more than 90 deg from the far end at RA 150 -- it fits a
+-- hemisphere all the same, and is taken round the smallest cap about it
+SELECT contains(point('ICRS', 75, 0), p) AS middle, contains(point('ICRS', 2, 0), p) AS near_start,
+       contains(point('ICRS', 75, 6), p) AS above, contains(point('ICRS', 200, 0), p) AS beyond,
+       round(area(p)::numeric, 1) AS sqdeg
+FROM (SELECT skycell_polygon(VARIADIC (SELECT array_agg(c ORDER BY k) FROM (
+        SELECT 2 * i AS k, (i * 0.1)::float8 AS c FROM generate_series(0, 40) i
+        UNION ALL SELECT 2 * i + 1, -1 FROM generate_series(0, 40) i) a) || ARRAY[150, -1, 150, 1, 0, 1]::float8[]) AS p) t;
 
 -- points, area, centroid --------------------------------------------
 SELECT contains(point('ICRS', 178.5, 1.5), u) AS left_arm,
@@ -110,6 +119,10 @@ INSERT INTO polys VALUES
   ('star',     ARRAY[45,45, 45.6,43, 48,42.5, 46,41.4, 47,39.5, 45,40.8, 43,39.5, 44,41.4, 42,42.5, 44.4,43]),
   ('tiny U',   ARRAY[179.998,-0.002, 180.002,-0.002, 180.002,0.002, 180.001,0.002, 180.001,-0.001,
                      179.999,-0.001, 179.999,0.002, 179.998,0.002]);
+-- wide, its vertices bunched at RA 0-4 (taken round the smallest cap about them)
+INSERT INTO polys SELECT 'wide', (SELECT array_agg(c ORDER BY k) FROM (
+    SELECT 2 * i AS k, (i * 0.1)::float8 AS c FROM generate_series(0, 40) i
+    UNION ALL SELECT 2 * i + 1, -1 FROM generate_series(0, 40) i) a) || ARRAY[150, -1, 150, 1, 0, 1]::float8[];
 
 CREATE FUNCTION poly_plan_uses_index(q text) RETURNS bool LANGUAGE plpgsql AS $$
 DECLARE l text; found bool := false;
