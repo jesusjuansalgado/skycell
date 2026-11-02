@@ -129,8 +129,16 @@ region_cone(double ra, double dec, double radius)
 	return r;
 }
 
+static SkyRegion *region_poly_ex(int nv, const double *coords, bool validate);
+
 static SkyRegion *
 region_poly(int nv, const double *coords)
+{
+	return region_poly_ex(nv, coords, true);
+}
+
+static SkyRegion *
+region_poly_ex(int nv, const double *coords, bool validate)
 {
 	Size		sz = offsetof(SkyRegion, v) + 2 * nv * sizeof(double);
 	SkyRegion  *r;
@@ -146,6 +154,7 @@ region_poly(int nv, const double *coords)
 		r->v[i] = coords[i];
 
 	/* refuse a polygon the geometry cannot handle, at construction */
+	if (validate)
 	{
 		double	   *ra = palloc(sizeof(double) * nv),
 				   *dec = palloc(sizeof(double) * nv);
@@ -790,8 +799,16 @@ skycell_not(PG_FUNCTION_ARGS)
 	PG_RETURN_POINTER(region_combine(SKY_NOT, kids, 1));
 }
 
+static SkyRegion *polygon_from_array_ex(ArrayType *arr, bool validate);
+
 static SkyRegion *
 polygon_from_array(ArrayType *arr)
+{
+	return polygon_from_array_ex(arr, true);
+}
+
+static SkyRegion *
+polygon_from_array_ex(ArrayType *arr, bool validate)
 {
 	Datum	   *elems;
 	bool	   *nulls;
@@ -814,7 +831,7 @@ polygon_from_array(ArrayType *arr)
 							errmsg("polygon coordinates must not be NULL")));
 		coords[i] = DatumGetFloat8(elems[i]);
 	}
-	r = region_poly(n / 2, coords);
+	r = region_poly_ex(n / 2, coords, validate);
 	pfree(coords);
 	return r;
 }
@@ -832,6 +849,40 @@ skycell_polygon_cs(PG_FUNCTION_ARGS)
 {
 	check_coordsys(PG_GETARG_TEXT_PP(0));
 	PG_RETURN_POINTER(polygon_from_array(PG_GETARG_ARRAYTYPE_P(1)));
+}
+
+/*
+ * skycell_poly(cell, ra, dec, <constant float8[]>) as the custom scan takes
+ * it: skycell_region_scan(cell, ra, dec, <the polygon as a skyregion>), or
+ * NULL when the installed SQL has no skycell_region_scan (before 0.39).
+ * sibling is any function of the extension, to find its schema.  The caller
+ * has validated the vertices already (skycell_poly's own checks, which are
+ * region_poly()'s), so they are not checked twice.
+ */
+FuncExpr *
+skycell_poly_region_scan(Oid sibling, Node *cell, Node *ra, Node *dec, ArrayType *arr)
+{
+	Oid			nsp = get_func_namespace(sibling);
+	char	   *nspname = get_namespace_name(nsp);
+	Oid			regtype = GetSysCacheOid2(TYPENAMENSP, Anum_pg_type_oid,
+										  CStringGetDatum("skyregion"),
+										  ObjectIdGetDatum(nsp));
+	Oid			t[4] = {INT8OID, FLOAT8OID, FLOAT8OID, regtype};
+	Oid			fn;
+	SkyRegion  *r;
+
+	if (!OidIsValid(regtype))
+		return NULL;
+	fn = LookupFuncName(list_make2(makeString(nspname), makeString(pstrdup("skycell_region_scan"))),
+						4, t, true);
+	if (!OidIsValid(fn))
+		return NULL;
+	r = polygon_from_array_ex(arr, false);
+	return makeFuncExpr(fn, BOOLOID,
+						list_make4(copyObject(cell), copyObject(ra), copyObject(dec),
+								   makeConst(regtype, -1, InvalidOid, -1, PointerGetDatum(r),
+											 false, false)),
+						InvalidOid, InvalidOid, COERCE_EXPLICIT_CALL);
 }
 
 /* ------------------------------------------------------------------ */
@@ -960,7 +1011,7 @@ skycell_pos_in_region_sel(PG_FUNCTION_ARGS)
 
 /*
  * skycell_region_scan(cell, ra, dec, region): a position in a constant
- * composite, as the custom scan answers it (the cell is its index key).  On
+ * polygon or composite, as the custom scan answers it (the cell is its index key).  On
  * its own it is the exact test, read straight from ra and dec.
  */
 PG_FUNCTION_INFO_V1(skycell_region_scan);
@@ -1824,18 +1875,19 @@ region_simplify_oriented(SupportRequestSimplify *req, Oid funcid, Node *pt, Node
 			return makeBoolConst(false, true);
 
 		/*
-		 * A composite as a top-level term goes to the custom scan, as a
-		 * circle does: one scan over its covering's ranges in cell order,
-		 * with no covering computed here and no OR of ranges to plan.  An
-		 * extension older than 0.39 has no skycell_region_scan and keeps
-		 * the rewrite below.
+		 * A polygon, a box (a polygon too) or a composite as a top-level
+		 * term goes to the custom scan, as a circle does: one scan over its
+		 * covering's ranges in cell order, with no covering computed here
+		 * and no OR of ranges to plan (polygons since 0.43, composites since
+		 * 0.39).  An extension older than 0.39 has no skycell_region_scan
+		 * and keeps the rewrite below.
 		 */
 		{
 			SkyRegion  *sr = DatumGetSkyRegion(((Const *) rg)->constvalue);
 			Node	   *ra,
 					   *dec;
 
-			if (SKY_IS_COMPOSITE(sr->kind) && !IsA(pt, Const) &&
+			if ((SKY_IS_COMPOSITE(sr->kind) || sr->kind == SKY_POLY) && !IsA(pt, Const) &&
 				pos_ra_dec(funcid, pt, &ra, &dec))
 			{
 				Oid			t[4] = {INT8OID, FLOAT8OID, FLOAT8OID, exprType(rg)};

@@ -1820,8 +1820,6 @@ simplify_poly(PlannerInfo *root, FuncExpr *fexpr)
 	Oid			exact_types[4] = {FLOAT8OID, FLOAT8OID, FLOAT8ARRAYOID, FLOAT8OID};
 	bool		uses_cell_ops;
 
-	density_for_var(root, cell, &dens, &dens_statrel, &uses_cell_ops);
-
 	if (IsA(poly, Const))
 	{
 		sc_region	reg;
@@ -1834,6 +1832,24 @@ simplify_poly(PlannerInfo *root, FuncExpr *fexpr)
 			return (Node *) makeBoolConst(false, true);
 
 		poly_from_array(DatumGetArrayTypeP(((Const *) poly)->constvalue), &reg);
+
+		/*
+		 * As a top-level term the polygon goes to the custom scan (0.43), as
+		 * a constant ADQL polygon does: skycell_region_scan() over its
+		 * covering in cell order, the rows tested from ra and dec.
+		 */
+		{
+			FuncExpr   *scan = skycell_poly_region_scan(fexpr->funcid, cell, lsecond(args),
+														lthird(args),
+														DatumGetArrayTypeP(((Const *) poly)->constvalue));
+
+			if (scan != NULL && region_scan_keep(root, fexpr, scan))
+			{
+				sc_region_free(&reg);
+				return (Node *) scan;
+			}
+		}
+		density_for_var(root, cell, &dens, &dens_statrel, &uses_cell_ops);
 		current_params(&p, skycell_max_ranges, &dens);
 		sc_cover_compute(&reg, &dens, &p, &cov);
 		sel = (cov.area > 0) ? fmin(1.0, reg.area / cov.area) : 0.0;
@@ -1865,13 +1881,15 @@ simplify_poly(PlannerInfo *root, FuncExpr *fexpr)
 		Oid			bound_types[5] = {FLOAT8ARRAYOID, INT4OID, INT4OID, FLOAT8OID, INT8ARRAYOID};
 		Oid			bound_oid = lookup_sibling_func(fexpr->funcid, "skycell_poly_bound", 5, bound_types);
 		int			k = skycell_join_slots;
-		Oid			arm_opfamily = uses_cell_ops
-			? cell_ops_opfamily() : INTEGER_BTREE_FAM_OID;
+		Oid			arm_opfamily;
 		Const	   *hist;
 		List	   *arms = NIL;
-		Datum	   *hd = palloc(sizeof(Datum) * Max(dens.nbounds, 1));
+		Datum	   *hd;
 		FuncExpr   *exact;
 
+		density_for_var(root, cell, &dens, &dens_statrel, &uses_cell_ops);
+		arm_opfamily = uses_cell_ops ? cell_ops_opfamily() : INTEGER_BTREE_FAM_OID;
+		hd = palloc(sizeof(Datum) * Max(dens.nbounds, 1));
 		for (int i = 0; i < dens.nbounds; i++)
 			hd[i] = Int64GetDatum(dens.bounds[i]);
 		hist = makeConst(INT8ARRAYOID, -1, InvalidOid, -1,

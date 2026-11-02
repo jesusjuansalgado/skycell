@@ -141,10 +141,14 @@ Nested Loop
         Mode: ordered
 ```
 
-**5. Polygons are rewritten by the planner.** A support function
-(`SupportRequestSimplify`, the mechanism PostGIS uses for `ST_DWithin`) turns a
-polygon or box predicate into B-tree range conditions plus the exact test
-before path generation, so the planner estimates them from the same histogram.
+**5. Polygons and boxes take the same scan.** Since 0.43 a constant polygon or
+box written as a top-level condition goes to the custom scan, as a circle does:
+covered once at plan time, its ranges read in cell order, each row tested from
+its `ra` and `dec`, and split among parallel workers when it is large. Anywhere
+else (under an `OR`, per row, or with the custom scan off) a support function
+(`SupportRequestSimplify`, the mechanism PostGIS uses for `ST_DWithin`) turns
+the predicate into B-tree range conditions plus the exact test before path
+generation, so the planner estimates them from the same histogram.
 
 **6. Regions are stored as regions.** `skyregion` holds circles and polygons
 in one type, so one column carries both. A `skyregion` column takes its own
@@ -554,7 +558,7 @@ read more naturally in plain SQL, and are what a pgSphere user already writes.
 
 | Operator | ADQL spelling | Meaning |
 |---|---|---|
-| `skypos <@ skyregion` | `CONTAINS(p, r) = 1`, `INTERSECTS(p, r) = 1` | position inside region. Against a circle (constant, or built per row as in a cross-match) it is planned exactly as `skycell_cone`, through the custom scan; against a polygon or a composite it is rewritten into index ranges |
+| `skypos <@ skyregion` | `CONTAINS(p, r) = 1`, `INTERSECTS(p, r) = 1` | position inside region. Against a circle (constant, or built per row as in a cross-match) it is planned exactly as `skycell_cone`, through the custom scan; so is a constant polygon, box (since 0.43) or composite (since 0.39). A per-row polygon, or one under an `OR`, is rewritten into index ranges |
 | `skyregion @> skypos` | `INTERSECTS(r, p) = 1` | the same, reversed. When `skyregion` is a stored column with a GiST (or MOC GIN) index, indexed through that instead |
 | `skyregion && skyregion` | `INTERSECTS(a, b) = 1` | regions overlap. Indexed by `CREATE INDEX ON t USING gist (region)` |
 | `skyregion @> skyregion` | `CONTAINS(b, a) = 1` | `a` wholly contains `b`. The same index |
@@ -572,8 +576,8 @@ cross-match probes whichever table has the index (the larger one if both do).
 and `skycell_dist`) gets the same plan: the planner adds the cone next to the
 comparison, which still decides, so the answer is exactly the comparison's,
 and the row estimate is the cone's (as of 0.28).
-Against a constant polygon or box they go through the B-tree cell rewrite
-described above. A `skyregion` column with its
+Against a constant polygon or box they go through the custom scan (since 0.43;
+the B-tree cell rewrite described above under an `OR`). A `skyregion` column with its
 own GiST index additionally indexes `&&` and both region-region containment
 operators (`@>`/`<@`, in either argument order — they're commutators of each
 other) directly against it, region side non-constant included — what a stored
@@ -638,7 +642,7 @@ fails with the same advice until the index is dropped.
 | Function | Notes |
 |---|---|
 | `skycell_cone(cell, ra, dec, ra0, dec0, radius)` | cone test, answered by the custom scan: a constant cone covered at plan time; a per-row cone (a cross-match, `JOIN cat c ON skycell_cone(c.cell, c.ra, c.dec, p.ra, p.dec, r)`) covered per outer row; a generic plan or correlated sub-select covered per rescan |
-| `skycell_poly(cell, ra, dec, poly float8[])` | the same for a polygon |
+| `skycell_poly(cell, ra, dec, poly float8[])` | the same for a polygon; a constant one goes to the custom scan (since 0.43) |
 | `skycell_radial_query(ra, dec, ra0, dec0, radius)` | Q3C's spelling of the cone test — no cell argument, the planner synthesises `skycell_ang2cell(ra, dec)`; the custom scan answers it through an expression index on that, or a stored column declared to hold it ([setup 2](#setting-up-a-table)) |
 | `skycell_join(ra1, dec1, ra2, dec2, radius)` | Q3C's spelling of the cross-match — likewise; the first pair is the indexed side, as in `q3c_join` |
 | `skycell_in_cone(ra, dec, ra0, dec0, radius [, sel])` | the exact test alone, no index |
@@ -807,7 +811,7 @@ WHERE 1 = CONTAINS(POINT('ICRS', ra, dec), CIRCLE('ICRS', 269.45, 4.69, 0.05 + 0
 | `skycell.max_area_ratio` | 64 | a partly covered cell may not exceed this × the region's area |
 | `skycell.use_stats` | on | use the histogram as a density map |
 | `skycell.cache_coverings` | on | memoise coverings per backend |
-| `skycell.join_slots` | 4 | range slots the rewrite emits for a non-constant region (used when the custom scan does not apply: `custom_scan` off, polygons and stored regions) |
+| `skycell.join_slots` | 4 | range slots the rewrite emits for a non-constant region (used when the custom scan does not apply: `custom_scan` off, per-row polygons and stored regions) |
 | `skycell.exact_cells` | on | tight cell geometry; off falls back to the `max_pixrad` cap |
 | `skycell.force_order` | -1 | diagnostics: cover cones at this order (-1 = let the model choose) |
 | `skycell.split_cost`, `skycell.max_steps` | 1, 4000 | refinement guards for polygons and very large cones |
@@ -1136,10 +1140,11 @@ locally), the standalone selftests, and the reference translators.
   twice the rows it returns (the ring's margin and the cells its edge
   crosses), each through a bitmap over an unordered heap, where pgSphere's
   GiST reads close to exactly the rows it returns.
-- **Where the custom scan applies.** It answers cones and cross-matches; polygons
-  and stored regions use the range rewrite and the region indexes. The cone must
-  be a top-level `AND` term of a `WHERE` or `JOIN ON`: a cone under an `OR` is
-  rewritten instead and stays indexable through a `BitmapOr`. It reads heap
+- **Where the custom scan applies.** It answers cones, cross-matches and
+  constant polygons, boxes and composites; per-row polygons and stored regions
+  use the range rewrite and the region indexes. The search must be a top-level
+  `AND` term of a `WHERE` or `JOIN ON`: one under an `OR` is rewritten instead
+  and stays indexable through a `BitmapOr`. It reads heap
   tables only; on a partitioned table each partition keeps the rewrite.
   Nearest neighbours on a partitioned table are answered partition by
   partition and merged (since 0.40), so every partition finds its own nearest
@@ -1148,8 +1153,8 @@ locally), the standalone selftests, and the reference translators.
   where partitions by cell range, each holding its own part of the sky, take
   2.3 ms. Before PostgreSQL 18 its bitmap mode does not prefetch.
 - **Parallel queries.** A cross-match's probes are shared out among workers,
-  and since 0.42 a single cone or composite search with a fixed region is
-  split among them (its covering in chunks). A cone whose region is known only
+  and since 0.42 a single cone or composite search with a fixed region (and
+  since 0.43 a polygon or box) is split among them (its covering in chunks). A cone whose region is known only
   at run time (a generic plan's parameters) and a nearest-neighbour query are
   not split. PostgreSQL gives
   the probe table workers by its size: none below 8 MB
