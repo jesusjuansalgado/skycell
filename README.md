@@ -351,7 +351,7 @@ for ADQL compatibility and must be `'ICRS'`; convert other frames first with
 | `point(ra, dec)`<br>`point(coordsys, ra, dec)` | `skypos` | degrees. ADQL `POINT` |
 | `circle(ra, dec, radius)`<br>`circle(coordsys, ra, dec, radius)` | `skyregion` | radius in degrees. ADQL `CIRCLE` |
 | `box(ra, dec, width, height)`<br>`box(coordsys, …)` | `skyregion` | centre and extent, as ADQL defines it. Errors if it reaches a pole — use a polygon there. ADQL `BOX` |
-| `polygon(ra1, dec1, ra2, dec2, …)`<br>`polygon(coordsys, …)` | `skyregion` | ≥ 3 vertices, convex or not (non-convex since 0.35), but simple: no two edges may cross or touch. Every vertex must lie within 90° of the vertices' mean. ADQL `POLYGON` |
+| `polygon(ra1, dec1, ra2, dec2, …)`<br>`polygon(coordsys, …)` | `skyregion` | ≥ 3 vertices, convex or not (non-convex since 0.35), but simple: no two edges may cross or touch. It must fit in a hemisphere: some point within 90° of every vertex (since 0.41 not necessarily the vertices' mean, which bunched vertices pull aside). ADQL `POLYGON` |
 | `contains(p skypos, r skyregion)`<br>`contains(a skyregion, b skyregion)` | `integer` (1/0) | ADQL `CONTAINS`. Compared with 1 (`contains(…) = 1`, or `1 = …`) in a `WHERE` or `JOIN ON` it is planned as the `<@` operator below, so it is indexed |
 | `intersects(p skypos, r skyregion)`<br>`intersects(r skyregion, p skypos)`<br>`intersects(a skyregion, b skyregion)` | `integer` (1/0) | ADQL `INTERSECTS`, the point on either side (the second form since 0.38). Compared with 1 it is planned as `<@` or `@>` (point-region) or `&&` (region-region) below, so it is indexed |
 | `distance(a skypos, b skypos)`<br>`distance(ra1, dec1, ra2, dec2)` | `float8` | degrees. ADQL `DISTANCE`, both forms. `distance(…) < r` (or `<=`) in a `WHERE` or `JOIN ON` is planned as the cone, like `<@` below |
@@ -849,7 +849,10 @@ Two layers, both in [`ext/test/`](ext/test/).
   covers 444,683 points, half of them a hair either side of an edge, and each
   point's membership and covering, the area, the centroid (against brute-force
   quadrature, every quarter of the shapes) and CONTAINS and INTERSECTS for
-  14,400 small triangles around the notches. It also prints ranges, cells examined, false-positive
+  14,400 small triangles around the notches. Then 300 wide polygons, the same
+  shapes stretched to about 70° from their centre with one edge cut into 60
+  more vertices, so that their vertex mean no longer holds them: membership,
+  covering and area against the same reference. It also prints ranges, cells examined, false-positive
   fraction and µs per covering. Then 1,500 random composites (unions,
   intersections, differences and NOTs, up to four deep, of cones and convex and
   non-convex polygons): every catalogue point inside must be covered, and every
@@ -960,8 +963,9 @@ locally), the standalone selftests, and the reference translators.
 ## Limitations
 
 - **Geometry.** A polygon must be simple, with no crossing or touching edges,
-  and every vertex must lie within 90° of the vertices' mean. A `BOX` may
-  not reach a pole. A composite region (`UNION`, `INTERSECTION`,
+  and it must fit in a hemisphere: some point within 90° of every vertex. A
+  larger region is written as a composite, the `NOT` of the rest of the sky or
+  a `UNION` of pieces. A `BOX` may not reach a pole. A composite region (`UNION`, `INTERSECTION`,
   `DIFFERENCE`, `NOT`) has its `AREA` and `CENTROID` integrated to about
   10⁻³, not computed exactly. Comparing it with another region is decided to
   10⁻⁴ of its smallest piece where its operands do not decide it, and an empty

@@ -348,6 +348,8 @@ main(void)
 	 * integration (for profiling); SC_SELFTEST_INT=1: only the integration */
 	if (getenv("SC_SELFTEST_INT"))
 		goto integration;
+	if (getenv("SC_SELFTEST_WIDE"))
+		goto wide;
 	if (getenv("SC_SELFTEST_PAIRS"))
 		goto pairs;
 
@@ -977,6 +979,128 @@ main(void)
 			   built, ncomp, tot_ranges / (built ? built : 1), pts, bad_cov, cells, bad_out, bad_in,
 			   tot_cov > 0 ? 1 - tot_true / tot_cov : 0);
 		failures += bad_cov + bad_out + bad_in;
+	}
+
+wide:
+	/*
+	 * Wide polygons whose vertex mean does not hold them: the same shapes,
+	 * stretched to about 70 deg from their centre, with one edge near one end
+	 * cut into 60 more vertices, which pulls the mean so far that the other
+	 * end is more than 90 deg from it.  The library then handles the polygon
+	 * round the centre of the smallest cap about its vertices.  Against the
+	 * reference: membership (uniform, and a hair either side of the edges),
+	 * every inside point covered, and the area.
+	 */
+	{
+		int nwide = getenv("SC_SELFTEST_NWIDE") ? atoi(getenv("SC_SELFTEST_NWIDE")) : 300;
+		int built = 0, fallback = 0, rejected = 0, bad_in = 0, bad_cov = 0, bad_area = 0;
+		long pts = 0;
+		sc_cover_params p;
+
+		sc_cover_params_default(&p);
+		rs = 9191;
+		for (int q = 0; q < nwide; q++)
+		{
+			xy P0[40], P[120];
+			double pra[120], pde[120], ref_area = 0, sx = 2.0 + 0.8 * urand(), sy = 0.3 + 0.5 * urand();
+			double cra = 360 * urand(), cde = (60 * urand() - 30);
+			int n0 = make_shape(q, P0), n = 0, e = 0;
+			frame3 f = frame_at(cra, cde);
+			sc_region r;
+			sc_cover c;
+			const char *err;
+			sc_vec3 mean = {0, 0, 0};
+			double md = 2;
+
+			/* the edge whose midpoint is farthest left: cut it into 61 */
+			for (int i = 1; i < n0; i++)
+				if (P0[i].x + P0[(i + 1) % n0].x < P0[e].x + P0[(e + 1) % n0].x)
+					e = i;
+			for (int i = 0; i < n0; i++)
+			{
+				xy a = {P0[i].x * sx, P0[i].y * sy}, b = {P0[(i + 1) % n0].x * sx, P0[(i + 1) % n0].y * sy};
+
+				P[n++] = a;
+				if (i == e)
+					for (int k = 1; k <= 60; k++)
+						P[n++] = (xy) {a.x + (b.x - a.x) * k / 61.0, a.y + (b.y - a.y) * k / 61.0};
+			}
+			for (int i = 0; i < n; i++)
+			{
+				sc_vec3 v = from_plane(&f, P[i]);
+
+				pde[i] = atan2(v.z, hypot(v.x, v.y)) * 180 / M_PI;
+				pra[i] = atan2(v.y, v.x) * 180 / M_PI;
+				mean = sc_add(mean, sc_radec2vec(pra[i], pde[i]));
+			}
+			for (int i = 0; i < n; i++)
+				P[i] = to_plane(&f, sc_radec2vec(pra[i], pde[i]));
+			for (int i = 0; i < n; i++)
+				md = fmin(md, sc_dot(sc_radec2vec(pra[i], pde[i]), mean) / sqrt(sc_dot(mean, mean)));
+			if (md <= 1e-9)
+				fallback++;
+			if ((err = sc_region_poly(&r, n, pra, pde, true)) != NULL)
+			{
+				rejected++;
+				if (rejected < 10) printf("WIDE REJECTED: shape %d: %s\n", q % 4, err);
+				sc_region_free(&r);
+				continue;
+			}
+			built++;
+			for (int i = 0; i < n; i++)
+			{
+				sc_vec3 a = sc_radec2vec(pra[i], pde[i]), b = sc_radec2vec(pra[(i + 1) % n], pde[(i + 1) % n]);
+
+				ref_area += 2 * atan2(sc_dot(f.c, sc_cross(a, b)), 1 + sc_dot(f.c, a) + sc_dot(a, b) + sc_dot(b, f.c));
+			}
+			if (fabs(r.area - fabs(ref_area)) > 1e-9 * fabs(ref_area))
+			{
+				bad_area++;
+				if (bad_area < 10) printf("WIDE AREA: shape %d: %.17g vs %.17g\n", q % 4, r.area, fabs(ref_area));
+			}
+			sc_cover_compute(&r, &dens_hist, &p, &c);
+			for (int k = 0; k < 400; k++)
+			{
+				xy t;
+				double d;
+				int ref, got;
+				sc_vec3 v;
+
+				if (k % 2)
+					t = (xy) {sx * 1.1 * (2 * urand() - 1), sy * 1.1 * (2 * urand() - 1)};
+				else
+				{
+					int ed = (int) (urand() * n) % n;
+					xy a = P[ed], b = P[(ed + 1) % n];
+					double u = urand(), len = hypot(b.x - a.x, b.y - a.y), off = pow(10, -9 * urand()) * (urand() < 0.5 ? 1 : -1);
+
+					t = (xy) {a.x + u * (b.x - a.x) - off * (b.y - a.y) / len, a.y + u * (b.y - a.y) + off * (b.x - a.x) / len};
+				}
+				v = from_plane(&f, t);
+				t = to_plane(&f, v);
+				ref = ref_inside(P, n, t, &d);
+				if (d < 1e-10)
+					continue;
+				pts++;
+				got = sc_region_contains(&r, v);
+				if (got != ref)
+				{
+					bad_in++;
+					if (bad_in < 10) printf("WIDE CONTAINS: shape %d d=%g ref=%d got=%d\n", q % 4, d, ref, got);
+				}
+				if (ref && !in_ranges(&c, sc_vec2pix(SC_MAX_ORDER, v)))
+				{
+					bad_cov++;
+					if (bad_cov < 10) printf("WIDE NOT COVERED: shape %d\n", q % 4);
+				}
+			}
+			sc_cover_free(&c);
+			sc_region_free(&r);
+		}
+		printf("wide polygons: %d built of %d (%d past their vertex mean's hemisphere), %ld points; "
+			   "rejected %d, wrong: contains %d, covering %d, area %d\n",
+			   built, nwide, fallback, pts, rejected, bad_in, bad_cov, bad_area);
+		failures += rejected + bad_in + bad_cov + bad_area + (fallback == 0);
 	}
 
 pairs:

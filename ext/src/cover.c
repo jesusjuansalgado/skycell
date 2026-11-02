@@ -577,6 +577,57 @@ done:
 	return err;
 }
 
+/* the least of v[i].g: > 0 when every vertex is in g's open hemisphere */
+static double
+min_dot(const sc_vec3 *v, int nv, sc_vec3 g)
+{
+	double		m = 2.0;
+
+	for (int i = 0; i < nv; i++)
+		m = fmin(m, sc_dot(v[i], g));
+	return m;
+}
+
+/*
+ * A centre whose open hemisphere holds every vertex, when the vertex mean's
+ * does not -- vertices bunched on one side pull the mean towards them.  The
+ * direction of the centre of the smallest ball round the vertices, which is
+ * the centre of the smallest cap round them on the sphere, by the
+ * Badoiu-Clarkson iteration: step towards the farthest vertex by 1/(k+1).
+ * Close enough after a few thousand steps for what it is for, a hemisphere
+ * with room to spare; a polygon that needs it closer than that is nearly a
+ * hemisphere itself.
+ */
+static sc_vec3
+enclosing_centre(const sc_vec3 *v, int nv)
+{
+	sc_vec3		c = v[0];
+
+	for (int k = 1; k <= 4000; k++)
+	{
+		int			far = 0;
+		double		fd = -1;
+
+		for (int i = 0; i < nv; i++)
+		{
+			double		dx = v[i].x - c.x,
+						dy = v[i].y - c.y,
+						dz = v[i].z - c.z,
+						d = dx * dx + dy * dy + dz * dz;
+
+			if (d > fd)
+			{
+				fd = d;
+				far = i;
+			}
+		}
+		c.x += (v[far].x - c.x) / (k + 1);
+		c.y += (v[far].y - c.y) / (k + 1);
+		c.z += (v[far].z - c.z) / (k + 1);
+	}
+	return sqrt(sc_dot(c, c)) < 1e-12 ? c : vnormalize(c);
+}
+
 const char *
 sc_region_poly(sc_region *r, int nv, const double *ra_deg, const double *dec_deg,
 			   bool need_covering)
@@ -604,9 +655,19 @@ sc_region_poly(sc_region *r, int nv, const double *ra_deg, const double *dec_deg
 		g.y += r->v[i].y;
 		g.z += r->v[i].z;
 	}
-	if (sqrt(sc_dot(g, g)) < 1e-9)
-		return "polygon must be smaller than a hemisphere";
-	g = vnormalize(g);
+	/*
+	 * The centre the polygon is handled round: the vertex mean, or when some
+	 * vertex is not in its open hemisphere, the centre of the smallest cap
+	 * round the vertices.  A polygon that fits in no hemisphere is refused.
+	 */
+	if (sqrt(sc_dot(g, g)) >= 1e-9)
+		g = vnormalize(g);
+	if (sqrt(sc_dot(g, g)) < 1e-9 || min_dot(r->v, nv, g) <= 1e-9)
+	{
+		g = enclosing_centre(r->v, nv);
+		if (sqrt(sc_dot(g, g)) < 1e-9 || min_dot(r->v, nv, g) <= 1e-9)
+			return "polygon must be smaller than a hemisphere";
+	}
 
 	if ((err = poly_setup(r)) != NULL)
 		return err;
