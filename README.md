@@ -854,6 +854,36 @@ by up to 7.1× and Q3C's by up to 2.6×. At Gaia
 DR3 scale that is one 38 GiB index where an archive running pgSphere for cones
 and Q3C for cross-matching keeps 160 GiB.
 
+**Polygons through the custom scan** (0.43, [`bench/results-polyscan/`](bench/results-polyscan/)).
+Since 0.43 a constant polygon or box takes the custom scan that cones have.
+Before that it was rewritten into an `OR` of index ranges plus a per-row test.
+The benchmark ran 60 centres on the 10M real Gaia DR3 positions, 0.05°–2°
+across, with three shapes: a convex quadrilateral, a box and a non-convex U.
+Each was timed five ways in random order, planning included:
+
+- `skycell_poly` through the custom scan;
+- the same query with `skycell.custom_scan` off (the 0.42 rewrite);
+- ADQL `CONTAINS(POINT, POLYGON)`;
+- pgSphere's `<@ spoly`;
+- Q3C's `q3c_poly_query` (convex shapes only).
+
+All counted the same rows. Summed time over the 0.42 rewrite's, with a 95%
+bootstrap interval:
+
+| shape | scan ÷ rewrite | scan ÷ pgSphere | scan ÷ Q3C |
+|---|---|---|---|
+| quadrilateral | 0.93 [0.89, 0.97] | 0.05 | 0.11 |
+| box | 0.90 [0.87, 0.92] | 0.09 | 0.07 |
+| U | 0.93 [0.89, 0.96] | 0.03 | — |
+
+Per query the gain is modest, because a polygon's covering was already tight.
+It grows with size: a 10° × 10° box (376k rows) takes 58 ms against the
+rewrite's 113 ms. A large polygon is also split among workers like a cone
+(0.42): with two workers, 22.8 ms against the rewrite's parallel bitmap scan at
+43.7 ms ([`parallel.md`](bench/results-polyscan/parallel.md)). The ADQL spelling
+costs the same as `skycell_poly` on polygons of 0.5° and more, and about 10%
+less below that, where planning is most of the time.
+
 **Composite regions** (0.39, [`bench/results-composite/`](bench/results-composite/)).
 Five shapes on 60 centres on the 10M real Gaia DR3 positions, 0.05°–2° across.
 Each is written three ways: one `REGION`, the same pieces as a boolean of ADQL
