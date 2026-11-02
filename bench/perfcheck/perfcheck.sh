@@ -7,7 +7,7 @@
 #   baseline   a git tag or commit to build (default: the latest v* tag), or a
 #              path to a built skycell.so
 #   candidate  a built skycell.so (default: ../../ext/skycell.so, `make` first)
-#   rounds     default 4; each runs both libraries, the order alternating
+#   rounds     default 20; each runs both libraries, the order alternating
 #
 # It installs each library in turn into the server's pkglibdir -- run it on a
 # development server only -- and restores the candidate at the end.  Each
@@ -23,7 +23,7 @@ cd "$(dirname "$0")"
 db=${PERF_DB:-real36}
 base=${1:-$(git describe --tags --abbrev=0 --match 'v*')}
 cand=${2:-../../ext/skycell.so}
-rounds=${3:-4}
+rounds=${3:-20}
 work=${PERF_WORK:-$(mktemp -d)}
 pkglib=$(pg_config --pkglibdir)
 

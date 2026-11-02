@@ -18,6 +18,7 @@ BEGIN
     INSERT INTO perf_out SELECT w, p.c, percentile_cont(0.5) WITHIN GROUP (ORDER BY t), x FROM unnest(ts) t;
   END LOOP;
 END $$;
+\o /dev/null
 SELECT pg_temp.perf_one(w, q) FROM (VALUES
   ('cone 1"',          'SELECT count(*) FROM gaia_realc WHERE 1 = CONTAINS(POINT(''ICRS'', ra, dec), CIRCLE(''ICRS'', %s, %s, 1.0/3600))'),
   ('cone 1 deg',       'SELECT count(*) FROM gaia_realc WHERE 1 = CONTAINS(POINT(''ICRS'', ra, dec), CIRCLE(''ICRS'', %s, %s, 1))'),
@@ -30,4 +31,5 @@ SELECT pg_temp.perf_one(w, q) FROM (VALUES
   ('partition cone 0.5 deg', 'SELECT count(*) FROM perf_part WHERE 1 = CONTAINS(POINT(''ICRS'', ra, dec), CIRCLE(''ICRS'', %s, %s, 0.5))'),
   ('partition xmatch 300 x 5"', 'SELECT count(*) + 0 * %s * %s FROM perf_probe p JOIN perf_part g ON 1 = CONTAINS(POINT(''ICRS'', g.ra, g.dec), CIRCLE(''ICRS'', p.ra, p.dec, 5.0/3600)) WHERE p.c = %s')
 ) v(w, q);
+\o
 \copy perf_out TO STDOUT CSV
