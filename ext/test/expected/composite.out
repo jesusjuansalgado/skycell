@@ -290,7 +290,7 @@ FROM cregs, comp_counts(r) c ORDER BY name;
 -------------+-------+----------+---------
  annulus     | t     | t        | t
  box less U  | t     | t        | t
- empty       | t     | f        | f
+ empty       | t     | f        | t
  lens        | t     | t        | t
  nested      | t     | t        | t
  not a cap   | t     | t        | t
@@ -306,6 +306,64 @@ FROM ccat WHERE contains(pos, region('DIFFERENCE ICRS (CIRCLE 10 20 2 CIRCLE 10 
  t
 (1 row)
 
+-- which plan: a top-level composite goes to the custom scan (0.39), over its
+-- covering's ranges, as a cone does, from a skypos column or from ra and dec;
+-- under an OR, or with the custom scan off, it keeps the range rewrite.  Every
+-- plan must give the exact test's rows.
+CREATE INDEX ccat_radec ON ccat (skycell_ang2cell(ra, dec));
+ANALYZE ccat;
+CREATE FUNCTION comp_plan_kind(q text) RETURNS text LANGUAGE plpgsql AS $$
+DECLARE l text;
+BEGIN
+  SET LOCAL enable_seqscan = off;   -- the patch is dense: compare index plans only
+  FOR l IN EXECUTE 'EXPLAIN (COSTS OFF) ' || q LOOP
+    IF l ~ 'SkycellCone' THEN RETURN 'custom scan'; END IF;
+    IF l ~ 'Bitmap Index Scan|Index Scan|Index Only Scan' THEN RETURN 'range rewrite'; END IF;
+  END LOOP;
+  RETURN 'other';
+END $$;
+CREATE FUNCTION comp_plan_rows(q text, OUT kind text, OUT agree bool) LANGUAGE plpgsql AS $$
+DECLARE n bigint; m bigint;
+BEGIN
+  kind := comp_plan_kind(q);
+  EXECUTE q INTO n;
+  SET LOCAL enable_indexscan = off;
+  SET LOCAL enable_bitmapscan = off;
+  SET LOCAL skycell.custom_scan = off;
+  EXECUTE q INTO m;
+  agree := n = m;
+  -- SET LOCAL lasts to the end of the statement's transaction, which runs
+  -- every row of the query calling this: restore for the next one
+  SET LOCAL enable_indexscan = on;
+  SET LOCAL enable_bitmapscan = on;
+  SET LOCAL skycell.custom_scan = on;
+END $$;
+SELECT name, (comp_plan_rows(q)).* FROM (VALUES
+  ('pos <@ union',        'SELECT count(*) FROM ccat WHERE pos <@ region(''UNION ICRS (CIRCLE 8 18 1 CIRCLE 12 22 1.5)'')'),
+  ('ADQL annulus',        'SELECT count(*) FROM ccat WHERE CONTAINS(POINT(''ICRS'', ra, dec), REGION(''DIFFERENCE ICRS (CIRCLE 10 20 2 CIRCLE 10 20 1)'')) = 1'),
+  ('region @> pos, NOT',  'SELECT count(*) FROM ccat WHERE region(''NOT ICRS (CIRCLE 10 20 60)'') @> pos'),
+  ('with another term',   'SELECT count(*) FROM ccat WHERE id % 2 = 0 AND pos <@ region(''INTERSECTION ICRS (CIRCLE 10 20 2 CIRCLE 11.5 20 2)'')'),
+  ('under an OR',         'SELECT count(*) FROM ccat WHERE pos <@ region(''UNION ICRS (CIRCLE 8 18 1 CIRCLE 12 22 1.5)'') OR pos <@ circle(''ICRS'', 200, -30, 1)')
+) v(name, q) ORDER BY name;
+        name        |     kind      | agree 
+--------------------+---------------+-------
+ ADQL annulus       | custom scan   | t
+ pos <@ union       | custom scan   | t
+ region @> pos, NOT | custom scan   | t
+ under an OR        | range rewrite | t
+ with another term  | custom scan   | t
+(5 rows)
+
+SET skycell.custom_scan = off;
+SELECT comp_plan_kind('SELECT count(*) FROM ccat WHERE pos <@ region(''UNION ICRS (CIRCLE 8 18 1 CIRCLE 12 22 1.5)'')') AS custom_scan_off;
+ custom_scan_off 
+-----------------
+ range rewrite
+(1 row)
+
+RESET skycell.custom_scan;
+DROP FUNCTION comp_plan_rows(text), comp_plan_kind(text);
+DROP INDEX ccat_radec;
 -- coverings keep every row, for many random composites
 CREATE FUNCTION rand_leaf() RETURNS skyregion LANGUAGE sql VOLATILE AS $$
   SELECT CASE WHEN random() < 0.6 THEN circle('ICRS', 6 + 8 * random(), 16 + 8 * random(), 0.2 + 2 * random())

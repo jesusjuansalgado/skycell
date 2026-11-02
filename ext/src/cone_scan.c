@@ -90,6 +90,7 @@ static bool skycell_nearest_scan = true;
 
 /* the six-argument skycell_cone, as last seen by cone_scan_keep() */
 static Oid	cone_funcid = InvalidOid;
+static Oid	region_scan_funcid = InvalidOid;	/* skycell_region_scan() */
 
 /* skycell_in_cone(float8 x 6), looked up once per cone_funcid */
 static Oid	in_cone_funcid = InvalidOid;
@@ -470,6 +471,56 @@ keep_cone(PlannerInfo *root, FuncExpr *written, FuncExpr *fcall)
 	if (!jointree_has_term(root, (Node *) root->parse->jointree, written))
 		return false;
 	cone_funcid = fcall->funcid;
+	return true;
+}
+
+/*
+ * The same decision for a constant composite region, which the simplify step
+ * (adql.c) turns into skycell_region_scan(cell, ra, dec, region) when the scan
+ * can answer it: cell, ra and dec read one heap relation, the region is a
+ * constant, and the call is a top-level AND term.  Otherwise the composite
+ * keeps the range rewrite.
+ */
+bool
+region_scan_keep(PlannerInfo *root, FuncExpr *written, FuncExpr *fcall)
+{
+	List	   *args = fcall->args;
+	List	   *vars;
+	ListCell   *lc;
+	Index		varno = 0;
+	RangeTblEntry *rte;
+
+	if (!skycell_custom_scan || root == NULL || root->parse == NULL ||
+		list_length(args) != 4 || !IsA(llast(args), Const) ||
+		((Const *) llast(args))->constisnull)
+		return false;
+	vars = sc_pull_local_vars((Node *) list_make3(linitial(args), lsecond(args), lthird(args)),
+							  PVC_INCLUDE_AGGREGATES | PVC_INCLUDE_WINDOWFUNCS | PVC_INCLUDE_PLACEHOLDERS);
+	foreach(lc, vars)
+	{
+		Var		   *v = (Var *) lfirst(lc);
+
+		if (!IsA(v, Var) || v->varlevelsup != 0 || (varno != 0 && v->varno != varno))
+			return false;
+		varno = v->varno;
+	}
+	if (varno == 0 || varno > list_length(root->parse->rtable))
+		return false;
+	rte = rt_fetch(varno, root->parse->rtable);
+	if (rte->rtekind != RTE_RELATION ||
+		(rte->relkind != RELKIND_RELATION && rte->relkind != RELKIND_MATVIEW))
+		return false;
+	{
+		Relation	r = table_open(rte->relid, NoLock);	/* locked by the parser */
+		bool		heap = table_slot_callbacks(r) == &TTSOpsBufferHeapTuple;
+
+		table_close(r, NoLock);
+		if (!heap)
+			return false;
+	}
+	if (!jointree_has_term(root, (Node *) root->parse->jointree, written))
+		return false;
+	region_scan_funcid = fcall->funcid;
 	return true;
 }
 
@@ -1288,7 +1339,7 @@ cone_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, Index rti, RangeTblEnt
 	}
 
 	add_nearest_path(root, rel, rte);
-	if (!OidIsValid(cone_funcid))
+	if (!OidIsValid(cone_funcid) && !OidIsValid(region_scan_funcid))
 		return;
 
 	foreach(lc, rel->baserestrictinfo)
@@ -1304,18 +1355,31 @@ cone_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, Index rti, RangeTblEnt
 		Const	   *bounds;
 		bool		bitmap;
 
-		if (ri->pseudoconstant || !IsA(f, FuncExpr) || f->funcid != cone_funcid ||
-			list_length(f->args) != 6)
+		if (ri->pseudoconstant || !IsA(f, FuncExpr))
 			continue;
-		if (cone_kind(f->args, rel->relid) == CONE_RUNTIME)
+		if (OidIsValid(region_scan_funcid) && f->funcid == region_scan_funcid &&
+			list_length(f->args) == 4)
 		{
-			add_runtime_path(root, rel, rte, f, NULL);
-			continue;
+			/* a constant composite: its covering's ranges, as a cone's */
+			if ((ix = cell_index(rel, linitial(f->args))) == NULL ||
+				!skycell_const_region_cover(root, f->args, &reg, &cov, &dens))
+				continue;
+			sc_region_free(&reg);
 		}
-		if ((ix = cell_index(rel, linitial(f->args))) == NULL)
-			continue;
-		if (!skycell_const_cone_cover(root, f->args, &reg, &cov, &dens))
-			continue;
+		else
+		{
+			if (f->funcid != cone_funcid || list_length(f->args) != 6)
+				continue;
+			if (cone_kind(f->args, rel->relid) == CONE_RUNTIME)
+			{
+				add_runtime_path(root, rel, rte, f, NULL);
+				continue;
+			}
+			if ((ix = cell_index(rel, linitial(f->args))) == NULL)
+				continue;
+			if (!skycell_const_cone_cover(root, f->args, &reg, &cov, &dens))
+				continue;
+		}
 
 		/* copy the ranges out of the covering memo straight away */
 		b = palloc(sizeof(Datum) * Max(2 * cov.n, 1));
@@ -1762,7 +1826,8 @@ cone_plan(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
 	List	   *quals = NIL;
 	ListCell   *lc;
 
-	if (skycell_index_filter)
+	/* a composite's own call is its exact test, and has no cone to filter on */
+	if (skycell_index_filter && driving->funcid != region_scan_funcid)
 	{
 		ira = index_column_of(rel, indexoid, lsecond(driving->args));
 		idec = index_column_of(rel, indexoid, lthird(driving->args));
@@ -1776,7 +1841,16 @@ cone_plan(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
 
 		if (ri->pseudoconstant)
 			continue;
-		if ((Node *) ri->clause == (Node *) driving)
+		if ((Node *) ri->clause == (Node *) driving && driving->funcid == region_scan_funcid)
+		{
+			/* the exact test, without computing each row's cell, which it never reads */
+			FuncExpr   *f = copyObject(driving);
+
+			linitial(f->args) = makeConst(INT8OID, -1, InvalidOid, sizeof(int64),
+										  Int64GetDatum(0), false, true);
+			quals = lappend(quals, f);
+		}
+		else if ((Node *) ri->clause == (Node *) driving)
 		{
 			List	   *a = list_copy_tail(copyObject(driving->args), 1);
 
