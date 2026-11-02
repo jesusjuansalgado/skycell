@@ -1846,7 +1846,7 @@ simplify_poly(PlannerInfo *root, FuncExpr *fexpr)
 			if (scan != NULL && region_scan_keep(root, fexpr, scan))
 			{
 				sc_region_free(&reg);
-				return (Node *) scan;
+				return region_with_partition_bounds(root, scan);
 			}
 		}
 		density_for_var(root, cell, &dens, &dens_statrel, &uses_cell_ops);

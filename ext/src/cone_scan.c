@@ -581,34 +581,30 @@ cone_bound_fn(Oid sibling, const char *name)
  * implies both.  Otherwise the cone alone.  Installed SQL older than 0.40 has
  * no bound functions and gets the cone alone too.
  */
-Node *
-cone_with_partition_bounds(PlannerInfo *root, FuncExpr *cone6)
+/*
+ * Whether cell's relation is range-partitioned on exactly cell (an int8
+ * expression or column): then the partition key's >= and <= operators, for
+ * comparisons PostgreSQL's partition pruning reads.
+ */
+static bool
+partition_key_ops(PlannerInfo *root, Node *cell, Oid *geop, Oid *leop)
 {
-	List	   *args = cone6->args;
-	Node	   *cell = linitial(args);
 	List	   *vars = sc_pull_local_vars(cell, 0);
 	Index		varno;
 	RangeTblEntry *rte;
 	Relation	rel;
 	PartitionKey key;
 	bool		match = false;
-	Oid			geop = InvalidOid,
-				leop = InvalidOid,
-				lofn,
-				hifn;
-	Expr	   *lo,
-			   *hi;
-	OpExpr	   *c1,
-			   *c2;
 
+	*geop = *leop = InvalidOid;
 	if (root == NULL || root->parse == NULL || vars == NIL || !IsA(linitial(vars), Var))
-		return (Node *) cone6;
+		return false;
 	varno = ((Var *) linitial(vars))->varno;
 	if (varno < 1 || varno > (Index) list_length(root->parse->rtable))
-		return (Node *) cone6;
+		return false;
 	rte = rt_fetch(varno, root->parse->rtable);
 	if (rte->rtekind != RTE_RELATION || rte->relkind != RELKIND_PARTITIONED_TABLE)
-		return (Node *) cone6;
+		return false;
 
 	rel = table_open(rte->relid, NoLock);	/* locked by the parser */
 	key = RelationGetPartitionKey(rel);
@@ -627,31 +623,139 @@ cone_with_partition_bounds(PlannerInfo *root, FuncExpr *cone6)
 		}
 		if (match)
 		{
-			geop = get_opfamily_member(key->partopfamily[0], INT8OID, INT8OID,
-									   BTGreaterEqualStrategyNumber);
-			leop = get_opfamily_member(key->partopfamily[0], INT8OID, INT8OID,
-									   BTLessEqualStrategyNumber);
+			*geop = get_opfamily_member(key->partopfamily[0], INT8OID, INT8OID,
+										BTGreaterEqualStrategyNumber);
+			*leop = get_opfamily_member(key->partopfamily[0], INT8OID, INT8OID,
+										BTLessEqualStrategyNumber);
 		}
 	}
 	table_close(rel, NoLock);
-	if (!match || !OidIsValid(geop) || !OidIsValid(leop))
+	return match && OidIsValid(*geop) && OidIsValid(*leop);
+}
+
+/* expr AND cell >= lo AND cell <= hi */
+static Node *
+with_cell_bounds(Node *expr, Node *cell, Oid geop, Oid leop, Expr *lo, Expr *hi)
+{
+	OpExpr	   *c1 = (OpExpr *) make_opclause(geop, BOOLOID, false, (Expr *) copyObject(cell), lo,
+											  InvalidOid, InvalidOid);
+	OpExpr	   *c2 = (OpExpr *) make_opclause(leop, BOOLOID, false, (Expr *) copyObject(cell), hi,
+											  InvalidOid, InvalidOid);
+
+	set_opfuncid(c1);
+	set_opfuncid(c2);
+	return (Node *) makeBoolExpr(AND_EXPR, list_make3(expr, c1, c2), -1);
+}
+
+/*
+ * A kept cone (skycell_cone(cell, ra, dec, ra0, dec0, radius)) with, when its
+ * relation is range-partitioned on exactly its cell expression, the two
+ * comparisons cell >= skycell_cone_cell_lo(ra0, dec0, radius) and cell <=
+ * skycell_cone_cell_hi(...): an AND that PostgreSQL's partition pruning
+ * reads, and the custom scan drops again (cone_implies_clause()), as the cone
+ * implies both.  Otherwise the cone alone.  Installed SQL older than 0.40 has
+ * no bound functions and gets the cone alone too.
+ */
+Node *
+cone_with_partition_bounds(PlannerInfo *root, FuncExpr *cone6)
+{
+	List	   *args = cone6->args;
+	Node	   *cell = linitial(args);
+	Oid			geop,
+				leop,
+				lofn,
+				hifn;
+
+	if (!partition_key_ops(root, cell, &geop, &leop))
 		return (Node *) cone6;
 	lofn = cone_bound_fn(cone6->funcid, "skycell_cone_cell_lo");
 	hifn = cone_bound_fn(cone6->funcid, "skycell_cone_cell_hi");
 	if (!OidIsValid(lofn) || !OidIsValid(hifn))
 		return (Node *) cone6;
+	return with_cell_bounds((Node *) cone6, cell, geop, leop,
+							(Expr *) makeFuncExpr(lofn, INT8OID, list_copy_tail(copyObject(args), 3),
+												  InvalidOid, InvalidOid, COERCE_EXPLICIT_CALL),
+							(Expr *) makeFuncExpr(hifn, INT8OID, list_copy_tail(copyObject(args), 3),
+												  InvalidOid, InvalidOid, COERCE_EXPLICIT_CALL));
+}
 
-	lo = (Expr *) makeFuncExpr(lofn, INT8OID, list_copy_tail(copyObject(args), 3),
-							   InvalidOid, InvalidOid, COERCE_EXPLICIT_CALL);
-	hi = (Expr *) makeFuncExpr(hifn, INT8OID, list_copy_tail(copyObject(args), 3),
-							   InvalidOid, InvalidOid, COERCE_EXPLICIT_CALL);
-	c1 = (OpExpr *) make_opclause(geop, BOOLOID, false, (Expr *) copyObject(cell), lo,
-								  InvalidOid, InvalidOid);
-	c2 = (OpExpr *) make_opclause(leop, BOOLOID, false, (Expr *) copyObject(cell), hi,
-								  InvalidOid, InvalidOid);
-	set_opfuncid(c1);
-	set_opfuncid(c2);
-	return (Node *) makeBoolExpr(AND_EXPR, list_make3(cone6, c1, c2), -1);
+/*
+ * The interval of cells a constant region (a polygon or a composite) can
+ * hold: its bounding cap's, as a cone's (0.45).  The whole sky for a region
+ * whose cap is (a NOT, say).
+ */
+static void
+region_cell_bounds(Datum region, int64 *lo, int64 *hi)
+{
+	sc_region	reg,
+				cap;
+	sc_vec3		c;
+	double		rad;
+
+	*lo = 0;
+	*hi = 12 * ((int64) 1 << (2 * SC_MAX_ORDER)) - 1;
+	skycell_region_from_datum_lite(region, &reg);
+	sc_region_bounding_cap(&reg, &c, &rad);
+	sc_region_free(&reg);
+	if (!(rad < M_PI) || isnan(rad))
+		return;
+	if (sc_region_cone(&cap, atan2(c.y, c.x) * (180.0 / M_PI),
+					   asin(fmax(-1.0, fmin(1.0, c.z))) * (180.0 / M_PI),
+					   rad * (180.0 / M_PI) * (1.0 + 1e-9) + 1e-12, false) != NULL)
+		return;
+	sc_cone_key_bounds(&cap, lo, hi);
+}
+
+/*
+ * A kept skycell_region_scan(cell, ra, dec, region) with, on a catalogue
+ * range-partitioned on its cell, cell >= lo and cell <= hi for the region's
+ * interval: constants, so PostgreSQL prunes at plan time.  The scan drops
+ * them again (region_implies_clause()).
+ */
+Node *
+region_with_partition_bounds(PlannerInfo *root, FuncExpr *scan)
+{
+	Node	   *cell = linitial(scan->args);
+	Const	   *rg = (Const *) lfourth(scan->args);
+	Oid			geop,
+				leop;
+	int64		lo,
+				hi;
+
+	if (!IsA(rg, Const) || rg->constisnull || !partition_key_ops(root, cell, &geop, &leop))
+		return (Node *) scan;
+	region_cell_bounds(rg->constvalue, &lo, &hi);
+	if (lo == 0 && hi == 12 * ((int64) 1 << (2 * SC_MAX_ORDER)) - 1)
+		return (Node *) scan;
+	return with_cell_bounds((Node *) scan, cell, geop, leop, (Expr *) int8_const(lo),
+							(Expr *) int8_const(hi));
+}
+
+/* whether a scan clause is one of those comparisons for this region scan */
+static bool
+region_implies_clause(FuncExpr *driving, Node *clause)
+{
+	OpExpr	   *op;
+	Const	   *rg = (Const *) lfourth(driving->args);
+	Node	   *r;
+	int64		lo,
+				hi,
+				v;
+
+	if (!IsA(clause, OpExpr) || list_length(((OpExpr *) clause)->args) != 2 ||
+		!IsA(rg, Const) || rg->constisnull)
+		return false;
+	op = (OpExpr *) clause;
+	set_opfuncid(op);
+	if (op->opfuncid != F_INT8GE && op->opfuncid != F_INT8LE)
+		return false;
+	r = lsecond(op->args);
+	if (!IsA(r, Const) || ((Const *) r)->constisnull ||
+		!equal(linitial(op->args), linitial(driving->args)))
+		return false;
+	region_cell_bounds(rg->constvalue, &lo, &hi);
+	v = DatumGetInt64(((Const *) r)->constvalue);
+	return op->opfuncid == F_INT8GE ? v <= lo : v >= hi;
 }
 
 /*
@@ -2232,8 +2336,10 @@ cone_plan(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
 
 		if (ri->pseudoconstant)
 			continue;
-		/* a partition bound next to the cone (0.44), which the cone implies */
-		if (driving->funcid != region_scan_funcid && cone_implies_clause(driving, (Node *) ri->clause))
+		/* a partition bound next to the cone or region, which it implies */
+		if (driving->funcid != region_scan_funcid
+			? cone_implies_clause(driving, (Node *) ri->clause)
+			: region_implies_clause(driving, (Node *) ri->clause))
 			continue;
 		if ((Node *) ri->clause == (Node *) driving && driving->funcid == region_scan_funcid)
 		{
