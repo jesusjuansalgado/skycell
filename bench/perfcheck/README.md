@@ -26,9 +26,26 @@ k = 1 (two index descents added to every query), which no test caught.
   neighbours k = 1 and 100, and on the partitioned table a 0.5° cone and a
   cross-match of 300 probes at 5″. Per centre the median of five executions,
   each planned anew at a centre 1e-9° away, after an untimed one.
-- **Verdict** (`report.py`): per workload, the candidate's summed per-centre
-  medians over the baseline's, each centre's median taken over the rounds,
-  with a 95% bootstrap interval over the centres. An interval wholly above
-  `PERF_LIMIT` (1.10) is a REGRESSION and the check exits 1; wholly below
-  1/1.10, faster. Both libraries must return the same counts at every centre.
-- **Time:** about a minute a round on the 4-vCPU host, with the tables built.
+- **Verdict** (`report.py`): the round is the unit. Within one, the two
+  libraries run back to back, so the host's drift between sessions, which
+  moves every centre of a session together, falls on both alike. Per round
+  and workload, the median over centres of the candidate's time over the
+  baseline's at the same centre; over the rounds, their geometric mean with a
+  95% t interval. An interval wholly above `PERF_LIMIT` (1.10) is a REGRESSION
+  and the check exits 1; wholly below 1/1.10, faster. Both libraries must
+  return the same counts at every centre. (A first version bootstrapped over
+  centres; an A/A run gave it intervals that excluded 1, 0.87 [0.83, 0.91] for
+  a 1″ cone.)
+- **Time:** about 4 s a round on the 4-vCPU host, the tables built; 20 rounds
+  by default, under three minutes.
+
+## Validation (`validation/`)
+
+- **A/A**, one library as both (`aa.csv`): every interval holds 1; none is
+  flagged. Their half-widths show what the check can see: about ±5% on the
+  cross-matches and the partitioned workloads, ±10–20% on the sub-millisecond
+  ones, so a short query is caught once it slows by about a fifth, a long one
+  by a tenth.
+- **v0.42 against v0.44** (`v042-v044.csv`): nearest k = 1 is flagged, 1.21
+  [1.13, 1.30], the regression 0.44 shipped; the polygon (0.60) and the
+  partitioned cross-match (0.35) come out faster, as 0.43 and 0.44 made them.

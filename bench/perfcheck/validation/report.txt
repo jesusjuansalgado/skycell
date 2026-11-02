@@ -1,0 +1,26 @@
+| workload | baseline aa.so, ms a round | candidate | candidate / baseline [95%] | |
+|---|---|---|---|---|
+| cone 1" | 0.89 | 0.94 | 1.03 [0.89, 1.20] |  |
+| cone 1 deg | 5.77 | 5.96 | 1.06 [0.90, 1.26] |  |
+| native cone 6' | 0.99 | 1.01 | 1.06 [0.90, 1.24] |  |
+| polygon 0.5 deg | 2.48 | 2.56 | 1.04 [0.92, 1.18] |  |
+| annulus 0.3 deg | 1.72 | 1.76 | 1.05 [0.92, 1.21] |  |
+| xmatch 300 x 1" | 37.78 | 37.49 | 0.99 [0.93, 1.06] |  |
+| nearest k=1 | 1.55 | 1.57 | 1.00 [0.88, 1.13] |  |
+| nearest k=100 | 3.50 | 3.51 | 0.93 [0.84, 1.04] |  |
+| partition cone 0.5 deg | 22.54 | 22.42 | 0.98 [0.93, 1.03] |  |
+| partition xmatch 300 x 5" | 102.76 | 101.59 | 1.01 [0.97, 1.06] |  |
+exit=0
+| workload | baseline skycell-v0.42.so, ms a round | candidate | candidate / baseline [95%] | |
+|---|---|---|---|---|
+| cone 1" | 0.96 | 1.11 | 1.07 [0.96, 1.19] |  |
+| cone 1 deg | 6.12 | 6.73 | 1.03 [0.89, 1.19] |  |
+| native cone 6' | 1.07 | 1.15 | 1.02 [0.90, 1.16] |  |
+| polygon 0.5 deg | 4.63 | 2.52 | 0.60 [0.54, 0.68] | faster |
+| annulus 0.3 deg | 1.75 | 1.71 | 0.99 [0.87, 1.12] |  |
+| xmatch 300 x 1" | 35.94 | 36.76 | 1.02 [0.97, 1.08] |  |
+| nearest k=1 | 1.58 | 1.95 | 1.21 [1.13, 1.30] | REGRESSION |
+| nearest k=100 | 3.54 | 3.84 | 1.09 [1.00, 1.18] |  |
+| partition cone 0.5 deg | 23.99 | 22.43 | 0.94 [0.86, 1.04] |  |
+| partition xmatch 300 x 5" | 291.15 | 99.36 | 0.35 [0.33, 0.36] | faster |
+exit=1
