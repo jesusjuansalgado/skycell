@@ -91,7 +91,11 @@ BEGIN
   PERFORM set_config('enable_seqscan', 'on', true);
 END $$;
 
-SELECT name, tbl, (pt_cmp(q, tbl)).*
+-- (on pt_dec a cross-match cannot be the inner side of a parameterized
+-- Append, its unindexed partition having no such path, and PostgreSQL
+-- versions pick different plans instead: its counts are left out)
+SELECT name, tbl, same,
+       CASE WHEN tbl = 'pt_dec' AND name LIKE 'xmatch%' THEN NULL ELSE custom END AS custom, scans
 FROM (VALUES
   ('cone',        'SELECT count(*) || '':'' || sum(id) FROM CAT WHERE 1 = contains(point(''ICRS'', ra, dec), circle(''ICRS'', 120, 30, 0.3))'),
   ('wide cone',   'SELECT count(*) || '':'' || sum(id) FROM CAT WHERE point(''ICRS'', ra, dec) <@ circle(''ICRS'', 100, 20, 50)'),
@@ -105,22 +109,38 @@ FROM (VALUES
   ('xmatch r',    'SELECT count(*) || '':'' || sum(c.id) FROM pt_probe p JOIN CAT c ON 1 = contains(point(''ICRS'', c.ra, c.dec), circle(''ICRS'', p.ra, p.dec, p.r))'),
   ('xmatch left', 'SELECT count(*) || '':'' || count(c.id) FROM pt_probe p LEFT JOIN CAT c ON skycell_join(c.ra, c.dec, p.ra, p.dec, 0.001)'),
   ('xmatch exists', 'SELECT count(*) FROM pt_probe p WHERE EXISTS (SELECT 1 FROM CAT c WHERE distance(c.ra, c.dec, p.ra, p.dec) < 0.001)')
-) v(name, q), unnest(ARRAY['pt_cell', 'pt_dec', 'pt_patch']) tbl
+) v(name, q), unnest(ARRAY['pt_cell', 'pt_dec', 'pt_patch']) tbl,
+LATERAL pt_cmp(q, tbl)
 ORDER BY tbl, name;
+
+-- each partition's custom scan in an EXPLAIN ANALYZE, with one of its figures
+CREATE FUNCTION pt_scans(q text, field text) RETURNS TABLE (rel text, value text)
+LANGUAGE plpgsql AS $$
+DECLARE j jsonb;
+BEGIN
+  EXECUTE 'EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF, BUFFERS ON, FORMAT JSON) ' || q INTO j;
+  RETURN QUERY
+    SELECT n->>'Relation Name', coalesce(n->>field, '0')
+    FROM jsonb_path_query(j, 'strict $.**') n
+    WHERE jsonb_typeof(n) = 'object' AND n->>'Custom Plan Provider' = 'SkycellCone'
+    ORDER BY 1;
+END $$;
 
 -- a cross-match whose probes all lie in pt_cell1's part of the sky: the
 -- other partitions' scans run once per probe but cover no cone (0 ranges)
 SET enable_hashjoin = off;
 SET enable_mergejoin = off;
-EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF, BUFFERS OFF)
+SELECT * FROM pt_scans($q$
 SELECT count(*) FROM (SELECT * FROM pt_probe WHERE skycell_ang2cell(ra, dec) >= 864691128455135232
                         AND skycell_ang2cell(ra, dec) < 1729382256910270464 LIMIT 30) p
-JOIN pt_cell c ON 1 = contains(point('ICRS', c.ra, c.dec), circle('ICRS', p.ra, p.dec, 0.001));
+JOIN pt_cell c ON 1 = contains(point('ICRS', c.ra, c.dec), circle('ICRS', p.ra, p.dec, 0.001))
+$q$, 'Ranges per Covering');
 RESET enable_hashjoin;
 RESET enable_mergejoin;
 -- a constant cone within one partition (pt_cell4): the others read no page
-EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF, BUFFERS ON)
-SELECT count(*) FROM pt_cell WHERE 1 = contains(point('ICRS', ra, dec), circle('ICRS', 300, -40, 1));
+SELECT * FROM pt_scans($q$
+SELECT count(*) FROM pt_cell WHERE 1 = contains(point('ICRS', ra, dec), circle('ICRS', 300, -40, 1))
+$q$, 'Shared Hit Blocks');
 
-DROP FUNCTION pt_cmp(text, text);
+DROP FUNCTION pt_cmp(text, text), pt_scans(text, text);
 DROP TABLE pt_flat, pt_cell, pt_dec, pt_patch, pt_probe;
