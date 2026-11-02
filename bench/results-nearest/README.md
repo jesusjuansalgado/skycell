@@ -26,22 +26,35 @@ GiST ordering (`pos <-> spoint(...)`).
 
 ## skycell / pgSphere
 
-| k | real DR3, 10M | ObsCore, 0.5M |
-|---|---|---|
-| 1 | 0.55 [0.53, 0.57] | 1.00 [0.89, 1.12] |
-| 10 | 0.47 [0.45, 0.49] | 0.98 [0.88, 1.09] |
-| 100 | 0.59 [0.56, 0.61] | 1.16 [1.04, 1.31] |
-| 1000 | 0.69 [0.68, 0.71] | 1.59 [1.37, 1.83] |
-| 10 beyond 2° | 1.74 [1.71, 1.76] | 1.90 [1.58, 2.35] |
+Rerun with 0.45 (`report.md`, `versions.txt`); the first run, built from main
+after #52, is in `report-v036.md`. Both runs on the same host and tables.
+
+| k | real DR3, 10M, #52 | real DR3, 0.45 | ObsCore, #52 | ObsCore, 0.45 |
+|---|---|---|---|---|
+| 1 | 0.55 [0.53, 0.57] | 0.56 [0.54, 0.59] | 1.00 [0.89, 1.12] | 1.05 [0.95, 1.17] |
+| 10 | 0.47 [0.45, 0.49] | 0.48 [0.45, 0.51] | 0.98 [0.88, 1.09] | 1.01 [0.90, 1.13] |
+| 100 | 0.59 [0.56, 0.61] | 0.57 [0.54, 0.61] | 1.16 [1.04, 1.31] | 1.15 [1.05, 1.28] |
+| 1000 | 0.69 [0.68, 0.71] | 0.67 [0.66, 0.68] | 1.59 [1.37, 1.83] | 1.55 [1.34, 1.78] |
+| 10 beyond 2° | 1.74 [1.71, 1.76] | 0.25 [0.24, 0.26] | 1.90 [1.58, 2.35] | 1.00 [0.66, 1.63] |
 
 - **Real DR3:** skycell takes about half of pgSphere's time up to k = 100.
-- **ObsCore:** level for a few rows, slower for hundreds. Over the 30 centres
-  the scan reads about twice the rows it returns (the ring's margin and the
-  cells its edge crosses), each through a bitmap over an unordered heap; GiST
-  reads close to exactly the rows it returns.
-- **Beyond 2°:** per row read skycell is the cheaper, but it reads about 3×
-  more rows: the last ring overshoots, and cells on the rings' edges are read
-  twice.
+- **Beyond 2°:** since 0.45 the rings start at the distance the condition
+  sets, instead of growing out to it from the centre: a quarter of pgSphere's
+  time on DR3, level on ObsCore.
+- **ObsCore:** level for a few rows, slower for hundreds. The scan reads about
+  2.5 times the rows it returns there: the first ring, sized from the density
+  of a cell round the centre, holds more rows than wanted where observations
+  cluster in fields, each read through a bitmap over an unordered heap.
+- **Tried and dropped (`ab.csv`, `ab.sh`):** testing each index entry by its
+  key, an order-29 cell, before the heap is read, and cutting the first ring
+  to the nearest keys. It cut the rows read to 1.2-1.6 per row returned, but
+  on this table, which is in memory, a skipped heap fetch saves less than the
+  key's decoding, the sort and the bitmap's entry-by-entry filling cost: 12-15%
+  slower at k = 100-1000 in a same-day A/B against v0.44.
+- **A regression found and fixed:** 0.44 read the index's lowest and highest
+  key at every nearest query (for partitions), about 25 µs, a third of a
+  k = 1 search (`bisect-v042-v044.txt`: v0.42 77 µs, v0.44 104 µs). Since
+  0.45 only a partition reads them (`bisect-fix.txt`: 78 µs).
 
 The answers were checked separately against PostgreSQL's own sort (the
 `nearest` regression test, and #50's sweeps); this run counts rows only.

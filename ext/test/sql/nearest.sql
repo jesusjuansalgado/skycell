@@ -130,9 +130,29 @@ BEGIN
   END LOOP;
   RETURN NULL;
 END $$;
+-- past a distance the rings start at it (0.45), instead of growing out to
+-- it from the centre
 SELECT nn_rings('SELECT id FROM nn_cat ORDER BY skycell_dist(ra, dec, 10, 20) LIMIT 5') AS one_ring,
        nn_rings('SELECT id FROM nn_cat WHERE skycell_dist(ra, dec, 10, 20) > 40
-                 ORDER BY skycell_dist(ra, dec, 10, 20) LIMIT 20') > 2 AS several_rings;
+                 ORDER BY skycell_dist(ra, dec, 10, 20) LIMIT 20') <= 2 AS starts_past_it;
+
+-- lower bounds in every spelling, with and without an upper one, and ones
+-- that keep nothing (NULL, NaN, or beyond the upper bound)
+SELECT count(*) AS queries, count(*) FILTER (WHERE nn_same(q)) AS same,
+       count(*) FILTER (WHERE nn_plan(q) ~ 'nearest') AS nearest
+FROM (SELECT format('SELECT id, skycell_dist(ra, dec, %s, %s) d FROM nn_%s WHERE %s ORDER BY 2 LIMIT %s',
+                    c.ra, c.dec, tbl, format(w, c.ra, c.dec), k) q
+      FROM nn_centre c, unnest(ARRAY['cat', 'sorted']) tbl, unnest(ARRAY[3, 60]) k,
+           unnest(ARRAY['skycell_dist(ra, dec, %1$s, %2$s) >= 1',
+                        '2 < skycell_dist(ra, dec, %1$s, %2$s)',
+                        '0.5 <= skycell_dist(ra, dec, %1$s, %2$s)',
+                        'skycell_dist(ra, dec, %1$s, %2$s) > 1 AND skycell_dist(ra, dec, %1$s, %2$s) < 4',
+                        'skycell_dist(ra, dec, %1$s, %2$s) > 0.2 AND skycell_dist(ra, dec, %1$s, %2$s) > 3 AND mag < 10',
+                        'skycell_dist(ra, dec, %1$s, %2$s) > 5 AND skycell_dist(ra, dec, %1$s, %2$s) < 2',
+                        'skycell_dist(ra, dec, %1$s, %2$s) > NULL::float8',
+                        $w$skycell_dist(ra, dec, %1$s, %2$s) > 'NaN'::float8$w$,
+                        'skycell_dist(ra, dec, %1$s, %2$s) > 179.9']) w) t;
+
 
 -- a radius the conditions bound the answer to -- the distance below it, ADQL's
 -- CONTAINS, a cone round the same centre -- is as far as the rings go: fewer
@@ -170,6 +190,7 @@ FROM (SELECT format('SELECT id, skycell_dist(ra, dec, %s, %s) d FROM nn_cat WHER
                     c.ra, c.dec, c.ra + 3, c.dec) FROM nn_centre c) t;
 SELECT nn_same('SELECT id, skycell_dist(ra, dec, 10, 20) d FROM nn_cat WHERE skycell_dist(ra, dec, 10, 20) < NULL::float8 ORDER BY 2 LIMIT 10') AS null_radius;
 RESET enable_sort;
+
 
 -- past the relation: every row, NULL distances last, through the final ring
 -- (forced: a sort is cheaper); OFFSET into the tail; a tiny work_mem, so that

@@ -1935,7 +1935,7 @@ region_simplify_oriented(SupportRequestSimplify *req, Oid funcid, Node *pt, Node
 													InvalidOid, InvalidOid, COERCE_EXPLICIT_CALL);
 
 					if (region_scan_keep(req->root, req->fcall, scan))
-						return (Node *) scan;
+						return region_with_partition_bounds(req->root, scan);
 				}
 			}
 		}

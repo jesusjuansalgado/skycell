@@ -562,34 +562,30 @@ cone_bound_fn(Oid sibling, const char *name)
  * implies both.  Otherwise the cone alone.  Installed SQL older than 0.40 has
  * no bound functions and gets the cone alone too.
  */
-Node *
-cone_with_partition_bounds(PlannerInfo *root, FuncExpr *cone6)
+/*
+ * Whether cell's relation is range-partitioned on exactly cell (an int8
+ * expression or column): then the partition key's >= and <= operators, for
+ * comparisons PostgreSQL's partition pruning reads.
+ */
+static bool
+partition_key_ops(PlannerInfo *root, Node *cell, Oid *geop, Oid *leop)
 {
-	List	   *args = cone6->args;
-	Node	   *cell = linitial(args);
 	List	   *vars = sc_pull_local_vars(cell, 0);
 	Index		varno;
 	RangeTblEntry *rte;
 	Relation	rel;
 	PartitionKey key;
 	bool		match = false;
-	Oid			geop = InvalidOid,
-				leop = InvalidOid,
-				lofn,
-				hifn;
-	Expr	   *lo,
-			   *hi;
-	OpExpr	   *c1,
-			   *c2;
 
+	*geop = *leop = InvalidOid;
 	if (root == NULL || root->parse == NULL || vars == NIL || !IsA(linitial(vars), Var))
-		return (Node *) cone6;
+		return false;
 	varno = ((Var *) linitial(vars))->varno;
 	if (varno < 1 || varno > (Index) list_length(root->parse->rtable))
-		return (Node *) cone6;
+		return false;
 	rte = rt_fetch(varno, root->parse->rtable);
 	if (rte->rtekind != RTE_RELATION || rte->relkind != RELKIND_PARTITIONED_TABLE)
-		return (Node *) cone6;
+		return false;
 
 	rel = table_open(rte->relid, NoLock);	/* locked by the parser */
 	key = RelationGetPartitionKey(rel);
@@ -608,31 +604,139 @@ cone_with_partition_bounds(PlannerInfo *root, FuncExpr *cone6)
 		}
 		if (match)
 		{
-			geop = get_opfamily_member(key->partopfamily[0], INT8OID, INT8OID,
-									   BTGreaterEqualStrategyNumber);
-			leop = get_opfamily_member(key->partopfamily[0], INT8OID, INT8OID,
-									   BTLessEqualStrategyNumber);
+			*geop = get_opfamily_member(key->partopfamily[0], INT8OID, INT8OID,
+										BTGreaterEqualStrategyNumber);
+			*leop = get_opfamily_member(key->partopfamily[0], INT8OID, INT8OID,
+										BTLessEqualStrategyNumber);
 		}
 	}
 	table_close(rel, NoLock);
-	if (!match || !OidIsValid(geop) || !OidIsValid(leop))
+	return match && OidIsValid(*geop) && OidIsValid(*leop);
+}
+
+/* expr AND cell >= lo AND cell <= hi */
+static Node *
+with_cell_bounds(Node *expr, Node *cell, Oid geop, Oid leop, Expr *lo, Expr *hi)
+{
+	OpExpr	   *c1 = (OpExpr *) make_opclause(geop, BOOLOID, false, (Expr *) copyObject(cell), lo,
+											  InvalidOid, InvalidOid);
+	OpExpr	   *c2 = (OpExpr *) make_opclause(leop, BOOLOID, false, (Expr *) copyObject(cell), hi,
+											  InvalidOid, InvalidOid);
+
+	set_opfuncid(c1);
+	set_opfuncid(c2);
+	return (Node *) makeBoolExpr(AND_EXPR, list_make3(expr, c1, c2), -1);
+}
+
+/*
+ * A kept cone (skycell_cone(cell, ra, dec, ra0, dec0, radius)) with, when its
+ * relation is range-partitioned on exactly its cell expression, the two
+ * comparisons cell >= skycell_cone_cell_lo(ra0, dec0, radius) and cell <=
+ * skycell_cone_cell_hi(...): an AND that PostgreSQL's partition pruning
+ * reads, and the custom scan drops again (cone_implies_clause()), as the cone
+ * implies both.  Otherwise the cone alone.  Installed SQL older than 0.40 has
+ * no bound functions and gets the cone alone too.
+ */
+Node *
+cone_with_partition_bounds(PlannerInfo *root, FuncExpr *cone6)
+{
+	List	   *args = cone6->args;
+	Node	   *cell = linitial(args);
+	Oid			geop,
+				leop,
+				lofn,
+				hifn;
+
+	if (!partition_key_ops(root, cell, &geop, &leop))
 		return (Node *) cone6;
 	lofn = cone_bound_fn(cone6->funcid, "skycell_cone_cell_lo");
 	hifn = cone_bound_fn(cone6->funcid, "skycell_cone_cell_hi");
 	if (!OidIsValid(lofn) || !OidIsValid(hifn))
 		return (Node *) cone6;
+	return with_cell_bounds((Node *) cone6, cell, geop, leop,
+							(Expr *) makeFuncExpr(lofn, INT8OID, list_copy_tail(copyObject(args), 3),
+												  InvalidOid, InvalidOid, COERCE_EXPLICIT_CALL),
+							(Expr *) makeFuncExpr(hifn, INT8OID, list_copy_tail(copyObject(args), 3),
+												  InvalidOid, InvalidOid, COERCE_EXPLICIT_CALL));
+}
 
-	lo = (Expr *) makeFuncExpr(lofn, INT8OID, list_copy_tail(copyObject(args), 3),
-							   InvalidOid, InvalidOid, COERCE_EXPLICIT_CALL);
-	hi = (Expr *) makeFuncExpr(hifn, INT8OID, list_copy_tail(copyObject(args), 3),
-							   InvalidOid, InvalidOid, COERCE_EXPLICIT_CALL);
-	c1 = (OpExpr *) make_opclause(geop, BOOLOID, false, (Expr *) copyObject(cell), lo,
-								  InvalidOid, InvalidOid);
-	c2 = (OpExpr *) make_opclause(leop, BOOLOID, false, (Expr *) copyObject(cell), hi,
-								  InvalidOid, InvalidOid);
-	set_opfuncid(c1);
-	set_opfuncid(c2);
-	return (Node *) makeBoolExpr(AND_EXPR, list_make3(cone6, c1, c2), -1);
+/*
+ * The interval of cells a constant region (a polygon or a composite) can
+ * hold: its bounding cap's, as a cone's (0.45).  The whole sky for a region
+ * whose cap is (a NOT, say).
+ */
+static void
+region_cell_bounds(Datum region, int64 *lo, int64 *hi)
+{
+	sc_region	reg,
+				cap;
+	sc_vec3		c;
+	double		rad;
+
+	*lo = 0;
+	*hi = 12 * ((int64) 1 << (2 * SC_MAX_ORDER)) - 1;
+	skycell_region_from_datum_lite(region, &reg);
+	sc_region_bounding_cap(&reg, &c, &rad);
+	sc_region_free(&reg);
+	if (!(rad < M_PI) || isnan(rad))
+		return;
+	if (sc_region_cone(&cap, atan2(c.y, c.x) * (180.0 / M_PI),
+					   asin(fmax(-1.0, fmin(1.0, c.z))) * (180.0 / M_PI),
+					   rad * (180.0 / M_PI) * (1.0 + 1e-9) + 1e-12, false) != NULL)
+		return;
+	sc_cone_key_bounds(&cap, lo, hi);
+}
+
+/*
+ * A kept skycell_region_scan(cell, ra, dec, region) with, on a catalogue
+ * range-partitioned on its cell, cell >= lo and cell <= hi for the region's
+ * interval: constants, so PostgreSQL prunes at plan time.  The scan drops
+ * them again (region_implies_clause()).
+ */
+Node *
+region_with_partition_bounds(PlannerInfo *root, FuncExpr *scan)
+{
+	Node	   *cell = linitial(scan->args);
+	Const	   *rg = (Const *) lfourth(scan->args);
+	Oid			geop,
+				leop;
+	int64		lo,
+				hi;
+
+	if (!IsA(rg, Const) || rg->constisnull || !partition_key_ops(root, cell, &geop, &leop))
+		return (Node *) scan;
+	region_cell_bounds(rg->constvalue, &lo, &hi);
+	if (lo == 0 && hi == 12 * ((int64) 1 << (2 * SC_MAX_ORDER)) - 1)
+		return (Node *) scan;
+	return with_cell_bounds((Node *) scan, cell, geop, leop, (Expr *) int8_const(lo),
+							(Expr *) int8_const(hi));
+}
+
+/* whether a scan clause is one of those comparisons for this region scan */
+static bool
+region_implies_clause(FuncExpr *driving, Node *clause)
+{
+	OpExpr	   *op;
+	Const	   *rg = (Const *) lfourth(driving->args);
+	Node	   *r;
+	int64		lo,
+				hi,
+				v;
+
+	if (!IsA(clause, OpExpr) || list_length(((OpExpr *) clause)->args) != 2 ||
+		!IsA(rg, Const) || rg->constisnull)
+		return false;
+	op = (OpExpr *) clause;
+	set_opfuncid(op);
+	if (op->opfuncid != F_INT8GE && op->opfuncid != F_INT8LE)
+		return false;
+	r = lsecond(op->args);
+	if (!IsA(r, Const) || ((Const *) r)->constisnull ||
+		!equal(linitial(op->args), linitial(driving->args)))
+		return false;
+	region_cell_bounds(rg->constvalue, &lo, &hi);
+	v = DatumGetInt64(((Const *) r)->constvalue);
+	return op->opfuncid == F_INT8GE ? v <= lo : v >= hi;
 }
 
 /*
@@ -1860,6 +1964,38 @@ radius_expr_ok(PlannerInfo *root, RelOptInfo *rel, Node *r)
 		!contain_subplans(r) && !bms_is_member(rel->relid, pull_varnos(root, r));
 }
 
+/*
+ * The radii the conditions keep the answer beyond: dist > x, dist >= x,
+ * x < dist, x <= dist (0.45).  No row nearer than the greatest of them can
+ * pass, so the rings start there instead of at the centre.
+ */
+static List *
+nearest_lower_bounds(PlannerInfo *root, RelOptInfo *rel, Node *dist)
+{
+	List	   *bounds = NIL;
+	ListCell   *lc;
+
+	foreach(lc, rel->baserestrictinfo)
+	{
+		Node	   *q = (Node *) lfirst_node(RestrictInfo, lc)->clause;
+		Node	   *r = NULL;
+
+		if (IsA(q, OpExpr) && list_length(((OpExpr *) q)->args) == 2)
+		{
+			OpExpr	   *op = (OpExpr *) q;
+			Oid			fn = OidIsValid(op->opfuncid) ? op->opfuncid : get_opcode(op->opno);
+
+			if ((fn == F_FLOAT8GT || fn == F_FLOAT8GE) && equal(linitial(op->args), dist))
+				r = lsecond(op->args);
+			else if ((fn == F_FLOAT8LT || fn == F_FLOAT8LE) && equal(lsecond(op->args), dist))
+				r = linitial(op->args);
+		}
+		if (r != NULL && radius_expr_ok(root, rel, r))
+			bounds = lappend(bounds, copyObject(r));
+	}
+	return bounds;
+}
+
 static List *
 nearest_bounds(PlannerInfo *root, RelOptInfo *rel, Node *dist, Node *ra0, Node *dec0)
 {
@@ -1960,7 +2096,8 @@ add_nearest_path(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte)
 						all;
 			bool		bitmap,
 						bitmap_all;
-			List	   *bounds;
+			List	   *bounds,
+					   *lower;
 			ListCell   *lb;
 			double		bound = -1;
 
@@ -1999,6 +2136,7 @@ add_nearest_path(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte)
 			 * it is a constant -- and there is no reading past it.
 			 */
 			bounds = nearest_bounds(root, rel, expr, ra0, dec0);
+			lower = nearest_lower_bounds(root, rel, expr);
 			foreach(lb, bounds)
 			{
 				Const	   *b = (Const *) lfirst(lb);
@@ -2044,6 +2182,7 @@ add_nearest_path(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte)
 																 Int16GetDatum(IsA(cell, Var) ? ((Var *) cell)->varattno : 1),
 																 false, true)),
 											list_concat(list_make3(expr, ra0, dec0), bounds));
+			cp->custom_private = lappend(cp->custom_private, lower);
 			cp->methods = &nearest_path_methods;
 			add_path(rel, &cp->path);
 			return;
@@ -2091,6 +2230,12 @@ nearest_plan(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
 	cs->custom_exprs = list_concat(list_make3(copyObject(lsecond(e)), copyObject(lthird(e)),
 											  copyObject(linitial(e))),
 								   copyObject(list_copy_tail(e, 3)));
+	/* the lower bounds after the upper ones, and how many upper ones there are */
+	cs->custom_private = lappend(cs->custom_private,
+								 makeConst(INT4OID, -1, InvalidOid, sizeof(int32),
+										   Int32GetDatum(list_length(e) - 3), false, true));
+	cs->custom_exprs = list_concat(cs->custom_exprs,
+								   copyObject((List *) list_nth(p, 5)));
 	cs->custom_scan_tlist = NIL;
 	cs->methods = &nearest_scan_methods;
 	return &cs->scan.plan;
@@ -2172,8 +2317,10 @@ cone_plan(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
 
 		if (ri->pseudoconstant)
 			continue;
-		/* a partition bound next to the cone (0.44), which the cone implies */
-		if (driving->funcid != region_scan_funcid && cone_implies_clause(driving, (Node *) ri->clause))
+		/* a partition bound next to the cone or region, which it implies */
+		if (driving->funcid != region_scan_funcid
+			? cone_implies_clause(driving, (Node *) ri->clause)
+			: region_implies_clause(driving, (Node *) ri->clause))
 			continue;
 		if ((Node *) ri->clause == (Node *) driving && driving->funcid == region_scan_funcid)
 		{
@@ -3037,6 +3184,7 @@ typedef struct NearestScanState
 				r;				/* for the first, which starts at the centre */
 	double		bound;			/* no ring reads past this radius; < 0: none */
 	bool		last;			/* the current ring reaches the bound */
+	int			nupper;			/* bounds among the args: the upper ones first */
 
 	/*
 	 * The current ring's rows: copies of their heap tuples with their
@@ -3083,8 +3231,25 @@ nearest_begin(CustomScanState *node, EState *estate, int eflags)
 	TupleDesc	hd = RelationGetDescr(heap);
 
 	cone_begin(node, estate, eflags);
+
+	/*
+	 * Off a partition, no key range: the cells an all-sky table holds clip
+	 * nothing, and reading its two ends costs a query of a few rows a third
+	 * of its time (0.44 did, at every query).  A partition reads them, at the
+	 * first ring, so that rings over another part of the sky read nothing.
+	 */
+	if (!heap->rd_rel->relispartition)
+	{
+		ns->cone.have_keyrange = true;
+		ns->cone.kmin = PG_INT64_MIN;
+		ns->cone.kmax = PG_INT64_MAX;
+		ns->cone.keys_partial = false;
+	}
 	ns->k0 = DatumGetFloat8(list_nth_node(Const, cscan->custom_private, 9)->constvalue);
 	ns->want = DatumGetFloat8(list_nth_node(Const, cscan->custom_private, 10)->constvalue);
+	ns->nupper = list_length(cscan->custom_private) > 11
+		? DatumGetInt32(list_nth_node(Const, cscan->custom_private, 11)->constvalue)
+		: list_length(cscan->custom_exprs) - 3;
 	if (eflags & EXEC_FLAG_EXPLAIN_ONLY)
 		return;
 
@@ -3590,6 +3755,7 @@ nearest_ring(NearestScanState *ns)
 					null2;
 		Datum		a = ExecEvalExpr((ExprState *) linitial(st->args), econtext, &null1);
 		Datum		b = ExecEvalExpr((ExprState *) lsecond(st->args), econtext, &null2);
+		double		lower;
 
 		ns->started = true;
 		ns->rprev = -1.0;
@@ -3603,6 +3769,7 @@ nearest_ring(NearestScanState *ns)
 		 * farther.  A NULL one keeps no row at all.
 		 */
 		ns->bound = -1.0;
+		lower = -1.0;
 		for (int i = 3; i < list_length(st->args); i++)
 		{
 			bool		isnull;
@@ -3614,9 +3781,21 @@ nearest_ring(NearestScanState *ns)
 				ns->done = true;
 				return;
 			}
+			if (i >= 3 + ns->nupper)
+			{
+				/* a lower bound (0.45): no row nearer passes; a hair narrower */
+				if (b > lower)
+					lower = b;
+				continue;
+			}
 			b = fmin(180.0, fmax(0.0, b) * (1.0 + 1e-9) + 1e-12);
 			if (ns->bound < 0 || b < ns->bound)
 				ns->bound = b;
+		}
+		if (lower >= 180.0 || (ns->bound >= 0 && lower >= 0 && lower >= ns->bound))
+		{
+			ns->done = true;		/* no distance is both beyond and within */
+			return;
 		}
 		ns->ra0 = null1 ? 0.0 : DatumGetFloat8(a);
 		ns->dec0 = null2 ? 0.0 : DatumGetFloat8(b);
@@ -3629,6 +3808,19 @@ nearest_ring(NearestScanState *ns)
 		else
 		{
 			ns->r = nearest_first_radius(ns, ns->k0, n);
+
+			/*
+			 * Beyond a lower bound the first ring is the annulus from it
+			 * that holds as many rows, at the density round the centre.
+			 */
+			if (lower > 0)
+			{
+				ns->rprev = lower * (1.0 - 1e-9) - 1e-12;
+				if (ns->rprev > 0)
+					ns->r = cap_radius(cap_area(ns->rprev) + cap_area(ns->r));
+				else
+					ns->rprev = -1.0;
+			}
 			ns->final = ns->r >= 180.0 || ns->k0 >= 0.5 * n;
 			if (ns->bound >= 0 && (ns->final || ns->r >= ns->bound))
 			{

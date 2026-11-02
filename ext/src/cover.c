@@ -2482,6 +2482,19 @@ sc_cone_key_bounds(const sc_region *r, int64_t *lo, int64_t *hi)
 		return;
 	}
 	order = seed_cone(r, &s);
+
+	/*
+	 * A cone past seed_cone()'s 10 deg, but within 90 deg, where the seed's
+	 * interval in (tt, z) still holds every point of the disc: seeded at a
+	 * coarse order instead, cells of 7 deg and up, which bounds its cells as
+	 * well, if more loosely.
+	 */
+	if (order < 0 && r->kind == SC_REGION_CONE && r->radius < M_PI / 2)
+	{
+		for (order = 3; order >= 0; order--)
+			if (seed_cone_at(r, order, &s))
+				break;
+	}
 	if (order < 0 || s.n == 0)
 		return;
 	*lo = sc_pix_lo(order, s.pix[0]);

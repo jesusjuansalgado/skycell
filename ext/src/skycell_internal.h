@@ -65,6 +65,7 @@ extern void cone_scan_init(void);
 extern bool cone_scan_keep(PlannerInfo *root, FuncExpr *fcall);
 extern bool cone_scan_keep_as(PlannerInfo *root, FuncExpr *written, FuncExpr *cone6);
 extern Node *cone_with_partition_bounds(PlannerInfo *root, FuncExpr *cone6);
+extern Node *region_with_partition_bounds(PlannerInfo *root, FuncExpr *scan);
 extern void skycell_index_adql_predicates(PlannerInfo *root);
 extern bool skycell_distance_order(Node *expr, Index relid, Node **cell, Node **ra0,
 								   Node **dec0);
