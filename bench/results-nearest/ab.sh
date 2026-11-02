@@ -13,7 +13,7 @@ for r in $(seq 1 "$rounds"); do
   if [ $((r % 2)) = 1 ]; then order="1 2"; else order="2 1"; fi
   for i in $order; do
     if [ $i = 1 ]; then lib=$1; label=$2; else lib=$3; label=$4; fi
-    cp "$lib" "$(pg_config --pkglibdir)/skycell.so"
+    cp "$lib" "$(pg_config --pkglibdir)/.skycell.so.ab" && mv -f "$(pg_config --pkglibdir)/.skycell.so.ab" "$(pg_config --pkglibdir)/skycell.so"   # by rename: see ../perfcheck/perfcheck.sh
     for db in oc05 real36; do
       t=$([ $db = oc05 ] && echo oc || echo gaia_realc)
       psql -d $db -X -q -c "SELECT count(*) FROM $t" >/dev/null

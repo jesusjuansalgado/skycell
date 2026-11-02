@@ -12,3 +12,4 @@ ext/test/regression.*
 ext/results/
 ext/regression.*
 *.bc.tmp
+bench/perfcheck/perf.csv

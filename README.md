@@ -1044,7 +1044,18 @@ in the source comments point to are in
 
 ## Testing
 
-Two layers, both in [`ext/test/`](ext/test/).
+Two layers, both in [`ext/test/`](ext/test/), and a performance check.
+
+**Performance, against the last release** — `make perfcheck` in `ext/`, on a
+development server with the benchmark database (about three minutes;
+[`bench/perfcheck/`](bench/perfcheck/)). The tests below check answers, not
+speed: 0.44 shipped a nearest-neighbour search a third slower at k = 1 that
+none of them could see. The check installs the library just built and the
+latest release tag in turn, over 20 alternating rounds, times ten short
+workloads (cones, a polygon, an annulus, a cross-match, nearest neighbours,
+a partitioned cone and cross-match) at 30 centres, and fails when one is more
+than 10% slower with 95% confidence; both libraries must return the same
+rows. Run against v0.42, it flags v0.44's regression (1.21 [1.13, 1.30]).
 
 **Geometry, standalone** — `make selftest` in `ext/`, no PostgreSQL needed
 (about two minutes):
