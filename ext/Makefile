@@ -75,3 +75,14 @@ upgrade:
 	  fi; \
 	done; \
 	if [ $$n -eq 0 ]; then echo "  no database has skycell installed"; fi
+
+# Performance check: the library just built against a baseline (default: the
+# latest v* tag, built from git), in alternating rounds on the server the PG*
+# variables point at, which must have the real36 benchmark database (see
+# ../bench/perfcheck/README.md).  It swaps the installed library: development
+# servers only.  Fails on a workload more than 10% slower.
+#
+#   make perfcheck [PERF_BASE=v0.44] [PERF_ROUNDS=4]
+.PHONY: perfcheck
+perfcheck: all
+	cd ../bench/perfcheck && ./perfcheck.sh "$(PERF_BASE)" $(CURDIR)/skycell.so $(or $(PERF_ROUNDS),4)
