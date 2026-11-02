@@ -304,6 +304,47 @@ DROP FUNCTION nn_val(text);
 DROP FUNCTION nn_scan(text);
 DROP TABLE nn_gen, nn_chk, nn_nullable, nn_notvalid, nn_unenforced, nn_other;
 
+-- a partitioned catalogue (0.40): each partition offers the nearest scan with
+-- the ORDER BY expression in its own columns, and PostgreSQL merges their
+-- ordered rows under the LIMIT (Merge Append).  A partition holding another
+-- part of the sky finds where its rows start from the index (a best-first
+-- walk over cells) instead of growing its rings blindly.  Declination bands,
+-- one created with its columns in another order and attached, one split again
+-- by right ascension, a default partition for the NULL declinations, and one
+-- band left without the cell index (sorted instead): every answer the sort's.
+CREATE TABLE nn_part (id int, ra float8, dec float8) PARTITION BY RANGE (dec);
+CREATE TABLE nn_part_s PARTITION OF nn_part FOR VALUES FROM (-90) TO (-30);
+CREATE TABLE nn_part_m (dec float8, id int, ra float8);
+ALTER TABLE nn_part ATTACH PARTITION nn_part_m FOR VALUES FROM (-30) TO (30);
+CREATE TABLE nn_part_n PARTITION OF nn_part FOR VALUES FROM (30) TO (60) PARTITION BY RANGE (ra);
+CREATE TABLE nn_part_n1 PARTITION OF nn_part_n FOR VALUES FROM (0) TO (180);
+CREATE TABLE nn_part_n2 PARTITION OF nn_part_n FOR VALUES FROM (180) TO (360);
+CREATE TABLE nn_part_p PARTITION OF nn_part FOR VALUES FROM (60) TO (90.0001);
+CREATE TABLE nn_part_d PARTITION OF nn_part DEFAULT;
+INSERT INTO nn_part SELECT id, ra, dec FROM nn_cat;
+CREATE INDEX nn_part_cell ON ONLY nn_part (skycell_ang2cell(ra, dec));
+CREATE INDEX ON nn_part_s (skycell_ang2cell(ra, dec));
+CREATE INDEX ON nn_part_m (skycell_ang2cell(ra, dec));
+CREATE INDEX ON nn_part_n1 (skycell_ang2cell(ra, dec));
+CREATE INDEX ON nn_part_n2 (skycell_ang2cell(ra, dec));
+CREATE INDEX ON nn_part_d (skycell_ang2cell(ra, dec));
+ANALYZE nn_part;
+SELECT count(*) AS queries, count(*) FILTER (WHERE nn_same(q)) AS same,
+       count(*) FILTER (WHERE nn_plan(q) ~ 'nearest') AS nearest,
+       count(*) FILTER (WHERE nn_plan(q) ~ 'sort') AS a_band_sorted
+FROM (SELECT format('SELECT id, skycell_dist(ra, dec, %s, %s) d FROM nn_part ORDER BY 2 LIMIT %s',
+                    c.ra, c.dec, k) q
+      FROM nn_centre c, unnest(ARRAY[1, 7, 50, 1000]) k) t;
+-- pruned to the northern bands by a condition on the partition key
+SELECT count(*) AS queries, count(*) FILTER (WHERE nn_same(q)) AS same,
+       count(*) FILTER (WHERE nn_plan(q) ~ 'nearest') AS nearest
+FROM (SELECT format('SELECT id, skycell_dist(ra, dec, %s, %s) d FROM nn_part WHERE dec > 30 ORDER BY 2 LIMIT %s',
+                    c.ra, c.dec, k) q
+      FROM nn_centre c, unnest(ARRAY[3, 300]) k) t;
+-- the band far from the centre finds its first row by probing cells
+SELECT nn_plan('SELECT id FROM nn_part ORDER BY skycell_dist(ra, dec, 10, 75) LIMIT 5') AS plan;
+DROP TABLE nn_part;
+
 DROP FUNCTION nn_param(float8, float8, int);
 DROP FUNCTION nn_read(text);
 DROP FUNCTION nn_rings(text);
