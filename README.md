@@ -750,7 +750,7 @@ skycell_dist(…)` with a `LIMIT` is indexed ([Nearest neighbours](#nearest-neig
 | Function | Returns | Notes |
 |---|---|---|
 | `skycell_cone_ranges(ra0, dec0, radius [, tbl, col])` | `SETOF (lo, hi)` | the covering as index ranges, for hand-built plans (a `LATERAL` cross-match); the plain join through the custom scan is faster. Index with `skycell_cell_ops` (`CREATE INDEX ON t (skycell_ang2cell(ra, dec) skycell_cell_ops)`) so the planner can estimate such a range join |
-| `skycell_cone_cell_lo(ra0, dec0, radius)`<br>`skycell_cone_cell_hi(ra0, dec0, radius)` | `int8` | the lowest and highest order-29 cell the cone can hold (since SQL 0.40). The planner adds `cell >= lo AND cell <= hi` next to a cone on a catalogue range-partitioned by its cell, so PostgreSQL prunes the partitions the cone cannot reach; the custom scan leaves them out of its filter. The whole sky for a cone over 10° or an invalid centre |
+| `skycell_cone_cell_lo(ra0, dec0, radius)`<br>`skycell_cone_cell_hi(ra0, dec0, radius)` | `int8` | the lowest and highest order-29 cell the cone can hold (since SQL 0.40). The planner adds `cell >= lo AND cell <= hi` next to a cone on a catalogue range-partitioned by its cell, so PostgreSQL prunes the partitions the cone cannot reach; the custom scan leaves them out of its filter. The whole sky for a cone over 90° or an invalid centre; cones over 10° are bounded more loosely (since 0.45). Constant polygons and composites get the same comparisons, as constants, from their bounding circle |
 | `skycell_poly_ranges(poly [, tbl, col])` | `SETOF (lo, hi)` | the same for a polygon |
 | `skycell_cone_moc(ra0, dec0, radius [, max_cells, max_order])` | `int8[]` | the covering as IVOA MOC `NUNIQ` cells — store these to index a region |
 | `skycell_poly_moc(poly [, max_cells, max_order])` | `int8[]` | likewise |
@@ -880,8 +880,9 @@ Partitioned time over unpartitioned, both tables matching the same rows:
 The 1.2–1.7 left is PostgreSQL's own work at each rescan: evaluating the bounds,
 finding the partition, restarting its scan, about 2 µs a probe. A constant cone
 on such a catalogue is pruned at plan time to the partitions it touches.
-Polygons and composites take the custom scan on each partition but are not
-pruned yet.
+Since 0.45 constant polygons and composites are pruned at plan time too, by
+the cells of their bounding circle; a `NOT` region, which bounds nothing, is
+not.
 
 Partitioning brings no parallel gain of its own. A parallel cross-match
 shares out its probes, each worker rescanning the partitioned table as above:
@@ -918,9 +919,10 @@ Per query the gain is modest, because a polygon's covering was already tight.
 It grows with size: a 10° × 10° box (376k rows) takes 58 ms against the
 rewrite's 113 ms. A large polygon is also split among workers like a cone
 (0.42): with two workers, 22.8 ms against the rewrite's parallel bitmap scan at
-43.7 ms ([`parallel.md`](bench/results-polyscan/parallel.md)). The ADQL spelling
-costs the same as `skycell_poly` on polygons of 0.5° and more, and about 10%
-less below that, where planning is most of the time.
+43.7 ms ([`parallel.md`](bench/results-polyscan/parallel.md)). The two
+spellings cost the same. In this benchmark, which runs five methods in turn on
+each polygon, ADQL came out about 10% ahead below 0.5°; timed on their own, on
+the same centres and sizes, `skycell_poly` was the faster by 5%.
 
 **Composite regions** (0.39, [`bench/results-composite/`](bench/results-composite/)).
 Five shapes on 60 centres on the 10M real Gaia DR3 positions, 0.05°–2° across.
@@ -1234,8 +1236,9 @@ locally), the standalone selftests, and the reference translators.
   every partition is rescanned, each one whose keys cannot hold the cone
   answering in about 0.3 µs; bands hold cells all over the key space, so
   there it is the covering that costs. A partition left without the index
-  stops a cross-match from using the others' scans at all. Polygons and
-  composites are not pruned; a cone over 10° prunes nothing.
+  stops a cross-match from using the others' scans at all. Constant polygons
+  and composites are pruned by their bounding circle (since 0.45); a cone or
+  circle over 90°, or a `NOT` region, prunes nothing.
   Nearest neighbours on a partitioned table are answered partition by
   partition and merged (since 0.40), so every partition finds its own nearest
   row before the first is returned: one far from the point costs a cell walk
