@@ -1,0 +1,117 @@
+ setseed 
+---------
+ 
+(1 row)
+
+ bp_run 
+--------
+ 
+(1 row)
+
+ cases | tables_disagree 
+-------+-----------------
+    45 |               0
+(1 row)
+
+ nprobe | radius_as | flat_ms | part_ms | part_over_flat 
+--------+-----------+---------+---------+----------------
+   1000 |         1 |     8.7 |    31.9 |           3.64
+   1000 |         5 |     8.7 |    36.1 |           4.14
+   1000 |        30 |    11.9 |    39.9 |           3.36
+  10000 |         1 |    45.9 |   352.1 |           7.67
+  10000 |         5 |    46.5 |   294.7 |           6.34
+  10000 |        30 |    80.8 |   309.5 |           3.83
+ 100000 |         1 |   377.2 |  3057.6 |           8.11
+ 100000 |         5 |   447.4 |  3309.9 |           7.40
+ 100000 |        30 |   640.4 |  3240.8 |           5.06
+(9 rows)
+
+                                                                      QUERY PLAN                                                                       
+-------------------------------------------------------------------------------------------------------------------------------------------------------
+ Aggregate
+   ->  Nested Loop
+         ->  Seq Scan on bp_probe
+               Filter: (pid <= 1000)
+         ->  Append
+               ->  Custom Scan (SkycellCone) on bp_part0 c_1
+                     Filter: skycell_in_cone(ra, "dec", bp_probe.ra, bp_probe."dec", '0.001388888888888889'::double precision, '-1'::double precision)
+                     Index: bp_part0_skycell_ang2cell_idx
+                     Ranges: per outer row
+                     Mode: ordered
+               ->  Custom Scan (SkycellCone) on bp_part1 c_2
+                     Filter: skycell_in_cone(ra, "dec", bp_probe.ra, bp_probe."dec", '0.001388888888888889'::double precision, '-1'::double precision)
+                     Index: bp_part1_skycell_ang2cell_idx
+                     Ranges: per outer row
+                     Mode: ordered
+               ->  Custom Scan (SkycellCone) on bp_part2 c_3
+                     Filter: skycell_in_cone(ra, "dec", bp_probe.ra, bp_probe."dec", '0.001388888888888889'::double precision, '-1'::double precision)
+                     Index: bp_part2_skycell_ang2cell_idx
+                     Ranges: per outer row
+                     Mode: ordered
+               ->  Custom Scan (SkycellCone) on bp_part3 c_4
+                     Filter: skycell_in_cone(ra, "dec", bp_probe.ra, bp_probe."dec", '0.001388888888888889'::double precision, '-1'::double precision)
+                     Index: bp_part3_skycell_ang2cell_idx
+                     Ranges: per outer row
+                     Mode: ordered
+               ->  Custom Scan (SkycellCone) on bp_part4 c_5
+                     Filter: skycell_in_cone(ra, "dec", bp_probe.ra, bp_probe."dec", '0.001388888888888889'::double precision, '-1'::double precision)
+                     Index: bp_part4_skycell_ang2cell_idx
+                     Ranges: per outer row
+                     Mode: ordered
+               ->  Custom Scan (SkycellCone) on bp_part5 c_6
+                     Filter: skycell_in_cone(ra, "dec", bp_probe.ra, bp_probe."dec", '0.001388888888888889'::double precision, '-1'::double precision)
+                     Index: bp_part5_skycell_ang2cell_idx
+                     Ranges: per outer row
+                     Mode: ordered
+               ->  Custom Scan (SkycellCone) on bp_part6 c_7
+                     Filter: skycell_in_cone(ra, "dec", bp_probe.ra, bp_probe."dec", '0.001388888888888889'::double precision, '-1'::double precision)
+                     Index: bp_part6_skycell_ang2cell_idx
+                     Ranges: per outer row
+                     Mode: ordered
+               ->  Custom Scan (SkycellCone) on bp_part7 c_8
+                     Filter: skycell_in_cone(ra, "dec", bp_probe.ra, bp_probe."dec", '0.001388888888888889'::double precision, '-1'::double precision)
+                     Index: bp_part7_skycell_ang2cell_idx
+                     Ranges: per outer row
+                     Mode: ordered
+               ->  Custom Scan (SkycellCone) on bp_part8 c_9
+                     Filter: skycell_in_cone(ra, "dec", bp_probe.ra, bp_probe."dec", '0.001388888888888889'::double precision, '-1'::double precision)
+                     Index: bp_part8_skycell_ang2cell_idx
+                     Ranges: per outer row
+                     Mode: ordered
+               ->  Custom Scan (SkycellCone) on bp_part9 c_10
+                     Filter: skycell_in_cone(ra, "dec", bp_probe.ra, bp_probe."dec", '0.001388888888888889'::double precision, '-1'::double precision)
+                     Index: bp_part9_skycell_ang2cell_idx
+                     Ranges: per outer row
+                     Mode: ordered
+               ->  Custom Scan (SkycellCone) on bp_part10 c_11
+                     Filter: skycell_in_cone(ra, "dec", bp_probe.ra, bp_probe."dec", '0.001388888888888889'::double precision, '-1'::double precision)
+                     Index: bp_part10_skycell_ang2cell_idx
+                     Ranges: per outer row
+                     Mode: ordered
+               ->  Custom Scan (SkycellCone) on bp_part11 c_12
+                     Filter: skycell_in_cone(ra, "dec", bp_probe.ra, bp_probe."dec", '0.001388888888888889'::double precision, '-1'::double precision)
+                     Index: bp_part11_skycell_ang2cell_idx
+                     Ranges: per outer row
+                     Mode: ordered
+               ->  Custom Scan (SkycellCone) on bp_part12 c_13
+                     Filter: skycell_in_cone(ra, "dec", bp_probe.ra, bp_probe."dec", '0.001388888888888889'::double precision, '-1'::double precision)
+                     Index: bp_part12_skycell_ang2cell_idx
+                     Ranges: per outer row
+                     Mode: ordered
+               ->  Custom Scan (SkycellCone) on bp_part13 c_14
+                     Filter: skycell_in_cone(ra, "dec", bp_probe.ra, bp_probe."dec", '0.001388888888888889'::double precision, '-1'::double precision)
+                     Index: bp_part13_skycell_ang2cell_idx
+                     Ranges: per outer row
+                     Mode: ordered
+               ->  Custom Scan (SkycellCone) on bp_part14 c_15
+                     Filter: skycell_in_cone(ra, "dec", bp_probe.ra, bp_probe."dec", '0.001388888888888889'::double precision, '-1'::double precision)
+                     Index: bp_part14_skycell_ang2cell_idx
+                     Ranges: per outer row
+                     Mode: ordered
+               ->  Custom Scan (SkycellCone) on bp_part15 c_16
+                     Filter: skycell_in_cone(ra, "dec", bp_probe.ra, bp_probe."dec", '0.001388888888888889'::double precision, '-1'::double precision)
+                     Index: bp_part15_skycell_ang2cell_idx
+                     Ranges: per outer row
+                     Mode: ordered
+(85 rows)
+

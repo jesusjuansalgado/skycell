@@ -854,6 +854,27 @@ by up to 7.1× and Q3C's by up to 2.6×. At Gaia
 DR3 scale that is one 38 GiB index where an archive running pgSphere for cones
 and Q3C for cross-matching keeps 160 GiB.
 
+**Partitioned catalogues** (0.44, [`bench/results-partition/`](bench/results-partition/)).
+5M real Gaia DR3 positions, once in one table and once in 16 partitions by cell
+range (as by HEALPix index or Gaia `source_id`), cross-matched with 10³–10⁵
+probes at 1″–30″. Every partition's scan is rescanned for every probe. Up to
+0.43 each rescan covered the cone and searched its partition's index. Since
+0.44 a scan reads its index's lowest and highest key once and tests each cone
+against them before covering it. Median ms, both tables matching the same rows:
+
+| probes, radius | unpartitioned | partitioned, 0.43 | partitioned, 0.44 |
+|---|---|---|---|
+| 10³, 5″ | 8.4 | 36.1 | 15.5 |
+| 10⁴, 5″ | 43.4 | 294.7 | 103.5 |
+| 10⁵, 1″ | 374.1 | 3057.6 | 888.2 |
+| 10⁵, 30″ | 632.1 | 3240.8 | 1117.1 |
+
+The partitioned table now takes 1.8–2.4 times the unpartitioned one's time,
+against 3.4–8.1; what is left is the rescans of the partitions that hold
+nothing for the probe, about 0.3 µs each. A constant cone, polygon or composite
+on a partitioned table also takes the custom scan on each partition since 0.44
+(the rewrite before), and a partition outside it reads no index page.
+
 **Polygons through the custom scan** (0.43, [`bench/results-polyscan/`](bench/results-polyscan/)).
 Since 0.43 a constant polygon or box takes the custom scan that cones have.
 Before that it was rewritten into an `OR` of index ranges plus a per-row test.
@@ -1110,6 +1131,13 @@ Two layers, both in [`ext/test/`](ext/test/).
   one band without the index) must give the sort's answer through a Merge
   Append of the partitions' nearest scans, pruned or not.
 
+- `partition`: catalogues partitioned by cell range (with an empty partition)
+  and by declination band (sub-partitioned, a default partition, a partition
+  without the index), and a table holding one patch of sky. Constant cones,
+  polygons, boxes, composites, distance comparisons and cross-matches must
+  give the unpartitioned table's answers (the patch's, with the custom scan
+  off), every indexed partition must offer the custom scan, and partitions
+  outside a cone must cover nothing and read no page.
 - `composite`: unions, intersections, differences and NOTs. STC-S in and
   out (every malformed form errors with a reason), the constructors, each
   composite's membership against the boolean combination of its pieces,
@@ -1175,7 +1203,16 @@ locally), the standalone selftests, and the reference translators.
   use the range rewrite and the region indexes. The search must be a top-level
   `AND` term of a `WHERE` or `JOIN ON`: one under an `OR` is rewritten instead
   and stays indexable through a `BitmapOr`. It reads heap
-  tables only; on a partitioned table each partition keeps the rewrite.
+  tables only. On a partitioned table each partition gets the scan (since
+  0.44; constant searches kept the rewrite before), and a partition without
+  the cell index a sequential scan. A cross-match against a partitioned
+  catalogue rescans every partition for every probe, PostgreSQL's Append under
+  a nested loop: since 0.44 a partition whose keys cannot hold the probe's cone
+  answers in about 0.3 µs without covering it, so 16 partitions by cell range
+  cost 1.8–2.4 times the unpartitioned table, against 3.4–8.1 before; a
+  partition left without the index stops the cross-match from using the
+  others' scans at all. Partitions by declination band hold cells all over the
+  key space and gain nothing from the key test.
   Nearest neighbours on a partitioned table are answered partition by
   partition and merged (since 0.40), so every partition finds its own nearest
   row before the first is returned: one far from the point costs a cell walk

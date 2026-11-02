@@ -1,0 +1,3 @@
+PostgreSQL 18.6
+v043: tag v0.43, md5 48682aed20be8b81fd0e3e48804beae0
+v044: 0.44 development build (branch claude/wizardly-pasteur-lbom0b), md5 81dca11cad7a07defd3d1e7dd54facce
