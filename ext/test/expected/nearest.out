@@ -165,12 +165,35 @@ BEGIN
   END LOOP;
   RETURN NULL;
 END $$;
+-- past a distance the rings start at it (0.45), instead of growing out to
+-- it from the centre
 SELECT nn_rings('SELECT id FROM nn_cat ORDER BY skycell_dist(ra, dec, 10, 20) LIMIT 5') AS one_ring,
        nn_rings('SELECT id FROM nn_cat WHERE skycell_dist(ra, dec, 10, 20) > 40
-                 ORDER BY skycell_dist(ra, dec, 10, 20) LIMIT 20') > 2 AS several_rings;
- one_ring | several_rings 
-----------+---------------
+                 ORDER BY skycell_dist(ra, dec, 10, 20) LIMIT 20') <= 2 AS starts_past_it;
+ one_ring | starts_past_it 
+----------+----------------
         1 | t
+(1 row)
+
+-- lower bounds in every spelling, with and without an upper one, and ones
+-- that keep nothing (NULL, NaN, or beyond the upper bound)
+SELECT count(*) AS queries, count(*) FILTER (WHERE nn_same(q)) AS same,
+       count(*) FILTER (WHERE nn_plan(q) ~ 'nearest') AS nearest
+FROM (SELECT format('SELECT id, skycell_dist(ra, dec, %s, %s) d FROM nn_%s WHERE %s ORDER BY 2 LIMIT %s',
+                    c.ra, c.dec, tbl, format(w, c.ra, c.dec), k) q
+      FROM nn_centre c, unnest(ARRAY['cat', 'sorted']) tbl, unnest(ARRAY[3, 60]) k,
+           unnest(ARRAY['skycell_dist(ra, dec, %1$s, %2$s) >= 1',
+                        '2 < skycell_dist(ra, dec, %1$s, %2$s)',
+                        '0.5 <= skycell_dist(ra, dec, %1$s, %2$s)',
+                        'skycell_dist(ra, dec, %1$s, %2$s) > 1 AND skycell_dist(ra, dec, %1$s, %2$s) < 4',
+                        'skycell_dist(ra, dec, %1$s, %2$s) > 0.2 AND skycell_dist(ra, dec, %1$s, %2$s) > 3 AND mag < 10',
+                        'skycell_dist(ra, dec, %1$s, %2$s) > 5 AND skycell_dist(ra, dec, %1$s, %2$s) < 2',
+                        'skycell_dist(ra, dec, %1$s, %2$s) > NULL::float8',
+                        $w$skycell_dist(ra, dec, %1$s, %2$s) > 'NaN'::float8$w$,
+                        'skycell_dist(ra, dec, %1$s, %2$s) > 179.9']) w) t;
+ queries | same | nearest 
+---------+------+---------
+     288 |  288 |     238
 (1 row)
 
 -- a radius the conditions bound the answer to -- the distance below it, ADQL's
@@ -221,6 +244,19 @@ SELECT nn_same('SELECT id, skycell_dist(ra, dec, 10, 20) d FROM nn_cat WHERE sky
  null_radius 
 -------------
  t
+(1 row)
+
+RESET enable_sort;
+-- the heap out of cell order (the bitmap mode): a ring's index entries are
+-- tested by their keys, and the first ring cut to the nearest ones (0.45),
+-- so it reads hardly more rows than it returns
+SET enable_sort = off;
+SELECT nn_read('SELECT id FROM nn_cat ORDER BY skycell_dist(ra, dec, 180, 0) LIMIT 100') < 160 AS key_cut,
+       nn_read('SELECT id FROM nn_cat WHERE skycell_dist(ra, dec, 180, 0) > 3
+                ORDER BY skycell_dist(ra, dec, 180, 0) LIMIT 100') < 400 AS key_cut_past;
+ key_cut | key_cut_past 
+---------+--------------
+ t       | t
 (1 row)
 
 RESET enable_sort;
