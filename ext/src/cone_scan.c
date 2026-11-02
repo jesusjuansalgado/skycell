@@ -3231,6 +3231,20 @@ nearest_begin(CustomScanState *node, EState *estate, int eflags)
 	TupleDesc	hd = RelationGetDescr(heap);
 
 	cone_begin(node, estate, eflags);
+
+	/*
+	 * Off a partition, no key range: the cells an all-sky table holds clip
+	 * nothing, and reading its two ends costs a query of a few rows a third
+	 * of its time (0.44 did, at every query).  A partition reads them, at the
+	 * first ring, so that rings over another part of the sky read nothing.
+	 */
+	if (!heap->rd_rel->relispartition)
+	{
+		ns->cone.have_keyrange = true;
+		ns->cone.kmin = PG_INT64_MIN;
+		ns->cone.kmax = PG_INT64_MAX;
+		ns->cone.keys_partial = false;
+	}
 	ns->k0 = DatumGetFloat8(list_nth_node(Const, cscan->custom_private, 9)->constvalue);
 	ns->want = DatumGetFloat8(list_nth_node(Const, cscan->custom_private, 10)->constvalue);
 	ns->nupper = list_length(cscan->custom_private) > 11
