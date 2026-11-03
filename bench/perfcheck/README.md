@@ -24,7 +24,11 @@ k = 1 (two index descents added to every query), which no test caught.
 - **Workloads** (`workloads.sql`): ADQL cones of 1″ and 1°, a native 6′ cone,
   a 0.5° polygon, an annulus, a cross-match of 300 probes at 1″, nearest
   neighbours k = 1 and 100, and on the partitioned table a 0.5° cone and a
-  cross-match of 300 probes at 5″. Per centre the median of five executions,
+  cross-match of 300 probes at 5″. Where the database has `perf_oc` and
+  `perf_oc_queries` (the ObsCore-shaped table of `../10_crossover.sql`, copied
+  from `oc05` with `pg_dump -t oc -t oc_queries` and renamed), nearest
+  neighbours k = 100 and 1000 on it too, at its first 30 query centres: the
+  case where skycell trails pgSphere. Without it those two are skipped. Per centre the median of five executions,
   each planned anew at a centre 1e-9° away, after an untimed one.
 - **Verdict** (`report.py`): the round is the unit. Within one, the two
   libraries run back to back, so the host's drift between sessions, which

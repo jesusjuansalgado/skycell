@@ -20,6 +20,14 @@ BEGIN
     ANALYZE perf_centre;
     ANALYZE perf_probe;
   END IF;
+  -- an ObsCore-shaped table, observations grouped in fields, its heap out of
+  -- cell order (copied from oc05 by hand: pg_dump -t oc -t oc_queries, both
+  -- renamed perf_oc, perf_oc_queries); its first 30 query centres
+  IF to_regclass('perf_oc_queries') IS NOT NULL AND to_regclass('perf_oc_centre') IS NULL THEN
+    CREATE TABLE perf_oc_centre AS
+      SELECT qid::int AS c, ra, dec FROM perf_oc_queries WHERE qid <= 30;
+    ANALYZE perf_oc_centre;
+  END IF;
   IF to_regclass('perf_part') IS NULL THEN
     -- 2M of the positions in 16 partitions by cell range
     CREATE TABLE perf_part (source_id bigint, ra float8, dec float8)
