@@ -1,0 +1,177 @@
+-- MOC export (0.43): IVOA MOC 2.0 ASCII and JSON, normalised (each cell at
+-- the coarsest order it can be written at, orders ascending, the MOC's
+-- depth declared by an empty max order written last).
+CREATE EXTENSION IF NOT EXISTS skycell;
+NOTICE:  extension "skycell" already exists, skipping
+-- a region's MOC
+SELECT skycell_moc(circle('ICRS', 10, 20, 2), 6);
+                                  skycell_moc                                   
+--------------------------------------------------------------------------------
+ 5/4965 4967 4976 6/19771 19774-19775 19818-19819 19857 19859 19865 19912-19914
+(1 row)
+
+SELECT skycell_moc(circle('ICRS', 10, 20, 2), 6, 'json');
+                                                  skycell_moc                                                  
+---------------------------------------------------------------------------------------------------------------
+ {"5": [4965, 4967, 4976], "6": [19771, 19774, 19775, 19818, 19819, 19857, 19859, 19865, 19912, 19913, 19914]}
+(1 row)
+
+SELECT skycell_moc(circle('ICRS', 10, 20, 2), 6, 'JSON') = skycell_moc(circle('ICRS', 10, 20, 2), 6, 'json') AS fmt_case_insensitive;
+ fmt_case_insensitive 
+----------------------
+ t
+(1 row)
+
+SELECT skycell_moc(circle('ICRS', 0, 0, 180), 10) AS full_sky;
+  full_sky  
+------------
+ 0/0-11 10/
+(1 row)
+
+SELECT skycell_moc(circle('ICRS', 0, 0, 180), 3, 'json') AS full_sky_json;
+                     full_sky_json                      
+--------------------------------------------------------
+ {"0": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11], "3": []}
+(1 row)
+
+SELECT skycell_moc(polygon('ICRS', 10, 10, 30, 12, 25, 30), 4);
+                           skycell_moc                           
+-----------------------------------------------------------------
+ 3/10 32 287 309 4/34 132 134 1142-1143 1145-1147 1221 1232-1233
+(1 row)
+
+SELECT skycell_moc(region('DIFFERENCE ICRS (CIRCLE 100 0 12 CIRCLE 100 0 6)'), 3);
+                    skycell_moc                     
+----------------------------------------------------
+ 2/86 3/327 333 335 338-339 348 350 357 368-369 372
+(1 row)
+
+SELECT length(skycell_moc(circle('ICRS', 10, 20, 2))) AS default_order_10;
+ default_order_10 
+------------------
+             1923
+(1 row)
+
+-- a small cone meets the one cell holding it, not the neighbours whose
+-- bounding caps reach it
+SELECT skycell_moc(circle('ICRS', 265.95665416560644, 78.0202866317311, 0.01), 3) AS small_cone;
+ small_cone 
+------------
+ 3/189
+(1 row)
+
+SELECT skycell_moc(circle('ICRS', 168.54353574393403, -79.35732915328946, 0.01), 7) AS small_cone;
+ small_cone 
+------------
+ 7/147787
+(1 row)
+
+-- the cells of max order a MOC holds are those skycell_cell_overlaps() counts
+SELECT skycell_moc_agg(6, ipix) = skycell_moc(circle('ICRS', 200, -40, 7), 6) AS moc_is_cell_overlaps
+FROM generate_series(0::bigint, (12 * 4^6 - 1)::bigint) ipix
+WHERE skycell_cell_overlaps(6, ipix, circle('ICRS', 200, -40, 7)) = 1;
+ moc_is_cell_overlaps 
+----------------------
+ t
+(1 row)
+
+SELECT skycell_moc_agg(5, ipix) = skycell_moc(region('UNION ICRS (CIRCLE 30 60 5 POLYGON 40 50 60 52 50 70)'), 5) AS moc_is_cell_overlaps
+FROM generate_series(0::bigint, (12 * 4^5 - 1)::bigint) ipix
+WHERE skycell_cell_overlaps(5, ipix, region('UNION ICRS (CIRCLE 30 60 5 POLYGON 40 50 60 52 50 70)')) = 1;
+ moc_is_cell_overlaps 
+----------------------
+ t
+(1 row)
+
+-- aggregating cells: duplicates are one cell, four siblings their parent
+SELECT skycell_moc_agg(2, ipix) FROM (VALUES (8), (9), (10), (11), (9), (40), (191)) v(ipix);
+ skycell_moc_agg 
+-----------------
+ 1/2 2/40 191
+(1 row)
+
+SELECT skycell_moc_agg(2, ipix, 'json') FROM (VALUES (8), (9), (10), (11), (9), (40), (191)) v(ipix);
+      skycell_moc_agg       
+----------------------------
+ {"1": [2], "2": [40, 191]}
+(1 row)
+
+SELECT skycell_moc_agg(0, ipix) FROM generate_series(0, 11) ipix;
+ skycell_moc_agg 
+-----------------
+ 0/0-11
+(1 row)
+
+SELECT skycell_moc_agg(3, ipix) FROM (VALUES (NULL::bigint), (5)) v(ipix);
+ skycell_moc_agg 
+-----------------
+ 3/5
+(1 row)
+
+SELECT skycell_moc_agg(3, ipix) IS NULL AS no_rows FROM generate_series(1, 0) ipix;
+ no_rows 
+---------
+ t
+(1 row)
+
+-- a table's coverage, by expression index or stored cell column
+CREATE TABLE moc_cat AS
+SELECT i AS id, mod(i * 137.50776405003785, 360.0) AS ra,
+       degrees(asin(1 - 2 * (i + 0.5) / 2000.0)) * 0.1 + 30 AS dec
+FROM generate_series(0, 1999) i;
+CREATE INDEX moc_cat_cell ON moc_cat (skycell_ang2cell(ra, dec));
+SELECT skycell_coverage_moc('moc_cat', 1);
+       skycell_coverage_moc       
+----------------------------------
+ 1/0-2 4-6 8-10 12-14 19 23 27 31
+(1 row)
+
+SELECT skycell_coverage_moc('moc_cat', 2, 'json');
+                                                                                         skycell_coverage_moc                                                                                          
+-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ {"2": [1, 2, 3, 4, 5, 6, 8, 9, 10, 17, 18, 19, 20, 21, 22, 24, 25, 26, 33, 34, 35, 36, 37, 38, 40, 41, 42, 49, 50, 51, 52, 53, 54, 56, 57, 58, 77, 78, 79, 93, 94, 95, 109, 110, 111, 125, 126, 127]}
+(1 row)
+
+SELECT skycell_coverage_moc('moc_cat') =
+       (SELECT skycell_moc_agg(10, skycell_ang2cell(ra, dec) >> 38) FROM moc_cat) AS coverage_is_agg;
+ coverage_is_agg 
+-----------------
+ t
+(1 row)
+
+CREATE TABLE moc_cells AS SELECT id, skycell_ang2cell(ra, dec) AS cell FROM moc_cat;
+CREATE INDEX ON moc_cells (cell);
+SELECT skycell_coverage_moc('moc_cells', 7) = skycell_coverage_moc('moc_cat', 7) AS cell_column;
+ cell_column 
+-------------
+ t
+(1 row)
+
+DELETE FROM moc_cells;
+SELECT skycell_coverage_moc('moc_cells', 7) AS empty_table;
+ empty_table 
+-------------
+ 7/
+(1 row)
+
+SELECT skycell_coverage_moc('moc_cells', 7, 'json') AS empty_table;
+ empty_table 
+-------------
+ {"7": []}
+(1 row)
+
+-- errors
+SELECT skycell_moc(circle('ICRS', 10, 20, 2), 30);
+ERROR:  skycell: MOC order must be within [0, 29]
+SELECT skycell_moc(circle('ICRS', 10, 20, 2), -1);
+ERROR:  skycell: MOC order must be within [0, 29]
+SELECT skycell_moc(circle('ICRS', 10, 20, 2), 6, 'fits');
+ERROR:  skycell: MOC format must be 'ascii' or 'json'
+SELECT skycell_moc_agg(13, ipix) FROM generate_series(0, 3) ipix;
+ERROR:  skycell: MOC order must be within [0, 12]
+SELECT skycell_moc_agg(2, ipix) FROM (VALUES (192)) v(ipix);
+ERROR:  skycell: no HEALPix cell 192 at order 2
+SELECT skycell_coverage_moc('moc_cat', 13);
+ERROR:  skycell: a coverage MOC's order must be within [0, 12]
+CONTEXT:  PL/pgSQL function skycell_coverage_moc(text,integer,text) line 8 at RAISE
+DROP TABLE moc_cat, moc_cells;

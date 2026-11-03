@@ -856,7 +856,7 @@ REFRESH MATERIALIZED VIEW CONCURRENTLY gaia.gaia_density;                     --
 | Function | Returns | Notes |
 |---|---|---|
 | `skycell_density_view(tbl text, target text, max_order int DEFAULT 8, min_order int DEFAULT 0)` | `bigint` | (re)creates `target` as a materialised view `(hpx_order, ipix, n)` with a unique index on `(hpx_order, ipix)`; returns its row count. Orders 0–20 |
-| `skycell_cell_overlaps(hpx_order int, ipix bigint, r skyregion)` | `integer` (1/0) | whether the cell meets region `r`, conservatively (a cell the region misses by a hair may count). ADQL |
+| `skycell_cell_overlaps(hpx_order int, ipix bigint, r skyregion)` | `integer` (1/0) | whether the cell meets region `r`: every cell it meets, and perhaps one it misses by less than 1/16 of the cell's size. ADQL |
 
 The table's cells come from its skycell index (or a stored `cell` column);
 the finest order is counted in one pass over the table and each coarser one
@@ -879,6 +879,45 @@ cells whole (398k rows for the 5° view above, against 294k inside it, which
 replaces the view it names; anything built on it must be dropped first.
 (`skycell_density_build`, below, is another thing: a finer density model
 the planner reads instead of the histogram.)
+
+### MOC export (since 0.43)
+
+A region's or a table's coverage as an IVOA MOC 2.0, in its ASCII or JSON
+serialisation, for MOCPy, Aladin, the CDS MOC server or any other tool that
+reads MOCs:
+
+```sql
+SELECT skycell_moc(CIRCLE('ICRS', 10, 20, 2), 6);
+-- 5/4965 4967 4976 6/19771 19774-19775 19818-19819 19857 19859 19865 19912-19914
+SELECT skycell_moc(CIRCLE('ICRS', 10, 20, 2), 6, 'json');
+-- {"5": [4965, 4967, 4976], "6": [19771, 19774, 19775, ...]}
+SELECT skycell_coverage_moc('gaia.gaia_source', 10);               -- where the table has rows
+SELECT skycell_moc_agg(10, skycell_ang2cell(ra, dec) >> 38)        -- where a query's rows are
+FROM gaia.gaia_source WHERE phot_g_mean_mag < 12;
+```
+
+| Function | Returns | Notes |
+|---|---|---|
+| `skycell_moc(r skyregion, max_order int DEFAULT 10, fmt text DEFAULT 'ascii')` | `text` | the cells of `max_order` that meet `r`, as `skycell_cell_overlaps` counts them; cells inside it whole at a coarser order. Orders 0–29 |
+| `skycell_moc_agg(hpx_order int, ipix bigint [, fmt text])` | `text` | aggregate: the MOC of the cells of one order, duplicates allowed. Orders 0–12; no rows give NULL |
+| `skycell_coverage_moc(tbl text, max_order int DEFAULT 10, fmt text DEFAULT 'ascii')` | `text` | the cells of `max_order` that hold a row of `tbl`, from its skycell index or stored `cell` column. Orders 0–12; an empty table gives an empty MOC |
+
+`fmt` is `'ascii'` or `'json'`. The output is normalised as MOCPy writes it:
+each cell at the coarsest order it can be written at (four sibling cells are
+their parent), orders ascending, runs of cells `a-b` in ASCII, and the MOC's
+depth declared by an empty max order written last (`10/`, `"10": []`) when
+no cell is that fine. MOCPy 0.21 reads every MOC above back and writes it out
+the same, for 200 random cones, boxes, unions and differences at orders 0–12;
+a table's coverage equals `MOC.from_lonlat` on the same positions at orders
+6, 10 and 12.
+
+A region's MOC holds every cell the region meets, and may hold a cell it
+misses by less than 1/16 of the cell's size. That is tighter than
+`MOC.from_cone`: on 50 random cones, MOCPy's MOC held every cell of skycell's,
+and 21 of the 50 held cells more, which by dense sampling lie outside the cone
+(up to 0.49° beyond a 5° cone at order 2). A 20° cone at order 10 takes
+18 ms; the coverage of the 10M-row Gaia table at order 10, 1.2 s, one pass
+over its index. FITS, the third MOC 2.0 serialisation, is not written.
 
 ### Diagnostics
 
@@ -1261,6 +1300,15 @@ rows. Run against v0.42, it flags v0.44's regression (1.21 [1.13, 1.30]).
   column), a constant cone must be pruned at plan time to its partition and a
   cross-match must run only the partition holding its probes; every cell of a
   cone must lie within `skycell_cone_cell_lo/hi`.
+- `estimate`: row-count and density estimates against exact counts on a
+  catalogue ANALYZE reads whole; density views at several orders against
+  `GROUP BY` counts, their refresh, and `skycell_cell_overlaps` with its
+  index rewrite against testing every cell.
+- `moc`: MOCs of cones, polygons, composites, the whole sky and nothing, in
+  ASCII and JSON; the max-order cells of a region's MOC must be exactly those
+  `skycell_cell_overlaps` counts; the aggregate's merging of duplicates and
+  siblings; a table's coverage by expression index and by stored cell
+  column, and of an empty table; out-of-range orders and formats.
 - `composite`: unions, intersections, differences and NOTs. STC-S in and
   out (every malformed form errors with a reason), the constructors, each
   composite's membership against the boolean combination of its pieces,

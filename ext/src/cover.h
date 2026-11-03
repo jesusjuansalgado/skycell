@@ -239,6 +239,13 @@ extern int	sc_order_probe;
 /* classify the pixel (order, pix) against the region (conservative) */
 sc_class	sc_region_classify(const sc_region *r, int order, int64_t pix, double *f_out);
 
+/*
+ * whether a cell sc_region_classify() finds PARTIAL meets the region, to
+ * within 1/16 of its size: refined SC_MEET_REFINE orders deeper
+ */
+#define SC_MEET_REFINE 4
+bool		sc_region_cell_meets(const sc_region *r, int order, int64_t pix);
+
 /* the same, always by the bounding cap: cheaper, looser */
 sc_class	sc_region_classify_cap(const sc_region *r, int order, int64_t pix, double *f_out);
 
