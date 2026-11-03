@@ -791,6 +791,57 @@ WHERE 1 = CONTAINS(POINT('ICRS', ra, dec), CIRCLE('ICRS', 269.45, 4.69, 0.05 + 0
                    CIRCLE('ICRS', 269.45, 4.69, 0.05));
 ```
 
+### Estimates for sky views (since 0.41)
+
+A zoomed-out sky view has no use for millions of points: it wants how many
+sources it holds, and a coarse density map by HiPS tile. skycell reads both
+from the statistics the planner already keeps (the `ANALYZE` histogram of
+the table's cell index), without reading a row:
+
+| Function | Returns | Notes |
+|---|---|---|
+| `skycell_count_estimate(tbl text, r skyregion)` | `float8` | the rows the table is expected to hold in region `r` (any region: cone, polygon, box, composite) |
+| `skycell_count_estimate(tbl text, hpx_order int, ipix bigint)` | `float8` | the same for one NESTED HEALPix cell, a HiPS tile |
+| `skycell_density_estimate(tbl text, r skyregion, hpx_order int)` | `SETOF (ipix, estimate, inside)` | the cells of order `hpx_order` (0–20) that `r` meets, with each one's estimate and whether it lies wholly inside `r`; at most 200,000 cells. For SQL: ADQL has no table functions |
+
+The table is named by a string, resolved as `regclass` would (schema,
+`search_path`, quoting); it needs an index on `skycell_ang2cell(ra, dec)` or
+`skycell_cell(pos)`, or a stored `cell` column, and a partitioned table is
+summed over its partitions. The functions are scalar so that ADQL can call
+them, on a TAP service that declares them as user-defined functions; the
+geometry translators pass them through:
+
+```sql
+-- the number of sources in the view
+SELECT skycell_count_estimate('gaia.gaia_source', CIRCLE('ICRS', 266.4, -28.9, 10))
+FROM tap_schema.schemas;
+-- a density map: the client knows its visible HiPS tiles, and uploads them
+SELECT t.ipix, skycell_count_estimate('gaia.gaia_source', 6, t.ipix) AS n
+FROM TAP_UPLOAD.tiles AS t;
+```
+
+A region's estimate integrates the density model over the region (its cells
+refined along the edge to a 16th of its size, each counted whole once
+inside). Against exact counts on the 10M real Gaia DR3 positions (statistics
+target 1000, so 10,000 rows a bucket), 150 cones of 0.5°–30°:
+
+| rows in the region | median factor off | worst |
+|---|---|---|
+| over 1M | 1.03 | 1.04 |
+| 100k–1M | 1.06 | 1.20 |
+| 10k–100k | 1.18 | 1.41 |
+| under 10k | 1.25 | 4.2 |
+
+HiPS tiles of orders 2–6 (300 to 44,000 rows each) come within 1.10–1.28 at
+the median. Below the size of a histogram bucket (the table's rows over its
+statistics target) an estimate is only indicative: raise the target
+(`ALTER INDEX … ALTER COLUMN 1 SET STATISTICS 1000`, on each partition of a
+partitioned table, whose default of 100 leaves coarse buckets). A region's
+estimate takes 0.1–0.3 ms, a tile's about 2 µs (14 µs over 16 partitions),
+a 40° × 30° map of 1,713 order-6 cells 1.7 ms; an exact count takes a few
+milliseconds in sparse sky and hundreds where the catalogue is crowded. The
+estimates are as current as the last `ANALYZE`: run it after loading rows.
+
 ### Diagnostics
 
 | Function | Notes |
