@@ -916,7 +916,7 @@ misses by less than 1/16 of the cell's size. That is tighter than
 `MOC.from_cone`: on 50 random cones, MOCPy's MOC held every cell of skycell's,
 and 21 of the 50 held cells more, which by dense sampling lie outside the cone
 (up to 0.49° beyond a 5° cone at order 2). A 20° cone at order 10 takes
-25 ms; the coverage of the 10M-row Gaia table at order 10, 1.6 s, one pass
+18 ms; the coverage of the 10M-row Gaia table at order 10, 1.2 s, one pass
 over its index. FITS, the third MOC 2.0 serialisation, is not written.
 
 ### Diagnostics

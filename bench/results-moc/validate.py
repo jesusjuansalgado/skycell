@@ -49,7 +49,7 @@ for i in range(200):
         if not ref.empty():
             extra_frac.append((m - ref).sky_fraction / ref.sky_fraction)
 print(f'{n} regions: ASCII normalised and re-serialised identically {fmt_ok}, JSON = ASCII {json_ok}, '
-      f'cones containing MOCPy\'s {superset_ok}/{sum(1 for i in range(200) if i % 4 == 0)}; '
+      f'cones whose MOC holds all of MOCPy\'s (the rest are within it) {superset_ok}/{sum(1 for i in range(200) if i % 4 == 0)}; '
       f'extra area beyond MOCPy\'s cone MOC: median {np.median(extra_frac):.3f}, max {max(extra_frac):.3f}')
 
 # coverage of the ObsCore-shaped table against MOCPy from the same positions
