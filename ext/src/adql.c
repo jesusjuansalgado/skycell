@@ -2554,11 +2554,29 @@ adql_predicate_operator(Node *qual)
 		fn = linitial(op->args);
 	}
 	if (!IsA(one, Const) || ((Const *) one)->constisnull || ((Const *) one)->consttype != INT4OID ||
-		DatumGetInt32(((Const *) one)->constvalue) != 1 ||
-		!IsA(fn, FuncExpr) || list_length(((FuncExpr *) fn)->args) != 2)
+		DatumGetInt32(((Const *) one)->constvalue) != 1 || !IsA(fn, FuncExpr))
 		return NULL;
 	f = (FuncExpr *) fn;
 	if ((src = skycell_c_src(f->funcid)) == NULL)
+		return NULL;
+
+	/*
+	 * skycell_cell_overlaps(order, ipix, region) = 1 (0.42): its boolean
+	 * twin, whose support function rewrites it into ranges of ipix.
+	 */
+	if (strcmp(src, "skycell_cell_overlaps") == 0 && list_length(f->args) == 3)
+	{
+		Oid			t[3] = {INT4OID, INT8OID, exprType(lthird(f->args))};
+		Oid			fn2 = LookupFuncName(list_make2(makeString(get_namespace_name(get_func_namespace(f->funcid))),
+												   makeString(pstrdup("skycell_cell_meets"))),
+										3, t, true);
+
+		if (!OidIsValid(fn2))
+			return NULL;
+		return (Node *) makeFuncExpr(fn2, BOOLOID, copyObject(f->args), InvalidOid, InvalidOid,
+									 COERCE_EXPLICIT_CALL);
+	}
+	if (list_length(f->args) != 2)
 		return NULL;
 	if (strcmp(src, "skycell_contains") == 0 || strcmp(src, "skycell_intersects_pos") == 0 ||
 		strcmp(src, "skycell_contains_region") == 0)
@@ -3047,4 +3065,163 @@ skycell_distance_below_support(PG_FUNCTION_ARGS)
 		PG_RETURN_POINTER(rawreq);
 	}
 	PG_RETURN_POINTER(NULL);
+}
+
+/* ------------------------------------------------------------------ */
+/* HEALPix cells against a region (0.42)                               */
+/* ------------------------------------------------------------------ */
+
+/*
+ * Whether the NESTED cell (order, pix) meets the region: neither it nor any
+ * of its ancestors is classified outside (an ancestor inside settles it).
+ * Conservative, as the classification is: a cell the region misses by a
+ * hair can count as meeting it.  The planner's rewrite below enumerates
+ * exactly these cells, so an indexed query and a scan agree.
+ */
+static bool
+cell_meets_region(const sc_region *reg, int order, int64 pix)
+{
+	for (int o = 0; o <= order; o++)
+	{
+		double		f;
+		sc_class	c = sc_region_classify(reg, o, pix >> (2 * (order - o)), &f);
+
+		if (c == SC_OUT)
+			return false;
+		if (c == SC_IN)
+			return true;
+	}
+	return true;
+}
+
+static void
+check_cell_args(int32 order, int64 pix)
+{
+	if (order < 0 || order > SC_MAX_ORDER)
+		ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+						errmsg("skycell: HEALPix order must be within [0, %d]", SC_MAX_ORDER)));
+	if (pix < 0 || pix >= 12 * ((int64) 1 << (2 * order)))
+		ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+						errmsg("skycell: no HEALPix cell %lld at order %d", (long long) pix, order)));
+}
+
+/* skycell_cell_overlaps(order, ipix, region): 1 if the cell meets the region, else 0 (ADQL) */
+PG_FUNCTION_INFO_V1(skycell_cell_overlaps);
+Datum
+skycell_cell_overlaps(PG_FUNCTION_ARGS)
+{
+	int32		order = PG_GETARG_INT32(0);
+	int64		pix = PG_GETARG_INT64(1);
+	sc_region  *reg = cached_region_arg(fcinfo, 0, PG_GETARG_DATUM(2));
+
+	check_cell_args(order, pix);
+	PG_RETURN_INT32(cell_meets_region(reg, order, pix) ? 1 : 0);
+}
+
+/* skycell_cell_meets(order, ipix, region): the same as a boolean, for the planner */
+PG_FUNCTION_INFO_V1(skycell_cell_meets);
+Datum
+skycell_cell_meets(PG_FUNCTION_ARGS)
+{
+	int32		order = PG_GETARG_INT32(0);
+	int64		pix = PG_GETARG_INT64(1);
+	sc_region  *reg = cached_region_arg(fcinfo, 0, PG_GETARG_DATUM(2));
+
+	check_cell_args(order, pix);
+	PG_RETURN_BOOL(cell_meets_region(reg, order, pix));
+}
+
+/*
+ * The planner's rewrite of skycell_cell_meets(order, ipix, region) with a
+ * constant order and region: the cells of that order the region meets, as
+ * ranges of ipix (consecutive cells merged, a whole subtree where a cell is
+ * inside), so that an index on (hpx_order, ipix) reads only them.  Past 500
+ * ranges the call stays, a filter.
+ */
+#define CELL_RANGES_MAX 500
+
+PG_FUNCTION_INFO_V1(skycell_cell_meets_support);
+Datum
+skycell_cell_meets_support(PG_FUNCTION_ARGS)
+{
+	Node	   *rawreq = (Node *) PG_GETARG_POINTER(0);
+	SupportRequestSimplify *req;
+	FuncExpr   *f;
+	Node	   *oc,
+			   *rc;
+	int32		order;
+	sc_region	reg;
+	int64	   *b;
+	int			n = 0;
+	List	   *arms = NIL;
+	struct
+	{
+		int			o;
+		int64		pix;
+	}			stack[12 + 3 * (SC_MAX_ORDER + 1)];
+	int			top = 0;
+
+	if (!IsA(rawreq, SupportRequestSimplify))
+		PG_RETURN_POINTER(NULL);
+	req = (SupportRequestSimplify *) rawreq;
+	f = req->fcall;
+	if (list_length(f->args) != 3)
+		PG_RETURN_POINTER(NULL);
+	oc = linitial(f->args);
+	rc = lthird(f->args);
+	if (!IsA(oc, Const) || !IsA(rc, Const))
+		PG_RETURN_POINTER(NULL);
+	if (((Const *) oc)->constisnull || ((Const *) rc)->constisnull)
+		PG_RETURN_POINTER(makeBoolConst(false, true));
+	order = DatumGetInt32(((Const *) oc)->constvalue);
+	if (order < 0 || order > SC_MAX_ORDER)
+		PG_RETURN_POINTER(NULL);	/* the call raises the error at run time */
+	skycell_region_from_datum(((Const *) rc)->constvalue, &reg);
+	b = palloc(sizeof(int64) * 2 * (CELL_RANGES_MAX + 1));
+	for (int fc = 11; fc >= 0; fc--)
+	{
+		stack[top].o = 0;
+		stack[top++].pix = fc;
+	}
+	while (top > 0 && n <= CELL_RANGES_MAX)
+	{
+		int			o = stack[--top].o;
+		int64		pix = stack[top].pix;
+		double		fo;
+		sc_class	c = sc_region_classify(&reg, o, pix, &fo);
+		int64		lo,
+					hi;
+
+		if (c == SC_OUT)
+			continue;
+		if (c == SC_PARTIAL && o < order)
+		{
+			for (int ch = 3; ch >= 0; ch--)
+			{
+				stack[top].o = o + 1;
+				stack[top++].pix = 4 * pix + ch;
+			}
+			continue;
+		}
+		/* inside (all its cells of that order), or a cell of that order */
+		lo = (o <= order) ? pix << (2 * (order - o)) : pix;
+		hi = (o <= order) ? ((pix + 1) << (2 * (order - o))) - 1 : pix;
+		if (n > 0 && b[2 * n - 1] + 1 == lo)
+			b[2 * n - 1] = hi;
+		else
+		{
+			b[2 * n] = lo;
+			b[2 * n + 1] = hi;
+			n++;
+		}
+	}
+	sc_region_free(&reg);
+	if (n > CELL_RANGES_MAX)
+		PG_RETURN_POINTER(NULL);
+	if (n == 0)
+		PG_RETURN_POINTER(makeBoolConst(false, false));
+	for (int i = 0; i < n; i++)
+		arms = lappend(arms, range_arm_family(lsecond(f->args), (Expr *) int8_const(b[2 * i]),
+											  (Expr *) int8_const(b[2 * i + 1]), INTEGER_BTREE_FAM_OID));
+	PG_RETURN_POINTER(n == 1 ? linitial(arms) : (Node *) makeBoolExpr(OR_EXPR, arms, -1));
 }

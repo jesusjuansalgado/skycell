@@ -842,6 +842,44 @@ a 40° × 30° map of 1,713 order-6 cells 1.7 ms; an exact count takes a few
 milliseconds in sparse sky and hundreds where the catalogue is crowded. The
 estimates are as current as the last `ANALYZE`: run it after loading rows.
 
+### Density maps in the database (since 0.42)
+
+For counts exact per cell, at HiPS orders, kept beside the catalogue and
+rebuilt after each load, `skycell_density_view` makes a materialised view of
+the rows in every occupied NESTED HEALPix cell:
+
+```sql
+SELECT skycell_density_view('gaia.gaia_source', 'gaia.gaia_density', 9, 0);  -- orders 0 to 9
+REFRESH MATERIALIZED VIEW CONCURRENTLY gaia.gaia_density;                     -- after a load
+```
+
+| Function | Returns | Notes |
+|---|---|---|
+| `skycell_density_view(tbl text, target text, max_order int DEFAULT 8, min_order int DEFAULT 0)` | `bigint` | (re)creates `target` as a materialised view `(hpx_order, ipix, n)` with a unique index on `(hpx_order, ipix)`; returns its row count. Orders 0–20 |
+| `skycell_cell_overlaps(hpx_order int, ipix bigint, r skyregion)` | `integer` (1/0) | whether the cell meets region `r`, conservatively (a cell the region misses by a hair may count). ADQL |
+
+The table's cells come from its skycell index (or a stored `cell` column);
+the finest order is counted in one pass over the table and each coarser one
+from the order below it. On the 10M real Gaia DR3 positions, orders 0–9
+(2.7M occupied cells) take 9 s to build, the same to `REFRESH`; `REFRESH …
+CONCURRENTLY`, which leaves the view readable meanwhile, 42 s. ADQL reads the
+view as a table, a sky view's cells through `skycell_cell_overlaps`, which
+the planner turns into ranges of `ipix` on the view's index for a constant
+order and region:
+
+```sql
+SELECT ipix, n FROM gaia.gaia_density
+WHERE hpx_order = 6 AND 1 = skycell_cell_overlaps(6, ipix, CIRCLE('ICRS', 266.4, -28.9, 5));
+```
+
+120 order-6 cells in 1.8 ms, 276 order-9 cells round a 1° view in 4 ms. Each
+cell's count is exact as of the last refresh; a view's sum counts its edge
+cells whole (398k rows for the 5° view above, against 294k inside it, which
+`skycell_count_estimate` gives within 0.2%). A `skycell_density_view` call
+replaces the view it names; anything built on it must be dropped first.
+(`skycell_density_build`, below, is another thing: a finer density model
+the planner reads instead of the histogram.)
+
 ### Diagnostics
 
 | Function | Notes |

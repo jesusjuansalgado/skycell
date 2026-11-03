@@ -1,5 +1,6 @@
 -- Estimates of the number of rows in a region (0.41): read from the
--- statistics the planner uses, no row read.  The catalogue is small enough
+-- statistics the planner uses, no row read; and materialised density maps
+-- (0.42), exact per cell.  The catalogue is small enough
 -- (20,000 rows) that ANALYZE reads all of it, so the histogram, and the
 -- estimates, are the same at every run.
 CREATE EXTENSION IF NOT EXISTS skycell;
@@ -75,5 +76,47 @@ SELECT skycell_count_estimate('es_cat', 2, 192);
 SELECT count(*) FROM skycell_density_estimate('es_cat', circle('ICRS', 0, 0, 1), 21);
 SELECT count(*) FROM skycell_density_estimate('es_cat', circle('ICRS', 0, 0, 180), 8);
 
-DROP TABLE es_cat, es_part, es_empty, es_plain;
+-- materialised density maps (0.42): rows per occupied cell, orders 0 to 5
+SELECT skycell_density_view('es_cat', 'es_dens', 5) AS cells;
+SELECT hpx_order, count(*) AS cells, sum(n) AS rows FROM es_dens GROUP BY 1 ORDER BY 1;
+-- every cell's count is the exact count of its rows
+SELECT count(*) AS cells_checked,
+       count(*) FILTER (WHERE n <> (SELECT count(*) FROM es_cat
+                                    WHERE skycell_ang2cell(ra, dec) >> (2 * (29 - d.hpx_order)) = d.ipix)) AS wrong
+FROM (SELECT * FROM es_dens WHERE hpx_order IN (0, 3, 5) AND ipix % 7 = 0) d;
+-- a view's cells through the index, as ADQL writes it; the same without the
+-- rewrite (every cell of the order tested)
+EXPLAIN (COSTS OFF)
+SELECT ipix, n FROM es_dens WHERE hpx_order = 4 AND 1 = skycell_cell_overlaps(4, ipix, CIRCLE('ICRS', 120, 30, 10));
+SELECT (SELECT array_agg(ipix ORDER BY ipix) FROM es_dens
+        WHERE hpx_order = 4 AND 1 = skycell_cell_overlaps(4, ipix, CIRCLE('ICRS', 120, 30, 10)))
+     = (SELECT array_agg(ipix ORDER BY ipix) FROM es_dens
+        WHERE hpx_order = 4 AND skycell_cell_overlaps(4, ipix, CIRCLE('ICRS', 120, 30, 10)) + 0 = 1) AS indexed_same,
+       (SELECT array_agg(ipix ORDER BY ipix) FROM es_dens
+        WHERE hpx_order = 5 AND 1 = skycell_cell_overlaps(5, ipix, region('DIFFERENCE ICRS (CIRCLE 0 0 20 CIRCLE 0 0 10)')))
+     = (SELECT array_agg(ipix ORDER BY ipix) FROM es_dens
+        WHERE hpx_order = 5 AND skycell_cell_overlaps(5, ipix, region('DIFFERENCE ICRS (CIRCLE 0 0 20 CIRCLE 0 0 10)')) + 0 = 1) AS indexed_same_annulus;
+-- the cells meeting a region hold all its rows
+SELECT (SELECT sum(n) FROM es_dens WHERE hpx_order = 4 AND 1 = skycell_cell_overlaps(4, ipix, CIRCLE('ICRS', 120, 30, 10)))
+       >= (SELECT count(*) FROM es_cat WHERE skycell_in_cone(ra, dec, 120, 30, 10)) AS cells_hold_the_cone;
+-- cell 0 of order 3 is the southern tip of face 0, at (45, 0); face 10 is
+-- the southern sky's
+SELECT skycell_cell_overlaps(3, 0, CIRCLE('ICRS', 45, 0, 1)) AS at_the_tip,
+       skycell_cell_overlaps(3, 640, CIRCLE('ICRS', 45, 0, 1)) AS far,
+       skycell_cell_overlaps(0, 4, CIRCLE('ICRS', 45, 0, 1)) AS face;
+-- rebuilt on demand, after rows are loaded
+INSERT INTO es_cat SELECT 30000 + i, 120, 30 FROM generate_series(1, 100) i;
+SELECT sum(n) AS before_refresh FROM es_dens WHERE hpx_order = 0;
+REFRESH MATERIALIZED VIEW CONCURRENTLY es_dens;
+SELECT sum(n) AS after_refresh FROM es_dens WHERE hpx_order = 0;
+-- a partitioned table, a schema-qualified target and a window of orders
+SELECT skycell_density_view('es_part', '"Es Schema"."Part Density"', 4, 2) AS cells;
+SELECT hpx_order, sum(n) AS rows FROM "Es Schema"."Part Density" GROUP BY 1 ORDER BY 1;
+-- refused
+SELECT skycell_density_view('es_plain', 'es_plain_dens');
+SELECT skycell_density_view('es_cat', 'es_bad', 21);
+SELECT skycell_cell_overlaps(30, 0, CIRCLE('ICRS', 0, 0, 1));
+
+DROP MATERIALIZED VIEW es_dens;
 DROP SCHEMA "Es Schema" CASCADE;
+DROP TABLE es_cat, es_part, es_empty, es_plain;
