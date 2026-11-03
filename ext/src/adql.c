@@ -3074,9 +3074,10 @@ skycell_distance_below_support(PG_FUNCTION_ARGS)
 /*
  * Whether the NESTED cell (order, pix) meets the region: neither it nor any
  * of its ancestors is classified outside (an ancestor inside settles it).
- * Conservative, as the classification is: a cell the region misses by a
- * hair can count as meeting it.  The planner's rewrite below enumerates
- * exactly these cells, so an indexed query and a scan agree.
+ * Conservative: a cell the region misses by less than 1/16 of its size can
+ * count as meeting it (sc_region_cell_meets()), one it meets always does.
+ * The planner's rewrite below enumerates exactly these cells, so an indexed
+ * query and a scan agree.
  */
 static bool
 cell_meets_region(const sc_region *reg, int order, int64 pix)
@@ -3091,7 +3092,7 @@ cell_meets_region(const sc_region *reg, int order, int64 pix)
 		if (c == SC_IN)
 			return true;
 	}
-	return true;
+	return sc_region_cell_meets(reg, order, pix);
 }
 
 static void
@@ -3203,6 +3204,8 @@ skycell_cell_meets_support(PG_FUNCTION_ARGS)
 			}
 			continue;
 		}
+		if (c == SC_PARTIAL && !sc_region_cell_meets(&reg, o, pix))
+			continue;
 		/* inside (all its cells of that order), or a cell of that order */
 		lo = (o <= order) ? pix << (2 * (order - o)) : pix;
 		hi = (o <= order) ? ((pix + 1) << (2 * (order - o))) - 1 : pix;

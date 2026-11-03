@@ -3576,3 +3576,282 @@ skycell_density_estimate(PG_FUNCTION_ARGS)
 	sc_region_free(&reg);
 	return (Datum) 0;
 }
+
+/* ------------------------------------------------------------------ */
+/* MOC export: IVOA MOC 2.0 ASCII and JSON (0.43)                      */
+/* ------------------------------------------------------------------ */
+
+/* a growable list of inclusive order-29 cell ranges */
+typedef struct
+{
+	int64	   *r;				/* lo0, hi0, lo1, hi1, ... */
+	int			n,
+				cap;
+} moc_ranges;
+
+static void
+moc_add(moc_ranges *m, int64 lo, int64 hi)
+{
+	if (m->n > 0 && m->r[2 * m->n - 1] + 1 >= lo)
+	{
+		if (hi > m->r[2 * m->n - 1])
+			m->r[2 * m->n - 1] = hi;
+		return;
+	}
+	if (m->n == m->cap)
+	{
+		m->cap = m->cap ? 2 * m->cap : 64;
+		m->r = m->r ? repalloc(m->r, sizeof(int64) * 2 * m->cap) : palloc(sizeof(int64) * 2 * m->cap);
+	}
+	m->r[2 * m->n] = lo;
+	m->r[2 * m->n + 1] = hi;
+	m->n++;
+}
+
+static int
+moc_fmt(text *t)
+{
+	char	   *f = text_to_cstring(t);
+
+	if (pg_strcasecmp(f, "ascii") == 0)
+		return 0;
+	if (pg_strcasecmp(f, "json") == 0)
+		return 1;
+	ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+					errmsg("skycell: MOC format must be 'ascii' or 'json'")));
+	return 0;
+}
+
+static void
+moc_check_order(int32 order, int32 max)
+{
+	if (order < 0 || order > max)
+		ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+						errmsg("skycell: MOC order must be within [0, %d]", max)));
+}
+
+/*
+ * Sorted, merged order-29 ranges (multiples of the max_order cell) as a
+ * normalised MOC: each range cut into the largest aligned cells it holds,
+ * so that four siblings are always their parent; then per order, ascending,
+ * the cells in order, runs written a-b in ASCII.  An empty max_order is
+ * written last ("10/", or "10": []) to declare the MOC's depth, as MOCPy and
+ * the MOC 2.0 recommendation do.
+ */
+static text *
+moc_serialise(const moc_ranges *m, int max_order, int json)
+{
+	StringInfoData *ord = palloc0(sizeof(StringInfoData) * (max_order + 1));
+	int64	   *last = palloc(sizeof(int64) * (max_order + 1)),
+			   *run = palloc(sizeof(int64) * (max_order + 1));
+	bool	   *any = palloc0(sizeof(bool) * (max_order + 1));
+	StringInfoData out;
+
+	for (int o = 0; o <= max_order; o++)
+		initStringInfo(&ord[o]);
+
+	/* the ASCII run of cells pending at order o, written when it ends */
+#define FLUSH_RUN(o) \
+	do { \
+		if (run[o] == last[o]) \
+			appendStringInfo(&ord[o], "%s" INT64_FORMAT, ord[o].len ? " " : "", run[o]); \
+		else \
+			appendStringInfo(&ord[o], "%s" INT64_FORMAT "-" INT64_FORMAT, ord[o].len ? " " : "", run[o], last[o]); \
+	} while (0)
+
+	for (int i = 0; i < m->n; i++)
+	{
+		int64		lo = m->r[2 * i],
+					end = m->r[2 * i + 1] + 1;
+
+		while (lo < end)
+		{
+			int			j = 2 * SC_MAX_ORDER;	/* 4^29 order-29 cells: an order-0 cell */
+			int			o;
+			int64		pix;
+
+			while (j > 0 && ((lo & (((int64) 1 << j) - 1)) != 0 || lo + ((int64) 1 << j) > end))
+				j -= 2;
+			o = SC_MAX_ORDER - j / 2;
+			pix = lo >> j;
+			if (json)
+			{
+				appendStringInfo(&ord[o], "%s" INT64_FORMAT, any[o] ? ", " : "", pix);
+				any[o] = true;
+			}
+			else if (!any[o])
+			{
+				run[o] = last[o] = pix;
+				any[o] = true;
+			}
+			else if (pix == last[o] + 1)
+				last[o] = pix;
+			else
+			{
+				FLUSH_RUN(o);
+				run[o] = last[o] = pix;
+			}
+			lo += (int64) 1 << j;
+		}
+	}
+	initStringInfo(&out);
+	if (json)
+		appendStringInfoChar(&out, '{');
+	for (int o = 0; o <= max_order; o++)
+	{
+		if (!any[o] && o < max_order)
+			continue;
+		if (!json && any[o])
+			FLUSH_RUN(o);
+		if (json)
+			appendStringInfo(&out, "%s\"%d\": [%s]", out.len > 1 ? ", " : "", o, ord[o].data);
+		else
+			appendStringInfo(&out, "%s%d/%s", out.len ? " " : "", o, ord[o].data);
+	}
+	if (json)
+		appendStringInfoChar(&out, '}');
+#undef FLUSH_RUN
+	return cstring_to_text(out.data);
+}
+
+/*
+ * skycell_moc(region, max_order, fmt): the MOC of the cells of max_order that
+ * meet the region (as skycell_cell_overlaps() counts them: a cell the region
+ * misses by less than 1/16 of its size may count, never one it meets left
+ * out), cells inside it whole at a coarser order.
+ */
+PG_FUNCTION_INFO_V1(skycell_moc);
+Datum
+skycell_moc(PG_FUNCTION_ARGS)
+{
+	int32		max_order = PG_GETARG_INT32(1);
+	int			json = moc_fmt(PG_GETARG_TEXT_PP(2));
+	sc_region	reg;
+	moc_ranges	m = {0};
+	struct
+	{
+		int			o;
+		int64		pix;
+	}			stack[12 + 3 * (SC_MAX_ORDER + 1)];
+	int			top = 0;
+
+	moc_check_order(max_order, SC_MAX_ORDER);
+	skycell_region_from_datum(PG_GETARG_DATUM(0), &reg);
+	for (int f = 11; f >= 0; f--)
+	{
+		stack[top].o = 0;
+		stack[top++].pix = f;
+	}
+	while (top > 0)
+	{
+		int			o = stack[--top].o;
+		int64		pix = stack[top].pix;
+		double		fo;
+		sc_class	c = sc_region_classify(&reg, o, pix, &fo);
+
+		CHECK_FOR_INTERRUPTS();
+		if (c == SC_OUT)
+			continue;
+		if (c == SC_PARTIAL && o < max_order)
+		{
+			for (int ch = 3; ch >= 0; ch--)
+			{
+				stack[top].o = o + 1;
+				stack[top++].pix = 4 * pix + ch;
+			}
+			continue;
+		}
+		if (c == SC_PARTIAL && !sc_region_cell_meets(&reg, o, pix))
+			continue;
+		moc_add(&m, sc_pix_lo(o, pix), sc_pix_hi(o, pix));
+	}
+	sc_region_free(&reg);
+	PG_RETURN_TEXT_P(moc_serialise(&m, max_order, json));
+}
+
+/*
+ * skycell_moc_agg(hpx_order, ipix [, fmt]): the MOC of the cells of one order
+ * aggregated, duplicates allowed (the coverage of the rows of a query: one
+ * bit a cell of that order, 1.5 MB at order 10; at most order 12).
+ */
+typedef struct
+{
+	int			order;
+	int			json;
+	int64		ncells;
+	uint8	   *bits;
+} moc_agg_state;
+
+#define MOC_AGG_MAX_ORDER 12
+
+PG_FUNCTION_INFO_V1(skycell_moc_agg_trans);
+Datum
+skycell_moc_agg_trans(PG_FUNCTION_ARGS)
+{
+	MemoryContext aggcxt;
+	moc_agg_state *st;
+	int32		order;
+	int64		pix;
+
+	if (!AggCheckCallContext(fcinfo, &aggcxt))
+		elog(ERROR, "skycell_moc_agg_trans called outside an aggregate");
+	st = PG_ARGISNULL(0) ? NULL : (moc_agg_state *) PG_GETARG_POINTER(0);
+	if (PG_ARGISNULL(1) || PG_ARGISNULL(2))
+		PG_RETURN_POINTER(st);	/* a row without a cell adds nothing */
+	order = PG_GETARG_INT32(1);
+	pix = PG_GETARG_INT64(2);
+	if (st == NULL)
+	{
+		MemoryContext old = MemoryContextSwitchTo(aggcxt);
+
+		moc_check_order(order, MOC_AGG_MAX_ORDER);
+		st = palloc0(sizeof(moc_agg_state));
+		st->order = order;
+		st->json = (PG_NARGS() > 3 && !PG_ARGISNULL(3)) ? moc_fmt(PG_GETARG_TEXT_PP(3)) : 0;
+		st->ncells = 12 * ((int64) 1 << (2 * order));
+		st->bits = palloc0((st->ncells + 7) / 8);	/* 25 MB at order 12 */
+		MemoryContextSwitchTo(old);
+	}
+	else if (order != st->order)
+		ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+						errmsg("skycell: skycell_moc_agg() takes one order")));
+	if (pix < 0 || pix >= st->ncells)
+		ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+						errmsg("skycell: no HEALPix cell " INT64_FORMAT " at order %d", pix, order)));
+	st->bits[pix >> 3] |= (uint8) (1 << (pix & 7));
+	PG_RETURN_POINTER(st);
+}
+
+PG_FUNCTION_INFO_V1(skycell_moc_agg_final);
+Datum
+skycell_moc_agg_final(PG_FUNCTION_ARGS)
+{
+	moc_agg_state *st;
+	moc_ranges	m = {0};
+	int			sh;
+
+	if (PG_ARGISNULL(0))
+		PG_RETURN_NULL();		/* no row, no order: no MOC */
+	st = (moc_agg_state *) PG_GETARG_POINTER(0);
+	sh = 2 * (SC_MAX_ORDER - st->order);
+	for (int64 i = 0; i < st->ncells;)
+	{
+		int64		j;
+
+		if (st->bits[i >> 3] == 0 && (i & 7) == 0)
+		{
+			i += 8;
+			continue;
+		}
+		if (!(st->bits[i >> 3] & (1 << (i & 7))))
+		{
+			i++;
+			continue;
+		}
+		for (j = i; j + 1 < st->ncells && (st->bits[(j + 1) >> 3] & (1 << ((j + 1) & 7))); j++)
+			;
+		moc_add(&m, i << sh, ((j + 1) << sh) - 1);
+		i = j + 1;
+	}
+	PG_RETURN_TEXT_P(moc_serialise(&m, st->order, st->json));
+}

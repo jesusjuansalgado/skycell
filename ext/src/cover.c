@@ -1228,6 +1228,56 @@ sc_region_classify(const sc_region *r, int order, int64_t pix, double *f_out)
 }
 
 /*
+ * Whether a cell sc_region_classify() calls PARTIAL really meets the region.
+ * OUT is a proven bound but a loose one -- a cell is OUT only when the cap
+ * around it clears the region, so a cell up to its own radius away can be
+ * PARTIAL -- and a MOC or a cell-by-cell overlap test should not report such
+ * a cell.  So descend SC_MEET_REFINE orders below it: the cell meets the
+ * region if a descendant is IN, or still PARTIAL at the deepest order; it
+ * misses it if every descendant there is OUT, which is then certain.  What
+ * may still be reported in error is within a descendant's radius of the
+ * region, 1/16 of the cell's own.
+ */
+bool
+sc_region_cell_meets(const sc_region *r, int order, int64_t pix)
+{
+	int			limit = order + SC_MEET_REFINE;
+	struct
+	{
+		int			o;
+		int64_t		pix;
+	}			stack[3 * SC_MEET_REFINE + 4];
+	int			top = 0;
+
+	if (limit > SC_MAX_ORDER)
+		limit = SC_MAX_ORDER;
+	if (order >= limit)
+		return true;
+	for (int ch = 3; ch >= 0; ch--)
+	{
+		stack[top].o = order + 1;
+		stack[top++].pix = 4 * pix + ch;
+	}
+	while (top > 0)
+	{
+		int			o = stack[--top].o;
+		int64_t		p = stack[top].pix;
+		double		f;
+		sc_class	c = sc_region_classify(r, o, p, &f);
+
+		if (c == SC_IN || (c == SC_PARTIAL && o >= limit))
+			return true;
+		if (c == SC_PARTIAL)
+			for (int ch = 3; ch >= 0; ch--)
+			{
+				stack[top].o = o + 1;
+				stack[top++].pix = 4 * p + ch;
+			}
+	}
+	return false;
+}
+
+/*
  * sc_region_classify(...) == SC_OUT, for callers that keep IN and PARTIAL
  * cells alike.  classify_cone_exact() answers OUT only when its OUT condition
  * dcentre - rcell > radius + SC_ANG_EPS holds and its IN test does not fire
