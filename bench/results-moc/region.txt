@@ -1,0 +1,3 @@
+perf_oc: 499968 positions
+60 MOCs x 3 plans: 180 equal to MOCPy, 3666893 rows in all
+20 MOC-less-cone composites x 3 plans: 60 equal to the expected rows

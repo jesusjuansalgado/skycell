@@ -36,10 +36,12 @@ typedef enum
 	SC_REGION_UNION = 3,		/* two or more */
 	SC_REGION_INTERSECTION = 4, /* two or more */
 	SC_REGION_DIFFERENCE = 5,	/* kids[0] less kids[1] */
-	SC_REGION_NOT = 6			/* the sky less kids[0] */
+	SC_REGION_NOT = 6,			/* the sky less kids[0] */
+	SC_REGION_MOC = 7			/* a set of HEALPix cells (IVOA MOC) */
 } sc_region_kind;
 
-#define SC_REGION_IS_COMPOSITE(r) ((r)->kind >= SC_REGION_UNION)
+#define SC_REGION_IS_COMPOSITE(r) ((r)->kind >= SC_REGION_UNION && (r)->kind <= SC_REGION_NOT)
+#define SC_REGION_IS_MOC(r) ((r)->kind == SC_REGION_MOC)
 
 typedef struct sc_region
 {
@@ -77,6 +79,18 @@ typedef struct sc_region
 	 */
 	int			nkids;
 	struct sc_region *kids;
+
+	/*
+	 * MOC: sorted, disjoint, non-adjacent order-29 cell ranges [mlo, mhi];
+	 * area exact; center/radius an enclosing cap (radius < 0 when empty);
+	 * moc_order the order of its finest cell.  A point is in it when the
+	 * order-29 cell holding the point is.
+	 */
+	int			nmoc;
+	int64_t    *mlo;
+	int64_t    *mhi;
+	int			moc_order;
+	bool		moc_balanced;	/* no centre of area: balanced about the sphere's */
 } sc_region;
 
 typedef struct sc_density
@@ -196,6 +210,12 @@ const char *sc_region_poly(sc_region *r, int nv, const double *ra_deg, const dou
 void		sc_region_free(sc_region *r);
 
 /*
+ * A MOC from n order-29 cell ranges [lo[i], hi[i]], in any order, overlapping
+ * or not (copied, sorted and merged).  n may be 0: the empty region.
+ */
+const char *sc_region_moc(sc_region *r, const int64_t *lo, const int64_t *hi, int n);
+
+/*
  * A composite of n regions (UNION, INTERSECTION: n >= 2; DIFFERENCE: 2; NOT:
  * 1).  The kids are moved into r, which then owns them; they must have been
  * built for a covering (need_covering) if r will be.
@@ -256,6 +276,9 @@ void		sc_cover_params_default(sc_cover_params *p);
 void		sc_cover_compute(const sc_region *r, const sc_density *d,
 							 const sc_cover_params *p, sc_cover *out);
 void		sc_cover_free(sc_cover *c);
+
+/* rows expected in the region itself, given its covering */
+double		sc_region_expected_rows(const sc_region *r, const sc_density *d, const sc_cover *cov);
 
 /* 0 when the cone can hold no order-29 cell in [kmin, kmax] (cover.c) */
 int			sc_cone_may_meet_keys(const sc_region *r, int64_t kmin, int64_t kmax);

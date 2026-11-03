@@ -745,6 +745,254 @@ sc_region_free(sc_region *r)
 	}
 	r->kids = NULL;
 	r->nkids = 0;
+	if (r->mlo)
+		SC_FREE(r->mlo);
+	if (r->mhi)
+		SC_FREE(r->mhi);
+	r->mlo = r->mhi = NULL;
+	r->nmoc = 0;
+}
+
+/* ------------------------------------------------------------------ */
+/* MOCs: sets of HEALPix cells                                         */
+/* ------------------------------------------------------------------ */
+
+/*
+ * A MOC (IVOA Multi-Order Coverage map) is kept as the order-29 cell ranges
+ * it covers, sorted and merged: the form the index key has, so a cell is
+ * classified, and a point tested, exactly, by a binary search.  A point is in
+ * the MOC when the order-29 cell holding it is, which is what the index
+ * answers for a row; at the 0.4 mas scale of those cells, that is the
+ * region's boundary.
+ */
+
+typedef struct
+{
+	int64_t		lo,
+				hi;
+} moc_pair;
+
+static int
+moc_pair_cmp(const void *a, const void *b)
+{
+	int64_t		x = ((const moc_pair *) a)->lo,
+				y = ((const moc_pair *) b)->lo;
+
+	return (x > y) - (x < y);
+}
+
+/*
+ * Calls f(order, pix, arg) for each of the largest aligned cells the range
+ * [lo, hi] splits into: at most six a level, ascending.
+ */
+static void
+moc_range_cells(int64_t lo, int64_t hi, void (*f) (int, int64_t, void *), void *arg)
+{
+	int64_t		end = hi + 1;
+
+	while (lo < end)
+	{
+		int			j = 2 * SC_MAX_ORDER;
+
+		while (j > 0 && ((lo & (((int64_t) 1 << j) - 1)) != 0 || lo + ((int64_t) 1 << j) > end))
+			j -= 2;
+		f(SC_MAX_ORDER - j / 2, lo >> j, arg);
+		lo += (int64_t) 1 << j;
+	}
+}
+
+typedef struct
+{
+	sc_vec3		sum;
+	sc_vec3		c;
+	double		radius;
+	int			order;
+} moc_cap_acc;
+
+static void
+moc_cap_moment(int order, int64_t pix, void *arg)
+{
+	moc_cap_acc *a = arg;
+	sc_vec3		v = sc_pix2vec(order, pix);
+	double		w = ldexp(1.0, -2 * order);	/* cell area, in order-0 cells */
+
+	a->sum.x += w * v.x;
+	a->sum.y += w * v.y;
+	a->sum.z += w * v.z;
+	if (order > a->order)
+		a->order = order;
+}
+
+static void
+moc_cap_reach(int order, int64_t pix, void *arg)
+{
+	moc_cap_acc *a = arg;
+
+	a->radius = fmax(a->radius, sc_angle(a->c, sc_pix2vec(order, pix)) + sc_pixrad(order));
+}
+
+const char *
+sc_region_moc(sc_region *r, const int64_t *lo, const int64_t *hi, int n)
+{
+	moc_pair   *p;
+	int			m = 0;
+	double		cells = 0,
+				norm;
+	moc_cap_acc acc = {{0, 0, 0}, {0, 0, 1}, 0, 0};
+
+	memset(r, 0, sizeof(*r));
+	r->kind = SC_REGION_MOC;
+	p = SC_MALLOC(sizeof(moc_pair) * (n > 0 ? n : 1));
+	for (int i = 0; i < n; i++)
+	{
+		if (lo[i] < 0 || hi[i] < lo[i] || hi[i] >= SC_NPIX29)
+		{
+			SC_FREE(p);
+			return "a MOC cell range is out of order or off the sky";
+		}
+		p[i].lo = lo[i];
+		p[i].hi = hi[i];
+	}
+	if (n > 1)
+		qsort(p, n, sizeof(moc_pair), moc_pair_cmp);
+	for (int i = 1; i < n; i++)
+	{
+		if (p[i].lo <= p[m].hi + 1)
+			p[m].hi = p[i].hi > p[m].hi ? p[i].hi : p[m].hi;
+		else
+			p[++m] = p[i];
+	}
+	r->nmoc = n > 0 ? m + 1 : 0;
+	r->mlo = SC_MALLOC(sizeof(int64_t) * (r->nmoc > 0 ? r->nmoc : 1));
+	r->mhi = SC_MALLOC(sizeof(int64_t) * (r->nmoc > 0 ? r->nmoc : 1));
+	for (int i = 0; i < r->nmoc; i++)
+	{
+		r->mlo[i] = p[i].lo;
+		r->mhi[i] = p[i].hi;
+		cells += (double) (p[i].hi - p[i].lo) + 1.0;
+	}
+	SC_FREE(p);
+	r->area = cells * SC_PIX29_AREA;
+
+	/* an enclosing cap, round the cells' centre of area */
+	for (int i = 0; i < r->nmoc; i++)
+		moc_range_cells(r->mlo[i], r->mhi[i], moc_cap_moment, &acc);
+	r->moc_order = acc.order;
+	norm = sqrt(sc_dot(acc.sum, acc.sum));
+	if (r->nmoc == 0)
+	{
+		r->center = acc.c;
+		r->radius = -1.0;
+	}
+	else if (norm < 1e-6 * cells / (double) ((int64_t) 1 << (2 * SC_MAX_ORDER)))
+	{
+		r->center = acc.c;
+		r->radius = M_PI;
+		r->moc_balanced = true;
+	}
+	else
+	{
+		acc.c = (sc_vec3) {acc.sum.x / norm, acc.sum.y / norm, acc.sum.z / norm};
+		acc.radius = 0;
+		for (int i = 0; i < r->nmoc; i++)
+			moc_range_cells(r->mlo[i], r->mhi[i], moc_cap_reach, &acc);
+		r->center = acc.c;
+		r->radius = fmin(M_PI, acc.radius + SC_ANG_EPS);
+	}
+	return NULL;
+}
+
+/* the first range ending at or after x (nmoc when none does) */
+static int
+moc_find(const sc_region *r, int64_t x)
+{
+	int			a = 0,
+				b = r->nmoc;
+
+	while (a < b)
+	{
+		int			mid = a + (b - a) / 2;
+
+		if (r->mhi[mid] < x)
+			a = mid + 1;
+		else
+			b = mid;
+	}
+	return a;
+}
+
+static int
+moc_contains(const sc_region *r, sc_vec3 p)
+{
+	int64_t		pix = sc_vec2pix(SC_MAX_ORDER, p);
+	int			i = moc_find(r, pix);
+
+	return i < r->nmoc && r->mlo[i] <= pix;
+}
+
+/* exact: the cell's order-29 range against the MOC's */
+static sc_class
+classify_moc(const sc_region *r, int order, int64_t pix, double *f_out)
+{
+	int64_t		lo = sc_pix_lo(order, pix),
+				hi = sc_pix_hi(order, pix);
+	int			i = moc_find(r, lo);
+	double		in = 0;
+
+	if (i == r->nmoc || r->mlo[i] > hi)
+	{
+		*f_out = 1.0;
+		return SC_OUT;
+	}
+	if (r->mlo[i] <= lo && r->mhi[i] >= hi)
+	{
+		*f_out = 0.0;
+		return SC_IN;
+	}
+	for (int k = 0; i + k < r->nmoc && r->mlo[i + k] <= hi; k++)
+	{
+		if (k == 32)
+		{
+			*f_out = 0.5;
+			return SC_PARTIAL;
+		}
+		in += (double) (Min(hi, r->mhi[i + k]) - Max(lo, r->mlo[i + k])) + 1.0;
+	}
+	*f_out = 1.0 - in / ((double) (hi - lo) + 1.0);
+	return SC_PARTIAL;
+}
+
+/* do two MOCs share a cell? */
+static int
+moc_meets_moc(const sc_region *a, const sc_region *b)
+{
+	int			i = 0,
+				j = 0;
+
+	while (i < a->nmoc && j < b->nmoc)
+	{
+		if (a->mhi[i] < b->mlo[j])
+			i++;
+		else if (b->mhi[j] < a->mlo[i])
+			j++;
+		else
+			return 1;
+	}
+	return 0;
+}
+
+/* is every cell of a in b? (ranges are merged, so each of a's lies in one of b's) */
+static int
+moc_within_moc(const sc_region *a, const sc_region *b)
+{
+	for (int i = 0; i < a->nmoc; i++)
+	{
+		int			j = moc_find(b, a->mlo[i]);
+
+		if (j == b->nmoc || b->mlo[j] > a->mlo[i] || b->mhi[j] < a->mhi[i])
+			return 0;
+	}
+	return 1;
 }
 
 /*
@@ -848,6 +1096,8 @@ sc_region_contains(const sc_region *r, sc_vec3 p)
 {
 	if (SC_REGION_IS_COMPOSITE(r))
 		return composite_contains(r, p);
+	if (SC_REGION_IS_MOC(r))
+		return moc_contains(r, p);
 	if (r->kind == SC_REGION_CONE)
 		return r->radius >= 0 &&
 			sc_chord2(p, r->center) <= 4.0 * pow(sin(r->radius / 2.0), 2);
@@ -1142,6 +1392,8 @@ sc_region_classify_cap(const sc_region *r, int order, int64_t pix, double *f_out
 
 	if (SC_REGION_IS_COMPOSITE(r))
 		return classify_composite(r, order, pix, f_out, CLASSIFY_BOTH_SOUND);
+	if (SC_REGION_IS_MOC(r))
+		return classify_moc(r, order, pix, f_out);
 	c = sc_pix2vec(order, pix);
 	rho = sc_pixrad(order);
 
@@ -1222,6 +1474,8 @@ sc_region_classify(const sc_region *r, int order, int64_t pix, double *f_out)
 {
 	if (SC_REGION_IS_COMPOSITE(r))
 		return classify_composite(r, order, pix, f_out, CLASSIFY_OUT_SOUND);
+	if (SC_REGION_IS_MOC(r))
+		return classify_moc(r, order, pix, f_out);
 	if (r->kind == SC_REGION_CONE && sc_exact_cells)
 		return classify_cone_exact(r, order, pix, f_out);
 	return sc_region_classify_cap(r, order, pix, f_out);
@@ -1469,8 +1723,8 @@ sc_region_centroid(const sc_region *r)
 		sc_region_bounding_cap(r, &c, &rad);
 		return c;
 	}
-	if (r->kind == SC_REGION_CONE)
-		return r->center;
+	if (r->kind == SC_REGION_CONE || SC_REGION_IS_MOC(r))
+		return r->center;		/* a MOC's: the centre of area of its cells */
 	return poly_centroid(r);
 }
 
@@ -1504,6 +1758,8 @@ region_farthest(const sc_region *r, sc_vec3 p)
 	}
 	if (r->kind == SC_REGION_CONE)
 		return sc_angle(p, r->center) + r->radius;
+	if (SC_REGION_IS_MOC(r))
+		return fmin(M_PI, sc_angle(p, r->center) + r->radius);	/* a bound */
 
 	/*
 	 * A polygon: the farthest point is on the boundary unless the polygon
@@ -1627,7 +1883,8 @@ sc_region_bounding_cap(const sc_region *r, sc_vec3 *center, double *radius)
 		return;
 	}
 	*center = sc_region_centroid(r);
-	*radius = (r->kind == SC_REGION_CONE) ? r->radius : region_farthest(r, *center);
+	*radius = (r->kind == SC_REGION_CONE || SC_REGION_IS_MOC(r)) ? r->radius
+		: region_farthest(r, *center);
 }
 
 /* do the minor arcs a1-a2 and b1-b2 cross? */
@@ -1896,6 +2153,8 @@ smallest_piece(const sc_region *r)
 	sc_vec3		c;
 	double		rad = M_PI;
 
+	if (SC_REGION_IS_MOC(r))
+		return sc_pixrad(r->moc_order);	/* its finest cell */
 	if (!SC_REGION_IS_COMPOSITE(r))
 	{
 		sc_region_bounding_cap(r, &c, &rad);
@@ -2030,7 +2289,10 @@ composite_contains_region(const sc_region *a, const sc_region *b)
 static int
 region_within(const sc_region *a, const sc_region *b)
 {
-	if (SC_REGION_IS_COMPOSITE(a) || SC_REGION_IS_COMPOSITE(b))
+	if (SC_REGION_IS_MOC(a) && SC_REGION_IS_MOC(b))
+		return moc_within_moc(a, b);
+	if (SC_REGION_IS_COMPOSITE(a) || SC_REGION_IS_COMPOSITE(b) ||
+		SC_REGION_IS_MOC(a) || SC_REGION_IS_MOC(b))
 		return composite_contains_region(a, b);
 	return prim_contains_region(a, b);
 }
@@ -2038,7 +2300,10 @@ region_within(const sc_region *a, const sc_region *b)
 static int
 region_meets(const sc_region *a, const sc_region *b)
 {
-	if (SC_REGION_IS_COMPOSITE(a) || SC_REGION_IS_COMPOSITE(b))
+	if (SC_REGION_IS_MOC(a) && SC_REGION_IS_MOC(b))
+		return moc_meets_moc(a, b);
+	if (SC_REGION_IS_COMPOSITE(a) || SC_REGION_IS_COMPOSITE(b) ||
+		SC_REGION_IS_MOC(a) || SC_REGION_IS_MOC(b))
 		return composite_overlaps(a, b);
 	return prim_overlaps(a, b);
 }
@@ -2054,6 +2319,8 @@ sc_region_contains_region(const sc_region *a, const sc_region *b)
 {
 	if (!region_within(a, b))
 		return 0;
+	if (SC_REGION_IS_MOC(a))
+		return a->nmoc > 0;
 	if (SC_REGION_IS_COMPOSITE(a))
 		return !region_is_empty(a, empty_test_order(a, a));
 	return 1;
@@ -3142,6 +3409,27 @@ cover_composite(const sc_region *r, const sc_density *d, const sc_cover_params *
 	}
 }
 
+/*
+ * Rows the region itself is expected to hold, from its covering: the
+ * covering's rows scaled by the share of its area the region fills, which
+ * assumes the density even across the covering.  A MOC's are read from the
+ * density over its own ranges instead: its covering merges the gaps between
+ * them, and a coverage map's cells sit where the density is not even.
+ */
+double
+sc_region_expected_rows(const sc_region *r, const sc_density *d, const sc_cover *cov)
+{
+	if (SC_REGION_IS_MOC(r))
+	{
+		double		n = 0;
+
+		for (int i = 0; i < r->nmoc; i++)
+			n += sc_density_rows(d, r->mlo[i], r->mhi[i]);
+		return fmin(n, cov->exp_rows);
+	}
+	return cov->area > 0 ? cov->exp_rows * fmin(1.0, r->area / cov->area) : 0.0;
+}
+
 void
 sc_cover_compute(const sc_region *r, const sc_density *d,
 				 const sc_cover_params *p, sc_cover *out)
@@ -3162,6 +3450,14 @@ sc_cover_compute(const sc_region *r, const sc_density *d,
 	if (SC_REGION_IS_COMPOSITE(r) && p->force_order < 0 &&
 		cover_composite(r, d, p, &kept, &steps))
 		goto finish;
+
+	/* a MOC is its own covering; finish below merges what is cheap to merge */
+	if (SC_REGION_IS_MOC(r) && p->force_order < 0)
+	{
+		for (int i = 0; i < r->nmoc; i++)
+			rlist_add(&kept, r->mlo[i], r->mhi[i]);
+		goto finish;
+	}
 
 	if (p->direct && r->kind == SC_REGION_CONE && r->radius >= 0 &&
 		r->radius <= 10.0 * M_PI / 180)

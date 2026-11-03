@@ -77,6 +77,10 @@ typedef struct
 #define SKY_DIFFERENCE 5
 #define SKY_NOT 6
 #define SKY_IS_COMPOSITE(k) ((k) >= SKY_UNION && (k) <= SKY_NOT)
+/* a MOC (0.44): v[] holds int64s, its depth then sorted, merged lo, hi pairs */
+#define SKY_MOC 7
+#define SKYMOC_DATA(r) ((int64 *) (r)->v)
+#define SKYMOC_NRANGES(r) ((int) (((VARSIZE(r) - offsetof(SkyRegion, v)) / sizeof(int64) - 1) / 2))
 
 typedef struct
 {
@@ -173,8 +177,223 @@ region_poly_ex(int nv, const double *coords, bool validate)
 }
 
 static const char *const sky_kind_name[] = {
-	"", "CIRCLE", "POLYGON", "UNION", "INTERSECTION", "DIFFERENCE", "NOT"
+	"", "CIRCLE", "POLYGON", "UNION", "INTERSECTION", "DIFFERENCE", "NOT", "MOC"
 };
+
+/*
+ * A MOC region from order-29 ranges in any order: normalised (sorted, merged)
+ * by sc_region_moc(), then stored with its depth, which is at least the
+ * order of its finest cell.
+ */
+static SkyRegion *
+region_moc(const int64 *lo, const int64 *hi, int n, int depth)
+{
+	sc_region	m;
+	SkyRegion  *r;
+	int64	   *d;
+	Size		sz;
+
+	check_err(sc_region_moc(&m, (const int64_t *) lo, (const int64_t *) hi, n));
+	sz = offsetof(SkyRegion, v) + sizeof(int64) * (1 + 2 * (Size) m.nmoc);
+	r = (SkyRegion *) palloc0(sz);
+	SET_VARSIZE(r, sz);
+	r->kind = SKY_MOC;
+	d = SKYMOC_DATA(r);
+	d[0] = Max(depth, m.moc_order);
+	for (int i = 0; i < m.nmoc; i++)
+	{
+		d[1 + 2 * i] = m.mlo[i];
+		d[2 + 2 * i] = m.mhi[i];
+	}
+	sc_region_free(&m);
+	return r;
+}
+
+/* cells read from a MOC's text, as order-29 ranges */
+typedef struct
+{
+	int64	   *lo,
+			   *hi;
+	int			n,
+				cap;
+	int			depth;
+	const char *str;			/* the whole input, for messages */
+} moc_cells;
+
+static void
+moc_text_error(const moc_cells *mc, const char *detail)
+{
+	ereport(ERROR, (errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
+					errmsg("invalid MOC: \"%.200s%s\"", mc->str, strlen(mc->str) > 200 ? "..." : ""),
+					errdetail("%s", detail),
+					errhint("Write an IVOA MOC in its ASCII form, \"order/cell cell-cell ... order/...\", "
+							"for example \"5/4965 4967 6/19771-19775\", or its JSON form, "
+							"{\"5\": [4965, 4967], \"6\": [19771]}.")));
+}
+
+/* cells a..b of an order */
+static void
+moc_cells_add(moc_cells *mc, int order, int64 a, int64 b)
+{
+	int			shift;
+
+	if (order < 0)
+		moc_text_error(mc, "A cell comes before any order.");
+	if (a < 0 || b < a || b >= 12 * ((int64) 1 << (2 * order)))
+		moc_text_error(mc, psprintf("No cell " INT64_FORMAT "%s at order %d.",
+									b < a ? a : b, b < a ? " (a range backwards)" : "", order));
+	if (mc->n == mc->cap)
+	{
+		mc->cap = mc->cap ? 2 * mc->cap : 64;
+		mc->lo = mc->lo ? repalloc_huge(mc->lo, sizeof(int64) * mc->cap) : palloc(sizeof(int64) * mc->cap);
+		mc->hi = mc->hi ? repalloc_huge(mc->hi, sizeof(int64) * mc->cap) : palloc(sizeof(int64) * mc->cap);
+	}
+	shift = 2 * (SC_MAX_ORDER - order);
+	mc->lo[mc->n] = a << shift;
+	mc->hi[mc->n] = ((b + 1) << shift) - 1;
+	mc->n++;
+}
+
+static int64
+moc_number(moc_cells *mc, const char **s)
+{
+	char	   *end;
+	long long	v;
+
+	errno = 0;
+	v = strtoll(*s, &end, 10);
+	if (end == *s || errno == ERANGE || v < 0)
+		moc_text_error(mc, "Expected a cell or order number.");
+	*s = end;
+	return (int64) v;
+}
+
+static int
+moc_order_number(moc_cells *mc, int64 v)
+{
+	if (v > SC_MAX_ORDER)
+		moc_text_error(mc, psprintf("Order " INT64_FORMAT " is beyond 29, the finest HEALPix order.", v));
+	mc->depth = Max(mc->depth, (int) v);
+	return (int) v;
+}
+
+/*
+ * MOC ASCII: MOC 2.0's "5/4965 4967 6/19771-19775 10/", or MOC 1.0's commas;
+ * an "s" before an order (MOC 2.0's space prefix) is allowed.  Stops at
+ * anything else, which is the caller's to judge (the next region of a
+ * composite, or trailing text).
+ */
+static const char *
+moc_parse_ascii(moc_cells *mc, const char *s)
+{
+	int			order = -1;
+
+	for (;;)
+	{
+		int64		a;
+
+		while (isspace((unsigned char) *s) || *s == ',')
+			s++;
+		if ((*s == 's' || *s == 'S') && isdigit((unsigned char) s[1]))
+			s++;
+		if (!isdigit((unsigned char) *s))
+			return s;
+		a = moc_number(mc, &s);
+		if (*s == '/')
+		{
+			order = moc_order_number(mc, a);
+			s++;
+			continue;
+		}
+		if (*s == '-' && isdigit((unsigned char) s[1]))
+		{
+			s++;
+			moc_cells_add(mc, order, a, moc_number(mc, &s));
+		}
+		else
+			moc_cells_add(mc, order, a, a);
+		if (*s != '\0' && !isspace((unsigned char) *s) && *s != ',' && *s != ')')
+			moc_text_error(mc, "Cells are separated by spaces or commas.");
+	}
+}
+
+/* MOC JSON: {"5": [4965, 4967], "6": [19771], "10": []} */
+static const char *
+moc_parse_json(moc_cells *mc, const char *s)
+{
+#define JSON_WS() while (isspace((unsigned char) *s)) s++
+	s++;						/* the '{' */
+	JSON_WS();
+	if (*s == '}')
+		return s + 1;
+	for (;;)
+	{
+		int			order;
+
+		if (*s != '"')
+			moc_text_error(mc, "Expected an order in quotes.");
+		s++;
+		if (!isdigit((unsigned char) *s))
+			moc_text_error(mc, "Expected an order in quotes.");
+		order = moc_order_number(mc, moc_number(mc, &s));
+		if (*s != '"')
+			moc_text_error(mc, "Expected an order in quotes.");
+		s++;
+		JSON_WS();
+		if (*s != ':')
+			moc_text_error(mc, "Expected ':' after an order.");
+		s++;
+		JSON_WS();
+		if (*s != '[')
+			moc_text_error(mc, "Expected the cells of an order in brackets.");
+		s++;
+		JSON_WS();
+		if (*s != ']')
+			for (;;)
+			{
+				int64		a;
+
+				if (!isdigit((unsigned char) *s))
+					moc_text_error(mc, "Expected a cell number.");
+				a = moc_number(mc, &s);
+				moc_cells_add(mc, order, a, a);
+				JSON_WS();
+				if (*s == ']')
+					break;
+				if (*s != ',')
+					moc_text_error(mc, "Expected ',' or ']' after a cell.");
+				s++;
+				JSON_WS();
+			}
+		s++;					/* the ']' */
+		JSON_WS();
+		if (*s == '}')
+			return s + 1;
+		if (*s != ',')
+			moc_text_error(mc, "Expected ',' or '}' after the cells of an order.");
+		s++;
+		JSON_WS();
+	}
+#undef JSON_WS
+}
+
+/* a MOC region from the whole of str, ASCII or JSON */
+static SkyRegion *
+moc_from_text(const char *str)
+{
+	moc_cells	mc = {0};
+	const char *s = str;
+
+	mc.str = str;
+	while (isspace((unsigned char) *s))
+		s++;
+	s = (*s == '{') ? moc_parse_json(&mc, s) : moc_parse_ascii(&mc, s);
+	while (isspace((unsigned char) *s))
+		s++;
+	if (*s != '\0')
+		moc_text_error(&mc, "Unexpected text after the MOC.");
+	return region_moc(mc.lo, mc.hi, mc.n, mc.depth);
+}
 
 /* the regions of a composite, in order; their count */
 static int
@@ -310,6 +529,22 @@ region_decode(const SkyRegion *r, sc_region *out, bool need_covering)
 	}
 	if (r->kind == SKY_CONE)
 		check_err(sc_region_cone(out, r->v[0], r->v[1], r->v[2], need_covering));
+	else if (r->kind == SKY_MOC)
+	{
+		const int64 *d = SKYMOC_DATA(r);
+		int			n = SKYMOC_NRANGES(r);
+		int64	   *lo = palloc(sizeof(int64) * Max(n, 1)),
+				   *hi = palloc(sizeof(int64) * Max(n, 1));
+
+		for (int i = 0; i < n; i++)
+		{
+			lo[i] = d[1 + 2 * i];
+			hi[i] = d[2 + 2 * i];
+		}
+		check_err(sc_region_moc(out, (int64_t *) lo, (int64_t *) hi, n));
+		pfree(lo);
+		pfree(hi);
+	}
 	else
 	{
 		int			nv = SKYREGION_NVERT(r);
@@ -448,7 +683,7 @@ static SkyRegion *box_region(double ra, double dec, double w, double h);
 static int
 stcs_kind_at(const char *s, const char **after)
 {
-	for (int k = SKY_CONE; k <= SKY_NOT; k++)
+	for (int k = SKY_CONE; k <= SKY_MOC; k++)
 		if ((*after = stcs_match_word(s, sky_kind_name[k])) != NULL)
 			return k;
 	return 0;
@@ -497,8 +732,19 @@ stcs_region(stcs_parser *ps, bool top)
 	if (kind == 0 && (t = stcs_match_word(ps->s, "BOX")) != NULL)
 		kind = STCS_BOX;		/* read as the polygon box() makes */
 	if (kind == 0)
-		stcs_error(ps, "Expected CIRCLE, BOX, POLYGON, UNION, INTERSECTION, DIFFERENCE or NOT.");
+		stcs_error(ps, "Expected CIRCLE, BOX, POLYGON, MOC, UNION, INTERSECTION, DIFFERENCE or NOT.");
 	ps->s = t;
+
+	/* MOC ASCII, as skycell_moc() writes it; a MOC has no frame of its own */
+	if (kind == SKY_MOC)
+	{
+		moc_cells	mc = {0};
+
+		stcs_frame(ps, false);
+		mc.str = ps->str;
+		ps->s = moc_parse_ascii(&mc, ps->s);
+		return region_moc(mc.lo, mc.hi, mc.n, mc.depth);
+	}
 	stcs_frame(ps, top);
 
 	if (SKY_IS_COMPOSITE(kind))
@@ -585,6 +831,13 @@ static void
 stcs_print(StringInfo buf, const SkyRegion *r, bool top)
 {
 	appendStringInfoString(buf, sky_kind_name[r->kind]);
+	if (r->kind == SKY_MOC)
+	{
+		appendStringInfoChar(buf, ' ');
+		appendStringInfoString(buf, skycell_moc_cstring(SKYMOC_DATA(r) + 1, SKYMOC_NRANGES(r),
+														(int) SKYMOC_DATA(r)[0], false));
+		return;
+	}
 	if (top)
 		appendStringInfoString(buf, " ICRS");
 	if (SKY_IS_COMPOSITE(r->kind))
@@ -735,6 +988,18 @@ skycell_region_stcs(PG_FUNCTION_ARGS)
 {
 	PG_RETURN_DATUM(DirectFunctionCall1(skyregion_in,
 										CStringGetDatum(text_to_cstring(PG_GETARG_TEXT_PP(0)))));
+}
+
+/*
+ * skycell_moc_region(moc text): a MOC, in its ASCII or JSON form, as a region
+ * (0.44); what skycell_moc(), skycell_moc_agg() and skycell_coverage_moc()
+ * write reads back.  REGION('MOC 5/4965 ...') reads the ASCII form too.
+ */
+PG_FUNCTION_INFO_V1(skycell_moc_region);
+Datum
+skycell_moc_region(PG_FUNCTION_ARGS)
+{
+	PG_RETURN_POINTER(moc_from_text(text_to_cstring(PG_GETARG_TEXT_PP(0))));
 }
 
 /* the regions of a skyregion[], detoasted; NULL elements refused */
@@ -933,6 +1198,7 @@ typedef struct
 	MemoryContext cxt;			/* owns last_datum and reg's arrays, or NULL */
 	bytea	   *last_datum;		/* copy of the datum the region was built from */
 	Size		last_size;
+	bool		fixed;			/* built from a constant argument: never changes */
 	sc_region	reg;
 } region_arg_cache;
 
@@ -941,13 +1207,21 @@ typedef struct
 	region_arg_cache arg[2];
 } region_pair_cache;
 
+/*
+ * The region of argument fnarg, kept in slot argno.  Where that argument is a
+ * constant (or an external parameter) for the whole query, the region built
+ * on the first call is returned on every later one without looking at the
+ * datum again: comparing it costs as much as its size, which for a MOC of
+ * many cells (hundreds of kilobytes) is more than the test it feeds.
+ */
 static sc_region *
-cached_region_arg(FunctionCallInfo fcinfo, int argno, Datum arg_datum)
+cached_region_arg(FunctionCallInfo fcinfo, int argno, int fnarg)
 {
 	region_pair_cache *c = (region_pair_cache *) fcinfo->flinfo->fn_extra;
 	region_arg_cache *slot;
-	bytea	   *b = DatumGetByteaP(arg_datum);
-	Size		sz = VARSIZE(b);
+	Datum		arg_datum = PG_GETARG_DATUM(fnarg);
+	bytea	   *b;
+	Size		sz;
 
 	if (c == NULL)
 	{
@@ -955,6 +1229,10 @@ cached_region_arg(FunctionCallInfo fcinfo, int argno, Datum arg_datum)
 		fcinfo->flinfo->fn_extra = c;
 	}
 	slot = &c->arg[argno];
+	if (slot->fixed)
+		return &slot->reg;
+	b = DatumGetByteaP(arg_datum);
+	sz = VARSIZE(b);
 	if (slot->last_datum == NULL || slot->last_size != sz ||
 		memcmp(slot->last_datum, b, sz) != 0)
 	{
@@ -975,14 +1253,15 @@ cached_region_arg(FunctionCallInfo fcinfo, int argno, Datum arg_datum)
 		memcpy(slot->last_datum, b, sz);
 		slot->last_size = sz;
 		MemoryContextSwitchTo(oldcxt);
+		slot->fixed = get_fn_expr_arg_stable(fcinfo->flinfo, fnarg);
 	}
 	return &slot->reg;
 }
 
 static bool
-pos_in_region(FunctionCallInfo fcinfo, SkyPos *p, Datum region)
+pos_in_region(FunctionCallInfo fcinfo, SkyPos *p, int region_arg)
 {
-	sc_region *reg = cached_region_arg(fcinfo, 0, region);
+	sc_region *reg = cached_region_arg(fcinfo, 0, region_arg);
 
 	return sc_region_contains(reg, pos_vec(p)) != 0;
 }
@@ -991,14 +1270,14 @@ PG_FUNCTION_INFO_V1(skycell_pos_in_region);
 Datum
 skycell_pos_in_region(PG_FUNCTION_ARGS)
 {
-	PG_RETURN_BOOL(pos_in_region(fcinfo, PG_GETARG_SKYPOS(0), PG_GETARG_DATUM(1)));
+	PG_RETURN_BOOL(pos_in_region(fcinfo, PG_GETARG_SKYPOS(0), 1));
 }
 
 PG_FUNCTION_INFO_V1(skycell_region_has_pos);
 Datum
 skycell_region_has_pos(PG_FUNCTION_ARGS)
 {
-	PG_RETURN_BOOL(pos_in_region(fcinfo, PG_GETARG_SKYPOS(1), PG_GETARG_DATUM(0)));
+	PG_RETURN_BOOL(pos_in_region(fcinfo, PG_GETARG_SKYPOS(1), 0));
 }
 
 /* the exact test the rewrite appends; the last argument is a selectivity hint */
@@ -1006,7 +1285,7 @@ PG_FUNCTION_INFO_V1(skycell_pos_in_region_sel);
 Datum
 skycell_pos_in_region_sel(PG_FUNCTION_ARGS)
 {
-	PG_RETURN_BOOL(pos_in_region(fcinfo, PG_GETARG_SKYPOS(0), PG_GETARG_DATUM(1)));
+	PG_RETURN_BOOL(pos_in_region(fcinfo, PG_GETARG_SKYPOS(0), 1));
 }
 
 /*
@@ -1020,7 +1299,7 @@ skycell_region_scan(PG_FUNCTION_ARGS)
 {
 	double		ra = PG_GETARG_FLOAT8(1),
 				dec = PG_GETARG_FLOAT8(2);
-	sc_region  *reg = cached_region_arg(fcinfo, 0, PG_GETARG_DATUM(3));
+	sc_region  *reg = cached_region_arg(fcinfo, 0, 3);
 
 	if (!isfinite(ra) || !(dec >= -90.0 && dec <= 90.0))
 		PG_RETURN_BOOL(false);
@@ -1031,14 +1310,14 @@ PG_FUNCTION_INFO_V1(skycell_contains);
 Datum
 skycell_contains(PG_FUNCTION_ARGS)
 {
-	PG_RETURN_INT32(pos_in_region(fcinfo, PG_GETARG_SKYPOS(0), PG_GETARG_DATUM(1)) ? 1 : 0);
+	PG_RETURN_INT32(pos_in_region(fcinfo, PG_GETARG_SKYPOS(0), 1) ? 1 : 0);
 }
 
 static int
 region_region(PG_FUNCTION_ARGS, bool contains)
 {
-	sc_region  *a = cached_region_arg(fcinfo, 0, PG_GETARG_DATUM(0));
-	sc_region  *b = cached_region_arg(fcinfo, 1, PG_GETARG_DATUM(1));
+	sc_region  *a = cached_region_arg(fcinfo, 0, 0);
+	sc_region  *b = cached_region_arg(fcinfo, 1, 1);
 	int			res;
 
 	res = contains ? sc_region_contains_region(a, b) : sc_region_overlaps(a, b);
@@ -1065,7 +1344,7 @@ Datum
 skycell_intersects_pos(PG_FUNCTION_ARGS)
 {
 	/* a point has no area: intersecting one is being contained in it */
-	PG_RETURN_INT32(pos_in_region(fcinfo, PG_GETARG_SKYPOS(0), PG_GETARG_DATUM(1)) ? 1 : 0);
+	PG_RETURN_INT32(pos_in_region(fcinfo, PG_GETARG_SKYPOS(0), 1) ? 1 : 0);
 }
 
 /* ADQL lets INTERSECTS take the point second: INTERSECTS(CIRCLE(...), POINT(...)) */
@@ -1073,7 +1352,7 @@ PG_FUNCTION_INFO_V1(skycell_intersects_region_pos);
 Datum
 skycell_intersects_region_pos(PG_FUNCTION_ARGS)
 {
-	PG_RETURN_INT32(pos_in_region(fcinfo, PG_GETARG_SKYPOS(1), PG_GETARG_DATUM(0)) ? 1 : 0);
+	PG_RETURN_INT32(pos_in_region(fcinfo, PG_GETARG_SKYPOS(1), 0) ? 1 : 0);
 }
 
 PG_FUNCTION_INFO_V1(skycell_region_overlap);
@@ -1100,8 +1379,8 @@ skycell_region_covers(PG_FUNCTION_ARGS)
 	 * reuses; the only regression test for this function,
 	 * skycell_region_covers(p, p), is symmetric and could never catch a
 	 * reversed argument order. */
-	sc_region  *a = cached_region_arg(fcinfo, 0, PG_GETARG_DATUM(0));
-	sc_region  *b = cached_region_arg(fcinfo, 1, PG_GETARG_DATUM(1));
+	sc_region  *a = cached_region_arg(fcinfo, 0, 0);
+	sc_region  *b = cached_region_arg(fcinfo, 1, 1);
 	int			res;
 
 	res = sc_region_contains_region(b, a);
@@ -1230,7 +1509,15 @@ skycell_centroid(PG_FUNCTION_ARGS)
 		}
 	}
 	else
+	{
+		if (SC_REGION_IS_MOC(&r) && r.nmoc == 0)
+			ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+							errmsg("an empty region has no centroid")));
+		if (SC_REGION_IS_MOC(&r) && r.moc_balanced)
+			ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+							errmsg("the region has no centroid: it is balanced about the centre of the sphere")));
 		c = sc_region_centroid(&r);
+	}
 	sc_region_free(&r);
 	dec = asin(fmax(-1.0, fmin(1.0, c.z))) * RAD2DEG;
 	ra = atan2(c.y, c.x) * RAD2DEG;
@@ -1919,7 +2206,8 @@ region_simplify_oriented(SupportRequestSimplify *req, Oid funcid, Node *pt, Node
 			Node	   *ra,
 					   *dec;
 
-			if ((SKY_IS_COMPOSITE(sr->kind) || sr->kind == SKY_POLY) && !IsA(pt, Const) &&
+			if ((SKY_IS_COMPOSITE(sr->kind) || sr->kind == SKY_POLY || sr->kind == SKY_MOC) &&
+				!IsA(pt, Const) &&
 				pos_ra_dec(funcid, pt, &ra, &dec))
 			{
 				Oid			t[4] = {INT8OID, FLOAT8OID, FLOAT8OID, exprType(rg)};
@@ -1951,7 +2239,8 @@ region_simplify_oriented(SupportRequestSimplify *req, Oid funcid, Node *pt, Node
 		}
 		else
 			sc_cover_compute(&reg, &dens, &p, &cov);
-		sel = (cov.area > 0) ? fmin(1.0, reg.area / cov.area) : 0.0;
+		sel = (cov.exp_rows > 0) ? fmin(1.0, sc_region_expected_rows(&reg, &dens, &cov) / cov.exp_rows)
+			: (cov.area > 0) ? fmin(1.0, reg.area / cov.area) : 0.0;
 
 		/*
 		 * Decline the rewrite when the covering's own cost model expects
@@ -2220,7 +2509,7 @@ region_pos_density_sel(Oid selfid, PlannerInfo *root, Node *pt, Node *rg)
 				else
 					sc_cover_compute(&reg, &dens, &p, &cov);
 
-				est = cov.exp_rows * ((cov.area > 0) ? fmin(1.0, reg.area / cov.area) : 0.0);
+				est = sc_region_expected_rows(&reg, &dens, &cov);
 				result = fmin(1.0, fmax(est / dens.ntotal, 1e-12));
 				/* cov not freed: see region_support_simplify's identical
 				 * comment above -- cover_cached()'s cone branch aliases its
@@ -3113,7 +3402,7 @@ skycell_cell_overlaps(PG_FUNCTION_ARGS)
 {
 	int32		order = PG_GETARG_INT32(0);
 	int64		pix = PG_GETARG_INT64(1);
-	sc_region  *reg = cached_region_arg(fcinfo, 0, PG_GETARG_DATUM(2));
+	sc_region  *reg = cached_region_arg(fcinfo, 0, 2);
 
 	check_cell_args(order, pix);
 	PG_RETURN_INT32(cell_meets_region(reg, order, pix) ? 1 : 0);
@@ -3126,7 +3415,7 @@ skycell_cell_meets(PG_FUNCTION_ARGS)
 {
 	int32		order = PG_GETARG_INT32(0);
 	int64		pix = PG_GETARG_INT64(1);
-	sc_region  *reg = cached_region_arg(fcinfo, 0, PG_GETARG_DATUM(2));
+	sc_region  *reg = cached_region_arg(fcinfo, 0, 2);
 
 	check_cell_args(order, pix);
 	PG_RETURN_BOOL(cell_meets_region(reg, order, pix));
