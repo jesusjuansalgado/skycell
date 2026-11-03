@@ -35,6 +35,8 @@
 #include "access/tableam.h"
 #include "access/heapam.h"
 #include "catalog/namespace.h"
+#include "catalog/pg_inherits.h"
+#include "utils/regproc.h"
 #include "utils/fmgroids.h"
 #include "utils/snapmgr.h"
 #include "catalog/pg_am_d.h"
@@ -3268,4 +3270,309 @@ skycell_region_moc(PG_FUNCTION_ARGS)
 	skycell_region_from_datum(PG_GETARG_DATUM(0), &reg);
 	PG_RETURN_ARRAYTYPE_P(moc_for_region(&reg, Max(PG_GETARG_INT32(1), 4),
 										 Min(Max(PG_GETARG_INT32(2), 0), SC_MAX_ORDER)));
+}
+
+/* ------------------------------------------------------------------ */
+/* estimates of the number of rows in a region (0.46)                  */
+/* ------------------------------------------------------------------ */
+
+/*
+ * The density model the planner reads for a table: its index on
+ * skycell_ang2cell(ra, dec) or skycell_cell(pos) (a skycell_cell_ops one
+ * preferred, as density_for_expr() does), else a stored column named cell.
+ * False when it has neither.
+ */
+static bool
+table_cell_density(Oid relid, sc_density *d)
+{
+	Relation	rel = table_open(relid, AccessShareLock);
+	List	   *indexes = RelationGetIndexList(rel);
+	ListCell   *lc;
+	Oid			best = InvalidOid;
+	bool		best_ops = false;
+	Oid			cellops = cell_ops_opfamily();
+	AttrNumber	att;
+
+	foreach(lc, indexes)
+	{
+		Oid			indexoid = lfirst_oid(lc);
+		Relation	irel = index_open(indexoid, AccessShareLock);
+
+		if (irel->rd_index->indnatts >= 1 && irel->rd_index->indkey.values[0] == 0)
+		{
+			List	   *exprs = RelationGetIndexExpressions(irel);
+			Node	   *e = exprs ? linitial(exprs) : NULL;
+
+			if (e != NULL && IsA(e, FuncExpr))
+			{
+				char	   *name = get_func_name(((FuncExpr *) e)->funcid);
+				bool		ops = OidIsValid(cellops) && irel->rd_opfamily[0] == cellops;
+
+				if (name != NULL && (strcmp(name, "skycell_ang2cell") == 0 ||
+									 strcmp(name, "skycell_cell") == 0) &&
+					(!OidIsValid(best) || (ops && !best_ops)))
+				{
+					best = indexoid;
+					best_ops = ops;
+				}
+			}
+		}
+		index_close(irel, AccessShareLock);
+	}
+	list_free(indexes);
+	table_close(rel, AccessShareLock);
+	if (OidIsValid(best))
+	{
+		load_density_cached(relid, best, 1, d);
+		return true;
+	}
+	att = get_attnum(relid, "cell");
+	if (att != InvalidAttrNumber)
+	{
+		load_density(relid, att, d);
+		return true;
+	}
+	return false;
+}
+
+/*
+ * The table a name gives, as regclass reads it (search_path, quoting), and
+ * the relations whose statistics hold its rows: itself, or a partitioned
+ * table's leaf partitions.
+ */
+static List *
+estimate_relations(text *name)
+{
+	char	   *s = text_to_cstring(name);
+	Oid			relid = DatumGetObjectId(DirectFunctionCall1(regclassin, CStringGetDatum(s)));
+	List	   *out = NIL;
+	ListCell   *lc;
+
+	if (get_rel_relkind(relid) != RELKIND_PARTITIONED_TABLE)
+		return list_make1_oid(relid);
+	foreach(lc, find_all_inheritors(relid, AccessShareLock, NULL))
+	{
+		Oid			r = lfirst_oid(lc);
+
+		if (get_rel_relkind(r) == RELKIND_RELATION || get_rel_relkind(r) == RELKIND_MATVIEW)
+			out = lappend_oid(out, r);
+	}
+	return out;
+}
+
+static void
+no_density(Oid relid)
+{
+	ereport(ERROR,
+			(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+			 errmsg("skycell: %s has no cell index to estimate from", get_rel_name(relid)),
+			 errhint("Index skycell_ang2cell(ra, dec) (or a stored cell column) and ANALYZE the table.")));
+}
+
+/*
+ * The rows the density model puts inside a region: the region's cells,
+ * refined from the twelve base cells where its edge crosses them, each cell
+ * inside counted whole, until a cell is a 16th of the region across or holds
+ * under half a row -- then counted whole if its centre is inside.  So a
+ * coarse covering where the table is sparse (a partition holding half the
+ * sky, the hole of an annulus) does not dilute the count, as scaling a
+ * covering's rows by its area would.  At most 20,000 cells.
+ */
+#define ESTIMATE_MAX_CELLS 20000
+
+static double
+region_rows(const sc_region *reg, const sc_density *d)
+{
+	struct
+	{
+		int			o;
+		int64		pix;
+	}			stack[12 + 3 * (SC_MAX_ORDER + 1)];
+	int			top = 0,
+				steps = 0,
+				maxo;
+	double		total = 0,
+				rad;
+	sc_vec3		c;
+
+	sc_region_bounding_cap(reg, &c, &rad);
+	maxo = (int) floor(log2(1.0233267079464885 / fmax(fmin(rad, M_PI) / 16.0, 1e-12)));
+	maxo = Max(0, Min(maxo, SC_MAX_ORDER));
+	for (int f = 11; f >= 0; f--)
+	{
+		stack[top].o = 0;
+		stack[top++].pix = f;
+	}
+	while (top > 0)
+	{
+		int			o = stack[--top].o;
+		int64		pix = stack[top].pix;
+		double		fo,
+					rows;
+		sc_class	cls = sc_region_classify(reg, o, pix, &fo);
+
+		steps++;
+		if (cls == SC_OUT)
+			continue;
+		rows = sc_density_rows(d, sc_pix_lo(o, pix), sc_pix_hi(o, pix));
+		if (cls == SC_IN)
+			total += rows;
+		else if (rows < 0.5 || o >= maxo || steps + top + 4 > ESTIMATE_MAX_CELLS)
+		{
+			if (sc_region_contains(reg, sc_pix2vec(o, pix)))
+				total += rows;
+		}
+		else
+			for (int ch = 3; ch >= 0; ch--)
+			{
+				stack[top].o = o + 1;
+				stack[top++].pix = 4 * pix + ch;
+			}
+	}
+	return total;
+}
+
+/*
+ * skycell_count_estimate(tbl, region): the rows the table's statistics expect
+ * in the region (region_rows() above).  No row is read: well under a
+ * millisecond, at the resolution of the histogram (about ntotal / statistics
+ * target rows per bucket), and as current as the last ANALYZE.
+ */
+PG_FUNCTION_INFO_V1(skycell_count_estimate);
+Datum
+skycell_count_estimate(PG_FUNCTION_ARGS)
+{
+	List	   *rels = estimate_relations(PG_GETARG_TEXT_PP(0));
+	sc_region	reg;
+	double		total = 0;
+	ListCell   *lc;
+
+	skycell_region_from_datum(PG_GETARG_DATUM(1), &reg);
+	foreach(lc, rels)
+	{
+		sc_density	d;
+
+		if (!table_cell_density(lfirst_oid(lc), &d))
+			no_density(lfirst_oid(lc));
+		if (d.ntotal > 0 && reg.area > 0)
+			total += region_rows(&reg, &d);
+	}
+	sc_region_free(&reg);
+	PG_RETURN_FLOAT8(total);
+}
+
+/* skycell_count_estimate(tbl, hpx_order, ipix): the same for one HEALPix cell */
+PG_FUNCTION_INFO_V1(skycell_count_estimate_cell);
+Datum
+skycell_count_estimate_cell(PG_FUNCTION_ARGS)
+{
+	List	   *rels = estimate_relations(PG_GETARG_TEXT_PP(0));
+	int32		order = PG_GETARG_INT32(1);
+	int64		ipix = PG_GETARG_INT64(2);
+	double		total = 0;
+	ListCell   *lc;
+
+	if (order < 0 || order > SC_MAX_ORDER)
+		ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+						errmsg("skycell: HEALPix order must be within [0, %d]", SC_MAX_ORDER)));
+	if (ipix < 0 || ipix >= 12 * ((int64) 1 << (2 * order)))
+		ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+						errmsg("skycell: no HEALPix cell %lld at order %d", (long long) ipix, order)));
+	foreach(lc, rels)
+	{
+		sc_density	d;
+
+		if (!table_cell_density(lfirst_oid(lc), &d))
+			no_density(lfirst_oid(lc));
+		if (d.ntotal > 0)
+			total += sc_density_rows(&d, sc_pix_lo(order, ipix), sc_pix_hi(order, ipix));
+	}
+	PG_RETURN_FLOAT8(total);
+}
+
+/*
+ * skycell_density_estimate(tbl, region, hpx_order) -> (ipix, estimate,
+ * inside): the cells of that order the region meets, each with the rows the
+ * statistics expect in it (the whole cell's) and whether it lies wholly inside
+ * the region; in cell order.  At most 200,000 cells.
+ */
+#define DENSITY_MAX_CELLS 200000
+
+PG_FUNCTION_INFO_V1(skycell_density_estimate);
+Datum
+skycell_density_estimate(PG_FUNCTION_ARGS)
+{
+	ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
+	List	   *rels = estimate_relations(PG_GETARG_TEXT_PP(0));
+	int32		order = PG_GETARG_INT32(2);
+	sc_region	reg;
+	sc_density *ds;
+	int			nd = 0,
+				n = 0;
+	ListCell   *lc;
+	struct
+	{
+		int			o;
+		int64		pix;
+	}		   *stack;
+	int			top = 0;
+
+	if (order < 0 || order > 20)
+		ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+						errmsg("skycell: HEALPix order must be within [0, 20] here")));
+	ds = palloc(sizeof(sc_density) * Max(list_length(rels), 1));
+	foreach(lc, rels)
+	{
+		if (!table_cell_density(lfirst_oid(lc), &ds[nd]))
+			no_density(lfirst_oid(lc));
+		nd++;
+	}
+	skycell_region_from_datum(PG_GETARG_DATUM(1), &reg);
+	InitMaterializedSRF(fcinfo, MAT_SRF_USE_EXPECTED_DESC);
+	stack = palloc(sizeof(*stack) * (12 + 3 * (order + 1)));
+	for (int f = 11; f >= 0; f--)
+	{
+		stack[top].o = 0;
+		stack[top++].pix = f;
+	}
+	while (top > 0)
+	{
+		int			o = stack[--top].o;
+		int64		pix = stack[top].pix;
+		double		fo;
+		sc_class	cls = sc_region_classify(&reg, o, pix, &fo);
+
+		if (cls == SC_OUT)
+			continue;
+		if (o < order)
+		{
+			/* children last to first, so that they come off in cell order */
+			for (int c = 3; c >= 0; c--)
+			{
+				stack[top].o = o + 1;
+				stack[top++].pix = 4 * pix + c;
+			}
+			continue;
+		}
+		if (++n > DENSITY_MAX_CELLS)
+			ereport(ERROR, (errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+							errmsg("skycell: the region meets more than %d cells at order %d",
+								   DENSITY_MAX_CELLS, order),
+							errhint("Ask for a coarser order.")));
+		{
+			double		est = 0;
+			Datum		v[3];
+			bool		nulls[3] = {false, false, false};
+
+			for (int i = 0; i < nd; i++)
+				if (ds[i].ntotal > 0)
+					est += sc_density_rows(&ds[i], sc_pix_lo(o, pix), sc_pix_hi(o, pix));
+			v[0] = Int64GetDatum(pix);
+			v[1] = Float8GetDatum(est);
+			v[2] = BoolGetDatum(cls == SC_IN);
+			tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, v, nulls);
+		}
+	}
+	sc_region_free(&reg);
+	return (Datum) 0;
 }
