@@ -32,3 +32,21 @@ The first version of `skycell_moc`, like `skycell_cell_overlaps` in 0.42,
 kept any cell whose circumscribing cap met the region, so a cell up to its
 own size away (0.87° from a 0.01° cone at order 3). 0.43 refines such a cell
 four orders deeper before keeping it, in both.
+
+## A MOC as a search region (0.44)
+
+`region.py` builds 60 random MOCs. Half come from skycell (`skycell_moc` of
+cones, polygons and annuli at orders 2–12), half from MOCPy (cones, the
+coverage of 2,000 of the table's own positions, and random cells of orders
+0–9, overlapping ones included). Each is used as a search region on
+`perf_oc`, through the custom scan, the range rewrite (custom scan off) and a
+sequential scan. The rows are compared with MOCPy's `contains_lonlat` on the
+same positions. Then 20 composites, a MOC less a cone, are compared with the
+rows expected from both tests.
+
+```bash
+PGDATABASE=real36 python3 region.py
+```
+
+Result ([`region.txt`](region.txt)): 180 of 180 answers equal MOCPy's (3.67
+million rows in all), and 60 of 60 composite answers equal the expected rows.

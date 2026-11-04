@@ -2167,7 +2167,7 @@ skycell_region_scan_support(PG_FUNCTION_ARGS)
 		{
 			/* an empty covering (an empty composite) holds no row */
 			req->selectivity = cov.area <= 0 ? 1e-12
-				: fmin(1.0, fmax(cov.exp_rows * fmin(1.0, reg.area / cov.area)
+				: fmin(1.0, fmax(sc_region_expected_rows(&reg, &dens, &cov)
 								 / dens.ntotal, 1e-12));
 			sc_region_free(&reg);
 			PG_RETURN_POINTER(req);
@@ -3638,8 +3638,28 @@ moc_check_order(int32 order, int32 max)
  * written last ("10/", or "10": []) to declare the MOC's depth, as MOCPy and
  * the MOC 2.0 recommendation do.
  */
+static char *moc_serialise_cstr(const moc_ranges *m, int max_order, int json);
+
 static text *
 moc_serialise(const moc_ranges *m, int max_order, int json)
+{
+	return cstring_to_text(moc_serialise_cstr(m, max_order, json));
+}
+
+/*
+ * The MOC of n sorted, merged order-29 ranges (pairs lo, hi), for the text
+ * form of a MOC region (adql.c); max_order no finer than its finest cell.
+ */
+char *
+skycell_moc_cstring(const int64 *pairs, int n, int max_order, bool json)
+{
+	moc_ranges	m = {(int64 *) pairs, n, n};
+
+	return moc_serialise_cstr(&m, max_order, json);
+}
+
+static char *
+moc_serialise_cstr(const moc_ranges *m, int max_order, int json)
 {
 	StringInfoData *ord = palloc0(sizeof(StringInfoData) * (max_order + 1));
 	int64	   *last = palloc(sizeof(int64) * (max_order + 1)),
@@ -3711,7 +3731,7 @@ moc_serialise(const moc_ranges *m, int max_order, int json)
 	if (json)
 		appendStringInfoChar(&out, '}');
 #undef FLUSH_RUN
-	return cstring_to_text(out.data);
+	return out.data;
 }
 
 /*

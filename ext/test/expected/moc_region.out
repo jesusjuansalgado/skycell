@@ -1,0 +1,340 @@
+-- A MOC as a search region (0.44): read from MOC ASCII or JSON, a point in it
+-- when its order-29 cell is; through the custom scan, the range rewrite and a
+-- sequential scan; in composites; region relations; stored and indexed.
+CREATE EXTENSION IF NOT EXISTS skycell;
+NOTICE:  extension "skycell" already exists, skipping
+SET extra_float_digits = 0;
+-- reading: MOC 2.0 ASCII, MOC 1.0 commas, the "s" prefix, JSON; normalised
+SELECT skycell_moc_region('5/4965 4967 6/19771-19775 10/');
+        skycell_moc_region        
+----------------------------------
+ MOC 5/4943 4965 4967 6/19771 10/
+(1 row)
+
+SELECT skycell_moc_region('1/0,1,2,3 2/40');
+ skycell_moc_region 
+--------------------
+ MOC 0/0 2/40
+(1 row)
+
+SELECT skycell_moc_region('s3/5 s4/24-27');
+ skycell_moc_region 
+--------------------
+ MOC 3/5-6 4/
+(1 row)
+
+SELECT skycell_moc_region('{"5": [4965, 4967], "6": [19771, 19772], "10": []}');
+        skycell_moc_region         
+-----------------------------------
+ MOC 5/4965 4967 6/19771-19772 10/
+(1 row)
+
+SELECT skycell_moc_region('{}') AS empty_json, skycell_moc_region('') AS empty, skycell_moc_region('7/') AS empty_depth;
+ empty_json | empty  | empty_depth 
+------------+--------+-------------
+ MOC 0/     | MOC 0/ | MOC 7/
+(1 row)
+
+SELECT skycell_moc_region('3/5 4/20-23 5/80') AS overlapping_cells;
+ overlapping_cells 
+-------------------
+ MOC 3/5 5/
+(1 row)
+
+SELECT region('MOC 5/4965 4967') AS stcs, 'MOC 3/1-2'::skyregion AS cast;
+      stcs       |   cast    
+-----------------+-----------
+ MOC 5/4965 4967 | MOC 3/1-2
+(1 row)
+
+SELECT region('UNION ICRS (MOC 3/5 CIRCLE 10 20 1)') AS in_union,
+       region('DIFFERENCE ICRS (MOC 1/0-3 NOT (MOC 2/0))') AS nested;
+              in_union               |                   nested                   
+-------------------------------------+--------------------------------------------
+ UNION ICRS (MOC 3/5 CIRCLE 10 20 1) | DIFFERENCE ICRS (MOC 0/0 1/ NOT (MOC 2/0))
+(1 row)
+
+-- what skycell_moc() writes reads back as the same MOC
+SELECT skycell_moc(skycell_moc_region(skycell_moc(circle('ICRS', 10, 20, 2), 8)), 8)
+       = skycell_moc(circle('ICRS', 10, 20, 2), 8) AS round_trip;
+ round_trip 
+------------
+ t
+(1 row)
+
+SELECT skycell_moc(skycell_moc_region('5/4965 4967 6/19771-19775'), 4) AS coarser;
+   coarser   
+-------------
+ 4/1235 1241
+(1 row)
+
+-- AREA and CENTROID
+SELECT round(area(skycell_moc_region('0/0-11'))::numeric, 6) AS full_sky,
+       round(area(skycell_moc_region('2/7'))::numeric, 6) AS order2_cell,
+       area(skycell_moc_region('3/')) AS empty;
+   full_sky   | order2_cell | empty 
+--------------+-------------+-------
+ 41252.961249 |  214.859173 |     0
+(1 row)
+
+SELECT round(coord1(centroid(skycell_moc_region('0/4')))::numeric, 9) AS ra,
+       round(coord2(centroid(skycell_moc_region('0/4')))::numeric, 9) AS dec;
+     ra      |     dec     
+-------------+-------------
+ 0.000000000 | 0.000000000
+(1 row)
+
+SELECT centroid(skycell_moc_region('3/'));
+ERROR:  an empty region has no centroid
+SELECT centroid(skycell_moc_region('0/0-11'));
+ERROR:  the region has no centroid: it is balanced about the centre of the sphere
+-- errors
+SELECT skycell_moc_region('5/99999');
+ERROR:  invalid MOC: "5/99999"
+DETAIL:  No cell 99999 at order 5.
+HINT:  Write an IVOA MOC in its ASCII form, "order/cell cell-cell ... order/...", for example "5/4965 4967 6/19771-19775", or its JSON form, {"5": [4965, 4967], "6": [19771]}.
+SELECT skycell_moc_region('4965');
+ERROR:  invalid MOC: "4965"
+DETAIL:  A cell comes before any order.
+HINT:  Write an IVOA MOC in its ASCII form, "order/cell cell-cell ... order/...", for example "5/4965 4967 6/19771-19775", or its JSON form, {"5": [4965, 4967], "6": [19771]}.
+SELECT skycell_moc_region('30/1');
+ERROR:  invalid MOC: "30/1"
+DETAIL:  Order 30 is beyond 29, the finest HEALPix order.
+HINT:  Write an IVOA MOC in its ASCII form, "order/cell cell-cell ... order/...", for example "5/4965 4967 6/19771-19775", or its JSON form, {"5": [4965, 4967], "6": [19771]}.
+SELECT skycell_moc_region('5/1 x');
+ERROR:  invalid MOC: "5/1 x"
+DETAIL:  Unexpected text after the MOC.
+HINT:  Write an IVOA MOC in its ASCII form, "order/cell cell-cell ... order/...", for example "5/4965 4967 6/19771-19775", or its JSON form, {"5": [4965, 4967], "6": [19771]}.
+SELECT skycell_moc_region('5/7-3');
+ERROR:  invalid MOC: "5/7-3"
+DETAIL:  No cell 7 (a range backwards) at order 5.
+HINT:  Write an IVOA MOC in its ASCII form, "order/cell cell-cell ... order/...", for example "5/4965 4967 6/19771-19775", or its JSON form, {"5": [4965, 4967], "6": [19771]}.
+SELECT skycell_moc_region('5/1;2');
+ERROR:  invalid MOC: "5/1;2"
+DETAIL:  Cells are separated by spaces or commas.
+HINT:  Write an IVOA MOC in its ASCII form, "order/cell cell-cell ... order/...", for example "5/4965 4967 6/19771-19775", or its JSON form, {"5": [4965, 4967], "6": [19771]}.
+SELECT skycell_moc_region('{"5": [1, 2}');
+ERROR:  invalid MOC: "{"5": [1, 2}"
+DETAIL:  Expected ',' or ']' after a cell.
+HINT:  Write an IVOA MOC in its ASCII form, "order/cell cell-cell ... order/...", for example "5/4965 4967 6/19771-19775", or its JSON form, {"5": [4965, 4967], "6": [19771]}.
+SELECT skycell_moc_region('{5: [1]}');
+ERROR:  invalid MOC: "{5: [1]}"
+DETAIL:  Expected an order in quotes.
+HINT:  Write an IVOA MOC in its ASCII form, "order/cell cell-cell ... order/...", for example "5/4965 4967 6/19771-19775", or its JSON form, {"5": [4965, 4967], "6": [19771]}.
+SELECT region('MOC 5/1 POINT');
+ERROR:  invalid input syntax for type skyregion: "MOC 5/1 POINT"
+DETAIL:  Unexpected text after the region.
+HINT:  Write STC-S: "CIRCLE ICRS ra dec radius", "BOX ICRS ra dec width height", "POLYGON ICRS ra1 dec1 ra2 dec2 ..." (degrees), or "UNION ICRS (...)", "INTERSECTION ICRS (...)", "DIFFERENCE ICRS (a b)", "NOT ICRS (a)".
+-- a catalogue: the rows of a MOC are those whose cell is in it, by any plan
+CREATE TABLE mr_cat AS
+SELECT i AS id, mod(i * 137.50776405003785, 360.0) AS ra,
+       degrees(asin(1 - 2 * (i + 0.5) / 50000.0)) AS dec
+FROM generate_series(0, 49999) i;
+CREATE INDEX mr_cat_cell ON mr_cat (skycell_ang2cell(ra, dec));
+ANALYZE mr_cat;
+CREATE TABLE mr_mocs (name text, m text);
+INSERT INTO mr_mocs VALUES
+  ('one cell', '4/1234'),
+  ('mixed orders', '3/100-110 5/2000-2010 7/40000-40100'),
+  ('cone at 8', skycell_moc(circle('ICRS', 120, 30, 5), 8)),
+  ('polygon at 10', skycell_moc(polygon('ICRS', 200, -10, 215, -8, 208, 4), 10)),
+  ('annulus at 7', skycell_moc(region('DIFFERENCE ICRS (CIRCLE 300 60 12 CIRCLE 300 60 6)'), 7)),
+  ('pole at 6', skycell_moc(circle('ICRS', 0, 90, 8), 6)),
+  ('scattered', '0/3 4/2000 6/40000 8/600000 10/9000000-9000100'),
+  ('whole sky', '0/0-11'),
+  ('empty', '5/');
+-- by cell, independently of the region code
+CREATE FUNCTION mr_by_cell(moc text) RETURNS bigint LANGUAGE sql AS $$
+  WITH t AS (SELECT split_part(x, '/', 1) o, split_part(x, '/', 2) cells
+             FROM regexp_split_to_table(trim(moc), ' (?=[0-9]+/)') x),
+       r AS (SELECT o::int o, split_part(c, '-', 1)::bigint a,
+                    coalesce(nullif(split_part(c, '-', 2), ''), split_part(c, '-', 1))::bigint b
+             FROM t, regexp_split_to_table(t.cells, ' ') c WHERE c <> '')
+  SELECT count(*) FROM mr_cat WHERE EXISTS (
+    SELECT 1 FROM r WHERE (skycell_ang2cell(ra, dec) >> (2 * (29 - r.o))) BETWEEN r.a AND r.b) $$;
+SELECT name, mr_by_cell(m) AS by_cell,
+       (SELECT count(*) FROM mr_cat WHERE 1 = CONTAINS(POINT('ICRS', ra, dec), skycell_moc_region(m))) AS adql
+FROM mr_mocs ORDER BY name;
+     name      | by_cell | adql  
+---------------+---------+-------
+ annulus at 7  |     447 |   447
+ cone at 8     |     102 |   102
+ empty         |       0 |     0
+ mixed orders  |     787 |   787
+ one cell      |      17 |    17
+ pole at 6     |     270 |   270
+ polygon at 10 |     117 |   117
+ scattered     |    4182 |  4182
+ whole sky     |   50000 | 50000
+(9 rows)
+
+CREATE FUNCTION mr_plans(moc text) RETURNS TABLE (scan bigint, rewrite bigint, seq bigint)
+LANGUAGE plpgsql AS $$
+BEGIN
+  EXECUTE format('SELECT count(*) FROM mr_cat WHERE 1 = CONTAINS(POINT(''ICRS'', ra, dec), skycell_moc_region(%L))', moc) INTO scan;
+  SET LOCAL skycell.custom_scan = off;
+  EXECUTE format('SELECT count(*) FROM mr_cat WHERE 1 = CONTAINS(POINT(''ICRS'', ra, dec), skycell_moc_region(%L))', moc) INTO rewrite;
+  SET LOCAL enable_indexscan = off; SET LOCAL enable_bitmapscan = off;
+  EXECUTE format('SELECT count(*) FROM mr_cat WHERE 1 = CONTAINS(POINT(''ICRS'', ra, dec), skycell_moc_region(%L))', moc) INTO seq;
+  RESET skycell.custom_scan; RESET enable_indexscan; RESET enable_bitmapscan;
+  RETURN NEXT;
+END $$;
+SELECT name, p.scan = mr_by_cell(m) AND p.rewrite = p.scan AND p.seq = p.scan AS same, p.scan
+FROM mr_mocs, LATERAL mr_plans(m) p ORDER BY name;
+     name      | same | scan  
+---------------+------+-------
+ annulus at 7  | t    |   447
+ cone at 8     | t    |   102
+ empty         | t    |     0
+ mixed orders  | t    |   787
+ one cell      | t    |    17
+ pole at 6     | t    |   270
+ polygon at 10 | t    |   117
+ scattered     | t    |  4182
+ whole sky     | t    | 50000
+(9 rows)
+
+-- a constant MOC takes the custom scan
+EXPLAIN (COSTS OFF)
+SELECT count(*) FROM mr_cat WHERE 1 = CONTAINS(POINT('ICRS', ra, dec), skycell_moc_region('3/100-110 5/2000-2010'));
+                                                                QUERY PLAN                                                                 
+-------------------------------------------------------------------------------------------------------------------------------------------
+ Aggregate
+   ->  Custom Scan (SkycellCone) on mr_cat
+         Filter: skycell_region_scan('0'::bigint, (ra)::double precision, "dec", 'MOC 2/25-26 3/108-110 4/500-501 5/2008-2010'::skyregion)
+         Index: mr_cat_cell
+         Ranges: 2
+         Mode: bitmap
+(6 rows)
+
+-- in composites: the boolean combination of the tests
+SELECT name,
+  (SELECT count(*) FROM mr_cat WHERE 1 = CONTAINS(POINT('ICRS', ra, dec),
+     region('DIFFERENCE ICRS (MOC ' || m || ' CIRCLE 120 30 3)'))) =
+  (SELECT count(*) FROM mr_cat WHERE 1 = CONTAINS(POINT('ICRS', ra, dec), skycell_moc_region(m))
+     AND 0 = CONTAINS(POINT('ICRS', ra, dec), CIRCLE('ICRS', 120, 30, 3))) AS difference,
+  (SELECT count(*) FROM mr_cat WHERE 1 = CONTAINS(POINT('ICRS', ra, dec),
+     region('INTERSECTION ICRS (MOC ' || m || ' POLYGON 100 0 140 0 140 50 100 50)'))) =
+  (SELECT count(*) FROM mr_cat WHERE 1 = CONTAINS(POINT('ICRS', ra, dec), skycell_moc_region(m))
+     AND 1 = CONTAINS(POINT('ICRS', ra, dec), POLYGON('ICRS', 100, 0, 140, 0, 140, 50, 100, 50))) AS intersection,
+  (SELECT count(*) FROM mr_cat WHERE 1 = CONTAINS(POINT('ICRS', ra, dec), region('NOT ICRS (MOC ' || m || ')'))) =
+  50000 - (SELECT count(*) FROM mr_cat WHERE 1 = CONTAINS(POINT('ICRS', ra, dec), skycell_moc_region(m))) AS negation
+FROM mr_mocs ORDER BY name;
+     name      | difference | intersection | negation 
+---------------+------------+--------------+----------
+ annulus at 7  | t          | t            | t
+ cone at 8     | t          | t            | t
+ empty         | t          | t            | t
+ mixed orders  | t          | t            | t
+ one cell      | t          | t            | t
+ pole at 6     | t          | t            | t
+ polygon at 10 | t          | t            | t
+ scattered     | t          | t            | t
+ whole sky     | t          | t            | t
+(9 rows)
+
+-- relations: MOC with MOC exactly; with a cone as the cone's own MOC says
+SELECT CONTAINS(skycell_moc_region('4/400-401'), skycell_moc_region('3/100')) AS a_in_b,
+       CONTAINS(skycell_moc_region('3/100'), skycell_moc_region('4/400-403')) AS same,
+       CONTAINS(skycell_moc_region('3/100'), skycell_moc_region('4/400-402')) AS b_in_a,
+       INTERSECTS(skycell_moc_region('4/403'), skycell_moc_region('3/100')) AS touching,
+       INTERSECTS(skycell_moc_region('4/404'), skycell_moc_region('3/100')) AS apart,
+       CONTAINS(skycell_moc_region('5/'), skycell_moc_region('3/100')) AS empty_in;
+ a_in_b | same | b_in_a | touching | apart | empty_in 
+--------+------+--------+----------+-------+----------
+      1 |    1 |      0 |        1 |     0 |        0
+(1 row)
+
+CREATE TABLE mr_fp AS
+SELECT i AS id, skycell_moc_region(skycell_moc(circle('ICRS', mod(i * 37.0, 360), mod(i * 13.0, 160) - 80,
+                                                      1 + mod(i, 5)), 6)) AS r
+FROM generate_series(1, 200) i;
+CREATE TEMP TABLE mr_cones AS
+SELECT j, c, skycell_moc_region(skycell_moc(c, 12)) AS cm
+FROM (SELECT j, circle('ICRS', mod(j * 71.3, 360), mod(j * 29.7, 170) - 85, 0.3 + mod(j, 7)) c
+      FROM generate_series(1, 25) j) s;
+SELECT count(*) AS pairs, sum(INTERSECTS(r, c)) AS meets,
+       count(*) FILTER (WHERE INTERSECTS(r, c) <> INTERSECTS(r, cm)) AS differ_meets,
+       count(*) FILTER (WHERE CONTAINS(r, c) <> CONTAINS(r, cm)) AS differ_moc_in_cone,
+       count(*) FILTER (WHERE CONTAINS(c, r) <> CONTAINS(cm, r)) AS differ_cone_in_moc
+FROM mr_fp, mr_cones;
+ pairs | meets | differ_meets | differ_moc_in_cone | differ_cone_in_moc 
+-------+-------+--------------+--------------------+--------------------
+  5000 |    27 |            0 |                  0 |                  0
+(1 row)
+
+-- stored MOCs under a GiST index: the sequential scan's answers
+CREATE INDEX mr_fp_r ON mr_fp USING gist (r);
+ANALYZE mr_fp;
+CREATE TEMP TABLE mr_seq AS
+SELECT j, (SELECT array_agg(id ORDER BY id) FROM mr_fp WHERE r && c) AS meets,
+          (SELECT array_agg(id ORDER BY id) FROM mr_fp WHERE 1 = CONTAINS(centroid(c), r)) AS holds
+FROM mr_cones;
+SET enable_seqscan = off;
+EXPLAIN (COSTS OFF) SELECT id FROM mr_fp WHERE r && CIRCLE('ICRS', 120, 10, 5);
+                       QUERY PLAN                       
+--------------------------------------------------------
+ Index Scan using mr_fp_r on mr_fp
+   Index Cond: (r && 'CIRCLE ICRS 120 10 5'::skyregion)
+(2 rows)
+
+SELECT count(*) AS cones, count(*) FILTER (WHERE s.meets IS NOT DISTINCT FROM
+         (SELECT array_agg(id ORDER BY id) FROM mr_fp WHERE r && c)) AS same_meets,
+       count(*) FILTER (WHERE s.holds IS NOT DISTINCT FROM
+         (SELECT array_agg(id ORDER BY id) FROM mr_fp WHERE 1 = CONTAINS(centroid(c), r))) AS same_holds,
+       sum(cardinality(s.meets)) AS meets
+FROM mr_cones JOIN mr_seq s USING (j);
+ cones | same_meets | same_holds | meets 
+-------+------------+------------+-------
+    25 |         25 |         25 |    27
+(1 row)
+
+RESET enable_seqscan;
+-- estimates and cell overlaps
+SELECT name, round((skycell_count_estimate('mr_cat', skycell_moc_region(m)) /
+                    nullif(mr_by_cell(m), 0))::numeric, 1) AS est_over_exact
+FROM mr_mocs WHERE name IN ('cone at 8', 'annulus at 7', 'whole sky') ORDER BY name;
+     name     | est_over_exact 
+--------------+----------------
+ annulus at 7 |            1.0
+ cone at 8    |            1.0
+ whole sky    |            1.0
+(3 rows)
+
+SELECT skycell_moc_agg(5, ipix) AS cells_overlapping
+FROM generate_series(0::bigint, (12 * 4^5 - 1)::bigint) ipix
+WHERE skycell_cell_overlaps(5, ipix, skycell_moc_region('3/100 4/2000 6/40000-40001')) = 1;
+  cells_overlapping   
+----------------------
+ 3/100 4/2000 5/10000
+(1 row)
+
+-- a catalogue range-partitioned by cell: a MOC prunes to the partitions it reaches
+CREATE TABLE mr_part (id int, ra float8, dec float8) PARTITION BY RANGE (skycell_ang2cell(ra, dec));
+CREATE TABLE mr_part_0 PARTITION OF mr_part FOR VALUES FROM (MINVALUE) TO (1152921504606846976);
+CREATE TABLE mr_part_1 PARTITION OF mr_part FOR VALUES FROM (1152921504606846976) TO (2305843009213693952);
+CREATE TABLE mr_part_2 PARTITION OF mr_part FOR VALUES FROM (2305843009213693952) TO (MAXVALUE);
+INSERT INTO mr_part SELECT id, ra, dec FROM mr_cat;
+CREATE INDEX ON mr_part (skycell_ang2cell(ra, dec));
+ANALYZE mr_part;
+EXPLAIN (COSTS OFF)
+SELECT count(*) FROM mr_part WHERE 1 = CONTAINS(POINT('ICRS', ra, dec), skycell_moc_region('3/100-110'));
+                                           QUERY PLAN                                            
+-------------------------------------------------------------------------------------------------
+ Aggregate
+   ->  Custom Scan (SkycellCone) on mr_part_0 mr_part
+         Filter: skycell_region_scan('0'::bigint, ra, "dec", 'MOC 2/25-26 3/108-110'::skyregion)
+         Index: mr_part_0_skycell_ang2cell_idx
+         Ranges: 1
+         Mode: bitmap
+(6 rows)
+
+SELECT (SELECT count(*) FROM mr_part WHERE 1 = CONTAINS(POINT('ICRS', ra, dec), skycell_moc_region('3/100-110 1/40')))
+     = mr_by_cell('3/100-110 1/40') AS partitioned_same;
+ partitioned_same 
+------------------
+ t
+(1 row)
+
+DROP TABLE mr_cat, mr_mocs, mr_fp, mr_part;
+DROP FUNCTION mr_by_cell(text), mr_plans(text);

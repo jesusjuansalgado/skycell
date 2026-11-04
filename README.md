@@ -919,6 +919,72 @@ and 21 of the 50 held cells more, which by dense sampling lie outside the cone
 18 ms; the coverage of the 10M-row Gaia table at order 10, 1.2 s, one pass
 over its index. FITS, the third MOC 2.0 serialisation, is not written.
 
+### MOCs as search regions (since 0.44)
+
+A MOC from MOCPy, Aladin, the CDS MOC server or skycell itself is a region
+like any other: the sources inside a survey's coverage, an observation's
+footprint MOC, or where two catalogues overlap.
+
+```sql
+-- the Gaia sources inside a footprint MOC
+SELECT source_id FROM gaia.gaia_source
+WHERE 1 = CONTAINS(POINT('ICRS', ra, dec), skycell_moc_region('9/1312345-1312360 10/5249461'));
+
+-- the same in STC-S style, and in a composite
+SELECT ... WHERE 1 = CONTAINS(POINT('ICRS', ra, dec), REGION('MOC 9/1312345-1312360'));
+SELECT ... WHERE 1 = CONTAINS(POINT('ICRS', ra, dec),
+                              REGION('DIFFERENCE ICRS (MOC 6/1200-1300 CIRCLE 266.4 -28.9 0.5)'));
+
+-- the Gaia sources inside the area another table covers
+SELECT count(*) FROM gaia.gaia_source
+WHERE 1 = CONTAINS(POINT('ICRS', ra, dec),
+                   skycell_moc_region(skycell_coverage_moc('ivoa.obscore', 10)));
+```
+
+| Function | Returns | Notes |
+|---|---|---|
+| `skycell_moc_region(moc text)` | `skyregion` | a MOC in its ASCII form (MOC 2.0 `5/4965 4967 6/19771-19775`, or MOC 1.0 with commas) or its JSON form (`{"5": [4965, 4967]}`). Cells may overlap and come in any order; they are merged |
+
+`REGION('MOC ...')`, a cast from text, and a `MOC` inside `UNION`,
+`INTERSECTION`, `DIFFERENCE` and `NOT` read the ASCII form. A MOC region
+prints as `MOC` followed by its normalised ASCII, so it can be stored in a
+`skyregion` column and read back.
+
+A position is in a MOC when the order-29 cell holding it is. That is the cell
+the index stores, so a MOC's answer is exact to its own cells. A MOC made from a
+shape at order k holds the shape and some sky around it: 121, 87 and 83 Gaia
+sources for a 0.5°×0.4° polygon's MOC at orders 10, 12 and 14, against 81 in
+the polygon. A MOC is its own covering: the custom scan reads its ranges,
+merging gaps where the density says they hold few rows. Everything else a
+region does works for MOCs too:
+
+- `AREA` is exact;
+- `CENTROID` is the centre of area of the MOC's cells;
+- `INTERSECTS` and `CONTAINS` between two MOCs are exact range tests;
+  - between a MOC and another region, they use the test composites use, to
+    within the size of the MOC's finest cell;
+- stored MOCs take a GiST index;
+- a MOC prunes cell-range partitions to its first and last cell;
+- `skycell_count_estimate` and `skycell_cell_overlaps` accept a MOC;
+- `skycell_moc` writes a MOC again at another order.
+
+**Validation** ([`bench/results-moc/`](bench/results-moc/)): 60 random MOCs,
+on the 500,000 positions of the ObsCore-shaped table. Half were written by
+skycell (cones, polygons and annuli at orders 2–12), half by MOCPy (cones,
+coverages of the table's own positions, and random cells of orders 0–9).
+Each gave exactly the rows MOCPy's `contains_lonlat` gives, 3.7 million in
+all, through the custom scan, the range rewrite and a sequential scan. A MOC
+less a cone gave the expected rows in 20 cases. On 5,000 stored MOC
+footprints against 25 cones, `INTERSECTS` and both `CONTAINS` agreed with the
+cones' own order-12 MOCs.
+
+**Speed:** a footprint MOC at order 12 or 14 takes 0.2–0.4 ms on the 10M-row
+Gaia table, as the polygon does. The coverage of the ObsCore table at order 6
+(22 KB of MOC, a ninth of the sky) holds 5M of those rows. A sequential scan
+reads them in 1.9 s; the row estimate is within 5% of the count. A constant
+MOC is decoded once a query, not once a row: before that, the same scan took
+50 s.
+
 ### Diagnostics
 
 | Function | Notes |
@@ -1309,6 +1375,15 @@ rows. Run against v0.42, it flags v0.44's regression (1.21 [1.13, 1.30]).
   `skycell_cell_overlaps` counts; the aggregate's merging of duplicates and
   siblings; a table's coverage by expression index and by stored cell
   column, and of an empty table; out-of-range orders and formats.
+- `moc_region`: MOCs read from ASCII, MOC 1.0 commas and JSON, normalised;
+  in STC-S and composites; AREA and CENTROID; malformed MOCs refused. On a
+  catalogue, nine MOCs (single cells, mixed orders, a pole, the whole sky,
+  nothing) must give the rows whose cell is in them, counted independently,
+  by the custom scan, the range rewrite and a sequential scan, and in a
+  DIFFERENCE, INTERSECTION and NOT the boolean combination of the tests.
+  Relations between MOCs, and with cones as the cones' own MOCs answer them;
+  stored MOCs under GiST against a sequential scan; estimates; partition
+  pruning.
 - `composite`: unions, intersections, differences and NOTs. STC-S in and
   out (every malformed form errors with a reason), the constructors, each
   composite's membership against the boolean combination of its pieces,

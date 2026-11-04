@@ -663,7 +663,7 @@ cone_with_partition_bounds(PlannerInfo *root, FuncExpr *cone6)
 /*
  * The interval of cells a constant region (a polygon or a composite) can
  * hold: its bounding cap's, as a cone's (0.45).  The whole sky for a region
- * whose cap is (a NOT, say).
+ * whose cap is (a NOT, say).  A MOC's are its own first and last cells.
  */
 static void
 region_cell_bounds(Datum region, int64 *lo, int64 *hi)
@@ -676,6 +676,14 @@ region_cell_bounds(Datum region, int64 *lo, int64 *hi)
 	*lo = 0;
 	*hi = 12 * ((int64) 1 << (2 * SC_MAX_ORDER)) - 1;
 	skycell_region_from_datum_lite(region, &reg);
+	if (SC_REGION_IS_MOC(&reg))
+	{
+		/* a MOC's own first and last cells (an empty one holds none) */
+		*lo = reg.nmoc > 0 ? reg.mlo[0] : 1;
+		*hi = reg.nmoc > 0 ? reg.mhi[reg.nmoc - 1] : 0;
+		sc_region_free(&reg);
+		return;
+	}
 	sc_region_bounding_cap(&reg, &c, &rad);
 	sc_region_free(&reg);
 	if (!(rad < M_PI) || isnan(rad))
