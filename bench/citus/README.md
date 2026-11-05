@@ -44,11 +44,58 @@ server made that call the custom scan, so on a worker a polygon, composite or
 MOC was answered by a sequential scan of the whole shard. Its support function
 now makes the same decision when it meets the call written.
 
+## Choosing shards: a shard key (0.45)
+
+Distributed by row id, every query goes to every shard. Distributed instead by
+a coarse HEALPix cell, kept true by a CHECK constraint the planner reads,
+
+```sql
+CREATE TABLE cat (id int, ra float8, dec float8,
+                  hpx3 bigint NOT NULL CHECK (hpx3 = skycell_ang2cell(ra, dec) >> 52));
+SELECT create_distributed_table('cat', 'hpx3', shard_count := 32);
+INSERT INTO cat SELECT id, ra, dec, skycell_ang2cell(ra, dec) >> 52 FROM ...;
+CREATE INDEX ON cat (skycell_ang2cell(ra, dec));
+```
+
+a constant cone, polygon, box, composite or MOC on the table gets
+`hpx3 = ANY('{the order-3 cells it meets}')`, and Citus sends the query only to
+the shards holding those cells. The shift is `2 × (29 − order)`: 52 for order
+3, 48 for order 5. Citus cannot distribute by a generated column, so the key
+is filled when rows are loaded; the constraint rejects a wrong one, and only a
+validated constraint counts. No key is added for a region meeting more than
+1,024 cells, or for one that isn't constant (a cross-match's per-row cone).
+
+[`shardkey.sql`](shardkey.sql): the same queries on the catalogue distributed
+by id over 8 shards and by its order-5 or order-3 cell over 32. The shards
+each query goes to:
+
+| query | by id (of 8) | order-5 key (of 32) | order-3 key (of 32) |
+|---|---|---|---|
+| cone 0.1° | 8 | 1 | 1 |
+| cone 1° | 8 | 4 | 1 |
+| cone 5° | 8 | 21 | 6 |
+| cone 20° | 8 | 32 | 22 |
+| cone 3° at the pole | 8 | 19 | 4 |
+| polygon (15° × 14°) | 8 | 26 | 5 |
+| composite (annulus 3°–6°) | 8 | 21 | 6 |
+| MOC (11 order-3 cells and more) | 8 | 32 | 8 |
+| `distance(...) < 1.5` | 8 | 7 | 2 |
+
+Every answer is the single node's. A key's cells should be larger than the
+typical query region: each cell hashes to its own shard, so a region meeting
+many cells meets many shards. Order 3 (768 cells of about 7°) suits cones up to
+a few degrees; order 5 (cells of about 1.8°) suits arcminute queries, or a
+table with many more shards than 32.
+
+Building this found two bugs, both fixed in 0.45:
+- since 0.44, a written `skycell_cone(...)` with another condition on a table
+  range-partitioned by cell sent the planner round an endless loop, until the
+  server ran out of memory;
+- the shard key's cells were corrupted for `distance(ra, dec, ra0, dec0) < r`,
+  which then found no rows.
+
 ## What is still to do
 
-- **Choosing shards.** Every query above goes to all 8 shards. Distributing by
-  a coarse cell and adding that cell's `= ANY(...)` to a region's query would
-  send a cone to the 1–4 shards that hold it.
 - **Aggregate pushdown.** A real state type for `skycell_moc_agg`, so that each
   shard aggregates its own rows.
 - **Estimates.** `skycell_count_estimate` and its relatives should sum over the

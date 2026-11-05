@@ -1102,8 +1102,10 @@ same, cross-matches 1.2–1.7 times as much.
 composite and MOC form tried gives the single node's rows. So do nearest
 neighbours and cross-matches against a reference or local probe table. Each
 shard plans its part with skycell and uses the custom scan on its own index.
-Not yet:
-- every query goes to every shard;
+Distributed by a coarse cell column kept true by a CHECK constraint, e.g.
+`hpx3 bigint CHECK (hpx3 = skycell_ang2cell(ra, dec) >> 52)`, a constant
+region gets `hpx3 = ANY('{its cells}')`, and Citus sends it only to the shards
+holding them: a 1° cone to 1 shard of 32, a 5° cone to 6. Not yet:
 - `skycell_moc_agg` is aggregated on the coordinator, not on the shards;
 - `skycell_count_estimate` returns 0 for a distributed table;
 - two distributed catalogues cannot be cross-matched.
