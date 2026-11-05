@@ -920,13 +920,11 @@ and 21 of the 50 held cells more, which by dense sampling lie outside the cone
 over its index. FITS, the third MOC 2.0 serialisation, is not written.
 
 Since 0.45 `skycell_moc_agg`, and so `skycell_coverage_moc`, runs in parallel:
-each worker marks its own rows' cells and the leader combines them (and on a
-sharded database such as Citus, each shard would). Workers pass their cells
-to the leader as runs, not as the bitmap. On the 10M-row Gaia table with four
-workers, the order-10 coverage takes 0.64 s against 1.24 s in one process,
-and order 3 takes 0.30 s against 0.87 s. At order 12 the time goes into
-writing the multi-megabyte MOC itself, which workers cannot share: 2.4–3.0 s
-against 3.1 s.
+each worker marks its own rows' cells and the leader combines them. On a
+sharded database such as Citus, each shard does the same. Its state is a type
+of its own, `skycell_mocstate`, so that it can travel between processes and
+nodes. On the 10M-row Gaia table with four workers: order 10 takes 0.68 s
+against 1.5 s in one process, order 12 takes 1.8 s, and order 3 takes 0.43 s.
 
 ### MOCs as search regions (since 0.44)
 
@@ -1105,10 +1103,11 @@ shard plans its part with skycell and uses the custom scan on its own index.
 Distributed by a coarse cell column kept true by a CHECK constraint, e.g.
 `hpx3 bigint CHECK (hpx3 = skycell_ang2cell(ra, dec) >> 52)`, a constant
 region gets `hpx3 = ANY('{its cells}')`, and Citus sends it only to the shards
-holding them: a 1° cone to 1 shard of 32, a 5° cone to 6. Not yet:
-- `skycell_moc_agg` is aggregated on the coordinator, not on the shards;
-- `skycell_count_estimate` returns 0 for a distributed table;
-- two distributed catalogues cannot be cross-matched.
+holding them: a 1° cone to 1 shard of 32, a 5° cone to 6.
+`skycell_moc_agg` (and `skycell_coverage_moc`) aggregates on the shards. The
+estimate functions sum over the shards. skycell's settings must be the same
+on every node: a plain `SET` on the coordinator does not reach them. Not yet:
+two distributed catalogues cannot be cross-matched.
 
 **Polygons through the custom scan** (0.43, [`bench/results-polyscan/`](bench/results-polyscan/)).
 Since 0.43 a constant polygon or box takes the custom scan that cones have.

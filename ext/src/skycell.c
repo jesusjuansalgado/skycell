@@ -36,6 +36,7 @@
 #include "access/heapam.h"
 #include "catalog/namespace.h"
 #include "catalog/pg_inherits.h"
+#include "catalog/pg_namespace_d.h"
 #include "utils/regproc.h"
 #include "utils/fmgroids.h"
 #include "utils/snapmgr.h"
@@ -49,9 +50,9 @@
 #include "utils/catcache.h"
 #include "utils/inval.h"
 #include "utils/memutils.h"
+#include "executor/spi.h"
 #include "fmgr.h"
 #include "funcapi.h"
-#include "libpq/pqformat.h"
 #include "miscadmin.h"
 #include "nodes/makefuncs.h"
 #include "nodes/nodeFuncs.h"
@@ -3379,6 +3380,79 @@ estimate_relations(text *name)
 	return out;
 }
 
+/*
+ * A Citus distributed table (0.45): its rows, and so its statistics, are in
+ * shards on the workers, and the coordinator holds none.  The estimates are
+ * then made on every shard, by the same function, and summed.  True when
+ * relid is such a table (Citus installed and the table in pg_dist_partition).
+ */
+static bool
+is_citus_distributed(Oid relid)
+{
+	Oid			argt[1] = {OIDOID};
+	Datum		argv[1] = {ObjectIdGetDatum(relid)};
+	bool		found;
+
+	if (!OidIsValid(get_relname_relid("pg_dist_partition", PG_CATALOG_NAMESPACE)))
+		return false;
+	if (SPI_connect() != SPI_OK_CONNECT)
+		elog(ERROR, "skycell: SPI_connect failed");
+	if (SPI_execute_with_args("SELECT 1 FROM pg_catalog.pg_dist_partition WHERE logicalrelid = $1",
+							  1, argt, argv, NULL, true, 1) != SPI_OK_SELECT)
+		elog(ERROR, "skycell: could not read pg_dist_partition");
+	found = SPI_processed > 0;
+	SPI_finish();
+	return found;
+}
+
+/* the relation tbl names, without its partitions */
+static Oid
+estimate_relid(text *name)
+{
+	return DatumGetObjectId(DirectFunctionCall1(regclassin, CStringGetDatum(text_to_cstring(name))));
+}
+
+/*
+ * The sum over a distributed table's shards of the float8 that shard_sql
+ * (with %s for the shard's name, which run_command_on_shards() fills in)
+ * returns; an error on any shard is raised here.
+ */
+static double
+citus_shard_sum(Oid relid, const char *shard_sql)
+{
+	Oid			argt[2] = {REGCLASSOID, TEXTOID};
+	Datum		argv[2] = {ObjectIdGetDatum(relid), CStringGetTextDatum(shard_sql)};
+	double		total = 0;
+
+	if (SPI_connect() != SPI_OK_CONNECT)
+		elog(ERROR, "skycell: SPI_connect failed");
+	if (SPI_execute_with_args("SELECT success, result FROM run_command_on_shards($1, $2)",
+							  2, argt, argv, NULL, true, 0) != SPI_OK_SELECT)
+		elog(ERROR, "skycell: run_command_on_shards failed");
+	for (uint64 i = 0; i < SPI_processed; i++)
+	{
+		bool		isnull;
+		bool		ok = DatumGetBool(SPI_getbinval(SPI_tuptable->vals[i], SPI_tuptable->tupdesc, 1, &isnull));
+		char	   *res = SPI_getvalue(SPI_tuptable->vals[i], SPI_tuptable->tupdesc, 2);
+
+		if (!ok)
+			ereport(ERROR, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+							errmsg("skycell: estimate on a shard of %s failed: %s",
+								   get_rel_name(relid), res ? res : "")));
+		if (res != NULL && *res != '\0')
+			total += strtod(res, NULL);
+	}
+	SPI_finish();
+	return total;
+}
+
+/* a skyregion as an SQL literal, for a shard's query */
+static char *
+region_literal(Datum r)
+{
+	return quote_literal_cstr(DatumGetCString(DirectFunctionCall1(skyregion_out, r)));
+}
+
 static void
 no_density(Oid relid)
 {
@@ -3461,10 +3535,21 @@ PG_FUNCTION_INFO_V1(skycell_count_estimate);
 Datum
 skycell_count_estimate(PG_FUNCTION_ARGS)
 {
-	List	   *rels = estimate_relations(PG_GETARG_TEXT_PP(0));
+	List	   *rels;
 	sc_region	reg;
 	double		total = 0;
 	ListCell   *lc;
+	Oid			relid = estimate_relid(PG_GETARG_TEXT_PP(0));
+
+	if (is_citus_distributed(relid))
+	{
+		const char *nsp = quote_identifier(get_namespace_name(get_func_namespace(fcinfo->flinfo->fn_oid)));
+
+		PG_RETURN_FLOAT8(citus_shard_sum(relid,
+										 psprintf("SELECT %s.skycell_count_estimate('%%s', %s::%s.skyregion)",
+												  nsp, region_literal(PG_GETARG_DATUM(1)), nsp)));
+	}
+	rels = estimate_relations(PG_GETARG_TEXT_PP(0));
 
 	skycell_region_from_datum(PG_GETARG_DATUM(1), &reg);
 	foreach(lc, rels)
@@ -3485,11 +3570,12 @@ PG_FUNCTION_INFO_V1(skycell_count_estimate_cell);
 Datum
 skycell_count_estimate_cell(PG_FUNCTION_ARGS)
 {
-	List	   *rels = estimate_relations(PG_GETARG_TEXT_PP(0));
+	List	   *rels;
 	int32		order = PG_GETARG_INT32(1);
 	int64		ipix = PG_GETARG_INT64(2);
 	double		total = 0;
 	ListCell   *lc;
+	Oid			relid = estimate_relid(PG_GETARG_TEXT_PP(0));
 
 	if (order < 0 || order > SC_MAX_ORDER)
 		ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
@@ -3497,6 +3583,15 @@ skycell_count_estimate_cell(PG_FUNCTION_ARGS)
 	if (ipix < 0 || ipix >= 12 * ((int64) 1 << (2 * order)))
 		ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 						errmsg("skycell: no HEALPix cell %lld at order %d", (long long) ipix, order)));
+	if (is_citus_distributed(relid))
+	{
+		const char *nsp = quote_identifier(get_namespace_name(get_func_namespace(fcinfo->flinfo->fn_oid)));
+
+		PG_RETURN_FLOAT8(citus_shard_sum(relid,
+										 psprintf("SELECT %s.skycell_count_estimate('%%s', %d, " INT64_FORMAT ")",
+												  nsp, order, ipix)));
+	}
+	rels = estimate_relations(PG_GETARG_TEXT_PP(0));
 	foreach(lc, rels)
 	{
 		sc_density	d;
@@ -3517,13 +3612,72 @@ skycell_count_estimate_cell(PG_FUNCTION_ARGS)
  */
 #define DENSITY_MAX_CELLS 200000
 
+/*
+ * skycell_density_estimate() of a distributed table: each shard's cells, as
+ * JSON, their estimates summed over the shards.  Every shard lists the same
+ * cells (those the region meets), so whether one is inside agrees.
+ */
+static void
+density_estimate_shards(FunctionCallInfo fcinfo, Oid relid, Datum region, int order)
+{
+	ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
+	const char *nsp = quote_identifier(get_namespace_name(get_func_namespace(fcinfo->flinfo->fn_oid)));
+	char	   *shard_sql = psprintf("SELECT coalesce(json_agg(json_build_array(ipix, estimate, inside)), '[]') "
+									 "FROM %s.skycell_density_estimate('%%s', %s::%s.skyregion, %d)",
+									 nsp, region_literal(region), nsp, order);
+	Oid			argt[2] = {REGCLASSOID, TEXTOID};
+	Datum		argv[2] = {ObjectIdGetDatum(relid), CStringGetTextDatum(shard_sql)};
+
+	InitMaterializedSRF(fcinfo, MAT_SRF_USE_EXPECTED_DESC);
+	if (SPI_connect() != SPI_OK_CONNECT)
+		elog(ERROR, "skycell: SPI_connect failed");
+	if (SPI_execute_with_args("SELECT success, result FROM run_command_on_shards($1, $2)",
+							  2, argt, argv, NULL, true, 0) != SPI_OK_SELECT)
+		elog(ERROR, "skycell: run_command_on_shards failed");
+	{
+		uint64		nshards = SPI_processed;
+		Datum	   *results = palloc(sizeof(Datum) * Max(nshards, 1));
+		Oid			at[1] = {TEXTARRAYOID};
+		Datum		av[1];
+
+		for (uint64 i = 0; i < nshards; i++)
+		{
+			bool		isnull;
+			char	   *res = SPI_getvalue(SPI_tuptable->vals[i], SPI_tuptable->tupdesc, 2);
+
+			if (!DatumGetBool(SPI_getbinval(SPI_tuptable->vals[i], SPI_tuptable->tupdesc, 1, &isnull)))
+				ereport(ERROR, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+								errmsg("skycell: estimate on a shard of %s failed: %s",
+									   get_rel_name(relid), res ? res : "")));
+			results[i] = CStringGetTextDatum(res ? res : "[]");
+		}
+		/* the shards' cells, summed */
+		av[0] = PointerGetDatum(construct_array(results, (int) nshards, TEXTOID, -1, false, TYPALIGN_INT));
+		if (SPI_execute_with_args("SELECT (e->>0)::int8, sum((e->>1)::float8), bool_and((e->>2)::bool) "
+								  "FROM unnest($1) r, json_array_elements(r::json) e GROUP BY 1 ORDER BY 1",
+								  1, at, av, NULL, true, 0) != SPI_OK_SELECT)
+			elog(ERROR, "skycell: summing the shards' estimates failed");
+	}
+	for (uint64 i = 0; i < SPI_processed; i++)
+	{
+		Datum		v[3];
+		bool		nulls[3];
+
+		for (int k = 0; k < 3; k++)
+			v[k] = SPI_getbinval(SPI_tuptable->vals[i], SPI_tuptable->tupdesc, k + 1, &nulls[k]);
+		tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, v, nulls);
+	}
+	SPI_finish();
+}
+
 PG_FUNCTION_INFO_V1(skycell_density_estimate);
 Datum
 skycell_density_estimate(PG_FUNCTION_ARGS)
 {
 	ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
-	List	   *rels = estimate_relations(PG_GETARG_TEXT_PP(0));
+	List	   *rels;
 	int32		order = PG_GETARG_INT32(2);
+	Oid			relid = estimate_relid(PG_GETARG_TEXT_PP(0));
 	sc_region	reg;
 	sc_density *ds;
 	int			nd = 0,
@@ -3539,6 +3693,12 @@ skycell_density_estimate(PG_FUNCTION_ARGS)
 	if (order < 0 || order > 20)
 		ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 						errmsg("skycell: HEALPix order must be within [0, 20] here")));
+	if (is_citus_distributed(relid))
+	{
+		density_estimate_shards(fcinfo, relid, PG_GETARG_DATUM(1), order);
+		return (Datum) 0;
+	}
+	rels = estimate_relations(PG_GETARG_TEXT_PP(0));
 	ds = palloc(sizeof(sc_density) * Max(list_length(rels), 1));
 	foreach(lc, rels)
 	{
@@ -3812,18 +3972,26 @@ skycell_moc(PG_FUNCTION_ARGS)
  * skycell_moc_agg(hpx_order, ipix [, fmt]): the MOC of the cells of one order
  * aggregated, duplicates allowed (the coverage of the rows of a query: one
  * bit a cell of that order, 1.5 MB at order 10; at most order 12).
+ *
+ * Its state is a type of its own, skycell_mocstate, not internal (0.45): a
+ * sharded database such as Citus pushes an aggregate down to its shards only
+ * when the state can travel, as text, from each shard to the coordinator,
+ * which then combines them; and PostgreSQL's parallel workers hand theirs to
+ * the leader the same way.  In memory the state is the bitmap, changed in
+ * place by the transition function (allowed when it is called as an
+ * aggregate); as text it is the runs of set cells, which for a coverage is
+ * far smaller than the bitmap.
  */
 typedef struct
 {
-	int			order;
-	int			json;
-	int64		ncells;
-	uint8	   *bits;
-} moc_agg_state;
+	int32		vl_len_;
+	int32		order;
+	int32		json;
+	uint8		bits[FLEXIBLE_ARRAY_MEMBER];
+} MocAggState;
 
 #define MOC_AGG_MAX_ORDER 12
-
-static moc_agg_state *moc_agg_new(MemoryContext cxt, int order, int json);
+#define MOC_AGG_NCELLS(order) (12 * ((int64) 1 << (2 * (order))))
 
 /*
  * The next set cell at or after i in a state's bitmap, or ncells; and the
@@ -3877,95 +4045,176 @@ moc_bits_set(uint8 *bits, int64 first, int64 n)
 		bits[i >> 3] |= (uint8) (1 << (i & 7));
 }
 
+/* an empty state of an order, in cxt */
+static MocAggState *
+moc_state_new(MemoryContext cxt, int order, int json)
+{
+	Size		sz = offsetof(MocAggState, bits) + (MOC_AGG_NCELLS(order) + 7) / 8;
+	MocAggState *st = MemoryContextAllocZero(cxt, sz);
+
+	SET_VARSIZE(st, sz);
+	st->order = order;
+	st->json = json;
+	return st;
+}
+
+/* a state datum as it is, detoasted (it never is, being built in memory) */
+static MocAggState *
+moc_state_arg(FunctionCallInfo fcinfo, int n)
+{
+	MocAggState *st = (MocAggState *) PG_DETOAST_DATUM(PG_GETARG_DATUM(n));
+
+	if (st->order < 0 || st->order > MOC_AGG_MAX_ORDER ||
+		VARSIZE(st) != offsetof(MocAggState, bits) + (MOC_AGG_NCELLS(st->order) + 7) / 8)
+		ereport(ERROR, (errcode(ERRCODE_DATA_CORRUPTED),
+						errmsg("skycell: invalid skycell_moc_agg state")));
+	return st;
+}
+
+/* text: "order json first+count first+count ..." */
+PG_FUNCTION_INFO_V1(skycell_mocstate_out);
+Datum
+skycell_mocstate_out(PG_FUNCTION_ARGS)
+{
+	MocAggState *st = moc_state_arg(fcinfo, 0);
+	int64		ncells = MOC_AGG_NCELLS(st->order);
+	StringInfoData buf;
+
+	initStringInfo(&buf);
+	appendStringInfo(&buf, "%d %d", st->order, st->json);
+	for (int64 i = moc_bits_next(st->bits, ncells, 0, true); i < ncells;)
+	{
+		int64		j = moc_bits_next(st->bits, ncells, i, false);
+
+		appendStringInfo(&buf, " " INT64_FORMAT "+" INT64_FORMAT, i, j - i);
+		i = moc_bits_next(st->bits, ncells, j, true);
+	}
+	PG_RETURN_CSTRING(buf.data);
+}
+
+PG_FUNCTION_INFO_V1(skycell_mocstate_in);
+Datum
+skycell_mocstate_in(PG_FUNCTION_ARGS)
+{
+	char	   *s = PG_GETARG_CSTRING(0);
+	char	   *end;
+	long		order,
+				json;
+	MocAggState *st;
+	int64		ncells;
+
+	order = strtol(s, &end, 10);
+	if (end == s || order < 0 || order > MOC_AGG_MAX_ORDER)
+		goto bad;
+	s = end;
+	json = strtol(s, &end, 10);
+	if (end == s || (json != 0 && json != 1))
+		goto bad;
+	s = end;
+	st = moc_state_new(CurrentMemoryContext, (int) order, (int) json);
+	ncells = MOC_AGG_NCELLS(order);
+	for (;;)
+	{
+		long long	first,
+					n;
+
+		while (*s == ' ')
+			s++;
+		if (*s == '\0')
+			break;
+		errno = 0;
+		first = strtoll(s, &end, 10);
+		if (end == s || *end != '+' || errno != 0)
+			goto bad;
+		s = end + 1;
+		n = strtoll(s, &end, 10);
+		if (end == s || errno != 0 || first < 0 || n < 1 || first + n > ncells)
+			goto bad;
+		s = end;
+		moc_bits_set(st->bits, first, n);
+	}
+	PG_RETURN_POINTER(st);
+bad:
+	ereport(ERROR, (errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
+					errmsg("invalid input syntax for type skycell_mocstate")));
+	PG_RETURN_NULL();
+}
+
 PG_FUNCTION_INFO_V1(skycell_moc_agg_trans);
 Datum
 skycell_moc_agg_trans(PG_FUNCTION_ARGS)
 {
 	MemoryContext aggcxt;
-	moc_agg_state *st;
+	MocAggState *st;
 	int32		order;
 	int64		pix;
 
 	if (!AggCheckCallContext(fcinfo, &aggcxt))
 		elog(ERROR, "skycell_moc_agg_trans called outside an aggregate");
-	st = PG_ARGISNULL(0) ? NULL : (moc_agg_state *) PG_GETARG_POINTER(0);
 	if (PG_ARGISNULL(1) || PG_ARGISNULL(2))
 	{
 		/* a row without a cell adds nothing; with no state yet, still none */
-		if (st == NULL)
+		if (PG_ARGISNULL(0))
 			PG_RETURN_NULL();
-		PG_RETURN_POINTER(st);
+		PG_RETURN_DATUM(PG_GETARG_DATUM(0));
 	}
 	order = PG_GETARG_INT32(1);
 	pix = PG_GETARG_INT64(2);
-	if (st == NULL)
+	if (PG_ARGISNULL(0))
 	{
 		moc_check_order(order, MOC_AGG_MAX_ORDER);
 		/* 25 MB at order 12 */
-		st = moc_agg_new(aggcxt, order,
-						 (PG_NARGS() > 3 && !PG_ARGISNULL(3)) ? moc_fmt(PG_GETARG_TEXT_PP(3)) : 0);
+		st = moc_state_new(aggcxt, order,
+						   (PG_NARGS() > 3 && !PG_ARGISNULL(3)) ? moc_fmt(PG_GETARG_TEXT_PP(3)) : 0);
 	}
-	else if (order != st->order)
-		ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-						errmsg("skycell: skycell_moc_agg() takes one order")));
-	if (pix < 0 || pix >= st->ncells)
+	else
+	{
+		/* in place: the aggregate's own state, in its own context */
+		st = (MocAggState *) PG_GETARG_POINTER(0);
+		if (order != st->order)
+			ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+							errmsg("skycell: skycell_moc_agg() takes one order")));
+	}
+	if (pix < 0 || pix >= MOC_AGG_NCELLS(order))
 		ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 						errmsg("skycell: no HEALPix cell " INT64_FORMAT " at order %d", pix, order)));
 	st->bits[pix >> 3] |= (uint8) (1 << (pix & 7));
 	PG_RETURN_POINTER(st);
 }
 
-/*
- * Partial aggregation (0.45): parallel workers, and Citus shards, each build
- * a bitmap of their own rows' cells; the leader ORs them.  Between processes
- * a state travels as its runs of set cells, which for a coverage is far
- * smaller than the bitmap (1.5 MB at order 10, 25 MB at 12).
- */
-static moc_agg_state *
-moc_agg_new(MemoryContext cxt, int order, int json)
-{
-	MemoryContext old = MemoryContextSwitchTo(cxt);
-	moc_agg_state *st = palloc0(sizeof(moc_agg_state));
-
-	st->order = order;
-	st->json = json;
-	st->ncells = 12 * ((int64) 1 << (2 * order));
-	st->bits = palloc0((st->ncells + 7) / 8);
-	MemoryContextSwitchTo(old);
-	return st;
-}
-
+/* partial states, of parallel workers or of shards: their cells ORed */
 PG_FUNCTION_INFO_V1(skycell_moc_agg_combine);
 Datum
 skycell_moc_agg_combine(PG_FUNCTION_ARGS)
 {
 	MemoryContext aggcxt;
-	moc_agg_state *a,
+	MocAggState *a,
 			   *b;
+	int64		nb;
 
 	if (!AggCheckCallContext(fcinfo, &aggcxt))
 		elog(ERROR, "skycell_moc_agg_combine called outside an aggregate");
-	a = PG_ARGISNULL(0) ? NULL : (moc_agg_state *) PG_GETARG_POINTER(0);
-	b = PG_ARGISNULL(1) ? NULL : (moc_agg_state *) PG_GETARG_POINTER(1);
-	if (b == NULL)
+	if (PG_ARGISNULL(1))
 	{
-		if (a == NULL)
+		if (PG_ARGISNULL(0))
 			PG_RETURN_NULL();
-		PG_RETURN_POINTER(a);
+		PG_RETURN_DATUM(PG_GETARG_DATUM(0));
 	}
-	if (a == NULL)
+	b = moc_state_arg(fcinfo, 1);
+	if (PG_ARGISNULL(0))
 	{
 		/* the first partial: a copy the aggregate's own context owns */
-		a = moc_agg_new(aggcxt, b->order, b->json);
-		memcpy(a->bits, b->bits, (b->ncells + 7) / 8);
+		a = moc_state_new(aggcxt, b->order, b->json);
+		memcpy(a->bits, b->bits, (MOC_AGG_NCELLS(b->order) + 7) / 8);
 		PG_RETURN_POINTER(a);
 	}
+	a = (MocAggState *) PG_GETARG_POINTER(0);
 	if (a->order != b->order)
 		ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 						errmsg("skycell: skycell_moc_agg() takes one order")));
+	nb = (MOC_AGG_NCELLS(a->order) + 7) / 8;
 	{
-		int64		nb = (a->ncells + 7) / 8,
-					i = 0;
+		int64		i = 0;
 
 		for (; i + 8 <= nb; i += 8)
 		{
@@ -3984,81 +4233,26 @@ skycell_moc_agg_combine(PG_FUNCTION_ARGS)
 	PG_RETURN_POINTER(a);
 }
 
-/* order, json, then each run of set cells as (first, count) */
-PG_FUNCTION_INFO_V1(skycell_moc_agg_serialize);
-Datum
-skycell_moc_agg_serialize(PG_FUNCTION_ARGS)
-{
-	moc_agg_state *st = (moc_agg_state *) PG_GETARG_POINTER(0);
-	StringInfoData buf;
-
-	pq_begintypsend(&buf);
-	pq_sendint32(&buf, st->order);
-	pq_sendint32(&buf, st->json);
-	for (int64 i = moc_bits_next(st->bits, st->ncells, 0, true); i < st->ncells;)
-	{
-		int64		j = moc_bits_next(st->bits, st->ncells, i, false);
-
-		pq_sendint64(&buf, i);
-		pq_sendint64(&buf, j - i);
-		i = moc_bits_next(st->bits, st->ncells, j, true);
-	}
-	PG_RETURN_BYTEA_P(pq_endtypsend(&buf));
-}
-
-PG_FUNCTION_INFO_V1(skycell_moc_agg_deserialize);
-Datum
-skycell_moc_agg_deserialize(PG_FUNCTION_ARGS)
-{
-	bytea	   *b = PG_GETARG_BYTEA_PP(0);
-	StringInfoData buf;
-	moc_agg_state *st;
-	int			order,
-				json;
-
-	if (!AggCheckCallContext(fcinfo, NULL))
-		elog(ERROR, "skycell_moc_agg_deserialize called outside an aggregate");
-	/* initReadOnlyStringInfo() by hand: it is PostgreSQL 17's */
-	buf.data = VARDATA_ANY(b);
-	buf.len = VARSIZE_ANY_EXHDR(b);
-	buf.maxlen = buf.len;
-	buf.cursor = 0;
-	order = pq_getmsgint(&buf, 4);
-	json = pq_getmsgint(&buf, 4);
-	moc_check_order(order, MOC_AGG_MAX_ORDER);
-	st = moc_agg_new(CurrentMemoryContext, order, json);
-	while (buf.cursor < buf.len)
-	{
-		int64		first = pq_getmsgint64(&buf),
-					n = pq_getmsgint64(&buf);
-
-		if (first < 0 || n < 1 || first + n > st->ncells)
-			ereport(ERROR, (errcode(ERRCODE_INVALID_BINARY_REPRESENTATION),
-							errmsg("skycell: invalid skycell_moc_agg state")));
-		moc_bits_set(st->bits, first, n);
-	}
-	pq_getmsgend(&buf);
-	PG_RETURN_POINTER(st);
-}
-
 PG_FUNCTION_INFO_V1(skycell_moc_agg_final);
 Datum
 skycell_moc_agg_final(PG_FUNCTION_ARGS)
 {
-	moc_agg_state *st;
+	MocAggState *st;
 	moc_ranges	m = {0};
+	int64		ncells;
 	int			sh;
 
 	if (PG_ARGISNULL(0))
 		PG_RETURN_NULL();		/* no row, no order: no MOC */
-	st = (moc_agg_state *) PG_GETARG_POINTER(0);
+	st = moc_state_arg(fcinfo, 0);
+	ncells = MOC_AGG_NCELLS(st->order);
 	sh = 2 * (SC_MAX_ORDER - st->order);
-	for (int64 i = moc_bits_next(st->bits, st->ncells, 0, true); i < st->ncells;)
+	for (int64 i = moc_bits_next(st->bits, ncells, 0, true); i < ncells;)
 	{
-		int64		j = moc_bits_next(st->bits, st->ncells, i, false);
+		int64		j = moc_bits_next(st->bits, ncells, i, false);
 
 		moc_add(&m, i << sh, (j << sh) - 1);
-		i = moc_bits_next(st->bits, st->ncells, j, true);
+		i = moc_bits_next(st->bits, ncells, j, true);
 	}
 	PG_RETURN_TEXT_P(moc_serialise(&m, st->order, st->json));
 }

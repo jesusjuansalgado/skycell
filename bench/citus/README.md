@@ -30,8 +30,8 @@ rewrites ADQL before sending it, so a shard receives skycell's own calls
 | Nearest neighbours, `ORDER BY distance(...) LIMIT k` | the single node's rows; each shard runs the nearest-neighbour scan with its own `LIMIT`, the coordinator merges |
 | Cross-match with a reference (replicated) probe table, or a local one | the single node's rows; every shard runs the custom scan once per probe |
 | Cross-match of two distributed tables | refused by Citus: it joins distributed tables only on their distribution columns |
-| `skycell_moc_agg`, `skycell_coverage_moc` | the single node's MOC, but the coordinator aggregates every row: Citus pushes down an aggregate only when its state is a real type, and this one's is `internal` |
-| `skycell_count_estimate` (a region, or a cell) | 0: it reads statistics, and the coordinator holds none for a distributed table |
+| `skycell_moc_agg`, `skycell_coverage_moc` | the single node's MOC; since 0.45 each shard aggregates its own rows and the coordinator combines them |
+| `skycell_count_estimate` (a region, or a cell), `skycell_density_estimate` | since 0.45, summed over the shards (before: 0, as the coordinator holds no statistics for a distributed table) |
 | `skycell_density_view` | works: the view is built on the coordinator from the shards |
 | Prepared statement, centre as a parameter | the single node's rows |
 
@@ -94,11 +94,47 @@ Building this found two bugs, both fixed in 0.45:
 - the shard key's cells were corrupted for `distance(ra, dec, ra0, dec0) < r`,
   which then found no rows.
 
+## Coverage and estimates (0.45)
+
+**`skycell_moc_agg`**, and `skycell_coverage_moc` built on it, are pushed down:
+each shard aggregates its own rows, and the coordinator combines the shards'
+states. Citus pushes down only an aggregate whose state is a real type, so
+the state is now one, `skycell_mocstate`: a bitmap in memory, sent between
+nodes as text listing its runs of cells. The same change lets PostgreSQL's
+parallel workers run it. The MOCs equal the single node's at orders 6, 8 and
+12.
+
+**`skycell_count_estimate`** (a region, or a cell) and
+**`skycell_density_estimate`** read a table's statistics, and for a
+distributed table the coordinator holds none. Such a table (one in Citus's
+`pg_dist_partition`, a reference table included) is now estimated on every
+shard with `run_command_on_shards()`, and the results summed. A 10° cone:
+1,524 rows against the single node's estimate of 1,536 and 1,516 counted;
+the density of its 122 order-5 cells, cell for cell the same cells. Each call
+goes to every shard: 70–95 ms here, against under a millisecond on one node.
+For a map of many tiles, ask `skycell_density_estimate` once rather than
+`skycell_count_estimate` per tile. A shard that cannot be estimated (no cell
+index) gives the error with its name.
+
+## Settings
+
+A worker plans its shard's query with its own settings. On the coordinator:
+
+| how it is set | reaches the shards? |
+|---|---|
+| `SET skycell.custom_scan = off` | no |
+| `ALTER DATABASE … SET skycell.custom_scan = off` | no |
+| `SET LOCAL skycell.custom_scan = off` in a transaction, with `SET LOCAL citus.propagate_set_commands = 'local'` | yes |
+
+The coordinator's own setting still counts, because it rewrites ADQL before
+sending it: with `skycell.custom_scan` off there, a constant region is sent as
+ranges of cells, not as a call to the custom scan. Set skycell's settings the
+same on every node: in `postgresql.conf` on each, with `ALTER DATABASE` run
+on each node (`run_command_on_workers()`), or per transaction as above.
+
 ## What is still to do
 
-- **Aggregate pushdown.** A real state type for `skycell_moc_agg`, so that each
-  shard aggregates its own rows.
-- **Estimates.** `skycell_count_estimate` and its relatives should sum over the
-  shards, as they already sum over a partitioned table's partitions.
-- **Cross-match of two large catalogues.** Both sharded by the same coarse
-  cell, with margin copies of the rows near each cell's edge.
+- **Cross-match of two large catalogues.** Citus joins two distributed tables
+  only on their distribution columns. Both sharded by the same coarse cell,
+  with margin copies of the rows near each cell's edge, a cross-match would
+  run shard by shard.

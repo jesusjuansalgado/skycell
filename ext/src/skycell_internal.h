@@ -112,6 +112,9 @@ extern FuncExpr *skycell_poly_region_scan(Oid sibling, Node *cell, Node *ra, Nod
 										  ArrayType *arr);
 extern void skycell_region_from_datum_lite(Datum d, sc_region *r);
 
+/* adql.c: a skyregion's text */
+extern Datum skyregion_out(PG_FUNCTION_ARGS);
+
 /* skycell.c: a MOC's ASCII or JSON text from sorted, merged order-29 ranges */
 extern char *skycell_moc_cstring(const int64 *pairs, int n, int max_order, bool json);
 

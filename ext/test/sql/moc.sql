@@ -60,6 +60,17 @@ SELECT skycell_moc_agg(13, ipix) FROM generate_series(0, 3) ipix;
 SELECT skycell_moc_agg(2, ipix) FROM (VALUES (192)) v(ipix);
 SELECT skycell_coverage_moc('moc_cat', 13);
 
+-- the aggregate's state (0.45), as a sharded database (Citus) sends it from a
+-- shard to the coordinator: its order, its format, then runs of cells
+SELECT '3 0 5+2 100+1'::skycell_mocstate AS state, '2 1'::skycell_mocstate AS empty_json;
+SELECT skycell_moc_agg_final('3 0 5+2 100+1'::skycell_mocstate) AS ascii,
+       skycell_moc_agg_final('2 1 0+192'::skycell_mocstate) AS json_whole_sky;
+SELECT skycell_moc_agg_final(skycell_moc_agg_final('3 0 5+2 100+1'::skycell_mocstate)::text::skycell_mocstate) AS bad;
+SELECT '13 0'::skycell_mocstate;
+SELECT '3 0 760+10'::skycell_mocstate;
+SELECT '3 0 5+0'::skycell_mocstate;
+SELECT '3 2'::skycell_mocstate;
+
 -- in parallel (0.45): workers aggregate their own rows, the leader combines
 -- them; the same MOC as one process makes
 CREATE TABLE moc_par AS

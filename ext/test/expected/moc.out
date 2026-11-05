@@ -186,6 +186,39 @@ ERROR:  skycell: no HEALPix cell 192 at order 2
 SELECT skycell_coverage_moc('moc_cat', 13);
 ERROR:  skycell: a coverage MOC's order must be within [0, 12]
 CONTEXT:  PL/pgSQL function skycell_coverage_moc(text,integer,text) line 8 at RAISE
+-- the aggregate's state (0.45), as a sharded database (Citus) sends it from a
+-- shard to the coordinator: its order, its format, then runs of cells
+SELECT '3 0 5+2 100+1'::skycell_mocstate AS state, '2 1'::skycell_mocstate AS empty_json;
+     state     | empty_json 
+---------------+------------
+ 3 0 5+2 100+1 | 2 1
+(1 row)
+
+SELECT skycell_moc_agg_final('3 0 5+2 100+1'::skycell_mocstate) AS ascii,
+       skycell_moc_agg_final('2 1 0+192'::skycell_mocstate) AS json_whole_sky;
+   ascii   |                     json_whole_sky                     
+-----------+--------------------------------------------------------
+ 3/5-6 100 | {"0": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11], "2": []}
+(1 row)
+
+SELECT skycell_moc_agg_final(skycell_moc_agg_final('3 0 5+2 100+1'::skycell_mocstate)::text::skycell_mocstate) AS bad;
+ERROR:  invalid input syntax for type skycell_mocstate
+SELECT '13 0'::skycell_mocstate;
+ERROR:  invalid input syntax for type skycell_mocstate
+LINE 1: SELECT '13 0'::skycell_mocstate;
+               ^
+SELECT '3 0 760+10'::skycell_mocstate;
+ERROR:  invalid input syntax for type skycell_mocstate
+LINE 1: SELECT '3 0 760+10'::skycell_mocstate;
+               ^
+SELECT '3 0 5+0'::skycell_mocstate;
+ERROR:  invalid input syntax for type skycell_mocstate
+LINE 1: SELECT '3 0 5+0'::skycell_mocstate;
+               ^
+SELECT '3 2'::skycell_mocstate;
+ERROR:  invalid input syntax for type skycell_mocstate
+LINE 1: SELECT '3 2'::skycell_mocstate;
+               ^
 -- in parallel (0.45): workers aggregate their own rows, the leader combines
 -- them; the same MOC as one process makes
 CREATE TABLE moc_par AS
