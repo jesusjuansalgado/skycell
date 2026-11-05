@@ -65,6 +65,19 @@ extern void cone_scan_init(void);
 extern bool cone_scan_keep(PlannerInfo *root, FuncExpr *fcall);
 extern bool cone_scan_keep_as(PlannerInfo *root, FuncExpr *written, FuncExpr *cone6);
 extern Node *cone_with_partition_bounds(PlannerInfo *root, FuncExpr *cone6);
+
+/*
+ * A skycell_cone() call that cone_with_partition_bounds() has given its
+ * bounds or shard key: inside an AND, PostgreSQL simplifies the members of an
+ * AND a simplification returns again, and the call must then be left as it
+ * is, or it gains its bounds again, without end.  The mark is the location of
+ * one of its arguments (the support function sees a stand-in for the call,
+ * whose own location is -1, but the arguments themselves); a location is
+ * never compared (equal()) or written out (deparsing).
+ */
+#define SKYCELL_BOUNDED_LOCATION (-29)
+extern void skycell_mark_bounded(FuncExpr *cone6);
+extern bool skycell_is_bounded(List *cone_args);
 extern Node *region_with_partition_bounds(PlannerInfo *root, FuncExpr *scan);
 extern void skycell_index_adql_predicates(PlannerInfo *root);
 extern bool skycell_distance_order(Node *expr, Index relid, Node **cell, Node **ra0,

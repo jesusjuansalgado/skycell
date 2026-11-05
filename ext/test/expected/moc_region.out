@@ -131,6 +131,8 @@ SELECT i AS id, mod(i * 137.50776405003785, 360.0) AS ra,
        degrees(asin(1 - 2 * (i + 0.5) / 50000.0)) AS dec
 FROM generate_series(0, 49999) i;
 CREATE INDEX mr_cat_cell ON mr_cat (skycell_ang2cell(ra, dec));
+-- every row in the sample (300 x the target), so the estimates are the same every run
+ALTER INDEX mr_cat_cell ALTER COLUMN 1 SET STATISTICS 1000;
 ANALYZE mr_cat;
 CREATE TABLE mr_mocs (name text, m text);
 INSERT INTO mr_mocs VALUES

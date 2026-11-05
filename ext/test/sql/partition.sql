@@ -179,5 +179,65 @@ SELECT skycell_cone_cell_lo(10, 20, -1) > skycell_cone_cell_hi(10, 20, -1) AS em
        skycell_cone_cell_lo(10, 20, 90) = 0 AS sky_lo,
        skycell_cone_cell_hi(10, 95, 1) = 12 * 4::int8 ^ 29 - 1 AS invalid_is_sky;
 
-DROP FUNCTION pt_cmp(text, text), pt_scans(text, text);
-DROP TABLE pt_flat, pt_cell, pt_dec, pt_patch, pt_probe, pt_col;
+-- a cone written as skycell_cone(), with another condition, on the catalogue
+-- partitioned by cell: the bounds are added once (until 0.45 the cone took
+-- them again each time PostgreSQL simplified the AND they came in, without
+-- end, until the server ran out of memory)
+SELECT count(*) = (SELECT count(*) FROM pt_flat WHERE skycell_in_cone(ra, dec, 120, 30, 2) AND id % 2 = 0)
+         AS written_same
+FROM pt_cell WHERE skycell_cone(skycell_ang2cell(ra, dec), ra, dec, 120::float8, 30::float8, 2::float8)
+                   AND id % 2 = 0;
+
+-- Shard keys (0.45): a coarse cell kept true by a CHECK constraint, the column
+-- a sharded database (Citus) distributes by.  A constant cone or region gets
+-- the key's cells it meets, and the answer is unchanged.
+CREATE TABLE pt_key (id int, ra float8, dec float8,
+                     hpx5 bigint NOT NULL CHECK (hpx5 = skycell_ang2cell(ra, dec) >> 48));
+INSERT INTO pt_key SELECT id, ra, dec, skycell_ang2cell(ra, dec) >> 48 FROM pt_flat
+WHERE ra IS NOT NULL AND dec IS NOT NULL;
+CREATE INDEX pt_key_cell ON pt_key (skycell_ang2cell(ra, dec));
+ANALYZE pt_key;
+CREATE FUNCTION pt_filter(q text, OUT scan text, OUT filter text) LANGUAGE plpgsql AS $$
+DECLARE j json;
+BEGIN
+  EXECUTE 'EXPLAIN (FORMAT JSON) ' || q INTO j;
+  scan := j -> 0 -> 'Plan' -> 'Plans' -> 0 ->> 'Custom Plan Provider';
+  filter := j -> 0 -> 'Plan' -> 'Plans' -> 0 ->> 'Filter';
+END $$;
+SELECT (pt_filter($q$SELECT count(*) FROM pt_key
+  WHERE 1 = CONTAINS(POINT('ICRS', ra, dec), CIRCLE('ICRS', 120, 30, 2))$q$)).*;
+SELECT (pt_filter($q$SELECT count(*) FROM pt_key
+  WHERE 1 = CONTAINS(POINT('ICRS', ra, dec), skycell_moc_region('3/100 4/2000'))$q$)).*;
+-- w on pt_key against flat (w, unless given) on pt_flat
+CREATE FUNCTION pt_keyed(w text, flat text DEFAULT NULL, OUT same bool, OUT keyed bool)
+LANGUAGE plpgsql AS $$
+DECLARE a bigint; b bigint; j json;
+BEGIN
+  EXECUTE format('SELECT count(*) FROM pt_key WHERE %s', w) INTO a;
+  EXECUTE format('SELECT count(*) FROM pt_flat WHERE %s', coalesce(flat, w)) INTO b;
+  EXECUTE format('EXPLAIN (FORMAT JSON) SELECT count(*) FROM pt_key WHERE %s', w) INTO j;
+  same := a = b;
+  keyed := j::text LIKE '%hpx5 = ANY%';
+END $$;
+SELECT t.name, (pt_keyed(t.w, t.flat)).* FROM (VALUES
+  ('cone',         $q$1 = CONTAINS(POINT('ICRS', ra, dec), CIRCLE('ICRS', 120, 30, 2))$q$, NULL),
+  ('cone written', $q$skycell_cone(skycell_ang2cell(ra, dec), ra, dec, 120::float8, 30::float8, 2::float8) AND id > 5$q$, NULL),
+  ('as a worker gets it', $q$skycell_cone(skycell_ang2cell(ra, dec), ra, dec, 120::float8, 30::float8, 2::float8) AND hpx5 = ANY ('{1553,1555,1556,1557,1558,1559,1561,1564,1565}'::bigint[])$q$,
+   $q$skycell_in_cone(ra, dec, 120, 30, 2)$q$),
+  ('pole',         $q$1 = CONTAINS(POINT('ICRS', ra, dec), CIRCLE('ICRS', 0, 90, 3))$q$, NULL),
+  ('polygon',      $q$1 = CONTAINS(POINT('ICRS', ra, dec), POLYGON('ICRS', 200, -10, 215, -8, 208, 4))$q$, NULL),
+  ('composite',    $q$1 = CONTAINS(POINT('ICRS', ra, dec), REGION('DIFFERENCE ICRS (CIRCLE 300 60 6 CIRCLE 300 60 3)'))$q$, NULL),
+  ('moc',          $q$1 = CONTAINS(POINT('ICRS', ra, dec), skycell_moc_region('3/100 4/2000 6/40000'))$q$, NULL),
+  ('too many cells', $q$1 = CONTAINS(POINT('ICRS', ra, dec), CIRCLE('ICRS', 120, 30, 60))$q$, NULL),
+  ('not constant', $q$1 = CONTAINS(POINT('ICRS', ra, dec), CIRCLE('ICRS', 120, 30, id % 3))$q$, NULL)
+) t(name, w, flat);
+-- the constraint either way round counts; one not validated does not
+ALTER TABLE pt_key DROP CONSTRAINT pt_key_check;
+ALTER TABLE pt_key ADD CONSTRAINT pt_key_rev CHECK ((skycell_ang2cell(ra, dec) >> 48) = hpx5);
+SELECT (pt_keyed($q$1 = CONTAINS(POINT('ICRS', ra, dec), CIRCLE('ICRS', 120, 30, 2))$q$)).*;
+ALTER TABLE pt_key DROP CONSTRAINT pt_key_rev;
+ALTER TABLE pt_key ADD CONSTRAINT pt_key_nv CHECK (hpx5 = skycell_ang2cell(ra, dec) >> 48) NOT VALID;
+SELECT (pt_keyed($q$1 = CONTAINS(POINT('ICRS', ra, dec), CIRCLE('ICRS', 120, 30, 2))$q$)).*;
+
+DROP FUNCTION pt_cmp(text, text), pt_scans(text, text), pt_keyed(text, text), pt_filter(text);
+DROP TABLE pt_flat, pt_cell, pt_dec, pt_patch, pt_probe, pt_col, pt_key;

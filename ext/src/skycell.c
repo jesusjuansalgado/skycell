@@ -2230,6 +2230,9 @@ skycell_support(PG_FUNCTION_ARGS)
 
 		if (nargs == 6)
 		{
+			/* already given its bounds: see SKYCELL_BOUNDED_LOCATION */
+			if (skycell_is_bounded(req->fcall->args))
+				PG_RETURN_POINTER(NULL);
 			/* left as is for the custom scan (cone_scan.c), if it can take it */
 			if (cone_scan_keep(req->root, req->fcall))
 			{

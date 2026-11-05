@@ -86,6 +86,7 @@
 #include "rewrite/rewriteManip.h"
 #include "parser/parse_func.h"
 #include "catalog/pg_operator_d.h"
+#include "catalog/pg_opfamily_d.h"
 
 #include "cover.h"
 #include "skycell_internal.h"
@@ -614,6 +615,210 @@ partition_key_ops(PlannerInfo *root, Node *cell, Oid *geop, Oid *leop)
 	return match && OidIsValid(*geop) && OidIsValid(*leop);
 }
 
+/*
+ * Shard keys (0.45).  A sharded database such as Citus distributes a
+ * catalogue by one column and skips the shards a query cannot reach only on
+ * key = ... or key = ANY(...).  Distributed by a coarse HEALPix cell, kept
+ * true by a constraint the planner can read,
+ *
+ *     hpx5 bigint NOT NULL CHECK (hpx5 = skycell_ang2cell(ra, dec) >> 48)
+ *
+ * (48 = 2 * (29 - 5): the order-5 cell), a constant cone or region on the
+ * table gets hpx5 = ANY('{the order-5 cells it meets}'), so each query goes
+ * to the shards holding those cells.  The cells come from the same
+ * classification as skycell_cell_overlaps(), which holds every cell the
+ * region meets, so no row of the region is skipped.  Only a validated
+ * constraint counts: it is what makes every row's key its own cell's.
+ */
+#define SHARD_KEY_MAX_CELLS 1024
+
+/* skycell_ang2cell(ra, dec) >> shift, ra and dec as the query has them */
+static bool
+shard_key_expr(Node *e, Node *ra, Node *dec, int *order)
+{
+	OpExpr	   *shr;
+	FuncExpr   *f;
+	Const	   *k;
+	char	   *name;
+	int			shift;
+
+	if (!IsA(e, OpExpr) || list_length(((OpExpr *) e)->args) != 2)
+		return false;
+	shr = (OpExpr *) e;
+	set_opfuncid(shr);
+	if (shr->opfuncid != F_INT8SHR)
+		return false;
+	f = (FuncExpr *) linitial(shr->args);
+	k = (Const *) lsecond(shr->args);
+	if (!IsA(f, FuncExpr) || list_length(f->args) != 2 || !IsA(k, Const) || k->constisnull)
+		return false;
+	name = get_func_name(f->funcid);
+	if (name == NULL || strcmp(name, "skycell_ang2cell") != 0 ||
+		!equal(linitial(f->args), ra) || !equal(lsecond(f->args), dec))
+		return false;
+	shift = DatumGetInt32(k->constvalue);
+	if (shift < 0 || shift > 2 * SC_MAX_ORDER || shift % 2 != 0)
+		return false;
+	*order = SC_MAX_ORDER - shift / 2;
+	return true;
+}
+
+/*
+ * The shard key of the relation ra and dec read: its column and the order of
+ * its cells, from a validated CHECK (key = skycell_ang2cell(ra, dec) >> s),
+ * either way round.
+ */
+static bool
+shard_key_for(PlannerInfo *root, Node *ra, Node *dec, Index *varno, AttrNumber *attnum,
+			  int *order)
+{
+	List	   *vars = sc_pull_local_vars((Node *) list_make2(ra, dec), 0);
+	RangeTblEntry *rte;
+	Relation	rel;
+	TupleConstr *constr;
+	bool		found = false;
+
+	if (root == NULL || root->parse == NULL || vars == NIL || !IsA(linitial(vars), Var))
+		return false;
+	*varno = ((Var *) linitial(vars))->varno;
+	if (*varno < 1 || *varno > (Index) list_length(root->parse->rtable))
+		return false;
+	rte = rt_fetch(*varno, root->parse->rtable);
+	if (rte->rtekind != RTE_RELATION ||
+		(rte->relkind != RELKIND_RELATION && rte->relkind != RELKIND_PARTITIONED_TABLE))
+		return false;
+
+	rel = table_open(rte->relid, NoLock);	/* locked by the parser */
+	constr = RelationGetDescr(rel)->constr;
+	for (int i = 0; constr != NULL && i < constr->num_check && !found; i++)
+	{
+		Node	   *e;
+		OpExpr	   *eq;
+		Node	   *a,
+				   *b;
+
+		if (!constr->check[i].ccvalid)
+			continue;
+		e = stringToNode(constr->check[i].ccbin);
+		ChangeVarNodes(e, 1, *varno, 0);
+		if (!IsA(e, OpExpr) || list_length(((OpExpr *) e)->args) != 2)
+			continue;
+		eq = (OpExpr *) e;
+		set_opfuncid(eq);
+		if (eq->opfuncid != F_INT8EQ)
+			continue;
+		a = linitial(eq->args);
+		b = lsecond(eq->args);
+		if (!IsA(a, Var))
+		{
+			Node	   *t = a;
+
+			a = b;
+			b = t;
+		}
+		if (IsA(a, Var) && ((Var *) a)->varno == (int) *varno &&
+			((Var *) a)->vartype == INT8OID && shard_key_expr(b, ra, dec, order))
+		{
+			*attnum = ((Var *) a)->varattno;
+			found = true;
+		}
+	}
+	table_close(rel, NoLock);
+	return found;
+}
+
+/*
+ * The cells of order the region meets, as skycell_cell_overlaps() counts
+ * them; -1 when there are more than max.
+ */
+static int
+region_cells_at(const sc_region *reg, int order, Datum *out, int max)
+{
+	struct
+	{
+		int			o;
+		int64		pix;
+	}			stack[12 + 3 * (SC_MAX_ORDER + 1)];
+	int			top = 0,
+				n = 0;
+
+	for (int f = 11; f >= 0; f--)
+	{
+		stack[top].o = 0;
+		stack[top++].pix = f;
+	}
+	while (top > 0)
+	{
+		int			o = stack[--top].o;
+		int64		pix = stack[top].pix;
+		double		fo;
+		sc_class	c = sc_region_classify(reg, o, pix, &fo);
+
+		if (c == SC_OUT)
+			continue;
+		if (c == SC_PARTIAL && o < order)
+		{
+			for (int ch = 3; ch >= 0; ch--)
+			{
+				stack[top].o = o + 1;
+				stack[top++].pix = 4 * pix + ch;
+			}
+			continue;
+		}
+		if (c == SC_PARTIAL && !sc_region_cell_meets(reg, o, pix))
+			continue;
+		{
+			int64		count = (int64) 1 << (2 * (order - o)),
+						first = pix << (2 * (order - o));
+
+			if (n + count > max)
+				return -1;
+			for (int64 i = 0; i < count; i++)
+				out[n++] = Int64GetDatum(first + i);
+		}
+	}
+	return n;
+}
+
+/* expr AND key = ANY(the cells of the key's order reg meets), when the relation has a key */
+static Node *
+with_shard_key(PlannerInfo *root, Node *expr, Node *ra, Node *dec, const sc_region *reg)
+{
+	Index		varno;
+	AttrNumber	attnum;
+	int			order,
+				n;
+	Datum	   *cells;
+	ScalarArrayOpExpr *saop;
+	Oid			eqop;
+
+	if (!shard_key_for(root, ra, dec, &varno, &attnum, &order))
+		return expr;
+	eqop = get_opfamily_member(INTEGER_BTREE_FAM_OID, INT8OID, INT8OID, BTEqualStrategyNumber);
+	if (!OidIsValid(eqop))
+		return expr;
+	cells = palloc(sizeof(Datum) * SHARD_KEY_MAX_CELLS);
+	n = region_cells_at(reg, order, cells, SHARD_KEY_MAX_CELLS);
+	if (n < 0)
+		return expr;			/* most of the sky: most shards anyway */
+	saop = makeNode(ScalarArrayOpExpr);
+	saop->opno = eqop;
+	saop->opfuncid = F_INT8EQ;
+	saop->useOr = true;
+	saop->inputcollid = InvalidOid;
+	saop->args = list_make2(makeVar(varno, attnum, INT8OID, -1, InvalidOid, 0),
+							makeConst(INT8ARRAYOID, -1, InvalidOid, -1,
+									  PointerGetDatum(construct_array(cells, n, INT8OID, 8, true,
+																	  TYPALIGN_DOUBLE)),
+									  false, false));
+	if (IsA(expr, BoolExpr) && ((BoolExpr *) expr)->boolop == AND_EXPR)
+	{
+		((BoolExpr *) expr)->args = lappend(((BoolExpr *) expr)->args, saop);
+		return expr;
+	}
+	return (Node *) makeBoolExpr(AND_EXPR, list_make2(expr, saop), -1);
+}
+
 /* expr AND cell >= lo AND cell <= hi */
 static Node *
 with_cell_bounds(Node *expr, Node *cell, Oid geop, Oid leop, Expr *lo, Expr *hi)
@@ -637,8 +842,77 @@ with_cell_bounds(Node *expr, Node *cell, Oid geop, Oid leop, Expr *lo, Expr *hi)
  * implies both.  Otherwise the cone alone.  Installed SQL older than 0.40 has
  * no bound functions and gets the cone alone too.
  */
+static Node *cone_with_cell_bounds(PlannerInfo *root, FuncExpr *cone6);
+
 Node *
 cone_with_partition_bounds(PlannerInfo *root, FuncExpr *cone6)
+{
+	Node	   *res = cone_with_cell_bounds(root, cone6);
+	List	   *args = cone6->args;
+	Const	   *c[3] = {lfourth(args), list_nth(args, 4), list_nth(args, 5)};
+	sc_region	reg;
+	bool		consts = true;
+
+	/* and, for a constant cone on a table with a shard key, the key's cells */
+	for (int i = 0; i < 3; i++)
+		if (!IsA(c[i], Const) || c[i]->constisnull)
+			consts = false;
+	if (consts && sc_region_cone(&reg, DatumGetFloat8(c[0]->constvalue),
+								 DatumGetFloat8(c[1]->constvalue),
+								 DatumGetFloat8(c[2]->constvalue), true) == NULL)
+	{
+		res = with_shard_key(root, res, lsecond(args), lthird(args), &reg);
+		sc_region_free(&reg);
+	}
+	if (res != (Node *) cone6)
+		skycell_mark_bounded(cone6);
+	return res;
+}
+
+/* the argument that carries the mark: a node with a location of its own */
+static int *
+bounded_mark_slot(List *args)
+{
+	ListCell   *lc;
+
+	foreach(lc, args)
+	{
+		Node	   *a = lfirst(lc);
+
+		if (IsA(a, Const))
+			return &((Const *) a)->location;
+		if (IsA(a, Var))
+			return &((Var *) a)->location;
+		if (IsA(a, FuncExpr))
+			return &((FuncExpr *) a)->location;
+		if (IsA(a, Param))
+			return &((Param *) a)->location;
+	}
+	return NULL;
+}
+
+void
+skycell_mark_bounded(FuncExpr *cone6)
+{
+	int		   *slot;
+
+	/* its own copy of the argument, so that no other expression is marked */
+	cone6->args = copyObject(cone6->args);
+	slot = bounded_mark_slot(cone6->args);
+	if (slot != NULL)
+		*slot = SKYCELL_BOUNDED_LOCATION;
+}
+
+bool
+skycell_is_bounded(List *cone_args)
+{
+	int		   *slot = bounded_mark_slot(cone_args);
+
+	return slot != NULL && *slot == SKYCELL_BOUNDED_LOCATION;
+}
+
+static Node *
+cone_with_cell_bounds(PlannerInfo *root, FuncExpr *cone6)
 {
 	List	   *args = cone6->args;
 	Node	   *cell = linitial(args);
@@ -706,18 +980,36 @@ region_with_partition_bounds(PlannerInfo *root, FuncExpr *scan)
 {
 	Node	   *cell = linitial(scan->args);
 	Const	   *rg = (Const *) lfourth(scan->args);
+	Node	   *res = (Node *) scan;
 	Oid			geop,
 				leop;
 	int64		lo,
 				hi;
+	sc_region	reg;
 
-	if (!IsA(rg, Const) || rg->constisnull || !partition_key_ops(root, cell, &geop, &leop))
-		return (Node *) scan;
-	region_cell_bounds(rg->constvalue, &lo, &hi);
-	if (lo == 0 && hi == 12 * ((int64) 1 << (2 * SC_MAX_ORDER)) - 1)
-		return (Node *) scan;
-	return with_cell_bounds((Node *) scan, cell, geop, leop, (Expr *) int8_const(lo),
-							(Expr *) int8_const(hi));
+	if (!IsA(rg, Const) || rg->constisnull)
+		return res;
+	if (partition_key_ops(root, cell, &geop, &leop))
+	{
+		region_cell_bounds(rg->constvalue, &lo, &hi);
+		if (!(lo == 0 && hi == 12 * ((int64) 1 << (2 * SC_MAX_ORDER)) - 1))
+			res = with_cell_bounds(res, cell, geop, leop, (Expr *) int8_const(lo),
+								   (Expr *) int8_const(hi));
+	}
+	/* and, on a table with a shard key, the key's cells */
+	{
+		Index		varno;
+		AttrNumber	attnum;
+		int			order;
+
+		if (shard_key_for(root, lsecond(scan->args), lthird(scan->args), &varno, &attnum, &order))
+		{
+			skycell_region_from_datum(rg->constvalue, &reg);
+			res = with_shard_key(root, res, lsecond(scan->args), lthird(scan->args), &reg);
+			sc_region_free(&reg);
+		}
+	}
+	return res;
 }
 
 /* whether a scan clause is one of those comparisons for this region scan */
