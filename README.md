@@ -1097,6 +1097,17 @@ took 49 ms against 36, a 30° cone 89 against 73. Partition a sky catalogue to
 load, index, vacuum or archive it by region, not for speed: cones cost the
 same, cross-matches 1.2–1.7 times as much.
 
+**Citus distributed tables** (0.45, [`bench/citus/`](bench/citus/)). On Citus
+13 with a catalogue hash-distributed over 8 shards, every cone, polygon,
+composite and MOC form tried gives the single node's rows. So do nearest
+neighbours and cross-matches against a reference or local probe table. Each
+shard plans its part with skycell and uses the custom scan on its own index.
+Not yet:
+- every query goes to every shard;
+- `skycell_moc_agg` is aggregated on the coordinator, not on the shards;
+- `skycell_count_estimate` returns 0 for a distributed table;
+- two distributed catalogues cannot be cross-matched.
+
 **Polygons through the custom scan** (0.43, [`bench/results-polyscan/`](bench/results-polyscan/)).
 Since 0.43 a constant polygon or box takes the custom scan that cones have.
 Before that it was rewritten into an `OR` of index ranges plus a per-row test.

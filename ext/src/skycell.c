@@ -2149,12 +2149,26 @@ skycell_const_region_cover(PlannerInfo *root, List *args, sc_region *reg,
 	return true;
 }
 
-/* selectivity of skycell_region_scan(): as a cone's, from its covering */
+/*
+ * selectivity of skycell_region_scan(): as a cone's, from its covering.  And
+ * the custom scan for a skycell_region_scan() that arrives written, not
+ * rewritten here from CONTAINS: a Citus worker receives its shard's query
+ * from the coordinator after the coordinator's rewrite (0.45).
+ */
 PG_FUNCTION_INFO_V1(skycell_region_scan_support);
 Datum
 skycell_region_scan_support(PG_FUNCTION_ARGS)
 {
 	Node	   *rawreq = (Node *) PG_GETARG_POINTER(0);
+
+	if (IsA(rawreq, SupportRequestSimplify))
+	{
+		SupportRequestSimplify *req = (SupportRequestSimplify *) rawreq;
+
+		if (req->root != NULL)
+			(void) region_scan_keep(req->root, req->fcall, req->fcall);
+		PG_RETURN_POINTER(NULL);	/* the call stays as it is */
+	}
 
 	if (IsA(rawreq, SupportRequestSelectivity))
 	{
