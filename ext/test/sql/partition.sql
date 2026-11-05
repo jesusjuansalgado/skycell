@@ -225,6 +225,8 @@ SELECT t.name, (pt_keyed(t.w, t.flat)).* FROM (VALUES
   ('as a worker gets it', $q$skycell_cone(skycell_ang2cell(ra, dec), ra, dec, 120::float8, 30::float8, 2::float8) AND hpx5 = ANY ('{1553,1555,1556,1557,1558,1559,1561,1564,1565}'::bigint[])$q$,
    $q$skycell_in_cone(ra, dec, 120, 30, 2)$q$),
   ('pole',         $q$1 = CONTAINS(POINT('ICRS', ra, dec), CIRCLE('ICRS', 0, 90, 3))$q$, NULL),
+  ('distance',     $q$distance(ra, dec, 200, -40) < 1.5$q$, NULL),
+  ('distance of points', $q$distance(POINT('ICRS', ra, dec), POINT('ICRS', 200, -40)) < 1.5$q$, NULL),
   ('polygon',      $q$1 = CONTAINS(POINT('ICRS', ra, dec), POLYGON('ICRS', 200, -10, 215, -8, 208, 4))$q$, NULL),
   ('composite',    $q$1 = CONTAINS(POINT('ICRS', ra, dec), REGION('DIFFERENCE ICRS (CIRCLE 300 60 6 CIRCLE 300 60 3)'))$q$, NULL),
   ('moc',          $q$1 = CONTAINS(POINT('ICRS', ra, dec), skycell_moc_region('3/100 4/2000 6/40000'))$q$, NULL),
