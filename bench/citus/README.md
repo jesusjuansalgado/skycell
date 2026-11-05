@@ -132,6 +132,58 @@ ranges of cells, not as a call to the custom scan. Set skycell's settings the
 same on every node: in `postgresql.conf` on each, with `ALTER DATABASE` run
 on each node (`run_command_on_workers()`), or per transaction as above.
 
+## One instance against Citus (0.45)
+
+[`perf.sql`](perf.sql). The same 2 million real Gaia DR3 positions (a random
+subset of the 10M-row table) are stored three ways:
+- as one plain table on the coordinator;
+- over 32 shards by id;
+- over 32 shards by order-3 cell, with the shard key.
+
+Each query form ran at 20 centres spread over the catalogue's sky, once to
+warm up and once timed; the table gives the median per query, planning
+included. **All three servers ran on one machine with 4 CPUs**, so this
+measures Citus's overhead and how the work spreads over shards. It cannot show
+what more machines would add.
+
+| query | one instance | Citus, by id | Citus, by cell |
+|---|---|---|---|
+| cone 1″ | 0.08 ms | 5.0 ms | 0.89 ms |
+| cone 0.2° | 0.08 ms | 4.7 ms | 0.78 ms |
+| cone 2° | 1.6 ms | 7.4 ms | 2.6 ms |
+| cone 10° | 19.5 ms | 16.3 ms | 20.7 ms |
+| box 1° | 0.29 ms | 6.0 ms | 1.1 ms |
+| nearest 10 | 0.20 ms | 5.4 ms | 110 ms |
+| cross-match, 2,000 probes × 2″ | 10.7 ms | 181 ms | 109 ms |
+| coverage MOC, order 8 | 94 ms (4 workers; 214 serial) | 465 ms | 417 ms |
+| full scan, `dec > 0` | 49 ms (4 workers; 117 serial) | 75 ms | 93 ms |
+| `skycell_count_estimate`, 5° cone | 0.42 ms | 257 ms | 261 ms |
+
+On one machine, one instance is faster at everything here. What the
+distributed queries pay:
+
+- **A fixed cost per query.** A query that goes to one shard costs about 0.7
+  ms more than on one instance; one that goes to all 32, about 5 ms. The shard
+  key cuts small cones from 5 ms to under 1 ms, because it sends them to one
+  shard.
+- **Nearest neighbours on a table sharded by cell: 110 ms.** Each shard holds
+  scattered patches of sky, so a shard far from the centre searches a long way
+  through empty sky before it finds its own nearest rows, all of which the
+  coordinator then discards. Sharded by id, every shard has nearby rows (5 ms).
+- **Cross-matches.** The probe table is copied to every shard, so all 32
+  shards each look up all 2,000 probes: 32 times the index probes. Sharding
+  both tables by the same cell (with margins) would let each shard match only
+  its own probes.
+- **Estimates.** These go to every shard, a quarter of a second, against under
+  a millisecond on one instance.
+- **Whole-table scans.** These spread over the shards, but on 4 CPUs
+  PostgreSQL's own parallel workers do it with less overhead.
+
+What Citus adds needs more than one machine: catalogues larger than one
+server's disk or memory, and the CPUs and disks of every worker for scans,
+coverage MOCs and many queries at once. For a catalogue one server holds, one
+instance with skycell is faster, and simpler.
+
 ## What is still to do
 
 - **Cross-match of two large catalogues.** Citus joins two distributed tables
