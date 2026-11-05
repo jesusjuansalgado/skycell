@@ -51,6 +51,7 @@
 #include "utils/memutils.h"
 #include "fmgr.h"
 #include "funcapi.h"
+#include "libpq/pqformat.h"
 #include "miscadmin.h"
 #include "nodes/makefuncs.h"
 #include "nodes/nodeFuncs.h"
@@ -61,6 +62,7 @@
 #include "parser/parse_func.h"
 #include "parser/parse_oper.h"
 #include "parser/parsetree.h"
+#include "port/pg_bitutils.h"
 #include "rewrite/rewriteManip.h"
 #include "utils/array.h"
 #include "utils/builtins.h"
@@ -3804,6 +3806,60 @@ typedef struct
 
 #define MOC_AGG_MAX_ORDER 12
 
+static moc_agg_state *moc_agg_new(MemoryContext cxt, int order, int json);
+
+/*
+ * The next set cell at or after i in a state's bitmap, or ncells; and the
+ * first clear one at or after i.  Word at a time: a coverage at order 12 is
+ * 200M bits, most of them in long runs of one value.
+ */
+static int64
+moc_bits_next(const uint8 *bits, int64 ncells, int64 i, bool set)
+{
+	while (i < ncells)
+	{
+		if ((i & 63) == 0 && i + 64 <= ncells)
+		{
+			const uint8 *p = bits + (i >> 3);
+			uint64		w = 0;
+
+			/* cell i + k is bit k of the word, on any byte order */
+			for (int k = 7; k >= 0; k--)
+				w = (w << 8) | p[k];
+			if (!set)
+				w = ~w;
+			if (w == 0)
+			{
+				i += 64;
+				continue;
+			}
+			return i + pg_rightmost_one_pos64(w);
+		}
+		if (((bits[i >> 3] >> (i & 7)) & 1) == (set ? 1 : 0))
+			return i;
+		i++;
+	}
+	return ncells;
+}
+
+/* set cells [first, first + n) */
+static void
+moc_bits_set(uint8 *bits, int64 first, int64 n)
+{
+	int64		i = first,
+				end = first + n;
+
+	for (; i < end && (i & 7); i++)
+		bits[i >> 3] |= (uint8) (1 << (i & 7));
+	if (end - i >= 8)
+	{
+		memset(bits + (i >> 3), 0xFF, (end - i) >> 3);
+		i += ((end - i) >> 3) << 3;
+	}
+	for (; i < end; i++)
+		bits[i >> 3] |= (uint8) (1 << (i & 7));
+}
+
 PG_FUNCTION_INFO_V1(skycell_moc_agg_trans);
 Datum
 skycell_moc_agg_trans(PG_FUNCTION_ARGS)
@@ -3817,20 +3873,20 @@ skycell_moc_agg_trans(PG_FUNCTION_ARGS)
 		elog(ERROR, "skycell_moc_agg_trans called outside an aggregate");
 	st = PG_ARGISNULL(0) ? NULL : (moc_agg_state *) PG_GETARG_POINTER(0);
 	if (PG_ARGISNULL(1) || PG_ARGISNULL(2))
-		PG_RETURN_POINTER(st);	/* a row without a cell adds nothing */
+	{
+		/* a row without a cell adds nothing; with no state yet, still none */
+		if (st == NULL)
+			PG_RETURN_NULL();
+		PG_RETURN_POINTER(st);
+	}
 	order = PG_GETARG_INT32(1);
 	pix = PG_GETARG_INT64(2);
 	if (st == NULL)
 	{
-		MemoryContext old = MemoryContextSwitchTo(aggcxt);
-
 		moc_check_order(order, MOC_AGG_MAX_ORDER);
-		st = palloc0(sizeof(moc_agg_state));
-		st->order = order;
-		st->json = (PG_NARGS() > 3 && !PG_ARGISNULL(3)) ? moc_fmt(PG_GETARG_TEXT_PP(3)) : 0;
-		st->ncells = 12 * ((int64) 1 << (2 * order));
-		st->bits = palloc0((st->ncells + 7) / 8);	/* 25 MB at order 12 */
-		MemoryContextSwitchTo(old);
+		/* 25 MB at order 12 */
+		st = moc_agg_new(aggcxt, order,
+						 (PG_NARGS() > 3 && !PG_ARGISNULL(3)) ? moc_fmt(PG_GETARG_TEXT_PP(3)) : 0);
 	}
 	else if (order != st->order)
 		ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
@@ -3839,6 +3895,132 @@ skycell_moc_agg_trans(PG_FUNCTION_ARGS)
 		ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 						errmsg("skycell: no HEALPix cell " INT64_FORMAT " at order %d", pix, order)));
 	st->bits[pix >> 3] |= (uint8) (1 << (pix & 7));
+	PG_RETURN_POINTER(st);
+}
+
+/*
+ * Partial aggregation (0.45): parallel workers, and Citus shards, each build
+ * a bitmap of their own rows' cells; the leader ORs them.  Between processes
+ * a state travels as its runs of set cells, which for a coverage is far
+ * smaller than the bitmap (1.5 MB at order 10, 25 MB at 12).
+ */
+static moc_agg_state *
+moc_agg_new(MemoryContext cxt, int order, int json)
+{
+	MemoryContext old = MemoryContextSwitchTo(cxt);
+	moc_agg_state *st = palloc0(sizeof(moc_agg_state));
+
+	st->order = order;
+	st->json = json;
+	st->ncells = 12 * ((int64) 1 << (2 * order));
+	st->bits = palloc0((st->ncells + 7) / 8);
+	MemoryContextSwitchTo(old);
+	return st;
+}
+
+PG_FUNCTION_INFO_V1(skycell_moc_agg_combine);
+Datum
+skycell_moc_agg_combine(PG_FUNCTION_ARGS)
+{
+	MemoryContext aggcxt;
+	moc_agg_state *a,
+			   *b;
+
+	if (!AggCheckCallContext(fcinfo, &aggcxt))
+		elog(ERROR, "skycell_moc_agg_combine called outside an aggregate");
+	a = PG_ARGISNULL(0) ? NULL : (moc_agg_state *) PG_GETARG_POINTER(0);
+	b = PG_ARGISNULL(1) ? NULL : (moc_agg_state *) PG_GETARG_POINTER(1);
+	if (b == NULL)
+	{
+		if (a == NULL)
+			PG_RETURN_NULL();
+		PG_RETURN_POINTER(a);
+	}
+	if (a == NULL)
+	{
+		/* the first partial: a copy the aggregate's own context owns */
+		a = moc_agg_new(aggcxt, b->order, b->json);
+		memcpy(a->bits, b->bits, (b->ncells + 7) / 8);
+		PG_RETURN_POINTER(a);
+	}
+	if (a->order != b->order)
+		ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+						errmsg("skycell: skycell_moc_agg() takes one order")));
+	{
+		int64		nb = (a->ncells + 7) / 8,
+					i = 0;
+
+		for (; i + 8 <= nb; i += 8)
+		{
+			uint64		x,
+						y;
+
+			memcpy(&x, a->bits + i, 8);
+			memcpy(&y, b->bits + i, 8);
+			x |= y;
+			memcpy(a->bits + i, &x, 8);
+		}
+		for (; i < nb; i++)
+			a->bits[i] |= b->bits[i];
+	}
+	a->json |= b->json;
+	PG_RETURN_POINTER(a);
+}
+
+/* order, json, then each run of set cells as (first, count) */
+PG_FUNCTION_INFO_V1(skycell_moc_agg_serialize);
+Datum
+skycell_moc_agg_serialize(PG_FUNCTION_ARGS)
+{
+	moc_agg_state *st = (moc_agg_state *) PG_GETARG_POINTER(0);
+	StringInfoData buf;
+
+	pq_begintypsend(&buf);
+	pq_sendint32(&buf, st->order);
+	pq_sendint32(&buf, st->json);
+	for (int64 i = moc_bits_next(st->bits, st->ncells, 0, true); i < st->ncells;)
+	{
+		int64		j = moc_bits_next(st->bits, st->ncells, i, false);
+
+		pq_sendint64(&buf, i);
+		pq_sendint64(&buf, j - i);
+		i = moc_bits_next(st->bits, st->ncells, j, true);
+	}
+	PG_RETURN_BYTEA_P(pq_endtypsend(&buf));
+}
+
+PG_FUNCTION_INFO_V1(skycell_moc_agg_deserialize);
+Datum
+skycell_moc_agg_deserialize(PG_FUNCTION_ARGS)
+{
+	bytea	   *b = PG_GETARG_BYTEA_PP(0);
+	StringInfoData buf;
+	moc_agg_state *st;
+	int			order,
+				json;
+
+	if (!AggCheckCallContext(fcinfo, NULL))
+		elog(ERROR, "skycell_moc_agg_deserialize called outside an aggregate");
+	/* initReadOnlyStringInfo() by hand: it is PostgreSQL 17's */
+	buf.data = VARDATA_ANY(b);
+	buf.len = VARSIZE_ANY_EXHDR(b);
+	buf.maxlen = buf.len;
+	buf.cursor = 0;
+	order = pq_getmsgint(&buf, 4);
+	json = pq_getmsgint(&buf, 4);
+	moc_check_order(order, MOC_AGG_MAX_ORDER);
+	st = moc_agg_new(CurrentMemoryContext, order, json);
+	while (buf.cursor < buf.len)
+	{
+		int64		first = pq_getmsgint64(&buf),
+					n = pq_getmsgint64(&buf);
+
+		if (first < 0 || n < 1 || first + n > st->ncells)
+			ereport(ERROR, (errcode(ERRCODE_INVALID_BINARY_REPRESENTATION),
+							errmsg("skycell: invalid skycell_moc_agg state")));
+		moc_bits_set(st->bits, first, n);
+	}
+	pq_getmsgend(&buf);
 	PG_RETURN_POINTER(st);
 }
 
@@ -3854,24 +4036,12 @@ skycell_moc_agg_final(PG_FUNCTION_ARGS)
 		PG_RETURN_NULL();		/* no row, no order: no MOC */
 	st = (moc_agg_state *) PG_GETARG_POINTER(0);
 	sh = 2 * (SC_MAX_ORDER - st->order);
-	for (int64 i = 0; i < st->ncells;)
+	for (int64 i = moc_bits_next(st->bits, st->ncells, 0, true); i < st->ncells;)
 	{
-		int64		j;
+		int64		j = moc_bits_next(st->bits, st->ncells, i, false);
 
-		if (st->bits[i >> 3] == 0 && (i & 7) == 0)
-		{
-			i += 8;
-			continue;
-		}
-		if (!(st->bits[i >> 3] & (1 << (i & 7))))
-		{
-			i++;
-			continue;
-		}
-		for (j = i; j + 1 < st->ncells && (st->bits[(j + 1) >> 3] & (1 << ((j + 1) & 7))); j++)
-			;
-		moc_add(&m, i << sh, ((j + 1) << sh) - 1);
-		i = j + 1;
+		moc_add(&m, i << sh, (j << sh) - 1);
+		i = moc_bits_next(st->bits, st->ncells, j, true);
 	}
 	PG_RETURN_TEXT_P(moc_serialise(&m, st->order, st->json));
 }

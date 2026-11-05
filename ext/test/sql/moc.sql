@@ -32,6 +32,8 @@ SELECT skycell_moc_agg(2, ipix, 'json') FROM (VALUES (8), (9), (10), (11), (9), 
 SELECT skycell_moc_agg(0, ipix) FROM generate_series(0, 11) ipix;
 SELECT skycell_moc_agg(3, ipix) FROM (VALUES (NULL::bigint), (5)) v(ipix);
 SELECT skycell_moc_agg(3, ipix) IS NULL AS no_rows FROM generate_series(1, 0) ipix;
+SELECT skycell_moc_agg(3, NULL::bigint) IS NULL AS no_cells FROM generate_series(1, 3);
+SELECT skycell_moc_agg(3, CASE WHEN i = 3 THEN 7 END) AS last_row_only FROM generate_series(1, 3) i;
 
 -- a table's coverage, by expression index or stored cell column
 CREATE TABLE moc_cat AS
@@ -57,5 +59,41 @@ SELECT skycell_moc(circle('ICRS', 10, 20, 2), 6, 'fits');
 SELECT skycell_moc_agg(13, ipix) FROM generate_series(0, 3) ipix;
 SELECT skycell_moc_agg(2, ipix) FROM (VALUES (192)) v(ipix);
 SELECT skycell_coverage_moc('moc_cat', 13);
+
+-- in parallel (0.45): workers aggregate their own rows, the leader combines
+-- them; the same MOC as one process makes
+CREATE TABLE moc_par AS
+SELECT i AS id, mod(i * 137.50776405003785, 360.0) AS ra,
+       degrees(asin(1 - 2 * (i + 0.5) / 100000.0)) * 0.3 AS dec
+FROM generate_series(0, 99999) i;
+CREATE INDEX moc_par_cell ON moc_par (skycell_ang2cell(ra, dec));
+ANALYZE moc_par;
+CREATE TEMP TABLE moc_serial AS
+SELECT o, skycell_moc_agg(o, skycell_ang2cell(ra, dec) >> (2 * (29 - o))) AS a,
+          skycell_moc_agg(o, skycell_ang2cell(ra, dec) >> (2 * (29 - o)), 'json') AS j
+FROM moc_par, (VALUES (0), (3), (8), (12)) v(o) GROUP BY o;
+SET parallel_setup_cost = 0;
+SET parallel_tuple_cost = 0;
+SET min_parallel_table_scan_size = 0;
+SET max_parallel_workers_per_gather = 3;
+SET parallel_leader_participation = off;
+EXPLAIN (COSTS OFF) SELECT skycell_moc_agg(8, skycell_ang2cell(ra, dec) >> 42) FROM moc_par;
+SELECT o, skycell_moc_agg(o, skycell_ang2cell(ra, dec) >> (2 * (29 - o))) = a AS ascii_same
+FROM moc_par, moc_serial WHERE o = 0 GROUP BY o, a
+UNION ALL SELECT 3, (SELECT skycell_moc_agg(3, skycell_ang2cell(ra, dec) >> 52) FROM moc_par) = a FROM moc_serial WHERE o = 3
+UNION ALL SELECT 8, (SELECT skycell_moc_agg(8, skycell_ang2cell(ra, dec) >> 42) FROM moc_par) = a FROM moc_serial WHERE o = 8
+UNION ALL SELECT 12, (SELECT skycell_moc_agg(12, skycell_ang2cell(ra, dec) >> 34) FROM moc_par) = a FROM moc_serial WHERE o = 12
+ORDER BY 1;
+SELECT (SELECT skycell_moc_agg(12, skycell_ang2cell(ra, dec) >> 34, 'json') FROM moc_par) = j AS json_same
+FROM moc_serial WHERE o = 12;
+-- a worker whose rows hold no cell, and no rows at all
+SELECT skycell_moc_agg(5, CASE WHEN id = 77777 THEN skycell_ang2cell(ra, dec) >> 48 END) =
+       (SELECT skycell_moc_agg(5, skycell_ang2cell(ra, dec) >> 48) FROM moc_par WHERE id = 77777) AS one_cell
+FROM moc_par;
+SELECT skycell_moc_agg(5, skycell_ang2cell(ra, dec) >> 48) IS NULL AS none FROM moc_par WHERE id < 0;
+SELECT skycell_coverage_moc('moc_par', 8) = (SELECT a FROM moc_serial WHERE o = 8) AS coverage_same;
+RESET parallel_setup_cost; RESET parallel_tuple_cost; RESET min_parallel_table_scan_size;
+RESET max_parallel_workers_per_gather; RESET parallel_leader_participation;
+DROP TABLE moc_par;
 
 DROP TABLE moc_cat, moc_cells;

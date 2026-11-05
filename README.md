@@ -899,7 +899,7 @@ FROM gaia.gaia_source WHERE phot_g_mean_mag < 12;
 | Function | Returns | Notes |
 |---|---|---|
 | `skycell_moc(r skyregion, max_order int DEFAULT 10, fmt text DEFAULT 'ascii')` | `text` | the cells of `max_order` that meet `r`, as `skycell_cell_overlaps` counts them; cells inside it whole at a coarser order. Orders 0–29 |
-| `skycell_moc_agg(hpx_order int, ipix bigint [, fmt text])` | `text` | aggregate: the MOC of the cells of one order, duplicates allowed. Orders 0–12; no rows give NULL |
+| `skycell_moc_agg(hpx_order int, ipix bigint [, fmt text])` | `text` | aggregate: the MOC of the cells of one order, duplicates allowed. Orders 0–12; no rows, or no row with a cell, give NULL. Runs in parallel (since 0.45) |
 | `skycell_coverage_moc(tbl text, max_order int DEFAULT 10, fmt text DEFAULT 'ascii')` | `text` | the cells of `max_order` that hold a row of `tbl`, from its skycell index or stored `cell` column. Orders 0–12; an empty table gives an empty MOC |
 
 `fmt` is `'ascii'` or `'json'`. The output is normalised as MOCPy writes it:
@@ -918,6 +918,15 @@ and 21 of the 50 held cells more, which by dense sampling lie outside the cone
 (up to 0.49° beyond a 5° cone at order 2). A 20° cone at order 10 takes
 18 ms; the coverage of the 10M-row Gaia table at order 10, 1.2 s, one pass
 over its index. FITS, the third MOC 2.0 serialisation, is not written.
+
+Since 0.45 `skycell_moc_agg`, and so `skycell_coverage_moc`, runs in parallel:
+each worker marks its own rows' cells and the leader combines them (and on a
+sharded database such as Citus, each shard would). Workers pass their cells
+to the leader as runs, not as the bitmap. On the 10M-row Gaia table with four
+workers, the order-10 coverage takes 0.64 s against 1.24 s in one process,
+and order 3 takes 0.30 s against 0.87 s. At order 12 the time goes into
+writing the multi-megabyte MOC itself, which workers cannot share: 2.4–3.0 s
+against 3.1 s.
 
 ### MOCs as search regions (since 0.44)
 
@@ -1374,7 +1383,9 @@ rows. Run against v0.42, it flags v0.44's regression (1.21 [1.13, 1.30]).
   ASCII and JSON; the max-order cells of a region's MOC must be exactly those
   `skycell_cell_overlaps` counts; the aggregate's merging of duplicates and
   siblings; a table's coverage by expression index and by stored cell
-  column, and of an empty table; out-of-range orders and formats.
+  column, and of an empty table; out-of-range orders and formats. The
+  aggregate in parallel (workers only) must give the one-process MOC at
+  orders 0–12, also when workers see no row with a cell.
 - `moc_region`: MOCs read from ASCII, MOC 1.0 commas and JSON, normalised;
   in STC-S and composites; AREA and CENTROID; malformed MOCs refused. On a
   catalogue, nine MOCs (single cells, mixed orders, a pole, the whole sky,
