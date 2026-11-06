@@ -51,6 +51,21 @@ after #52, is in `report-v036.md`. Both runs on the same host and tables.
   on this table, which is in memory, a skipped heap fetch saves less than the
   key's decoding, the sort and the bitmap's entry-by-entry filling cost: 12-15%
   slower at k = 100-1000 in a same-day A/B against v0.44.
+- **Tried in 0.51 (`micro_oc.sql`, on real36's copy of the ObsCore table):**
+  - **Kept:** sorting only the rows the query wants (quickselect, then sort
+    the prefix; the rest only if asked for), and rejecting a row whose
+    declination is farther from the centre's than the ring reaches, before
+    the exact distance. perfcheck against v0.50: ObsCore k = 100 0.93
+    [0.90, 0.96], k = 1000 0.98 [0.96, 1.00], Gaia k = 1 0.95 [0.91, 0.99].
+    Against pgSphere on ObsCore: 1.16–1.20 at k = 100, 1.43–1.48 at
+    k = 1000.
+  - **Dropped:** finer and coarser ring coverings (slower at every k), and
+    shrinking the first ring by the count of index entries its bitmap holds.
+    That shrinking cut rows read at k = 100 from 3.9 to 2.6 per row
+    returned, but the discarded bitmaps and extra coverings cost as much:
+    neutral to 10% slower.
+  - The problem, the profile and everything tried are written up for a
+    second opinion in [`open-problem.md`](open-problem.md).
 - **A regression found and fixed:** 0.44 read the index's lowest and highest
   key at every nearest query (for partitions), about 25 µs, a third of a
   k = 1 search (`bisect-v042-v044.txt`: v0.42 77 µs, v0.44 104 µs). Since

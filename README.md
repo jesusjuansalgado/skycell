@@ -1518,15 +1518,23 @@ locally), the standalone selftests, and the reference translators.
   (`ctid`, `FOR UPDATE`) keeps the sort too, since the scan returns rows from
   its own buffer. Against pgSphere's GiST ordering on a clustered relation (an
   ObsCore table, observations grouped in fields, its heap out of cell order)
-  it is level for a few rows and slower for hundreds or more (1.15 times
-  pgSphere's time at k = 100, 1.55 at 1000): it reads about 2.5 times the rows
-  it returns, the first ring sized from a cell's density holding more where
-  observations cluster in fields, each through a bitmap over an unordered
-  heap, where pgSphere's GiST reads close to exactly the rows it returns.
-  Testing index entries by their key before the heap read cut the rows read,
-  but cost more than it saved on a table in memory, and was dropped
-  ([`bench/results-nearest/`](bench/results-nearest/)). A condition `distance
-  > x` starts the rings at x (since 0.45).
+  it is level for a few rows and slower for hundreds or more: since 0.51,
+  1.16–1.20 times pgSphere's time at k = 100 and about 1.45 at 1000 (1.15–1.23
+  and 1.55 before). It reads 2–4 times the rows it returns, each with an exact
+  distance. Part of that is the first ring, sized from a cell's density,
+  holding more where observations cluster in fields; part is the ring's
+  covering cells reaching past the ring. pgSphere's GiST reads close to
+  exactly the rows it returns. Since 0.51 only the rows wanted are sorted, and
+  a row whose declination alone puts it outside the ring is rejected before
+  its distance is computed. Tried and dropped
+  ([`bench/results-nearest/`](bench/results-nearest/)):
+  - testing index entries by their key before the heap read;
+  - finer or coarser ring coverings;
+  - shrinking the first ring by its index count.
+
+  The problem is written up in
+  [`open-problem.md`](bench/results-nearest/open-problem.md). A condition
+  `distance > x` starts the rings at x (since 0.45).
 - **Where the custom scan applies.** It answers cones, cross-matches and
   constant polygons, boxes and composites; per-row polygons and stored regions
   use the range rewrite and the region indexes. The search must be a top-level
