@@ -64,6 +64,7 @@
 #include "optimizer/plancat.h"
 #include "optimizer/planner.h"
 #include "optimizer/optimizer.h"
+#include "optimizer/paramassign.h"
 #include "optimizer/pathnode.h"
 #include "optimizer/paths.h"
 #include "port/atomics.h"
@@ -2498,6 +2499,39 @@ add_nearest_path(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte)
  * ring's rows and the rows the query was planned to read; custom_exprs holds
  * the centre, the ORDER BY expression and the radii the answer is bounded by.
  */
+/* does an entry of the target list hold the expression? */
+static bool
+tlist_has_expr_walker(Node *node, Node *expr)
+{
+	if (node == NULL)
+		return false;
+	if (equal(node, expr))
+		return true;
+	return expression_tree_walker(node, tlist_has_expr_walker, expr);
+}
+
+static bool
+tlist_has_expr(List *tlist, Node *expr)
+{
+	return tlist_has_expr_walker((Node *) tlist, expr);
+}
+
+typedef struct
+{
+	Node	   *expr;
+	Param	   *param;
+} expr_param_context;
+
+static Node *
+expr_to_param_mutator(Node *node, expr_param_context *cx)
+{
+	if (node == NULL)
+		return NULL;
+	if (equal(node, cx->expr))
+		return (Node *) copyObject(cx->param);
+	return expression_tree_mutator(node, expr_to_param_mutator, cx);
+}
+
 static Plan *
 nearest_plan(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
 			 List *tlist, List *clauses, List *custom_plans)
@@ -2536,6 +2570,19 @@ nearest_plan(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
 										   Int32GetDatum(list_length(e) - 3), false, true));
 	cs->custom_exprs = list_concat(cs->custom_exprs,
 								   copyObject((List *) list_nth(p, 5)));
+
+	/*
+	 * A parameter for the distance, should the target list compute it: the
+	 * scan has computed it already, for every row it returns.  The plan's
+	 * target list keeps the expression, which the nodes above it match; the
+	 * scan's projection reads the parameter in its place (0.52).  The target
+	 * list is not final here -- a projection can be pushed into the scan
+	 * later -- so the parameter is always assigned, and used if it is.
+	 */
+	cs->custom_private = lappend(cs->custom_private,
+								 makeConst(INT4OID, -1, InvalidOid, sizeof(int32),
+										   Int32GetDatum(assign_special_exec_param(root)),
+										   false, true));
 	cs->custom_scan_tlist = NIL;
 	cs->methods = &nearest_scan_methods;
 	return &cs->scan.plan;
@@ -3498,8 +3545,13 @@ typedef struct NearestScanState
 				next,
 				sorted;			/* rows[0 .. sorted) are in order (0.51) */
 	double		nout;			/* rows returned so far */
+	double		bf_cells,		/* best-first: cells read, split, batches */
+				bf_splits,
+				bf_batches;
 	ExprState  *rowdec;			/* the row's declination, when the distance is
 								 * skycell_dist() of a column pair (0.51) */
+	ParamExecData *distparam;	/* the distance the projection reads, set as a
+								 * row is returned; NULL: it computes it (0.52) */
 	Size		mem;
 	Tuplesortstate *sort;
 	TupleDesc	sortdesc;		/* the relation's columns, then the distance */
@@ -3563,6 +3615,47 @@ nearest_begin(CustomScanState *node, EState *estate, int eflags)
 	 * expressions.  It holds no sub-plan (adql.c checks).
 	 */
 	ns->dist = ExecInitExpr((Expr *) lthird(cscan->custom_exprs), NULL);
+
+	/*
+	 * The projection reads the distance from the parameter, not computing it
+	 * again; not under EvalPlanQual, whose rows the rings did not read.  Its
+	 * second compilation costs a few distances: only for queries of more
+	 * rows than that.
+	 */
+	if (list_length(cscan->custom_private) > 12 && node->ss.ps.ps_ProjInfo != NULL &&
+		estate->es_epq_active == NULL && ns->want >= 32)
+	{
+		int			paramid = DatumGetInt32(list_nth_node(Const, cscan->custom_private,
+														   12)->constvalue);
+
+		if (paramid >= 0 &&
+			tlist_has_expr((List *) cscan->scan.plan.targetlist,
+						   (Node *) lthird(cscan->custom_exprs)))
+		{
+			Param	   *prm = makeNode(Param);
+			expr_param_context cx;
+			List	   *tl;
+
+			prm->paramkind = PARAM_EXEC;
+			prm->paramid = paramid;
+			prm->paramtype = FLOAT8OID;
+			prm->paramtypmod = -1;
+			prm->paramcollid = InvalidOid;
+			prm->location = -1;
+			cx.expr = (Node *) lthird(cscan->custom_exprs);
+			cx.param = prm;
+			if (exprType(cx.expr) == FLOAT8OID)
+			{
+				tl = (List *) expr_to_param_mutator((Node *) cscan->scan.plan.targetlist, &cx);
+				node->ss.ps.ps_ProjInfo =
+					ExecBuildProjectionInfo(tl, node->ss.ps.ps_ExprContext,
+											node->ss.ps.ps_ResultTupleSlot, &node->ss.ps,
+											node->ss.ss_ScanTupleSlot->tts_tupleDescriptor);
+				ns->distparam = &estate->es_param_exec_vals[paramid];
+				ns->distparam->execPlan = NULL;
+			}
+		}
+	}
 
 	/*
 	 * When the distance is skycell_dist(ra, dec, ra0, dec0) -- either pair
@@ -3761,12 +3854,34 @@ nearest_row_cmp(const NearestRow *x, const NearestRow *y)
 	return (x->d > y->d) - (x->d < y->d);
 }
 
-#define ST_SORT nearest_sort_rows
+#define ST_SORT nearest_sort_rows_any
 #define ST_ELEMENT_TYPE NearestRow
 #define ST_COMPARE(a, b) nearest_row_cmp(a, b)
 #define ST_SCOPE static
 #define ST_DEFINE
 #include "lib/sort_template.h"
+
+/* the same for rows whose distances are all numbers: a comparison of two (0.52) */
+#define ST_SORT nearest_sort_rows_finite
+#define ST_ELEMENT_TYPE NearestRow
+#define ST_COMPARE(a, b) (((a)->d > (b)->d) - ((a)->d < (b)->d))
+#define ST_SCOPE static
+#define ST_DEFINE
+#include "lib/sort_template.h"
+
+static void
+nearest_sort_rows(NearestRow *rows, int n)
+{
+	for (int i = 0; i < n; i++)
+	{
+		if (rows[i].isnull || isnan(rows[i].d))
+		{
+			nearest_sort_rows_any(rows, n);
+			return;
+		}
+	}
+	nearest_sort_rows_finite(rows, n);
+}
 
 /*
  * Rows rearranged so that rows[0 .. m) are the m nearest, in no order, and
@@ -4144,6 +4259,287 @@ nearest_density_at(NearestScanState *ns, sc_vec3 v, double k, double n)
 }
 
 /* collect and sort the next ring's rows, and choose the one after it */
+/*
+ * Best-first first ring (skycell.nearest_bestfirst, 0.52).
+ *
+ * Instead of a cone sized from the density and covered whole, a queue of
+ * HEALPix cells ordered by the least distance a point of each can have from
+ * the centre.  A cell the statistics expect to hold many rows is split into
+ * its four children, without touching the index; the others are gathered
+ * into a batch, read through one TID bitmap when the batch is expected to
+ * hold the rows still wanted, their exact distances computed.  Once k rows
+ * are held, D_k, the k-th distance, bounds the answer: a row farther is never
+ * copied, and when the nearest cell left in the queue is farther than D_k
+ * every row within D_k has been read.  Those rows are then the first ring --
+ * a ring of radius D_k, ties included -- and the rings carry on from there if
+ * the query wants more.  The NESTED cell ids make every cell, at any order,
+ * one range of the index.
+ */
+static bool nearest_bestfirst = true;
+
+/* the least distance from c (unit vector) of any point of the cell, degrees; a hair low */
+static double
+cell_lower_bound(sc_vec3 c, int order, int64 pix)
+{
+	double		d = sc_angle(c, sc_pix2vec(order, pix)) - sc_pixrad(order);
+
+	return d <= 0 ? 0.0 : fmax(0.0, d * (180.0 / M_PI) * (1.0 - 1e-9) - 1e-12);
+}
+
+static int
+bestfirst_range_cmp(const void *a, const void *b)
+{
+	int64		x = *(const int64 *) a,
+				y = *(const int64 *) b;
+
+	return (x > y) - (x < y);
+}
+
+/* the greatest distance from c of any point of the cell, degrees; a hair high */
+static double
+cell_upper_bound(sc_vec3 c, int order, int64 pix)
+{
+	double		d = sc_angle(c, sc_pix2vec(order, pix)) + sc_pixrad(order);
+
+	return d * (180.0 / M_PI) * (1.0 + 1e-9) + 1e-12;
+}
+
+/* a batch's rows: their distances, the rows within the bound copied */
+static void
+bestfirst_read_batch(NearestScanState *ns, int64 *b, int nb, double *dk)
+{
+	ConeScanState *st = &ns->cone;
+	ExprContext *econtext = st->css.ss.ps.ps_ExprContext;
+	EState	   *estate = st->css.ss.ps.state;
+
+	if (nb > st->rt_cap)
+	{
+		st->rt_cap = Max(nb, 2 * st->rt_cap);
+		st->rt_bounds = (st->rt_bounds == NULL)
+			? MemoryContextAlloc(estate->es_query_cxt, sizeof(int64) * 2 * st->rt_cap)
+			: repalloc(st->rt_bounds, sizeof(int64) * 2 * st->rt_cap);
+	}
+	/* in key order, adjacent cells (siblings read whole) merged: one index descent each */
+	qsort(b, nb, sizeof(int64) * 2, bestfirst_range_cmp);
+	st->nranges = 0;
+	for (int i = 0; i < nb; i++)
+	{
+		int64		lo = Max(b[2 * i], st->kmin),
+					hi = Min(b[2 * i + 1], st->kmax);
+
+		if (lo > hi)
+			continue;
+		if (st->nranges > 0 && st->rt_bounds[2 * st->nranges - 1] + 1 >= lo)
+		{
+			st->rt_bounds[2 * st->nranges - 1] = Max(hi, st->rt_bounds[2 * st->nranges - 1]);
+			continue;
+		}
+		st->rt_bounds[2 * st->nranges] = lo;
+		st->rt_bounds[2 * st->nranges + 1] = hi;
+		st->nranges++;
+	}
+	st->bounds = st->rt_bounds;
+	st->cur = -1;
+	cone_release_bitmap(st, false);
+	ns->bf_batches += 1;
+	for (;;)
+	{
+		TupleTableSlot *row = cone_next_bitmap(st, ns->fetch);
+		bool		isnull;
+		double		d;
+		Datum		v;
+
+		if (TupIsNull(row))
+			break;
+		ns->nread += 1;
+		ResetExprContext(econtext);
+		econtext->ecxt_scantuple = row;
+		if (ns->rowdec != NULL && isfinite(*dk))
+		{
+			Datum		dv = ExecEvalExprSwitchContext(ns->rowdec, econtext, &isnull);
+			double		dec = isnull ? 0.0 : DatumGetFloat8(dv);
+
+			if (!isnull && dec >= -90.0 && dec <= 90.0 &&
+				fabs(dec - ns->dec0) > *dk * (1.0 + 1e-9) + 1e-12)
+				continue;
+		}
+		v = ExecEvalExprSwitchContext(ns->dist, econtext, &isnull);
+		d = isnull ? 0.0 : DatumGetFloat8(v);
+		/* a NULL or NaN distance sorts last: the final ring's */
+		if (isnull || isnan(d) || d > *dk)
+			continue;
+		if (ns->prequal && !ExecQual(ns->prequal, econtext))
+		{
+			InstrCountFiltered1(&ns->cone.css.ss.ps, 1);
+			continue;
+		}
+		{
+			MemoryContext old = MemoryContextSwitchTo(ns->ringcxt);
+
+			if (ns->nrows == ns->cap)
+			{
+				ns->cap = ns->cap ? 2 * ns->cap : 256;
+				ns->rows = ns->rows ? repalloc(ns->rows, sizeof(NearestRow) * ns->cap)
+					: palloc(sizeof(NearestRow) * ns->cap);
+			}
+			ns->rows[ns->nrows].d = d;
+			ns->rows[ns->nrows].isnull = false;
+			ns->rows[ns->nrows].tup = ExecCopySlotHeapTuple(row);
+			ns->nrows++;
+			MemoryContextSwitchTo(old);
+		}
+	}
+	ExecClearTuple(ns->fetch);
+}
+
+/* with need rows held: D_k, and the rows beyond it dropped */
+static void
+bestfirst_bound(NearestScanState *ns, int need, double *dk)
+{
+	double		m = 0;
+	int			k = 0;
+
+	if (ns->nrows < need)
+		return;
+	if (ns->nrows > need)
+		nearest_select_rows(ns->rows, ns->nrows, need);
+	for (int i = 0; i < need; i++)
+		m = fmax(m, ns->rows[i].d);
+	*dk = m;
+	/* keep every row within it, ties included */
+	for (int i = 0; i < ns->nrows; i++)
+	{
+		if (ns->rows[i].d <= m)
+			ns->rows[k++] = ns->rows[i];
+		else
+			heap_freetuple(ns->rows[i].tup);
+	}
+	ns->nrows = k;
+}
+
+/*
+ * Best-first holds the rows it reads in memory, with no tuplesort to spill
+ * to: used when what it may hold -- a few times the rows wanted, at the
+ * heap's average width -- fits in work_mem.  Rings, which spill, otherwise.
+ */
+static bool
+bestfirst_fits(NearestScanState *ns)
+{
+	Relation	rel = ns->cone.css.ss.ss_currentRelation;
+	double		need = fmax(1.0, ns->want - ns->nout),
+				tuples = rel->rd_rel->reltuples,
+				pages = rel->rd_rel->relpages,
+				width = (tuples > 0 && pages > 0) ? pages * BLCKSZ / tuples : 256.0;
+
+	return 3.0 * need * (width + HEAPTUPLESIZE + sizeof(NearestRow)) <= work_mem * 1024.0;
+}
+
+static void
+nearest_bestfirst_ring(NearestScanState *ns)
+{
+	ConeScanState *st = &ns->cone;
+	sc_vec3		c = sc_radec2vec(ns->ra0, ns->dec0);
+	int			need = (int) fmin(1e9, fmax(1.0, ns->want - ns->nout));
+	double		split_rows = fmax(8.0, need / 8.0),
+				edge_rows = 8.0,
+				dk = INFINITY,
+				batch_rows = 0,
+				maxd = -1.0;
+	int			hn = 0,
+				hcap = 256,
+				nb = 0,
+				bcap = 64;
+	probe_cell *h = palloc(sizeof(probe_cell) * hcap);
+	int64	   *b = palloc(sizeof(int64) * 2 * bcap);
+	bool		exhausted;
+
+	/* a partition's ranges are clipped to the keys it holds */
+	if (!st->have_keyrange)
+		cone_key_range(st);
+	for (int f = 0; f < 12; f++)
+		probe_push(&h, &hn, &hcap, (probe_cell) {cell_lower_bound(c, 0, f), f, 0});
+	for (;;)
+	{
+		probe_cell	cell;
+		int64		lo,
+					hi;
+		double		exp;
+
+		/* nothing left nearer than D_k: read what is gathered, or stop */
+		if (hn == 0 || h[0].d > dk)
+		{
+			if (nb == 0)
+				break;
+			bestfirst_read_batch(ns, b, nb, &dk);
+			bestfirst_bound(ns, need, &dk);
+			nb = 0;
+			batch_rows = 0;
+			continue;
+		}
+		cell = probe_pop(h, &hn);
+		lo = sc_pix_lo(cell.order, cell.pix);
+		hi = sc_pix_hi(cell.order, cell.pix);
+		if (hi < st->kmin || lo > st->kmax)
+			continue;			/* none of the index's keys: another partition's */
+		exp = sc_density_rows(&st->dens, lo, hi);
+		/*
+		 * Split a cell while it is expected to hold many rows; once D_k is
+		 * known, a cell wholly within it is read whole, and one crossing it
+		 * is split finer, so that little is read beyond it.
+		 */
+		if (cell.order < SC_MAX_ORDER &&
+			(!isfinite(dk) ? exp > split_rows
+			 : exp > edge_rows && cell_upper_bound(c, cell.order, cell.pix) > dk))
+		{
+			ns->bf_splits += 1;
+			for (int ch = 0; ch < 4; ch++)
+			{
+				int64		p = 4 * cell.pix + ch;
+
+				probe_push(&h, &hn, &hcap,
+						   (probe_cell) {cell_lower_bound(c, cell.order + 1, p), p, cell.order + 1});
+			}
+			continue;
+		}
+		if (nb == bcap)
+		{
+			bcap *= 2;
+			b = repalloc(b, sizeof(int64) * 2 * bcap);
+		}
+		b[2 * nb] = lo;
+		b[2 * nb + 1] = hi;
+		nb++;
+		ns->bf_cells += 1;
+		batch_rows += exp;
+		/* before D_k is known, read once the batch should complete the k; after, gather all */
+		if (!isfinite(dk) && batch_rows >= fmax(16.0, need - ns->nrows))
+		{
+			bestfirst_read_batch(ns, b, nb, &dk);
+			bestfirst_bound(ns, need, &dk);
+			nb = 0;
+			batch_rows = 0;
+		}
+	}
+	exhausted = (hn == 0);
+	for (int i = 0; i < ns->nrows; i++)
+		maxd = fmax(maxd, ns->rows[i].d);
+	ns->n_inside = ns->n_passed = ns->nrows;
+	if (exhausted && !isfinite(dk))
+	{
+		/* the whole relation read: what is left has a NULL or NaN distance */
+		ns->rprev = maxd;
+		ns->final = true;
+	}
+	else
+	{
+		ns->rprev = isfinite(dk) ? dk : maxd;
+		ns->r = cap_radius(fmin(4.0 * M_PI, 2.0 * cap_area(fmax(ns->rprev, 1e-9))));
+		ns->final = ns->r >= 180.0 || ns->nrows * 2.0 >= 0.5 * fmax(st->dens.ntotal, 1.0);
+	}
+	pfree(h);
+	pfree(b);
+}
+
 static void
 nearest_ring(NearestScanState *ns)
 {
@@ -4235,6 +4631,14 @@ nearest_ring(NearestScanState *ns)
 				ns->last = true;
 			}
 		}
+	}
+
+	/* the first ring best-first: an unordered heap, no bounds, rows that fit in memory */
+	if (nearest_bestfirst && ns->nrings == 0 && !ns->final && ns->rprev < 0 &&
+		ns->bound < 0 && st->bitmap && !st->parallel && bestfirst_fits(ns))
+	{
+		nearest_bestfirst_ring(ns);
+		goto finish;
 	}
 
 	if (ns->final)
@@ -4358,6 +4762,7 @@ nearest_ring(NearestScanState *ns)
 			ns->last = true;
 		}
 	}
+finish:
 	ExecClearTuple(ns->fetch);
 	ResetExprContext(econtext);
 	if (ns->sort)
@@ -4400,12 +4805,24 @@ nearest_next(ScanState *ss)
 				ns->sorted = ns->nrows;
 			}
 			ns->nout += 1;
+			if (ns->distparam != NULL)
+			{
+				ns->distparam->value = Float8GetDatum(ns->rows[ns->next].d);
+				ns->distparam->isnull = ns->rows[ns->next].isnull;
+			}
 			ExecStoreHeapTuple(ns->rows[ns->next++].tup, out, false);
 			return out;
 		}
 		if (ns->sort != NULL && tuplesort_gettupleslot(ns->sort, true, false, ns->got, NULL))
 		{
 			slot_getallattrs(ns->got);
+			if (ns->distparam != NULL)
+			{
+				int			natts = ns->sortdesc->natts - 1;
+
+				ns->distparam->value = ns->got->tts_values[natts];
+				ns->distparam->isnull = ns->got->tts_isnull[natts];
+			}
 			ExecStoreHeapTuple(heap_form_tuple(out->tts_tupleDescriptor, ns->got->tts_values,
 											   ns->got->tts_isnull), out, true);
 			return out;
@@ -4470,6 +4887,12 @@ nearest_explain(CustomScanState *node, List *ancestors, ExplainState *es)
 		ExplainPropertyFloat("Rings", NULL, ns->nrings / loops, 1, es);
 		ExplainPropertyFloat("Rows Read by Rings", NULL, ns->nread / loops, 0, es);
 		ExplainPropertyFloat("Rows Inside Rings", NULL, ns->n_inside / loops, 0, es);
+		if (ns->bf_batches > 0)
+		{
+			ExplainPropertyFloat("Best-first Cells Read", NULL, ns->bf_cells / loops, 0, es);
+			ExplainPropertyFloat("Best-first Cells Split", NULL, ns->bf_splits / loops, 0, es);
+			ExplainPropertyFloat("Best-first Batches", NULL, ns->bf_batches / loops, 0, es);
+		}
 		if (ns->nprobes > 0)
 			ExplainPropertyFloat("Cells Probed", NULL, ns->nprobes / loops, 0, es);
 	}
@@ -4480,6 +4903,11 @@ nearest_explain(CustomScanState *node, List *ancestors, ExplainState *es)
 void
 cone_scan_init(void)
 {
+	DefineCustomBoolVariable("skycell.nearest_bestfirst",
+							 "Find a nearest-neighbour search's first rows on a heap out of "
+							 "cell order by a best-first walk over HEALPix cells, instead of "
+							 "a first ring.",
+							 NULL, &nearest_bestfirst, true, PGC_USERSET, 0, NULL, NULL, NULL);
 	DefineCustomBoolVariable("skycell.custom_scan",
 							 "Answer cones and cross-matches with skycell's own scan node "
 							 "instead of rewriting them into B-tree range conditions.",

@@ -22,28 +22,30 @@ GiST ordering (`pos <-> spoint(...)`).
   per-centre median time over pgSphere's, with a 95% bootstrap interval over
   the centres.
 - **Host and server:** as `../results-v036/realcone/` (`../REPRODUCING.md`
-  section 2), skycell built from main after #52 (`versions.txt`).
+  section 2), skycell as `versions.txt` records (0.52 for `report.md`).
 
 ## skycell / pgSphere
 
-Rerun with 0.45 (`report.md`, `versions.txt`); the first run, built from main
-after #52, is in `report-v036.md`. Both runs on the same host and tables.
+Rerun with 0.52 (`report.md`, `versions.txt`); the first run, built from main
+after #52, is in `report-v036.md`, and 0.45's figures are kept below. All runs
+on the same host and tables.
 
-| k | real DR3, 10M, #52 | real DR3, 0.45 | ObsCore, #52 | ObsCore, 0.45 |
-|---|---|---|---|---|
-| 1 | 0.55 [0.53, 0.57] | 0.56 [0.54, 0.59] | 1.00 [0.89, 1.12] | 1.05 [0.95, 1.17] |
-| 10 | 0.47 [0.45, 0.49] | 0.48 [0.45, 0.51] | 0.98 [0.88, 1.09] | 1.01 [0.90, 1.13] |
-| 100 | 0.59 [0.56, 0.61] | 0.57 [0.54, 0.61] | 1.16 [1.04, 1.31] | 1.15 [1.05, 1.28] |
-| 1000 | 0.69 [0.68, 0.71] | 0.67 [0.66, 0.68] | 1.59 [1.37, 1.83] | 1.55 [1.34, 1.78] |
-| 10 beyond 2° | 1.74 [1.71, 1.76] | 0.25 [0.24, 0.26] | 1.90 [1.58, 2.35] | 1.00 [0.66, 1.63] |
+| k | real DR3, 10M, #52 | real DR3, 0.45 | real DR3, 0.52 | ObsCore, #52 | ObsCore, 0.45 | ObsCore, 0.52 |
+|---|---|---|---|---|---|---|
+| 1 | 0.55 [0.53, 0.57] | 0.56 [0.54, 0.59] | 0.56 [0.55, 0.57] | 1.00 [0.89, 1.12] | 1.05 [0.95, 1.17] | 1.01 [0.94, 1.08] |
+| 10 | 0.47 [0.45, 0.49] | 0.48 [0.45, 0.51] | 0.48 [0.46, 0.49] | 0.98 [0.88, 1.09] | 1.01 [0.90, 1.13] | 1.01 [0.94, 1.07] |
+| 100 | 0.59 [0.56, 0.61] | 0.57 [0.54, 0.61] | 0.53 [0.51, 0.56] | 1.16 [1.04, 1.31] | 1.15 [1.05, 1.28] | 0.94 [0.88, 1.00] |
+| 1000 | 0.69 [0.68, 0.71] | 0.67 [0.66, 0.68] | 0.61 [0.60, 0.62] | 1.59 [1.37, 1.83] | 1.55 [1.34, 1.78] | 0.95 [0.86, 1.06] |
+| 10 beyond 2° | 1.74 [1.71, 1.76] | 0.25 [0.24, 0.26] | 0.24 [0.23, 0.24] | 1.90 [1.58, 2.35] | 1.00 [0.66, 1.63] | 0.97 [0.64, 1.53] |
 
 - **Real DR3:** skycell takes about half of pgSphere's time up to k = 100.
 - **Beyond 2°:** since 0.45 the rings start at the distance the condition
   sets, instead of growing out to it from the centre: a quarter of pgSphere's
   time on DR3, level on ObsCore.
-- **ObsCore:** level for a few rows, slower for hundreds. The scan reads about
-  2.5 times the rows it returns there: the first ring, sized from the density
-  of a cell round the centre, holds more rows than wanted where observations
+- **ObsCore:** level with pgSphere at every k since 0.52 (below); until
+  0.51, level for a few rows and slower for hundreds. The scan read about
+  2.5 times the rows it returned: the first ring, sized from the density of
+  a cell round the centre, held more rows than wanted where observations
   cluster in fields, each read through a bitmap over an unordered heap.
 - **Tried and dropped (`ab.csv`, `ab.sh`):** testing each index entry by its
   key, an order-29 cell, before the heap is read, and cutting the first ring
@@ -66,6 +68,43 @@ after #52, is in `report-v036.md`. Both runs on the same host and tables.
     neutral to 10% slower.
   - The problem, the profile and everything tried are written up for a
     second opinion in [`open-problem.md`](open-problem.md).
+- **Best-first, 0.52** (the GUC `skycell.nearest_bestfirst`, on by default),
+  after the second opinion on `open-problem.md`. On a heap out of cell order
+  the first ring is replaced by a walk over HEALPix cells, nearest first,
+  ordered by the least distance a point of each can have from the centre:
+  - a cell the statistics expect to hold many rows is split into its four
+    children (a key range each, without touching the index);
+  - the others are gathered into a batch, read through one TID bitmap
+    (adjacent cells merged into one range) once the batch should complete
+    the k rows, their exact distances computed;
+  - once k rows are held, D_k (the k-th distance) prunes: a row beyond it is
+    not copied, a cell crossing it is split finer, a cell within it is read
+    whole, and every cell left nearer than D_k goes into one more batch;
+  - it stops when the nearest cell left is farther than D_k. The rows within
+    D_k, ties included, are the first ring, and rings carry on beyond it if
+    the query wants more.
+
+  At k = 1000 (`micro_oc.sql`, real36's copy) rows read fell from 2,150 to
+  about 1,480 per query (1,000 copied, against 1,680), in 2.7 batches.
+  Profiling then found two costs common to both modes, fixed with it:
+  - the scan's projection computed the distance a second time for every row
+    returned, for the `ORDER BY` column (13% of a k = 1000 search). The
+    projection now reads it from a parameter the scan sets, for queries of 32
+    rows or more (below that, compiling the projection again costs more);
+  - sorting compared NULL and NaN flags for every pair; rows whose distances
+    are all numbers now use a comparison of two doubles.
+
+  Split and batch thresholds (a cell is split above max(8, k/8) expected
+  rows, and once D_k is known above 8 if it crosses it) were tuned over
+  4–32 and k/4–k/16; the times were flat within the noise round 8 and k/8.
+  The walk holds its rows in memory, so it is used only when about three
+  times the rows wanted fit in `work_mem` at the heap's average width; the
+  rings, which spill to a tuplesort, otherwise. perfcheck against v0.51
+  (`perfcheck-v051-v052.md`): ObsCore k = 100 0.84 [0.78, 0.90], k = 1000
+  0.74 [0.69, 0.79]; nothing else moved (Gaia k = 1 1.02 [0.99, 1.04]).
+  Exactness: the `nearest` regression test with the walk forced on, and
+  comparisons against PostgreSQL's sort at random and field centres, with
+  conditions, offsets, ties, NULL positions and partitions by cell range.
 - **A regression found and fixed:** 0.44 read the index's lowest and highest
   key at every nearest query (for partitions), about 25 µs, a third of a
   k = 1 search (`bisect-v042-v044.txt`: v0.42 77 µs, v0.44 104 µs). Since

@@ -366,6 +366,64 @@ FROM (SELECT format('SELECT id, skycell_dist(ra, dec, %s, %s) d FROM nn_part WHE
 SELECT nn_plan('SELECT id FROM nn_part ORDER BY skycell_dist(ra, dec, 10, 75) LIMIT 5') AS plan;
 DROP TABLE nn_part;
 
+-- best-first (0.52): on a heap out of cell order, the first rows found by a
+-- walk over HEALPix cells nearest first, read in batches through a bitmap,
+-- until no cell left can hold a row nearer than the k-th.  A clustered table
+-- (fields of 60 within 0.1 deg, a tenth of them duplicated: ties), out of
+-- cell order, by cell range in two partitions too; centres on fields, beside
+-- them and in the empty sky between, k past the first fields, with and without
+-- a condition, and with the walk turned off.
+CREATE TABLE nn_cl AS
+SELECT f * 100 + j AS id,
+       mod(f * 23.7 + mod(j * 0.618034, 1.0) * 0.1, 360.0)::float8 AS ra,
+       (mod(f * 7.3, 160.0) - 80 + mod(j * 0.414214, 1.0) * 0.1)::float8 AS dec
+FROM generate_series(0, 199) f, generate_series(1, 60) j;
+INSERT INTO nn_cl SELECT id + 100000, ra, dec FROM nn_cl WHERE id % 10 = 0;
+ALTER TABLE nn_cl ADD COLUMN mag float8;
+UPDATE nn_cl SET mag = mod(id * 7919, 1000) / 50.0;
+CREATE TABLE nn_clu AS SELECT * FROM nn_cl ORDER BY mod(id * 2654435761, 1000003);
+CREATE INDEX nn_clu_cell ON nn_clu (skycell_ang2cell(ra, dec));
+ANALYZE nn_clu;
+CREATE TABLE nn_clp (id int, ra float8, dec float8, mag float8)
+  PARTITION BY RANGE (skycell_ang2cell(ra, dec));
+CREATE TABLE nn_clp_a PARTITION OF nn_clp FOR VALUES FROM (MINVALUE) TO (skycell_ang2cell(90, 0));
+CREATE TABLE nn_clp_b PARTITION OF nn_clp FOR VALUES FROM (skycell_ang2cell(90, 0)) TO (MAXVALUE);
+INSERT INTO nn_clp SELECT * FROM nn_clu;
+CREATE INDEX ON nn_clp (skycell_ang2cell(ra, dec));
+ANALYZE nn_clp;
+CREATE TABLE nn_clc AS
+SELECT f, mod(f * 23.7 + 0.05 + o, 360.0) AS ra, mod(f * 7.3, 160.0) - 80 + 0.05 AS dec
+FROM generate_series(0, 199, 9) f, unnest(ARRAY[0, 0.07, 3.0]) o;
+SELECT t, w <> '' AS cond, count(*) AS queries, count(*) FILTER (WHERE nn_same(q)) AS same
+FROM (SELECT t, w, format('SELECT id, skycell_dist(ra, dec, %s, %s) d FROM %s %s ORDER BY 2 LIMIT %s',
+                          c.ra, c.dec, t, w, k) q
+      FROM nn_clc c, unnest(ARRAY[1, 25, 200, 1500]) k, unnest(ARRAY['nn_clu', 'nn_clp']) t,
+           unnest(ARRAY['', 'WHERE mag < 5']) w) x
+GROUP BY 1, 2 ORDER BY 1, 2;
+-- the walk's counters, and rows read close to the rows returned
+CREATE FUNCTION nn_bf(q text) RETURNS text LANGUAGE plpgsql AS $$
+DECLARE l text; p text := ''; rd float8; n float8;
+BEGIN
+  FOR l IN EXECUTE 'EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF) ' || q LOOP
+    IF l ~ 'Best-first Batches' THEN p := p || 'best-first '; END IF;
+    IF l ~ 'Rows Read by Rings' THEN rd := substring(l from ': ([0-9.]+)')::float8; END IF;
+    IF l ~ 'SkycellNearest' THEN n := substring(l from 'rows=([0-9.]+)')::float8; END IF;
+  END LOOP;
+  RETURN p || CASE WHEN rd <= 3 * n THEN 'reads under 3k' ELSE 'reads ' || rd END;
+END $$;
+SELECT nn_bf(format('SELECT id FROM nn_clu ORDER BY skycell_dist(ra, dec, %s, %s) LIMIT 200', ra, dec))
+FROM nn_clc WHERE f = 18 AND ra = mod(18 * 23.7 + 0.05, 360.0);
+-- off: the first ring, sized from the density, as before 0.52
+SET skycell.nearest_bestfirst = off;
+SELECT count(*) AS queries, count(*) FILTER (WHERE nn_same(q)) AS same,
+       count(*) FILTER (WHERE nn_bf(q) ~ 'best-first') AS best_first
+FROM (SELECT format('SELECT id, skycell_dist(ra, dec, %s, %s) d FROM nn_clu ORDER BY 2 LIMIT %s',
+                    c.ra, c.dec, k) q
+      FROM nn_clc c, unnest(ARRAY[1, 200]) k) x;
+RESET skycell.nearest_bestfirst;
+DROP FUNCTION nn_bf(text);
+DROP TABLE nn_cl, nn_clu, nn_clp, nn_clc;
+
 DROP FUNCTION nn_param(float8, float8, int);
 DROP FUNCTION nn_read(text);
 DROP FUNCTION nn_rings(text);

@@ -2,6 +2,8 @@
 
 *A self-contained description for a second opinion: what the search does, where its time goes, what has been tried, and what is wanted.*
 
+> **Status (0.52): resolved.** The best-first walk over the cell hierarchy suggested in the second opinion (the "better use of the index" question below) is implemented, together with two fixes the profile of it found: the projection no longer computes the distance a second time, and sorting finite distances skips the NULL/NaN checks. Against pgSphere on this table: 0.94 at k = 100 and 0.95 at k = 1000; on Gaia 0.53 and 0.61. See [`README.md`](README.md) ("Best-first, 0.52"). The description below is kept as it was written, for 0.51.
+
 ## Context
 
 `skycell` is a PostgreSQL extension (C, PostgreSQL 16–18) that indexes sky positions with an ordinary **B-tree on a 64-bit HEALPix NESTED cell id at order 29**, computed from `(ra, dec)` in degrees:

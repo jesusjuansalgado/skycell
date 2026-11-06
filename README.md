@@ -691,6 +691,18 @@ for speed, though: `ORDER BY` the distance with a `LIMIT` is the fast form on
 its own. Rows with a NULL distance come last, as `ASC NULLS LAST` puts them.
 Without a `LIMIT`, or ordered `DESC`, the query keeps PostgreSQL's sort.
 
+On a heap out of cell order (the bitmap mode) the first ring is found best
+first (0.52): HEALPix cells are visited nearest first, by the least distance a
+point of each can have from the point. A cell the statistics expect to hold
+many rows is split into its four children, at no cost to the index, since a
+cell at any order is one key range; the others are read in batches through one
+TID bitmap. Once k rows are held, the k-th distance bounds the rest: a cell
+crossing it is split finer, a farther row is not kept, and the walk stops when
+the nearest cell left is farther. The rows read come close to the rows
+returned, as with a GiST ordering. `skycell.nearest_bestfirst = off` sizes the
+first ring from the density instead; the walk is also left aside when the
+rows it would hold do not fit in `work_mem`.
+
 When a ring holds no row at all — empty sky round the point, or a partition
 holding another part of the sky — the scan finds where the rows start from the
 index itself: a best-first walk over HEALPix cells, nearest first, each probed
@@ -707,9 +719,11 @@ partitions by cell range and 32 ms with four declination bands, against
 730 ms for the sort over the partitions before 0.40 and 0.35 ms on the table
 unpartitioned.
 
-On 10M real Gaia DR3 positions it takes 0.47–0.69 of the time of pgSphere's
+On 10M real Gaia DR3 positions it takes 0.48–0.61 of the time of pgSphere's
 GiST ordering for k from 10 to 1000 (warm, a new point every query, planning
-included); see [Limitations](#limitations) for a clustered relation.
+included); on a clustered ObsCore table with its heap out of cell order, 0.94
+at k = 100 and 0.95 at k = 1000 since 0.52 (1.15 and 1.55 before;
+[`bench/results-nearest/`](bench/results-nearest/)).
 
 ### Coming from Q3C
 
@@ -1058,6 +1072,7 @@ compared with MOCPy's A ∩ (complement of B), because MOCPy 0.21.0's own
 |---|---|---|
 | `skycell.custom_scan` | on | answer `skycell_cone` (and `skycell_join`, `skycell_radial_query`, and ADQL's `CONTAINS(POINT, CIRCLE) = 1`, `point <@ circle` and `DISTANCE(…) < r`) with the `SkycellCone` scan node instead of rewriting it into B-tree range conditions — constant cones, cross-match cones (a parameterized scan, one covering per outer row) and cones over parameters alone (generic plans, correlated sub-selects). A cone that is not a top-level `AND` term of a `WHERE`/`JOIN ON` (one under an `OR`, say) keeps the rewrite, so it stays indexable. Off restores the rewrite everywhere |
 | `skycell.index_filter` | on | when the cell index also holds the position — `CREATE INDEX ON t ((skycell_ang2cell(ra, dec))) INCLUDE (ra, dec)` — the `SkycellCone` scan tests the cone on each index entry and fetches from the table only the rows inside it, instead of every row of the covering cells (both modes, constant cones and cross-matches). The plan's exact test still applies to every row, so the answer is the same; off reads every row of the covering cells |
+| `skycell.nearest_bestfirst` | on | on a heap out of cell order, find a nearest-neighbour search's first rows by a best-first walk over HEALPix cells (0.52) instead of a first ring sized from the density ([Nearest neighbours](#nearest-neighbours)) |
 | `skycell.nearest_scan` | on | answer `ORDER BY` a distance to a point, with a `LIMIT`, with the `SkycellNearest` scan ([Nearest neighbours](#nearest-neighbours)); needs `skycell.custom_scan`. Off leaves the query to a sort of the relation |
 | `skycell.range_cost` | -1 (derive) | price of one index range, in rows; -1 derives it from the relation's rows/page and the planner's cost factors (for the custom scan, also from how much of the relation `shared_buffers` holds) |
 | `skycell.max_ranges` | 64 | cap on ranges per covering |
@@ -1516,23 +1531,13 @@ locally), the standalone selftests, and the reference translators.
   a sort, as it leaves ADQL's `distance()` and `contains()` unindexed. A query
   that reads a system column of the relation
   (`ctid`, `FOR UPDATE`) keeps the sort too, since the scan returns rows from
-  its own buffer. Against pgSphere's GiST ordering on a clustered relation (an
-  ObsCore table, observations grouped in fields, its heap out of cell order)
-  it is level for a few rows and slower for hundreds or more: since 0.51,
-  1.16–1.20 times pgSphere's time at k = 100 and about 1.45 at 1000 (1.15–1.23
-  and 1.55 before). It reads 2–4 times the rows it returns, each with an exact
-  distance. Part of that is the first ring, sized from a cell's density,
-  holding more where observations cluster in fields; part is the ring's
-  covering cells reaching past the ring. pgSphere's GiST reads close to
-  exactly the rows it returns. Since 0.51 only the rows wanted are sorted, and
-  a row whose declination alone puts it outside the ring is rejected before
-  its distance is computed. Tried and dropped
-  ([`bench/results-nearest/`](bench/results-nearest/)):
-  - testing index entries by their key before the heap read;
-  - finer or coarser ring coverings;
-  - shrinking the first ring by its index count.
-
-  The problem is written up in
+  its own buffer. On a clustered relation (an ObsCore table, observations
+  grouped in fields, its heap out of cell order) it was slower than
+  pgSphere's GiST ordering for hundreds of rows or more until 0.51 (1.15 at
+  k = 100, 1.45–1.55 at 1000): it read 2–4 times the rows it returned. Since
+  0.52 the first rows are found by a best-first walk over HEALPix cells
+  ([Nearest neighbours](#nearest-neighbours)), level with pgSphere (0.94 and
+  0.95); the problem as it stood is written up in
   [`open-problem.md`](bench/results-nearest/open-problem.md). A condition
   `distance > x` starts the rings at x (since 0.45).
 - **Where the custom scan applies.** It answers cones, cross-matches and
