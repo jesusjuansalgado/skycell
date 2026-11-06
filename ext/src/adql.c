@@ -3521,3 +3521,457 @@ skycell_cell_meets_support(PG_FUNCTION_ARGS)
 											  (Expr *) int8_const(b[2 * i + 1]), INTEGER_BTREE_FAM_OID));
 	PG_RETURN_POINTER(n == 1 ? linitial(arms) : (Node *) makeBoolExpr(OR_EXPR, arms, -1));
 }
+
+/* ------------------------------------------------------------------ */
+/* MOC set operations (0.46)                                           */
+/* ------------------------------------------------------------------ */
+
+/*
+ * A MOC's cells are order-29 ranges, sorted and merged, so its union,
+ * intersection, difference and complement with another are exact: each is a
+ * walk along both lists, as the MOC 2.0 recommendation defines them.  A
+ * region that is not a MOC becomes one with skycell_moc_region(r, order),
+ * the cells of that order it meets.  The result's depth is the finer of the
+ * operands'.
+ */
+typedef struct
+{
+	int64	   *lo,
+			   *hi;
+	int			n,
+				cap;
+	int			depth;
+} moc_list;
+
+static void
+mlist_add(moc_list *m, int64 lo, int64 hi)
+{
+	if (m->n > 0 && lo <= m->hi[m->n - 1] + 1)
+	{
+		if (hi > m->hi[m->n - 1])
+			m->hi[m->n - 1] = hi;
+		return;
+	}
+	if (m->n == m->cap)
+	{
+		m->cap = m->cap ? 2 * m->cap : 64;
+		m->lo = m->lo ? repalloc_huge(m->lo, sizeof(int64) * m->cap) : palloc(sizeof(int64) * m->cap);
+		m->hi = m->hi ? repalloc_huge(m->hi, sizeof(int64) * m->cap) : palloc(sizeof(int64) * m->cap);
+	}
+	m->lo[m->n] = lo;
+	m->hi[m->n] = hi;
+	m->n++;
+}
+
+/* the cells of a MOC region; NULL lists when r is not a MOC */
+static bool
+moc_list_of(const SkyRegion *r, moc_list *m)
+{
+	const int64 *d;
+	int			n;
+
+	memset(m, 0, sizeof(*m));
+	if (r->kind != SKY_MOC)
+		return false;
+	d = SKYMOC_DATA(r);
+	n = SKYMOC_NRANGES(r);
+	m->depth = (int) d[0];
+	for (int i = 0; i < n; i++)
+		mlist_add(m, d[1 + 2 * i], d[2 + 2 * i]);
+	return true;
+}
+
+static void
+moc_list_arg(FunctionCallInfo fcinfo, int argno, moc_list *m)
+{
+	if (!moc_list_of(PG_GETARG_SKYREGION(argno), m))
+		ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+						errmsg("skycell: a MOC operation takes MOCs"),
+						errhint("Make one from any region with skycell_moc_region(region, max_order).")));
+}
+
+static Datum
+moc_list_datum(const moc_list *m)
+{
+	return PointerGetDatum(region_moc(m->lo, m->hi, m->n, m->depth));
+}
+
+/*
+ * skycell_moc_region(r, max_order): the MOC of the cells of max_order region
+ * r meets, as skycell_moc() writes it; a MOC is returned at max_order
+ * (degraded, if it is finer).
+ */
+static void moc_degrade(moc_list *m, int order);
+
+/* any region as the MOC of the cells of order it meets (a MOC degraded, if finer) */
+static void
+region_moc_list(Datum d, int order, moc_list *m)
+{
+	if (order < 0 || order > SC_MAX_ORDER)
+		ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+						errmsg("skycell: MOC order must be within [0, %d]", SC_MAX_ORDER)));
+	if (moc_list_of(DatumGetSkyRegion(d), m))
+	{
+		if (order < m->depth)
+			moc_degrade(m, order);
+	}
+	else
+	{
+		sc_region	reg;
+		int			n;
+		int64	   *pairs;
+
+		skycell_region_from_datum(d, &reg);
+		pairs = skycell_region_moc_pairs(&reg, order, &n);
+		sc_region_free(&reg);
+		for (int i = 0; i < n; i++)
+			mlist_add(m, pairs[2 * i], pairs[2 * i + 1]);
+		m->depth = order;
+	}
+}
+
+PG_FUNCTION_INFO_V1(skycell_moc_region_of);
+Datum
+skycell_moc_region_of(PG_FUNCTION_ARGS)
+{
+	moc_list	m;
+
+	region_moc_list(PG_GETARG_DATUM(0), PG_GETARG_INT32(1), &m);
+	PG_RETURN_DATUM(moc_list_datum(&m));
+}
+
+PG_FUNCTION_INFO_V1(skycell_moc_union);
+Datum
+skycell_moc_union(PG_FUNCTION_ARGS)
+{
+	moc_list	a,
+				b,
+				r = {0};
+	int			i = 0,
+				j = 0;
+
+	moc_list_arg(fcinfo, 0, &a);
+	moc_list_arg(fcinfo, 1, &b);
+	while (i < a.n || j < b.n)
+	{
+		if (j == b.n || (i < a.n && a.lo[i] <= b.lo[j]))
+		{
+			mlist_add(&r, a.lo[i], a.hi[i]);
+			i++;
+		}
+		else
+		{
+			mlist_add(&r, b.lo[j], b.hi[j]);
+			j++;
+		}
+	}
+	r.depth = Max(a.depth, b.depth);
+	PG_RETURN_DATUM(moc_list_datum(&r));
+}
+
+PG_FUNCTION_INFO_V1(skycell_moc_intersection);
+Datum
+skycell_moc_intersection(PG_FUNCTION_ARGS)
+{
+	moc_list	a,
+				b,
+				r = {0};
+	int			i = 0,
+				j = 0;
+
+	moc_list_arg(fcinfo, 0, &a);
+	moc_list_arg(fcinfo, 1, &b);
+	while (i < a.n && j < b.n)
+	{
+		int64		lo = Max(a.lo[i], b.lo[j]),
+					hi = Min(a.hi[i], b.hi[j]);
+
+		if (lo <= hi)
+			mlist_add(&r, lo, hi);
+		if (a.hi[i] < b.hi[j])
+			i++;
+		else
+			j++;
+	}
+	r.depth = Max(a.depth, b.depth);
+	PG_RETURN_DATUM(moc_list_datum(&r));
+}
+
+/* a less b: each range of a, less the ranges of b that overlap it */
+PG_FUNCTION_INFO_V1(skycell_moc_difference);
+Datum
+skycell_moc_difference(PG_FUNCTION_ARGS)
+{
+	moc_list	a,
+				b,
+				r = {0};
+	int			j = 0;
+
+	moc_list_arg(fcinfo, 0, &a);
+	moc_list_arg(fcinfo, 1, &b);
+	for (int i = 0; i < a.n; i++)
+	{
+		int64		lo = a.lo[i];
+
+		while (j < b.n && b.hi[j] < lo)
+			j++;
+		for (int k = j; k < b.n && b.lo[k] <= a.hi[i]; k++)
+		{
+			if (b.lo[k] > lo)
+				mlist_add(&r, lo, b.lo[k] - 1);
+			lo = Max(lo, b.hi[k] + 1);
+		}
+		if (lo <= a.hi[i])
+			mlist_add(&r, lo, a.hi[i]);
+	}
+	r.depth = Max(a.depth, b.depth);
+	PG_RETURN_DATUM(moc_list_datum(&r));
+}
+
+/* the rest of the sky */
+PG_FUNCTION_INFO_V1(skycell_moc_complement);
+Datum
+skycell_moc_complement(PG_FUNCTION_ARGS)
+{
+	moc_list	a,
+				r = {0};
+	int64		next = 0;
+
+	moc_list_arg(fcinfo, 0, &a);
+	for (int i = 0; i < a.n; i++)
+	{
+		if (a.lo[i] > next)
+			mlist_add(&r, next, a.lo[i] - 1);
+		next = a.hi[i] + 1;
+	}
+	if (next <= 12 * ((int64) 1 << (2 * SC_MAX_ORDER)) - 1)
+		mlist_add(&r, next, 12 * ((int64) 1 << (2 * SC_MAX_ORDER)) - 1);
+	r.depth = a.depth;
+	PG_RETURN_DATUM(moc_list_datum(&r));
+}
+
+/*
+ * The MOC at a coarser order: every cell of that order it meets, whole -- a
+ * superset, as MOCPy's degrade_to_order() makes it.
+ */
+static void
+moc_degrade(moc_list *m, int order)
+{
+	int64		mask = ((int64) 1 << (2 * (SC_MAX_ORDER - order))) - 1;
+	moc_list	r = {0};
+
+	for (int i = 0; i < m->n; i++)
+		mlist_add(&r, m->lo[i] & ~mask, m->hi[i] | mask);
+	r.depth = order;
+	*m = r;
+}
+
+PG_FUNCTION_INFO_V1(skycell_moc_degrade);
+Datum
+skycell_moc_degrade(PG_FUNCTION_ARGS)
+{
+	moc_list	a;
+	int32		order = PG_GETARG_INT32(1);
+
+	moc_list_arg(fcinfo, 0, &a);
+	if (order < 0 || order > SC_MAX_ORDER)
+		ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+						errmsg("skycell: MOC order must be within [0, %d]", SC_MAX_ORDER)));
+	if (order < a.depth)
+		moc_degrade(&a, order);
+	PG_RETURN_DATUM(moc_list_datum(&a));
+}
+
+/*
+ * skycell_moc_union_agg(r [, max_order]): the union of the MOCs aggregated
+ * (or, with max_order, of any regions, each as skycell_moc_region(r,
+ * max_order) makes it): the combined footprint of a set of observations.
+ * The state gathers ranges unsorted and sorts and merges them when it has
+ * doubled since the last time, and at the end.
+ */
+typedef struct
+{
+	int64		lo,
+				hi;
+} moc_pair;
+
+typedef struct
+{
+	moc_pair   *p;
+	int64		n,
+				cap,
+				merged;
+	int			depth;
+} moc_union_state;
+
+static int
+moc_pair_cmp(const void *a, const void *b)
+{
+	int64		x = ((const moc_pair *) a)->lo,
+				y = ((const moc_pair *) b)->lo;
+
+	return (x > y) - (x < y);
+}
+
+static void
+union_compact(moc_union_state *st)
+{
+	int64		m = 0;
+
+	if (st->n > 1)
+		qsort(st->p, st->n, sizeof(moc_pair), moc_pair_cmp);
+	for (int64 i = 1; i < st->n; i++)
+	{
+		if (st->p[i].lo <= st->p[m].hi + 1)
+			st->p[m].hi = Max(st->p[m].hi, st->p[i].hi);
+		else
+			st->p[++m] = st->p[i];
+	}
+	st->n = st->n > 0 ? m + 1 : 0;
+	st->merged = st->n;
+}
+
+static void
+union_add(moc_union_state *st, int64 lo, int64 hi)
+{
+	if (st->n == st->cap)
+	{
+		if (st->n >= 2 * Max(st->merged, 512))
+			union_compact(st);
+		if (st->n == st->cap)
+		{
+			st->cap = st->cap ? 2 * st->cap : 256;
+			st->p = st->p ? repalloc_huge(st->p, sizeof(moc_pair) * st->cap)
+				: palloc(sizeof(moc_pair) * st->cap);
+		}
+	}
+	st->p[st->n].lo = lo;
+	st->p[st->n].hi = hi;
+	st->n++;
+}
+
+static moc_union_state *
+union_state(FunctionCallInfo fcinfo, MemoryContext *aggcxt)
+{
+	if (!AggCheckCallContext(fcinfo, aggcxt))
+		elog(ERROR, "skycell_moc_union_agg called outside an aggregate");
+	if (PG_ARGISNULL(0))
+		return MemoryContextAllocZero(*aggcxt, sizeof(moc_union_state));
+	return (moc_union_state *) PG_GETARG_POINTER(0);
+}
+
+PG_FUNCTION_INFO_V1(skycell_moc_union_agg_trans);
+Datum
+skycell_moc_union_agg_trans(PG_FUNCTION_ARGS)
+{
+	MemoryContext aggcxt,
+				old;
+	moc_union_state *st;
+	moc_list	m;
+
+	/* a NULL region adds nothing; with no state yet, still none */
+	if (PG_ARGISNULL(1) || (PG_NARGS() > 2 && PG_ARGISNULL(2)))
+	{
+		if (PG_ARGISNULL(0))
+			PG_RETURN_NULL();
+		PG_RETURN_POINTER(PG_GETARG_POINTER(0));
+	}
+	/* the row's cells, in the call's own memory */
+	if (PG_NARGS() > 2)
+		region_moc_list(PG_GETARG_DATUM(1), PG_GETARG_INT32(2), &m);
+	else if (!moc_list_of(PG_GETARG_SKYREGION(1), &m))
+		ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+						errmsg("skycell: skycell_moc_union_agg(r) takes MOCs"),
+						errhint("Give an order, skycell_moc_union_agg(r, max_order), to take any region.")));
+	/* then into the state, in the aggregate's */
+	st = union_state(fcinfo, &aggcxt);
+	old = MemoryContextSwitchTo(aggcxt);
+	for (int i = 0; i < m.n; i++)
+		union_add(st, m.lo[i], m.hi[i]);
+	st->depth = Max(st->depth, m.depth);
+	MemoryContextSwitchTo(old);
+	PG_RETURN_POINTER(st);
+}
+
+PG_FUNCTION_INFO_V1(skycell_moc_union_agg_combine);
+Datum
+skycell_moc_union_agg_combine(PG_FUNCTION_ARGS)
+{
+	MemoryContext aggcxt,
+				old;
+	moc_union_state *st;
+	moc_union_state *b = PG_ARGISNULL(1) ? NULL : (moc_union_state *) PG_GETARG_POINTER(1);
+
+	if (b == NULL)
+	{
+		if (PG_ARGISNULL(0))
+			PG_RETURN_NULL();
+		PG_RETURN_POINTER(PG_GETARG_POINTER(0));
+	}
+	st = union_state(fcinfo, &aggcxt);
+	old = MemoryContextSwitchTo(aggcxt);
+	for (int64 i = 0; i < b->n; i++)
+		union_add(st, b->p[i].lo, b->p[i].hi);
+	st->depth = Max(st->depth, b->depth);
+	MemoryContextSwitchTo(old);
+	PG_RETURN_POINTER(st);
+}
+
+PG_FUNCTION_INFO_V1(skycell_moc_union_agg_serialize);
+Datum
+skycell_moc_union_agg_serialize(PG_FUNCTION_ARGS)
+{
+	moc_union_state *st = (moc_union_state *) PG_GETARG_POINTER(0);
+	Size		sz;
+	bytea	   *b;
+	char	   *p;
+
+	union_compact(st);
+	sz = VARHDRSZ + sizeof(int32) + sizeof(moc_pair) * st->n;
+	b = palloc(sz);
+	SET_VARSIZE(b, sz);
+	p = VARDATA(b);
+	memcpy(p, &st->depth, sizeof(int32));
+	if (st->n > 0)
+		memcpy(p + sizeof(int32), st->p, sizeof(moc_pair) * st->n);
+	PG_RETURN_BYTEA_P(b);
+}
+
+PG_FUNCTION_INFO_V1(skycell_moc_union_agg_deserialize);
+Datum
+skycell_moc_union_agg_deserialize(PG_FUNCTION_ARGS)
+{
+	bytea	   *b = PG_GETARG_BYTEA_PP(0);
+	Size		len = VARSIZE_ANY_EXHDR(b);
+	moc_union_state *st;
+
+	if (!AggCheckCallContext(fcinfo, NULL))
+		elog(ERROR, "skycell_moc_union_agg_deserialize called outside an aggregate");
+	if (len < sizeof(int32) || (len - sizeof(int32)) % sizeof(moc_pair) != 0)
+		ereport(ERROR, (errcode(ERRCODE_INVALID_BINARY_REPRESENTATION),
+						errmsg("skycell: invalid skycell_moc_union_agg state")));
+	st = palloc0(sizeof(moc_union_state));
+	memcpy(&st->depth, VARDATA_ANY(b), sizeof(int32));
+	st->n = st->cap = st->merged = (len - sizeof(int32)) / sizeof(moc_pair);
+	st->p = palloc(sizeof(moc_pair) * Max(st->n, 1));
+	if (st->n > 0)
+		memcpy(st->p, VARDATA_ANY(b) + sizeof(int32), sizeof(moc_pair) * st->n);
+	PG_RETURN_POINTER(st);
+}
+
+PG_FUNCTION_INFO_V1(skycell_moc_union_agg_final);
+Datum
+skycell_moc_union_agg_final(PG_FUNCTION_ARGS)
+{
+	moc_union_state *st;
+	moc_list	m = {0};
+
+	if (PG_ARGISNULL(0))
+		PG_RETURN_NULL();
+	st = (moc_union_state *) PG_GETARG_POINTER(0);
+	union_compact(st);
+	for (int64 i = 0; i < st->n; i++)
+		mlist_add(&m, st->p[i].lo, st->p[i].hi);
+	m.depth = st->depth;
+	PG_RETURN_DATUM(moc_list_datum(&m));
+}

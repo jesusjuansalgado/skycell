@@ -3919,14 +3919,14 @@ moc_serialise_cstr(const moc_ranges *m, int max_order, int json)
  * misses by less than 1/16 of its size may count, never one it meets left
  * out), cells inside it whole at a coarser order.
  */
-PG_FUNCTION_INFO_V1(skycell_moc);
-Datum
-skycell_moc(PG_FUNCTION_ARGS)
+/*
+ * The cells of max_order a region meets, as skycell_cell_overlaps() counts
+ * them, those inside it whole at coarser orders: sorted, merged order-29
+ * ranges (pairs lo, hi), *n of them.
+ */
+static void
+region_moc_ranges(const sc_region *reg, int max_order, moc_ranges *m)
 {
-	int32		max_order = PG_GETARG_INT32(1);
-	int			json = moc_fmt(PG_GETARG_TEXT_PP(2));
-	sc_region	reg;
-	moc_ranges	m = {0};
 	struct
 	{
 		int			o;
@@ -3934,8 +3934,6 @@ skycell_moc(PG_FUNCTION_ARGS)
 	}			stack[12 + 3 * (SC_MAX_ORDER + 1)];
 	int			top = 0;
 
-	moc_check_order(max_order, SC_MAX_ORDER);
-	skycell_region_from_datum(PG_GETARG_DATUM(0), &reg);
 	for (int f = 11; f >= 0; f--)
 	{
 		stack[top].o = 0;
@@ -3946,7 +3944,7 @@ skycell_moc(PG_FUNCTION_ARGS)
 		int			o = stack[--top].o;
 		int64		pix = stack[top].pix;
 		double		fo;
-		sc_class	c = sc_region_classify(&reg, o, pix, &fo);
+		sc_class	c = sc_region_classify(reg, o, pix, &fo);
 
 		CHECK_FOR_INTERRUPTS();
 		if (c == SC_OUT)
@@ -3960,10 +3958,34 @@ skycell_moc(PG_FUNCTION_ARGS)
 			}
 			continue;
 		}
-		if (c == SC_PARTIAL && !sc_region_cell_meets(&reg, o, pix))
+		if (c == SC_PARTIAL && !sc_region_cell_meets(reg, o, pix))
 			continue;
-		moc_add(&m, sc_pix_lo(o, pix), sc_pix_hi(o, pix));
+		moc_add(m, sc_pix_lo(o, pix), sc_pix_hi(o, pix));
 	}
+}
+
+int64 *
+skycell_region_moc_pairs(const sc_region *reg, int max_order, int *n)
+{
+	moc_ranges	m = {0};
+
+	region_moc_ranges(reg, max_order, &m);
+	*n = m.n;
+	return m.r;
+}
+
+PG_FUNCTION_INFO_V1(skycell_moc);
+Datum
+skycell_moc(PG_FUNCTION_ARGS)
+{
+	int32		max_order = PG_GETARG_INT32(1);
+	int			json = moc_fmt(PG_GETARG_TEXT_PP(2));
+	sc_region	reg;
+	moc_ranges	m = {0};
+
+	moc_check_order(max_order, SC_MAX_ORDER);
+	skycell_region_from_datum(PG_GETARG_DATUM(0), &reg);
+	region_moc_ranges(&reg, max_order, &m);
 	sc_region_free(&reg);
 	PG_RETURN_TEXT_P(moc_serialise(&m, max_order, json));
 }

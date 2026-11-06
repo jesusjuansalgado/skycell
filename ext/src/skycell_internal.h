@@ -115,6 +115,9 @@ extern void skycell_region_from_datum_lite(Datum d, sc_region *r);
 /* adql.c: a skyregion's text */
 extern Datum skyregion_out(PG_FUNCTION_ARGS);
 
+/* skycell.c: the cells of max_order a region meets, as sorted, merged order-29 pairs */
+extern int64 *skycell_region_moc_pairs(const sc_region *reg, int max_order, int *n);
+
 /* skycell.c: a MOC's ASCII or JSON text from sorted, merged order-29 ranges */
 extern char *skycell_moc_cstring(const int64 *pairs, int n, int max_order, bool json);
 

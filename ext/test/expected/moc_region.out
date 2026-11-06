@@ -338,5 +338,105 @@ SELECT (SELECT count(*) FROM mr_part WHERE 1 = CONTAINS(POINT('ICRS', ra, dec), 
  t
 (1 row)
 
-DROP TABLE mr_cat, mr_mocs, mr_fp, mr_part;
+-- MOC set operations (0.46): exact, on the cells; the result's depth the finer
+SELECT skycell_moc_union(skycell_moc_region('3/100-110 5/2000-2010'), skycell_moc_region('2/25-27 4/1700')) AS union_,
+       skycell_moc_intersection(skycell_moc_region('3/100-110 5/2000-2010'), skycell_moc_region('2/25-27 4/1700')) AS intersection_;
+                 union_                 |      intersection_       
+----------------------------------------+--------------------------
+ MOC 2/25-27 4/500-501 1700 5/2008-2010 | MOC 2/25-26 3/108-110 5/
+(1 row)
+
+SELECT skycell_moc_difference(skycell_moc_region('3/100-110 5/2000-2010'), skycell_moc_region('2/25-27 4/1700')) AS difference_,
+       skycell_moc_difference(skycell_moc_region('1/1'), skycell_moc_region('1/5')) AS apart,
+       skycell_moc_difference(skycell_moc_region('1/1'), skycell_moc_region('0/0')) AS all_gone;
+        difference_        |  apart  | all_gone 
+---------------------------+---------+----------
+ MOC 4/500-501 5/2008-2010 | MOC 1/1 | MOC 1/
+(1 row)
+
+SELECT skycell_moc_complement(skycell_moc_region('0/0-10')) AS one_left,
+       skycell_moc_complement(skycell_moc_region('0/0-11')) AS none_left,
+       skycell_moc_complement(skycell_moc_region('3/')) AS everything;
+ one_left | none_left |  everything   
+----------+-----------+---------------
+ MOC 0/11 | MOC 0/    | MOC 0/0-11 3/
+(1 row)
+
+SELECT skycell_moc_degrade(skycell_moc_region('3/100-110 5/2000-2010'), 2) AS order2,
+       skycell_moc_degrade(skycell_moc_region('3/100-110 5/2000-2010'), 9) AS finer_unchanged;
+     order2     |               finer_unchanged               
+----------------+---------------------------------------------
+ MOC 2/25-27 31 | MOC 2/25-26 3/108-110 4/500-501 5/2008-2010
+(1 row)
+
+-- any region as a MOC: what skycell_moc writes, and a MOC degraded
+SELECT skycell_moc_region(circle('ICRS', 10, 20, 2), 6)::text = 'MOC ' || skycell_moc(circle('ICRS', 10, 20, 2), 6) AS as_skycell_moc,
+       skycell_moc_region(skycell_moc_region('3/100-110 5/2000-2010'), 3) AS degraded;
+ as_skycell_moc |         degraded          
+----------------+---------------------------
+ t              | MOC 2/25-26 3/108-110 125
+(1 row)
+
+-- identities: (a less b) with (a and b) is a; a with its complement is the sky
+WITH m(a, b) AS (VALUES (skycell_moc_region(circle('ICRS', 120, 30, 5), 8), skycell_moc_region(polygon('ICRS', 118, 25, 130, 28, 125, 36), 9)))
+SELECT skycell_moc(skycell_moc_union(skycell_moc_difference(a, b), skycell_moc_intersection(a, b)), 29)
+       = skycell_moc(a, 29) AS split_and_join,
+       area(skycell_moc_union(a, skycell_moc_complement(a))) = area(skycell_moc_region('0/0-11')) AS whole_sky,
+       area(skycell_moc_intersection(a, skycell_moc_complement(a))) = 0 AS nothing,
+       round((area(skycell_moc_union(a, b)) + area(skycell_moc_intersection(a, b)) - area(a) - area(b))::numeric, 9) AS inclusion_exclusion
+FROM m;
+ split_and_join | whole_sky | nothing | inclusion_exclusion 
+----------------+-----------+---------+---------------------
+ t              | t         | t       |         0.000000000
+(1 row)
+
+-- the union of stored footprints, MOCs or (with an order) any regions; in parallel too
+CREATE TABLE mr_obs AS
+SELECT i AS id, skycell_moc_region(circle('ICRS', mod(i * 37.0, 360), mod(i * 13.0, 160) - 80, 0.5 + mod(i, 3)), 7) AS fp,
+       circle('ICRS', mod(i * 37.0, 360), mod(i * 13.0, 160) - 80, 0.5 + mod(i, 3)) AS c
+FROM generate_series(1, 3000) i;
+ANALYZE mr_obs;
+CREATE TEMP TABLE mr_u AS SELECT skycell_moc_union_agg(fp) AS a, skycell_moc_union_agg(c, 7) AS b FROM mr_obs;
+SELECT a::text = b::text AS regions_as_mocs, round(area(a)::numeric, 3) AS area FROM mr_u;
+ regions_as_mocs |   area    
+-----------------+-----------
+ t               | 16584.023
+(1 row)
+
+SET parallel_setup_cost = 0; SET parallel_tuple_cost = 0; SET min_parallel_table_scan_size = 0;
+SET max_parallel_workers_per_gather = 3; SET parallel_leader_participation = off;
+EXPLAIN (COSTS OFF) SELECT skycell_moc_union_agg(fp) FROM mr_obs;
+                  QUERY PLAN                   
+-----------------------------------------------
+ Finalize Aggregate
+   ->  Gather
+         Workers Planned: 3
+         ->  Partial Aggregate
+               ->  Parallel Seq Scan on mr_obs
+(5 rows)
+
+SELECT (SELECT skycell_moc_union_agg(fp) FROM mr_obs)::text = a::text AS parallel_same FROM mr_u;
+ parallel_same 
+---------------
+ t
+(1 row)
+
+RESET parallel_setup_cost; RESET parallel_tuple_cost; RESET min_parallel_table_scan_size;
+RESET max_parallel_workers_per_gather; RESET parallel_leader_participation;
+SELECT skycell_moc_union_agg(fp) IS NULL AS no_rows FROM mr_obs WHERE id < 0;
+ no_rows 
+---------
+ t
+(1 row)
+
+-- errors
+SELECT skycell_moc_union(skycell_moc_region('1/1'), circle('ICRS', 10, 20, 1));
+ERROR:  skycell: a MOC operation takes MOCs
+HINT:  Make one from any region with skycell_moc_region(region, max_order).
+SELECT skycell_moc_union_agg(c) FROM mr_obs;
+ERROR:  skycell: skycell_moc_union_agg(r) takes MOCs
+HINT:  Give an order, skycell_moc_union_agg(r, max_order), to take any region.
+SELECT skycell_moc_degrade(skycell_moc_region('1/1'), 30);
+ERROR:  skycell: MOC order must be within [0, 29]
+DROP TABLE mr_cat, mr_mocs, mr_fp, mr_part, mr_obs;
 DROP FUNCTION mr_by_cell(text), mr_plans(text);

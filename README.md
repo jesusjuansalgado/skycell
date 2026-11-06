@@ -992,6 +992,57 @@ reads them in 1.9 s; the row estimate is within 5% of the count. A constant
 MOC is decoded once a query, not once a row: before that, the same scan took
 50 s.
 
+### MOC set operations (since 0.46)
+
+Footprints kept as MOCs, one per observation, can be combined in the database:
+the area a collection covers, where two surveys overlap, or what one covers
+and another does not.
+
+```sql
+-- each observation's footprint as an order-10 MOC, under a GiST index
+ALTER TABLE obs ADD COLUMN fp skyregion;
+UPDATE obs SET fp = skycell_moc_region(s_region, 10);
+CREATE INDEX ON obs USING gist (fp);
+
+-- the observations whose footprint holds a source
+SELECT obs_id FROM obs WHERE 1 = CONTAINS(POINT('ICRS', 120.3, 30.2), fp);
+
+-- the coverage of a collection, as one MOC, and its area
+SELECT area(skycell_moc_union_agg(fp)) FROM obs WHERE obs_collection = 'HST';
+
+-- where two collections overlap, and what the first covers that the second does not
+SELECT skycell_moc_intersection(a, b), skycell_moc_difference(a, b)
+FROM (SELECT skycell_moc_union_agg(fp) FILTER (WHERE obs_collection = 'HST') AS a,
+             skycell_moc_union_agg(fp) FILTER (WHERE obs_collection = 'JWST') AS b FROM obs) s;
+```
+
+| Function | Returns | Notes |
+|---|---|---|
+| `skycell_moc_region(r skyregion, max_order int)` | `skyregion` | any region as a MOC: the cells of `max_order` it meets, as `skycell_moc` writes them; a MOC finer than `max_order` is degraded to it |
+| `skycell_moc_union(a, b)`, `skycell_moc_intersection(a, b)`, `skycell_moc_difference(a, b)` | `skyregion` | exact, on the two MOCs' cells; the result's depth is the finer of the two |
+| `skycell_moc_complement(a)` | `skyregion` | the rest of the sky |
+| `skycell_moc_degrade(a, hpx_order int)` | `skyregion` | at a coarser order: every cell of that order it meets, whole (a superset) |
+| `skycell_moc_union_agg(r skyregion [, max_order int])` | `skyregion` | aggregate: the union of the MOCs aggregated, or with `max_order` of any regions, each as `skycell_moc_region(r, max_order)` makes it. Runs in parallel; NULL over no rows |
+
+The operations take MOCs (`skycell_moc_region(r, order)` makes one of any
+region). The result is a MOC region like any other: it can be stored, indexed,
+searched, measured with `AREA`, or written out with `skycell_moc(m, order,
+'json')`.
+
+**Validation** ([`bench/results-moc/setops.py`](bench/results-moc/)): 60
+pairs of random MOCs, written by skycell and by MOCPy 0.21.0. Union,
+intersection, difference, complement and degrade equal MOCPy's, cell for cell,
+in every case, and so does the union of 200 MOCs at once. Difference is
+compared with MOCPy's A ∩ (complement of B), because MOCPy 0.21.0's own
+`difference()` returns an empty MOC when the two do not overlap
+(`MOC("1/1").difference(MOC("1/5"))`), as it did for 21 of the 60 pairs.
+
+**Speed:** 50,000 footprints of 0.1°–0.4°, stored as order-10 MOCs:
+- the union of all of them takes 0.6 s;
+- the footprints that hold a source take 0.14 ms under the GiST index (0.2 s
+  without);
+- making the MOC of a footprint takes 0.3 ms at order 10, 1 ms at order 12.
+
 ### Diagnostics
 
 | Function | Notes |
@@ -1406,7 +1457,11 @@ rows. Run against v0.42, it flags v0.44's regression (1.21 [1.13, 1.30]).
   DIFFERENCE, INTERSECTION and NOT the boolean combination of the tests.
   Relations between MOCs, and with cones as the cones' own MOCs answer them;
   stored MOCs under GiST against a sequential scan; estimates; partition
-  pruning.
+  pruning. The set operations (0.46) on chosen MOCs, the identities they must
+  keep (a split by b and joined again is a; a with its complement is the sky;
+  inclusion–exclusion of areas), the union aggregate over 3,000 footprints as
+  MOCs and as circles, in parallel and over no rows; operations refused on a
+  region that is not a MOC.
 - `composite`: unions, intersections, differences and NOTs. STC-S in and
   out (every malformed form errors with a reason), the constructors, each
   composite's membership against the boolean combination of its pieces,
