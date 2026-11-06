@@ -3495,7 +3495,11 @@ typedef struct NearestScanState
 	NearestRow *rows;
 	int			nrows,
 				cap,
-				next;
+				next,
+				sorted;			/* rows[0 .. sorted) are in order (0.47) */
+	double		nout;			/* rows returned so far */
+	ExprState  *rowdec;			/* the row's declination, when the distance is
+								 * skycell_dist() of a column pair (0.47) */
 	Size		mem;
 	Tuplesortstate *sort;
 	TupleDesc	sortdesc;		/* the relation's columns, then the distance */
@@ -3559,6 +3563,35 @@ nearest_begin(CustomScanState *node, EState *estate, int eflags)
 	 * expressions.  It holds no sub-plan (adql.c checks).
 	 */
 	ns->dist = ExecInitExpr((Expr *) lthird(cscan->custom_exprs), NULL);
+
+	/*
+	 * When the distance is skycell_dist(ra, dec, ra0, dec0) -- either pair
+	 * the row's, the other free of its columns -- the row's declination
+	 * alone rejects a row a ring's covering read from beyond the ring: the
+	 * distance is never less than the difference in declination.  A
+	 * subtraction instead of the trigonometry, for the rows of the cells the
+	 * ring's edge crosses (0.47).
+	 */
+	{
+		FuncExpr   *f = (FuncExpr *) lthird(cscan->custom_exprs);
+
+		if (IsA(f, FuncExpr) && list_length(f->args) == 4)
+		{
+			char	   *name = get_func_name(f->funcid);
+
+			if (name != NULL && strcmp(name, "skycell_dist") == 0)
+			{
+				Node	   *a = (Node *) list_make2(linitial(f->args), lsecond(f->args)),
+						   *b = (Node *) list_make2(lthird(f->args), lfourth(f->args));
+				bool		av = contain_var_clause(a),
+							bv = contain_var_clause(b);
+
+				if (av != bv)
+					ns->rowdec = ExecInitExpr((Expr *) (av ? lsecond(f->args) : lfourth(f->args)),
+											  NULL);
+			}
+		}
+	}
 
 	/*
 	 * The relation's conditions, tested as a row is read: a row they reject
@@ -3655,6 +3688,19 @@ nearest_consider(NearestScanState *ns, TupleTableSlot *row)
 
 	ResetExprContext(econtext);
 	econtext->ecxt_scantuple = row;
+	if (ns->rowdec != NULL && !ns->final)
+	{
+		Datum		dv = ExecEvalExprSwitchContext(ns->rowdec, econtext, &isnull);
+		double		dec = isnull ? 0.0 : DatumGetFloat8(dv);
+
+		/* a valid declination farther from the centre's than the ring reaches */
+		if (!isnull && dec >= -90.0 && dec <= 90.0 &&
+			fabs(dec - ns->dec0) > ns->r * (1.0 + 1e-9) + 1e-12)
+		{
+			ns->nread += 1;
+			return;
+		}
+	}
 	v = ExecEvalExprSwitchContext(ns->dist, econtext, &isnull);
 	d = isnull ? 0.0 : DatumGetFloat8(v);
 	ns->nread += 1;
@@ -3721,6 +3767,66 @@ nearest_row_cmp(const NearestRow *x, const NearestRow *y)
 #define ST_SCOPE static
 #define ST_DEFINE
 #include "lib/sort_template.h"
+
+/*
+ * Rows rearranged so that rows[0 .. m) are the m nearest, in no order, and
+ * every row after them is no nearer than any of them (quickselect, median of
+ * three).  A ring holds more rows than the query was planned to read, about
+ * twice where the rows cluster, and sorting them all was a sixth of a search:
+ * only the rows needed are sorted, the rest if the query asks for them (0.47).
+ */
+static void
+nearest_select_rows(NearestRow *rows, int n, int m)
+{
+	int			lo = 0,
+				hi = n - 1;
+
+	while (hi > lo)
+	{
+		int			mid = lo + (hi - lo) / 2,
+					i,
+					j;
+		NearestRow	t,
+					pivot;
+
+		/* the median of rows[lo], rows[mid], rows[hi] as the pivot */
+		if (nearest_row_cmp(&rows[mid], &rows[lo]) < 0)
+		{
+			t = rows[mid]; rows[mid] = rows[lo]; rows[lo] = t;
+		}
+		if (nearest_row_cmp(&rows[hi], &rows[lo]) < 0)
+		{
+			t = rows[hi]; rows[hi] = rows[lo]; rows[lo] = t;
+		}
+		if (nearest_row_cmp(&rows[hi], &rows[mid]) < 0)
+		{
+			t = rows[hi]; rows[hi] = rows[mid]; rows[mid] = t;
+		}
+		pivot = rows[mid];
+		i = lo;
+		j = hi;
+		while (i <= j)
+		{
+			while (nearest_row_cmp(&rows[i], &pivot) < 0)
+				i++;
+			while (nearest_row_cmp(&rows[j], &pivot) > 0)
+				j--;
+			if (i <= j)
+			{
+				t = rows[i]; rows[i] = rows[j]; rows[j] = t;
+				i++;
+				j--;
+			}
+		}
+		/* rows[lo .. j] <= pivot <= rows[i .. hi] */
+		if (m <= j)
+			hi = j;
+		else if (m >= i)
+			lo = i;
+		else
+			return;
+	}
+}
 
 /*
  * The radius whose cone the density expects to hold k rows around the centre:
@@ -3875,7 +3981,7 @@ nearest_clear_ring(NearestScanState *ns)
 	if (ns->ringcxt)
 		MemoryContextReset(ns->ringcxt);
 	ns->rows = NULL;
-	ns->nrows = ns->cap = ns->next = 0;
+	ns->nrows = ns->cap = ns->next = ns->sorted = 0;
 	ns->mem = 0;
 }
 
@@ -4256,8 +4362,24 @@ nearest_ring(NearestScanState *ns)
 	ResetExprContext(econtext);
 	if (ns->sort)
 		tuplesort_performsort(ns->sort);
-	else if (ns->nrows > 1)
-		nearest_sort_rows(ns->rows, ns->nrows);
+	else
+	{
+		/* the rows the query still wants, in order; the rest when asked for */
+		double		need = fmax(1.0, ns->want - ns->nout);
+
+		if (ns->nrows > 1 && need < 0.5 * ns->nrows)
+		{
+			nearest_select_rows(ns->rows, ns->nrows, (int) need);
+			nearest_sort_rows(ns->rows, (int) need);
+			ns->sorted = (int) need;
+		}
+		else
+		{
+			if (ns->nrows > 1)
+				nearest_sort_rows(ns->rows, ns->nrows);
+			ns->sorted = ns->nrows;
+		}
+	}
 	ns->nrings += 1;
 }
 
@@ -4271,6 +4393,13 @@ nearest_next(ScanState *ss)
 	{
 		if (ns->sort == NULL && ns->next < ns->nrows)
 		{
+			if (ns->next >= ns->sorted)
+			{
+				/* past the rows the query was planned to read: the rest, in order */
+				nearest_sort_rows(ns->rows + ns->sorted, ns->nrows - ns->sorted);
+				ns->sorted = ns->nrows;
+			}
+			ns->nout += 1;
 			ExecStoreHeapTuple(ns->rows[ns->next++].tup, out, false);
 			return out;
 		}
@@ -4298,6 +4427,7 @@ nearest_reset(NearestScanState *ns)
 {
 	nearest_clear_ring(ns);
 	ns->started = ns->final = ns->done = false;
+	ns->nout = 0;
 	ns->cone.cur = -1;
 }
 
@@ -4339,6 +4469,7 @@ nearest_explain(CustomScanState *node, List *ancestors, ExplainState *es)
 
 		ExplainPropertyFloat("Rings", NULL, ns->nrings / loops, 1, es);
 		ExplainPropertyFloat("Rows Read by Rings", NULL, ns->nread / loops, 0, es);
+		ExplainPropertyFloat("Rows Inside Rings", NULL, ns->n_inside / loops, 0, es);
 		if (ns->nprobes > 0)
 			ExplainPropertyFloat("Cells Probed", NULL, ns->nprobes / loops, 0, es);
 	}
