@@ -51,7 +51,7 @@ after #52, is in `report-v036.md`. Both runs on the same host and tables.
   on this table, which is in memory, a skipped heap fetch saves less than the
   key's decoding, the sort and the bitmap's entry-by-entry filling cost: 12-15%
   slower at k = 100-1000 in a same-day A/B against v0.44.
-- **Tried in 0.47 (`micro_oc.sql`, on real36's copy of the ObsCore table):**
+- **Tried in 0.51 (`micro_oc.sql`, on real36's copy of the ObsCore table):**
   - **Kept:** sorting only the rows the query wants (quickselect, then sort
     the prefix; the rest only if asked for), and rejecting a row whose
     declination is farther from the centre's than the ring reaches, before

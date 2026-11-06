@@ -3496,10 +3496,10 @@ typedef struct NearestScanState
 	int			nrows,
 				cap,
 				next,
-				sorted;			/* rows[0 .. sorted) are in order (0.47) */
+				sorted;			/* rows[0 .. sorted) are in order (0.51) */
 	double		nout;			/* rows returned so far */
 	ExprState  *rowdec;			/* the row's declination, when the distance is
-								 * skycell_dist() of a column pair (0.47) */
+								 * skycell_dist() of a column pair (0.51) */
 	Size		mem;
 	Tuplesortstate *sort;
 	TupleDesc	sortdesc;		/* the relation's columns, then the distance */
@@ -3570,7 +3570,7 @@ nearest_begin(CustomScanState *node, EState *estate, int eflags)
 	 * alone rejects a row a ring's covering read from beyond the ring: the
 	 * distance is never less than the difference in declination.  A
 	 * subtraction instead of the trigonometry, for the rows of the cells the
-	 * ring's edge crosses (0.47).
+	 * ring's edge crosses (0.51).
 	 */
 	{
 		FuncExpr   *f = (FuncExpr *) lthird(cscan->custom_exprs);
@@ -3773,7 +3773,7 @@ nearest_row_cmp(const NearestRow *x, const NearestRow *y)
  * every row after them is no nearer than any of them (quickselect, median of
  * three).  A ring holds more rows than the query was planned to read, about
  * twice where the rows cluster, and sorting them all was a sixth of a search:
- * only the rows needed are sorted, the rest if the query asks for them (0.47).
+ * only the rows needed are sorted, the rest if the query asks for them (0.51).
  */
 static void
 nearest_select_rows(NearestRow *rows, int n, int m)

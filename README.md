@@ -1518,13 +1518,13 @@ locally), the standalone selftests, and the reference translators.
   (`ctid`, `FOR UPDATE`) keeps the sort too, since the scan returns rows from
   its own buffer. Against pgSphere's GiST ordering on a clustered relation (an
   ObsCore table, observations grouped in fields, its heap out of cell order)
-  it is level for a few rows and slower for hundreds or more: since 0.47,
+  it is level for a few rows and slower for hundreds or more: since 0.51,
   1.16–1.20 times pgSphere's time at k = 100 and about 1.45 at 1000 (1.15–1.23
   and 1.55 before). It reads 2–4 times the rows it returns, each with an exact
   distance. Part of that is the first ring, sized from a cell's density,
   holding more where observations cluster in fields; part is the ring's
   covering cells reaching past the ring. pgSphere's GiST reads close to
-  exactly the rows it returns. Since 0.47 only the rows wanted are sorted, and
+  exactly the rows it returns. Since 0.51 only the rows wanted are sorted, and
   a row whose declination alone puts it outside the ring is rejected before
   its distance is computed. Tried and dropped
   ([`bench/results-nearest/`](bench/results-nearest/)):
