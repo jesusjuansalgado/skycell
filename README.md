@@ -899,7 +899,7 @@ FROM gaia.gaia_source WHERE phot_g_mean_mag < 12;
 | Function | Returns | Notes |
 |---|---|---|
 | `skycell_moc(r skyregion, max_order int DEFAULT 10, fmt text DEFAULT 'ascii')` | `text` | the cells of `max_order` that meet `r`, as `skycell_cell_overlaps` counts them; cells inside it whole at a coarser order. Orders 0–29 |
-| `skycell_moc_agg(hpx_order int, ipix bigint [, fmt text])` | `text` | aggregate: the MOC of the cells of one order, duplicates allowed. Orders 0–12; no rows give NULL |
+| `skycell_moc_agg(hpx_order int, ipix bigint [, fmt text])` | `text` | aggregate: the MOC of the cells of one order, duplicates allowed. Orders 0–12; no rows, or no row with a cell, give NULL. Runs in parallel (since 0.45) |
 | `skycell_coverage_moc(tbl text, max_order int DEFAULT 10, fmt text DEFAULT 'ascii')` | `text` | the cells of `max_order` that hold a row of `tbl`, from its skycell index or stored `cell` column. Orders 0–12; an empty table gives an empty MOC |
 
 `fmt` is `'ascii'` or `'json'`. The output is normalised as MOCPy writes it:
@@ -918,6 +918,13 @@ and 21 of the 50 held cells more, which by dense sampling lie outside the cone
 (up to 0.49° beyond a 5° cone at order 2). A 20° cone at order 10 takes
 18 ms; the coverage of the 10M-row Gaia table at order 10, 1.2 s, one pass
 over its index. FITS, the third MOC 2.0 serialisation, is not written.
+
+Since 0.45 `skycell_moc_agg`, and so `skycell_coverage_moc`, runs in parallel:
+each worker marks its own rows' cells and the leader combines them. On a
+sharded database such as Citus, each shard does the same. Its state is a type
+of its own, `skycell_mocstate`, so that it can travel between processes and
+nodes. On the 10M-row Gaia table with four workers: order 10 takes 0.68 s
+against 1.5 s in one process, order 12 takes 1.8 s, and order 3 takes 0.43 s.
 
 ### MOCs as search regions (since 0.44)
 
@@ -1087,6 +1094,20 @@ unpartitioned table's parallel cone scan (0.42) is faster still: a 10° cone
 took 49 ms against 36, a 30° cone 89 against 73. Partition a sky catalogue to
 load, index, vacuum or archive it by region, not for speed: cones cost the
 same, cross-matches 1.2–1.7 times as much.
+
+**Citus distributed tables** (0.45, [`bench/citus/`](bench/citus/)). On Citus
+13 with a catalogue hash-distributed over 8 shards, every cone, polygon,
+composite and MOC form tried gives the single node's rows. So do nearest
+neighbours and cross-matches against a reference or local probe table. Each
+shard plans its part with skycell and uses the custom scan on its own index.
+Distributed by a coarse cell column kept true by a CHECK constraint, e.g.
+`hpx3 bigint CHECK (hpx3 = skycell_ang2cell(ra, dec) >> 52)`, a constant
+region gets `hpx3 = ANY('{its cells}')`, and Citus sends it only to the shards
+holding them: a 1° cone to 1 shard of 32, a 5° cone to 6.
+`skycell_moc_agg` (and `skycell_coverage_moc`) aggregates on the shards. The
+estimate functions sum over the shards. skycell's settings must be the same
+on every node: a plain `SET` on the coordinator does not reach them. Not yet:
+two distributed catalogues cannot be cross-matched.
 
 **Polygons through the custom scan** (0.43, [`bench/results-polyscan/`](bench/results-polyscan/)).
 Since 0.43 a constant polygon or box takes the custom scan that cones have.
@@ -1374,7 +1395,9 @@ rows. Run against v0.42, it flags v0.44's regression (1.21 [1.13, 1.30]).
   ASCII and JSON; the max-order cells of a region's MOC must be exactly those
   `skycell_cell_overlaps` counts; the aggregate's merging of duplicates and
   siblings; a table's coverage by expression index and by stored cell
-  column, and of an empty table; out-of-range orders and formats.
+  column, and of an empty table; out-of-range orders and formats. The
+  aggregate in parallel (workers only) must give the one-process MOC at
+  orders 0–12, also when workers see no row with a cell.
 - `moc_region`: MOCs read from ASCII, MOC 1.0 commas and JSON, normalised;
   in STC-S and composites; AREA and CENTROID; malformed MOCs refused. On a
   catalogue, nine MOCs (single cells, mixed orders, a pole, the whole sky,

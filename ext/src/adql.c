@@ -2080,8 +2080,12 @@ region_support_simplify(SupportRequestSimplify *req, Oid funcid, Node *pt, Node 
 
 				for_each_from(lc, ((BoolExpr *) res)->args, 1)
 				{
-					OpExpr	   *b = lfirst_node(OpExpr, lc);
+					OpExpr	   *b = (OpExpr *) lfirst(lc);
 
+					/* the bound comparisons only, not a shard key's cells (0.45) */
+					if (!IsA(b, OpExpr) || list_length(b->args) != 2 ||
+						!IsA(lsecond(b->args), FuncExpr))
+						continue;
 					((FuncExpr *) lsecond(b->args))->args =
 						list_copy_tail(copyObject(((FuncExpr *) cone)->args), 3);
 				}

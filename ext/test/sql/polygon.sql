@@ -223,5 +223,22 @@ DROP INDEX preg_caps;
 CREATE INDEX preg_box4 ON preg USING gist (r skyregion_box4_gist_ops);
 SELECT name, seq = idx AS agree FROM region_counts() ORDER BY name;
 
+-- skycell_region_scan() as a query arrives at a Citus worker, already
+-- rewritten by the coordinator: the custom scan still reads the index, and
+-- the rows are those of the region written in ADQL (0.45)
+CREATE FUNCTION pcat_scan(q text) RETURNS text LANGUAGE plpgsql AS $$
+DECLARE j json;
+BEGIN
+  EXECUTE 'EXPLAIN (FORMAT JSON) ' || q INTO j;
+  RETURN j -> 0 -> 'Plan' ->> 'Custom Plan Provider';
+END $$;
+SELECT pcat_scan($q$SELECT id FROM pcat
+  WHERE skycell_region_scan(skycell_ang2cell(ra, dec), ra, dec, 'POLYGON ICRS 200 -10 215 -8 208 4')$q$) AS scan;
+DROP FUNCTION pcat_scan(text);
+SELECT (SELECT count(*) FROM pcat
+        WHERE skycell_region_scan(skycell_ang2cell(ra, dec), ra, dec, 'POLYGON ICRS 200 -10 215 -8 208 4'))
+     = (SELECT count(*) FROM pcat
+        WHERE 1 = CONTAINS(POINT('ICRS', ra, dec), POLYGON('ICRS', 200, -10, 215, -8, 208, 4))) AS written_same;
+
 DROP TABLE preg, ppts, polys, pcat, shape;
 DROP FUNCTION region_counts(), poly_counts(float8[]), poly_plan_uses_index(text);
