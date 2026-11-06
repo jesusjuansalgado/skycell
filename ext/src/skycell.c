@@ -150,6 +150,12 @@ _PG_init(void)
 							 "Use the ANALYZE histogram of the cell column as a density map.",
 							 NULL, &skycell_use_stats, true,
 							 PGC_USERSET, 0, NULL, NULL, NULL);
+	DefineCustomBoolVariable("skycell.fold_regions",
+							 "Answer a position tested against several constant regions, joined "
+							 "by OR, AND and NOT, as one test against their union, intersection "
+							 "or difference.",
+							 NULL, &skycell_fold_regions, true,
+							 PGC_USERSET, 0, NULL, NULL, NULL);
 	DefineCustomBoolVariable("skycell.cache_coverings",
 							 "Memoise coverings per backend (cleared when statistics change).",
 							 NULL, &skycell_cache_coverings, true,

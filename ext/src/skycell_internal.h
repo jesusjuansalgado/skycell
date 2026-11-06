@@ -62,6 +62,8 @@ extern void skycell_scan_params(sc_cover_params *p, const sc_density *d);
 
 /* cone_scan.c: the custom scan for constant and cross-match cones (skycell.custom_scan) */
 extern void cone_scan_init(void);
+extern bool skycell_fold_regions;	/* adql.c: booleans of constant regions as one (0.53) */
+extern void skycell_fold_query_regions(Query *parse);
 extern bool cone_scan_keep(PlannerInfo *root, FuncExpr *fcall);
 extern bool cone_scan_keep_as(PlannerInfo *root, FuncExpr *written, FuncExpr *cone6);
 extern Node *cone_with_partition_bounds(PlannerInfo *root, FuncExpr *cone6);

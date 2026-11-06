@@ -1,0 +1,29 @@
+ setseed 
+---------
+ 
+(1 row)
+
+SELECT 60
+CREATE TABLE
+INSERT 0 5
+CREATE FUNCTION
+CREATE FUNCTION
+CREATE FUNCTION
+CREATE TABLE
+CREATE FUNCTION
+ setseed 
+---------
+ 
+(1 row)
+
+ bf_run 
+--------
+ 
+(1 row)
+
+COPY 3600
+ shapes | methods_disagree 
+--------+------------------
+    300 |                0
+(1 row)
+

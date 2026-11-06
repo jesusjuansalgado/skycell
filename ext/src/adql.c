@@ -3190,6 +3190,346 @@ distance_cone(Node *qual, Node **below)
 }
 
 /*
+ * Booleans of constant regions folded into one composite (0.53).  A position
+ * tested against several constant regions joined by OR, AND and NOT --
+ *   p <@ A OR p <@ B            ->  p <@ UNION(A, B)
+ *   p <@ A AND p <@ B           ->  p <@ INTERSECTION(A, B)
+ *   p <@ A AND NOT p <@ B       ->  p <@ DIFFERENCE(A, B)
+ *   p <@ A OR NOT p <@ B        ->  p <@ UNION(A, NOT(B))
+ * (or ADQL's contains(p, r) = 1 and = 0) -- is the same test: a composite's
+ * membership is the boolean combination of its pieces' exact tests, and every
+ * function involved is strict, so a NULL position gives NULL either way.  One
+ * covering of the whole shape then replaces a covering per piece and the
+ * BitmapOr or filter that joined them: 4-6 times faster for unions, 16-39% for
+ * intersections and differences (the paper's Table 9).  Only constant,
+ * non-NULL regions fold, of the same position expression; terms on anything
+ * else stay as they are, and so does an OR that holds one.
+ */
+typedef struct
+{
+	Node	   *pos;			/* the position; NULL: not a region term */
+	SkyRegion  *reg;
+	Oid			regtype,		/* the region's type, and skycell's schema */
+				nsp;
+	bool		neg;			/* NOT p <@ r */
+} region_term;
+
+bool		skycell_fold_regions = true;
+
+static Node *fold_region_bool(Node *n, bool *changed);
+
+/* t as "p <@ constant region", possibly negated; false if it is not one */
+static bool
+as_region_term(Node *t, region_term *rt)
+{
+	bool		neg = false;
+	Node	   *pos = NULL,
+			   *reg = NULL;
+	char	   *src;
+
+	if (is_notclause(t))
+	{
+		neg = true;
+		t = (Node *) get_notclausearg((Expr *) t);
+	}
+	if (!IsA(t, OpExpr) || list_length(((OpExpr *) t)->args) != 2)
+		return false;
+	{
+		OpExpr	   *op = (OpExpr *) t;
+		Oid			fn = OidIsValid(op->opfuncid) ? op->opfuncid : get_opcode(op->opno);
+
+		if (fn == F_INT4EQ)
+		{
+			/* ADQL: contains(p, r) = 1 (when not yet an operator) or = 0 */
+			Node	   *one = linitial(op->args),
+					   *f = lsecond(op->args);
+			int			v;
+
+			if (!IsA(one, Const))
+			{
+				one = lsecond(op->args);
+				f = linitial(op->args);
+			}
+			if (!IsA(one, Const) || ((Const *) one)->constisnull ||
+				((Const *) one)->consttype != INT4OID || !IsA(f, FuncExpr) ||
+				list_length(((FuncExpr *) f)->args) != 2)
+				return false;
+			v = DatumGetInt32(((Const *) one)->constvalue);
+			if (v != 0 && v != 1)
+				return false;
+			if (v == 0)
+				neg = !neg;
+			if ((src = skycell_c_src(((FuncExpr *) f)->funcid)) == NULL)
+				return false;
+			rt->nsp = get_func_namespace(((FuncExpr *) f)->funcid);
+			if (strcmp(src, "skycell_contains") == 0 || strcmp(src, "skycell_intersects_pos") == 0)
+			{
+				pos = linitial(((FuncExpr *) f)->args);
+				reg = lsecond(((FuncExpr *) f)->args);
+			}
+			else if (strcmp(src, "skycell_intersects_region_pos") == 0)
+			{
+				reg = linitial(((FuncExpr *) f)->args);
+				pos = lsecond(((FuncExpr *) f)->args);
+			}
+			else
+				return false;
+		}
+		else
+		{
+			if ((src = skycell_c_src(fn)) == NULL)
+				return false;
+			rt->nsp = get_func_namespace(fn);
+			if (strcmp(src, "skycell_pos_in_region") == 0)
+			{
+				pos = linitial(op->args);
+				reg = lsecond(op->args);
+			}
+			else if (strcmp(src, "skycell_region_has_pos") == 0)
+			{
+				reg = linitial(op->args);
+				pos = lsecond(op->args);
+			}
+			else
+				return false;
+		}
+	}
+	if (contain_volatile_functions(pos) || IsA(pos, Const))
+		return false;
+	if (!IsA(reg, Const))
+	{
+		/* in the parse tree: a region of constants, evaluated now */
+		if (contain_var_clause(reg) || contain_volatile_functions(reg) ||
+			checkExprHasSubLink(reg))
+			return false;
+		reg = eval_const_expressions(NULL, reg);
+	}
+	if (!IsA(reg, Const) || ((Const *) reg)->constisnull)
+		return false;
+	rt->pos = pos;
+	rt->reg = DatumGetSkyRegion(((Const *) reg)->constvalue);
+	rt->regtype = exprType(reg);
+	rt->neg = neg;
+	return true;
+}
+
+/* the composite of kind over regs, or NULL past the limits region_combine() sets */
+static SkyRegion *
+combine_or_null(int kind, SkyRegion **regs, int n)
+{
+	int			d = 0;
+
+	if (n == 1 && kind != SKY_NOT)
+		return regs[0];
+	if (n > SKY_MAX_KIDS)
+		return NULL;
+	for (int i = 0; i < n; i++)
+		d = Max(d, region_depth(regs[i]));
+	if (d + 1 > 32)
+		return NULL;
+	return region_combine(kind, regs, n);
+}
+
+/* "pos <@ reg", with the operator of the position's and the region's types */
+static Node *
+region_term_qual(const region_term *t, SkyRegion *reg)
+{
+	Node	   *pos = t->pos;
+	Oid			regtype = t->regtype;
+	Oid			opno = OpernameGetOprid(list_make2(makeString(get_namespace_name(t->nsp)),
+												   makeString(pstrdup("<@"))),
+										exprType(pos), regtype);
+	OpExpr	   *res;
+
+	if (!OidIsValid(opno))
+		return NULL;
+	res = (OpExpr *) make_opclause(opno, BOOLOID, false, (Expr *) copyObject(pos),
+								   (Expr *) makeConst(regtype, -1, InvalidOid, -1,
+													  PointerGetDatum(reg), false, false),
+								   InvalidOid, InvalidOid);
+	res->opfuncid = get_opcode(opno);
+	return (Node *) res;
+}
+
+/*
+ * The terms of one AND (is_or false) or OR, with the region terms of each
+ * position folded into one; NIL when nothing folds.
+ */
+static List *
+fold_region_terms(List *terms, bool is_or)
+{
+	int			n = list_length(terms);
+	region_term *rt = palloc0(sizeof(region_term) * Max(n, 1));
+	bool	   *done = palloc0(sizeof(bool) * Max(n, 1));
+	List	   *out = NIL;
+	bool		any = false;
+
+	for (int i = 0; i < n; i++)
+		if (!as_region_term(list_nth(terms, i), &rt[i]))
+			rt[i].pos = NULL;
+	for (int i = 0; i < n; i++)
+	{
+		SkyRegion **pos = palloc(sizeof(SkyRegion *) * n),
+				  **neg = palloc(sizeof(SkyRegion *) * n);
+		int			np = 0,
+					nn = 0,
+					members = 0;
+		SkyRegion  *r = NULL;
+		Node	   *q = NULL;
+
+		if (done[i])
+			continue;
+		if (rt[i].pos == NULL)
+		{
+			out = lappend(out, list_nth(terms, i));
+			continue;
+		}
+		for (int j = i; j < n; j++)
+		{
+			if (done[j] || rt[j].pos == NULL || !equal(rt[i].pos, rt[j].pos))
+				continue;
+			if (rt[j].regtype != rt[i].regtype)
+				continue;
+			if (rt[j].neg)
+				neg[nn++] = rt[j].reg;
+			else
+				pos[np++] = rt[j].reg;
+			members++;
+		}
+		/* AND: at least one region to start from; OR: any two terms */
+		if (members >= 2 && (is_or || np >= 1))
+		{
+			if (is_or)
+			{
+				SkyRegion **all = palloc(sizeof(SkyRegion *) * (np + nn));
+				bool		ok = true;
+
+				for (int j = 0; j < np; j++)
+					all[j] = pos[j];
+				for (int j = 0; j < nn && ok; j++)
+					ok = (all[np + j] = combine_or_null(SKY_NOT, &neg[j], 1)) != NULL;
+				r = ok ? combine_or_null(SKY_UNION, all, np + nn) : NULL;
+			}
+			else
+			{
+				r = combine_or_null(SKY_INTERSECTION, pos, np);
+				if (r != NULL && nn > 0)
+				{
+					SkyRegion  *u = combine_or_null(SKY_UNION, neg, nn);
+					SkyRegion  *pair[2] = {r, u};
+
+					r = u != NULL ? combine_or_null(SKY_DIFFERENCE, pair, 2) : NULL;
+				}
+			}
+			if (r != NULL)
+				q = region_term_qual(&rt[i], r);
+		}
+		if (q == NULL)
+		{
+			out = lappend(out, list_nth(terms, i));
+			continue;
+		}
+		for (int j = i; j < n; j++)
+			if (!done[j] && rt[j].pos != NULL && rt[j].regtype == rt[i].regtype &&
+				equal(rt[i].pos, rt[j].pos))
+				done[j] = true;
+		out = lappend(out, q);
+		any = true;
+	}
+	if (!any)
+	{
+		list_free(out);
+		return NIL;
+	}
+	return out;
+}
+
+/* n with its booleans folded, the innermost first; *changed set if any was */
+static Node *
+fold_region_bool(Node *n, bool *changed)
+{
+	BoolExpr   *b;
+	List	   *args = NIL;
+	List	   *folded;
+	bool		inner = false;
+	ListCell   *lc;
+
+	check_stack_depth();
+	if (!IsA(n, BoolExpr) || ((BoolExpr *) n)->boolop == NOT_EXPR)
+		return n;
+	b = (BoolExpr *) n;
+	foreach(lc, b->args)
+		args = lappend(args, fold_region_bool(lfirst(lc), &inner));
+	folded = fold_region_terms(args, b->boolop == OR_EXPR);
+	if (folded == NIL && !inner)
+	{
+		list_free(args);
+		return n;
+	}
+	*changed = true;
+	if (folded != NIL)
+		args = folded;
+	if (list_length(args) == 1)
+		return linitial(args);
+	return (Node *) (b->boolop == OR_EXPR ? make_orclause(args) : make_andclause(args));
+}
+
+/* the WHERE and JOIN ON conditions of a query's join tree, folded */
+static void
+fold_jointree(Node *jt)
+{
+	ListCell   *lc;
+	bool		changed = false;
+
+	if (jt == NULL)
+		return;
+	if (IsA(jt, FromExpr))
+	{
+		FromExpr   *f = (FromExpr *) jt;
+
+		if (f->quals != NULL)
+			f->quals = fold_region_bool(f->quals, &changed);
+		foreach(lc, f->fromlist)
+			fold_jointree(lfirst(lc));
+	}
+	else if (IsA(jt, JoinExpr))
+	{
+		JoinExpr   *j = (JoinExpr *) jt;
+
+		if (j->quals != NULL)
+			j->quals = fold_region_bool(j->quals, &changed);
+		fold_jointree(j->larg);
+		fold_jointree(j->rarg);
+	}
+}
+
+static bool
+fold_query_walker(Node *node, void *context)
+{
+	if (node == NULL)
+		return false;
+	if (IsA(node, Query))
+	{
+		fold_jointree((Node *) ((Query *) node)->jointree);
+		return query_tree_walker((Query *) node, fold_query_walker, context, 0);
+	}
+	return expression_tree_walker(node, fold_query_walker, context);
+}
+
+/*
+ * From the planner hook, before PostgreSQL simplifies the conditions: by
+ * then each "p <@ constant" has become the custom scan's or ranges of the
+ * cell key (the support function), and could no longer be joined with its
+ * neighbours.  Every query level, sub-queries included.
+ */
+void
+skycell_fold_query_regions(Query *parse)
+{
+	if (skycell_fold_regions)
+		fold_query_walker((Node *) parse, NULL);
+}
+
+/*
  * Index the ADQL predicates of one WHERE or JOIN ON: contains()/intersects()
  * compared with 1 become their operator (adql_predicate_operator()), and
  * distance comparisons get a cone.  By now its quals are an implicit-AND

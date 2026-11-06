@@ -1655,6 +1655,7 @@ static PlannedStmt *
 cone_planner(Query *parse, const char *query_string, int cursorOptions, ParamListInfo boundParams)
 {
 	plan_generation++;
+	skycell_fold_query_regions(parse);
 	if (prev_planner_hook)
 		return prev_planner_hook(parse, query_string, cursorOptions, boundParams);
 	return standard_planner(parse, query_string, cursorOptions, boundParams);
