@@ -1,0 +1,3 @@
+60 pairs of MOCs: union 60/60 equal to MOCPy, intersection 60/60 equal to MOCPy, difference 60/60 equal to MOCPy, complement 60/60 equal to MOCPy, degrade 60/60 equal to MOCPy
+(MOCPy 0.21.0 difference() itself differed from A and not B in 21 of 60)
+union aggregate of 200 MOCs equal to MOCPy: True

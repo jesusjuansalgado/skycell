@@ -50,3 +50,21 @@ PGDATABASE=real36 python3 region.py
 
 Result ([`region.txt`](region.txt)): 180 of 180 answers equal MOCPy's (3.67
 million rows in all), and 60 of 60 composite answers equal the expected rows.
+
+## MOC set operations (0.46)
+
+`setops.py` makes 60 pairs of random MOCs, half written by skycell (cones and
+annuli at orders 3–12), half by MOCPy (cones, and random cells of orders 0–9
+degraded to order 9). It compares `skycell_moc_union`, `_intersection`,
+`_difference`, `_complement` and `_degrade` with MOCPy's operations, and
+`skycell_moc_union_agg` over 200 MOCs at once with MOCPy's union of them.
+
+```bash
+PGDATABASE=real36 python3 setops.py
+```
+
+Result ([`setops.txt`](setops.txt)): every operation equals MOCPy's, cell for
+cell, for all 60 pairs, and so does the aggregate. The difference is compared
+with MOCPy's A ∩ (complement of B): MOCPy 0.21.0's own `difference()` returns
+an empty MOC when the two MOCs do not overlap (`MOC("1/1").difference(MOC("1/5"))`
+gives `1/`), and so differed from it for 21 of the 60 pairs.
