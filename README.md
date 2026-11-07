@@ -476,9 +476,11 @@ operators above it need, so a covering never misses a row. The exact
 membership test runs on what it keeps. A constant composite written as a
 top-level condition is answered by the custom scan (since 0.39), as a cone is.
 It is covered once at plan time, and the scan reads the ranges in cell order,
-testing each row from its `ra` and `dec`. Under an `OR`, or with
-`skycell.custom_scan` off, it is rewritten into range conditions, as a polygon
-is.
+testing each row from its `ra` and `dec`. Under an `OR` it is folded with the
+other constant regions of the same position
+([Booleans of regions](#booleans-of-regions-become-one-region)); otherwise, or
+with `skycell.custom_scan` off, it is rewritten into range conditions, as a
+polygon is.
 
 Regions are compared with composites too, stored or constant: `&&`, `@>`
 and `<@` between regions, and ADQL `INTERSECTS` and `CONTAINS` of two
@@ -510,6 +512,56 @@ polygon is exact.
 
 STC-S `BOX ICRS ra dec width height` is read as the four-corner polygon
 `box()` makes, alone or inside a composite, and prints as that `POLYGON`.
+
+### Booleans of regions become one region
+
+Since 0.53 a query need not write the composite itself. A position tested
+against several constant regions, joined by `OR`, `AND` and `NOT`, is folded
+at plan time into one test against their union, intersection or difference,
+and answered by the custom scan with one covering of the whole shape:
+
+```sql
+-- planned as POINT <@ UNION(CIRCLE, CIRCLE), one SkycellCone scan
+SELECT * FROM cat
+WHERE CONTAINS(POINT('ICRS', ra, dec), CIRCLE('ICRS', 10.0, 20, 0.5)) = 1
+   OR CONTAINS(POINT('ICRS', ra, dec), CIRCLE('ICRS', 10.6, 20, 0.5)) = 1;
+```
+
+| written as | folded into |
+|---|---|
+| `p <@ A OR p <@ B` | `p <@ UNION(A, B)` |
+| `p <@ A AND p <@ B` | `p <@ INTERSECTION(A, B)` |
+| `p <@ A AND NOT p <@ B` (or `CONTAINS(p, B) = 0`) | `p <@ DIFFERENCE(A, B)` |
+| `p <@ A OR NOT p <@ B` | `p <@ UNION(A, NOT(B))` |
+
+The answer cannot change: a composite's membership is the boolean of its
+pieces' exact tests, and every function involved is strict, so a NULL
+position gives NULL either way. Folding happens innermost first, so
+`(p <@ A OR p <@ B) AND NOT p <@ C` becomes one difference, and other
+conditions are kept beside the folded one. It applies to ADQL's
+`CONTAINS(...) = 1` and `= 0`, `INTERSECTS` of a point, and the native `<@`
+and `@>`, at every query level. What does not fold: regions that are not
+constant (a column, a parameter of a generic plan, a sub-select), two different
+position expressions (`pos` and `point(ra, dec)` are two), and an `OR` holding
+a term on anything else (`... OR mag < 5`), which keeps the range rewrite.
+
+On the composite benchmark's shapes (60 each, 0.05°–2°, the 10M real Gaia DR3
+positions; [`bench/results-fold/`](bench/results-fold/)), the folded boolean
+against the same boolean unfolded:
+
+| shape | folded ÷ unfolded | folded ÷ one `REGION` | folded ÷ pgSphere |
+|---|---|---|---|
+| annulus | 0.84 [0.79, 0.91] | 1.05 [0.99, 1.15] | 0.89 [0.82, 0.98] |
+| two circles | 0.32 [0.29, 0.36] | 1.04 [1.02, 1.07] | 0.90 [0.88, 0.93] |
+| lens | 0.76 [0.73, 0.80] | 1.05 [1.01, 1.08] | 0.50 [0.43, 0.60] |
+| square less circle | 0.84 [0.82, 0.86] | 1.01 [0.99, 1.04] | 0.15 [0.12, 0.20] |
+| five circles | 0.29 [0.27, 0.32] | 1.17 [1.12, 1.22] | 0.71 [0.69, 0.73] |
+
+All four spellings counted the same rows for all 300 shapes. What remains
+against one `REGION` is parsing the longer query (five `CONTAINS`, `POINT` and
+`CIRCLE` calls to resolve for the five circles): planning the folded boolean
+takes about what planning the `REGION` does, and a third of the unfolded one.
+`skycell.fold_regions = off` answers each region on its own, as written.
 
 ## Operators and functions
 
@@ -558,7 +610,7 @@ read more naturally in plain SQL, and are what a pgSphere user already writes.
 
 | Operator | ADQL spelling | Meaning |
 |---|---|---|
-| `skypos <@ skyregion` | `CONTAINS(p, r) = 1`, `INTERSECTS(p, r) = 1` | position inside region. Against a circle (constant, or built per row as in a cross-match) it is planned exactly as `skycell_cone`, through the custom scan; so is a constant polygon, box (since 0.43) or composite (since 0.39). A per-row polygon, or one under an `OR`, is rewritten into index ranges |
+| `skypos <@ skyregion` | `CONTAINS(p, r) = 1`, `INTERSECTS(p, r) = 1` | position inside region. Against a circle (constant, or built per row as in a cross-match) it is planned exactly as `skycell_cone`, through the custom scan; so is a constant polygon, box (since 0.43) or composite (since 0.39). Constant regions of the same position joined by `OR`, `AND` and `NOT` are folded into one composite (since 0.53). A per-row polygon, or one under an `OR` with anything else, is rewritten into index ranges |
 | `skyregion @> skypos` | `INTERSECTS(r, p) = 1` | the same, reversed. When `skyregion` is a stored column with a GiST (or MOC GIN) index, indexed through that instead |
 | `skyregion && skyregion` | `INTERSECTS(a, b) = 1` | regions overlap. Indexed by `CREATE INDEX ON t USING gist (region)` |
 | `skyregion @> skyregion` | `CONTAINS(b, a) = 1` | `a` wholly contains `b`. The same index |
@@ -1070,6 +1122,7 @@ compared with MOCPy's A ∩ (complement of B), because MOCPy 0.21.0's own
 
 | GUC | default | meaning |
 |---|---|---|
+| `skycell.fold_regions` | on | answer a position tested against several constant regions, joined by `OR`, `AND` and `NOT`, as one test against their union, intersection or difference (0.53; [Booleans of regions](#booleans-of-regions-become-one-region)). Off answers each region on its own, as written |
 | `skycell.custom_scan` | on | answer `skycell_cone` (and `skycell_join`, `skycell_radial_query`, and ADQL's `CONTAINS(POINT, CIRCLE) = 1`, `point <@ circle` and `DISTANCE(…) < r`) with the `SkycellCone` scan node instead of rewriting it into B-tree range conditions — constant cones, cross-match cones (a parameterized scan, one covering per outer row) and cones over parameters alone (generic plans, correlated sub-selects). A cone that is not a top-level `AND` term of a `WHERE`/`JOIN ON` (one under an `OR`, say) keeps the rewrite, so it stays indexable. Off restores the rewrite everywhere |
 | `skycell.index_filter` | on | when the cell index also holds the position — `CREATE INDEX ON t ((skycell_ang2cell(ra, dec))) INCLUDE (ra, dec)` — the `SkycellCone` scan tests the cone on each index entry and fetches from the table only the rows inside it, instead of every row of the covering cells (both modes, constant cones and cross-matches). The plan's exact test still applies to every row, so the answer is the same; off reads every row of the covering cells |
 | `skycell.nearest_bestfirst` | on | on a heap out of cell order, find a nearest-neighbour search's first rows by a best-first walk over HEALPix cells (0.52) instead of a first ring sized from the density ([Nearest neighbours](#nearest-neighbours)) |
@@ -1543,8 +1596,9 @@ locally), the standalone selftests, and the reference translators.
 - **Where the custom scan applies.** It answers cones, cross-matches and
   constant polygons, boxes and composites; per-row polygons and stored regions
   use the range rewrite and the region indexes. The search must be a top-level
-  `AND` term of a `WHERE` or `JOIN ON`: one under an `OR` is rewritten instead
-  and stays indexable through a `BitmapOr`. It reads heap
+  `AND` term of a `WHERE` or `JOIN ON`, or a boolean of constant regions of
+  one position, which is folded into one (since 0.53); one under an `OR` with
+  anything else is rewritten instead and stays indexable through a `BitmapOr`. It reads heap
   tables only. On a partitioned table each partition gets the scan (since
   0.44; constant searches kept the rewrite before), and a partition without
   the cell index a sequential scan. A cross-match against a partitioned

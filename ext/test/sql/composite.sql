@@ -161,8 +161,9 @@ FROM ccat WHERE contains(pos, region('DIFFERENCE ICRS (CIRCLE 10 20 2 CIRCLE 10 
 
 -- which plan: a top-level composite goes to the custom scan (0.39), over its
 -- covering's ranges, as a cone does, from a skypos column or from ra and dec;
--- under an OR, or with the custom scan off, it keeps the range rewrite.  Every
--- plan must give the exact test's rows.
+-- under an OR with other regions of the same position it is folded with them
+-- (0.53); with the custom scan off it keeps the range rewrite.  Every plan must
+-- give the rows of the exact tests, joined as written (no fold, no index).
 CREATE INDEX ccat_radec ON ccat (skycell_ang2cell(ra, dec));
 ANALYZE ccat;
 CREATE FUNCTION comp_plan_kind(q text) RETURNS text LANGUAGE plpgsql AS $$
@@ -183,6 +184,7 @@ BEGIN
   SET LOCAL enable_indexscan = off;
   SET LOCAL enable_bitmapscan = off;
   SET LOCAL skycell.custom_scan = off;
+  SET LOCAL skycell.fold_regions = off;
   EXECUTE q INTO m;
   agree := n = m;
   -- SET LOCAL lasts to the end of the statement's transaction, which runs
@@ -190,6 +192,7 @@ BEGIN
   SET LOCAL enable_indexscan = on;
   SET LOCAL enable_bitmapscan = on;
   SET LOCAL skycell.custom_scan = on;
+  SET LOCAL skycell.fold_regions = on;
 END $$;
 SELECT name, (comp_plan_rows(q)).* FROM (VALUES
   ('pos <@ union',        'SELECT count(*) FROM ccat WHERE pos <@ region(''UNION ICRS (CIRCLE 8 18 1 CIRCLE 12 22 1.5)'')'),
@@ -201,6 +204,47 @@ SELECT name, (comp_plan_rows(q)).* FROM (VALUES
 SET skycell.custom_scan = off;
 SELECT comp_plan_kind('SELECT count(*) FROM ccat WHERE pos <@ region(''UNION ICRS (CIRCLE 8 18 1 CIRCLE 12 22 1.5)'')') AS custom_scan_off;
 RESET skycell.custom_scan;
+
+-- booleans of constant regions on one position, folded into one composite
+-- (0.53): OR to a union, AND to an intersection, AND NOT to a difference,
+-- ADQL's = 1 and = 0, nested; not across two positions, nor an OR holding a
+-- term on something else; and each as written with the fold off
+SELECT name, (comp_plan_rows(q)).* FROM (VALUES
+  ('OR of two',           'SELECT count(*) FROM ccat WHERE pos <@ circle(''ICRS'', 8, 18, 1) OR pos <@ circle(''ICRS'', 12, 22, 1.5)'),
+  ('OR of three, ADQL',   'SELECT count(*) FROM ccat WHERE CONTAINS(POINT(''ICRS'', ra, dec), CIRCLE(''ICRS'', 8, 18, 1)) = 1 OR CONTAINS(POINT(''ICRS'', ra, dec), BOX(''ICRS'', 12, 22, 2, 1)) = 1 OR CONTAINS(POINT(''ICRS'', ra, dec), CIRCLE(''ICRS'', 10, 20, 0.5)) = 1'),
+  ('AND of two',          'SELECT count(*) FROM ccat WHERE pos <@ circle(''ICRS'', 10, 20, 2) AND pos <@ circle(''ICRS'', 11.5, 20, 2)'),
+  ('AND NOT',             'SELECT count(*) FROM ccat WHERE pos <@ circle(''ICRS'', 10, 20, 2) AND NOT pos <@ circle(''ICRS'', 10, 20, 1)'),
+  ('ADQL = 0',            'SELECT count(*) FROM ccat WHERE CONTAINS(POINT(''ICRS'', ra, dec), CIRCLE(''ICRS'', 10, 20, 2)) = 1 AND CONTAINS(POINT(''ICRS'', ra, dec), CIRCLE(''ICRS'', 10, 20, 1)) = 0'),
+  ('nested',              'SELECT count(*) FROM ccat WHERE (pos <@ circle(''ICRS'', 8, 18, 1.5) OR circle(''ICRS'', 12, 22, 1.5) @> pos) AND NOT pos <@ box(''ICRS'', 10, 20, 8, 0.5) AND id % 3 > 0'),
+  ('OR with NOT',         'SELECT count(*) FROM ccat WHERE pos <@ circle(''ICRS'', 10, 20, 1) OR NOT pos <@ circle(''ICRS'', 10, 20, 170)'),
+  ('two positions',       'SELECT count(*) FROM ccat WHERE pos <@ circle(''ICRS'', 8, 18, 1) OR point(''ICRS'', ra, dec) <@ circle(''ICRS'', 12, 22, 1.5)'),
+  ('OR another term',     'SELECT count(*) FROM ccat WHERE pos <@ circle(''ICRS'', 8, 18, 1) OR pos <@ circle(''ICRS'', 12, 22, 1.5) OR id = 7')
+) v(name, q) ORDER BY name;
+SET skycell.fold_regions = off;
+SELECT comp_plan_kind('SELECT count(*) FROM ccat WHERE pos <@ circle(''ICRS'', 8, 18, 1) OR pos <@ circle(''ICRS'', 12, 22, 1.5)') AS fold_off;
+RESET skycell.fold_regions;
+-- the folded region, as the plan shows it
+EXPLAIN (COSTS OFF) SELECT count(*) FROM ccat
+WHERE pos <@ circle('ICRS', 10, 20, 2) AND NOT pos <@ circle('ICRS', 10, 20, 1) AND NOT pos <@ circle('ICRS', 11, 20, 0.3);
+
+-- random booleans of circles and boxes, two or three deep, against the same
+-- tests joined as written
+CREATE FUNCTION rand_leaf_sql(p text) RETURNS text LANGUAGE sql VOLATILE AS $$
+  SELECT CASE WHEN random() < 0.6
+    THEN format('%s <@ circle(''ICRS'', %s, %s, %s)', p, round((6 + 8 * random())::numeric, 3), round((16 + 8 * random())::numeric, 3), round((0.2 + 2 * random())::numeric, 3))
+    ELSE format('%s <@ box(''ICRS'', %s, %s, %s, %s)', p, round((6 + 8 * random())::numeric, 3), round((16 + 8 * random())::numeric, 3), round((0.5 + 3 * random())::numeric, 3), round((0.5 + 3 * random())::numeric, 3)) END $$;
+CREATE FUNCTION rand_bool_sql(p text, depth int) RETURNS text LANGUAGE plpgsql VOLATILE AS $$
+DECLARE k float8 := random();
+BEGIN
+  IF depth = 0 OR k < 0.2 THEN RETURN rand_leaf_sql(p); END IF;
+  IF k < 0.5 THEN RETURN '(' || rand_bool_sql(p, depth - 1) || ' OR ' || rand_bool_sql(p, depth - 1) || ')'; END IF;
+  IF k < 0.8 THEN RETURN '(' || rand_bool_sql(p, depth - 1) || ' AND ' || rand_bool_sql(p, depth - 1) || ')'; END IF;
+  RETURN '(NOT ' || rand_bool_sql(p, depth - 1) || ')';
+END $$;
+SELECT count(*) AS booleans, count(*) FILTER (WHERE (comp_plan_rows(q)).agree) AS agree
+FROM (SELECT format('SELECT count(*) FROM ccat WHERE %s', rand_bool_sql(CASE WHEN i % 2 = 0 THEN 'pos' ELSE 'point(''ICRS'', ra, dec)' END, 2 + i % 2)) q
+      FROM generate_series(1, 60) i) t;
+DROP FUNCTION rand_bool_sql(text, int), rand_leaf_sql(text);
 DROP FUNCTION comp_plan_rows(text), comp_plan_kind(text);
 DROP INDEX ccat_radec;
 
