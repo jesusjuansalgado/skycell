@@ -1748,6 +1748,13 @@ single_varno(Node *node)
 	return varno;
 }
 
+/* pos_ra_dec() for cone_scan.c: a per-row region's scan (0.54) */
+bool
+skycell_pos_coords(Oid funcid, Node *pt, Node **ra, Node **dec)
+{
+	return pos_ra_dec(funcid, pt, ra, dec);
+}
+
 /* ra and dec of a position: point([coordsys,] ra, dec), a constant or a column */
 static bool
 pos_ra_dec(Oid funcid, Node *pt, Node **ra, Node **dec)

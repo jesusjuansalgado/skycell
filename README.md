@@ -357,7 +357,8 @@ for the spellings that work from `ra` and `dec` (ADQL's, `skycell_join`,
 `skycell_radial_query`) — neither an index on `skycell_ang2cell(ra, dec)` nor a
 stored `cell` column declared to hold it. Per-row regions are indexed too: a
 per-row cone (a cross-match) by the custom scan, one covering per outer row,
-and a per-row polygon or stored region by the rewrite's run-time range slots.
+and a per-row region (a stored footprint joined to the catalogue) by the custom
+scan too, each outer row's region covered as it runs.
 
 ## Composite regions: instrument footprints
 
@@ -649,8 +650,9 @@ operators (`@>`/`<@`, in either argument order — they're commutators of each
 other) directly against it, region side non-constant included — what a stored
 footprint column (an ObsCore `s_region`, say) should carry. A per-row region
 matched against a plain point catalogue needs no `skyregion` column of its own:
-a per-row circle goes to the custom scan and a per-row polygon to the rewrite's
-run-time range slots.
+a per-row circle, or a per-row `skyregion` (a footprint of another table, or
+`REGION()` of its STC-S text), goes to the custom scan, covered per outer row;
+a per-row polygon given as an array, to the rewrite's run-time range slots.
 
 **Region opclasses.** `CREATE INDEX ON t USING gist (region)` picks
 `skyregion_box4_gist_ops`: an axis-aligned 3D box rounded outward to `float4`
@@ -1135,7 +1137,7 @@ compared with MOCPy's A ∩ (complement of B), because MOCPy 0.21.0's own
 | `skycell.max_area_ratio` | 64 | a partly covered cell may not exceed this × the region's area |
 | `skycell.use_stats` | on | use the histogram as a density map |
 | `skycell.cache_coverings` | on | memoise coverings per backend |
-| `skycell.join_slots` | 4 | range slots the rewrite emits for a non-constant region (used when the custom scan does not apply: `custom_scan` off, per-row polygons and stored regions) |
+| `skycell.join_slots` | 4 | range slots the rewrite emits for a non-constant region (used when the custom scan does not apply: `custom_scan` off, a region under an `OR`, per-row polygon arrays) |
 | `skycell.exact_cells` | on | tight cell geometry; off falls back to the `max_pixrad` cap |
 | `skycell.force_order` | -1 | diagnostics: cover cones at this order (-1 = let the model choose) |
 | `skycell.split_cost`, `skycell.max_steps` | 1, 4000 | refinement guards for polygons and very large cones |
@@ -1246,13 +1248,6 @@ in [`docs/testing.md`](docs/testing.md); the tutorials' own SQL is checked by
   per covering is the leader's own, labelled so, since a node that is not
   parallel aware gets no shared memory to collect the workers' figures; the rows
   removed by the index filter are counted in every process.
-- **A stored region against a catalogue, in a join.** The sources inside one
-  footprint taken from another table (`JOIN obscore o ON CONTAINS(POINT(c.ra,
-  c.dec), o.s_region) = 1 WHERE o.obs_id = ...`) are searched through
-  run-time range slots on the cell index, but the planner overestimates their
-  rows and can prefer reading the whole catalogue. Write the footprint as a
-  scalar sub-query instead, which is searched like a constant region
-  ([tutorial 2](docs/tutorials/02-regions-and-footprints.md#sources-inside-a-footprint)).
 - **Planning costs.** A covering is computed per query: skycell plans a 1″
   cone in 0.054 ms, against 0.040 ms for pgSphere, so on a small table (0.5M
   rows) a small cone at a new position every query can still favour pgSphere.

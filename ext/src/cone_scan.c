@@ -1013,6 +1013,45 @@ region_with_partition_bounds(PlannerInfo *root, FuncExpr *scan)
 	return res;
 }
 
+/*
+ * Whether a clause is the range slots the rewrite gives a per-row region
+ * (adql.c): an AND / OR of comparisons of the cell with
+ * skycell_region_bound(rg, ...), every one of them on this region.  *cell,
+ * if asked, gets the cell expression they compare.
+ */
+static bool
+region_slot_clause(Node *n, Node *rg, Node **cell)
+{
+	if (n == NULL)
+		return false;
+	if (IsA(n, BoolExpr))
+	{
+		BoolExpr   *b = (BoolExpr *) n;
+		ListCell   *lc;
+
+		if (b->boolop == NOT_EXPR)
+			return false;
+		foreach(lc, b->args)
+			if (!region_slot_clause(lfirst(lc), rg, cell))
+				return false;
+		return true;
+	}
+	if (IsA(n, OpExpr) && list_length(((OpExpr *) n)->args) == 2)
+	{
+		FuncExpr   *r = (FuncExpr *) lsecond(((OpExpr *) n)->args);
+		char	   *name;
+
+		if (!IsA(r, FuncExpr) || list_length(r->args) != 5 ||
+			(name = get_func_name(r->funcid)) == NULL ||
+			strcmp(name, "skycell_region_bound") != 0 || !equal(linitial(r->args), rg))
+			return false;
+		if (cell != NULL)
+			*cell = linitial(((OpExpr *) n)->args);
+		return true;
+	}
+	return false;
+}
+
 /* whether a scan clause is one of those comparisons for this region scan */
 static bool
 region_implies_clause(FuncExpr *driving, Node *clause)
@@ -1024,6 +1063,9 @@ region_implies_clause(FuncExpr *driving, Node *clause)
 				hi,
 				v;
 
+	/* a per-row region: its range slots, which its covering implies (0.54) */
+	if (!IsA(rg, Const))
+		return region_slot_clause(clause, (Node *) rg, NULL);
 	if (!IsA(clause, OpExpr) || list_length(((OpExpr *) clause)->args) != 2 ||
 		!IsA(rg, Const) || rg->constisnull)
 		return false;
@@ -1749,6 +1791,197 @@ join_cone_estimate_uncached(PlannerInfo *root, List *args, join_estimate *e)
 }
 
 /*
+ * What a per-row region costs per outer row (0.54): the regions of up to
+ * REGION_SAMPLES outer rows, read spread over the outer table's pages,
+ * covered against the relation's density as the scan will cover them, and
+ * averaged.  The region must be an expression of one plain table's columns
+ * (a skyregion column, or REGION() of an STC-S text one); anything else keeps
+ * the range slots, whose rows the planner cannot estimate.
+ */
+#define REGION_SAMPLES 8
+
+/*
+ * Sampling and covering the regions costs a few milliseconds of planning on a
+ * dense catalogue, so the estimate is kept for the backend: keyed by the
+ * outer table, the region expression, the inner relation's density source,
+ * and both tables' row counts, so that an ANALYZE or a load that changes
+ * them takes a new sample.
+ */
+#define REGION_EST_CACHE 16
+
+typedef struct
+{
+	Oid			orel;
+	Oid			statrel;
+	double		otuples,
+				ntotal;
+	char	   *key;
+	join_estimate e;
+} region_est_entry;
+
+static region_est_entry region_est_cache[REGION_EST_CACHE];
+static int	region_est_n = 0,
+			region_est_next = 0;
+static MemoryContext region_est_cxt = NULL;
+
+static bool region_join_estimate_uncached(PlannerInfo *root, List *args, join_estimate *e);
+
+static bool
+region_join_estimate(PlannerInfo *root, List *args, join_estimate *e)
+{
+	Node	   *rg = lfourth(args);
+	Relids		ov = pull_varnos(root, rg);
+	int			ovarno;
+	RangeTblEntry *orte;
+	RelOptInfo *orelinfo;
+	sc_density	dens;
+	Oid			statrel;
+	bool		uses_cell_ops;
+	char	   *key;
+	region_est_entry *c;
+
+	if (!bms_get_singleton_member(ov, &ovarno) || !sampleable_rel(root, ovarno, &orte))
+		return false;
+	orelinfo = find_base_rel(root, ovarno);
+	density_for_var(root, linitial(args), &dens, &statrel, &uses_cell_ops);
+	key = nodeToString(rg);
+	for (int i = 0; i < region_est_n; i++)
+	{
+		c = &region_est_cache[i];
+		if (c->orel == orte->relid && c->statrel == statrel && c->ntotal == dens.ntotal &&
+			c->otuples == orelinfo->tuples && strcmp(c->key, key) == 0)
+		{
+			*e = c->e;
+			return true;
+		}
+	}
+	if (!region_join_estimate_uncached(root, args, e))
+		return false;
+	if (region_est_cxt == NULL)
+		region_est_cxt = AllocSetContextCreate(TopMemoryContext, "skycell region estimates",
+											   ALLOCSET_SMALL_SIZES);
+	c = &region_est_cache[region_est_next];
+	if (region_est_next < region_est_n)
+		pfree(c->key);
+	c->orel = orte->relid;
+	c->statrel = statrel;
+	c->ntotal = dens.ntotal;
+	c->otuples = orelinfo->tuples;
+	c->key = MemoryContextStrdup(region_est_cxt, key);
+	c->e = *e;
+	region_est_next = (region_est_next + 1) % REGION_EST_CACHE;
+	region_est_n = Max(region_est_n, region_est_next == 0 ? REGION_EST_CACHE : region_est_next);
+	return true;
+}
+
+static bool
+region_join_estimate_uncached(PlannerInfo *root, List *args, join_estimate *e)
+{
+	Node	   *cell = linitial(args),
+			   *rg = lfourth(args);
+	Relids		ov;
+	int			ovarno;
+	RangeTblEntry *orte;
+	sc_density	dens;
+	sc_cover_params p;
+	bool		uses_cell_ops;
+	Relation	orel;
+	BlockNumber nblocks;
+	MemoryContext cxt,
+				old;
+	EState	   *estate;
+	ExprContext *econtext;
+	ExprState  *x_rg;
+	TupleTableSlot *oslot;
+	TableScanDesc tscan = NULL;
+	int			n = 0,
+				nblk,
+				per_blk;
+
+	memset(e, 0, sizeof(*e));
+	ov = pull_varnos(root, rg);
+	if (!bms_get_singleton_member(ov, &ovarno) || !sampleable_rel(root, ovarno, &orte) ||
+		contain_volatile_functions(rg) || contain_subplans(rg) || !ActiveSnapshotSet())
+		return false;
+	density_for_var(root, cell, &dens, &e->statrel, &uses_cell_ops);
+	if (!(dens.ntotal > 0))
+		return false;
+	e->ntotal = dens.ntotal;
+	skycell_scan_params(&p, &dens);
+
+	cxt = AllocSetContextCreate(CurrentMemoryContext, "skycell region sample", ALLOCSET_DEFAULT_SIZES);
+	old = MemoryContextSwitchTo(cxt);
+	orel = table_open(orte->relid, NoLock);	/* locked by the parser */
+	nblocks = RelationGetNumberOfBlocks(orel);
+	if (nblocks == 0 || orel->rd_tableam->scan_set_tidrange == NULL)
+	{
+		table_close(orel, NoLock);
+		MemoryContextSwitchTo(old);
+		MemoryContextDelete(cxt);
+		return false;
+	}
+	estate = CreateExecutorState();
+	econtext = GetPerTupleExprContext(estate);
+	x_rg = ExecPrepareExpr((Expr *) copyObject(rg), estate);
+	oslot = table_slot_create(orel, NULL);
+	nblk = (int) Min((BlockNumber) REGION_SAMPLES, nblocks);
+	per_blk = (REGION_SAMPLES + nblk - 1) / nblk;
+	for (int k = 0; k < nblk && n < REGION_SAMPLES; k++)
+	{
+		BlockNumber b = (BlockNumber) (((uint64) k * nblocks) / nblk);
+		ItemPointerData lo,
+					hi;
+		int			got = 0;
+
+		ItemPointerSet(&lo, b, FirstOffsetNumber);
+		ItemPointerSet(&hi, b, MaxOffsetNumber);
+		if (tscan == NULL)
+			tscan = table_beginscan_tidrange(orel, GetActiveSnapshot(), &lo, &hi);
+		else
+			table_rescan_tidrange(tscan, &lo, &hi);
+		while (got < per_blk && n < REGION_SAMPLES &&
+			   table_scan_getnextslot_tidrange(tscan, ForwardScanDirection, oslot))
+		{
+			bool		isnull;
+			Datum		d;
+			sc_region	reg;
+			sc_cover	cov;
+
+			got++;
+			ResetExprContext(econtext);
+			econtext->ecxt_scantuple = oslot;
+			d = ExecEvalExprSwitchContext(x_rg, econtext, &isnull);
+			n++;				/* a NULL region is a row that matches nothing */
+			if (isnull)
+				continue;
+			skycell_region_from_datum(d, &reg);
+			sc_cover_compute(&reg, &dens, &p, &cov);
+			e->nranges += cov.n;
+			e->cand += cov.exp_rows;
+			e->matches += cov.area > 0 ? sc_region_expected_rows(&reg, &dens, &cov) : 0;
+			e->steps += cov.steps;
+			sc_cover_free(&cov);
+			sc_region_free(&reg);
+		}
+	}
+	if (tscan != NULL)
+		table_endscan(tscan);
+	ExecDropSingleTupleTableSlot(oslot);
+	FreeExecutorState(estate);
+	table_close(orel, NoLock);
+	MemoryContextSwitchTo(old);
+	MemoryContextDelete(cxt);
+	if (n == 0)
+		return false;
+	e->nranges /= n;
+	e->cand /= n;
+	e->matches /= n;
+	e->steps /= n;
+	e->sampled = true;
+	return true;
+}
+
+/*
  * Selectivity of a cross-match or run-time cone, for skycell_support's
  * SupportRequestSelectivity: the rows one outer row's cone is expected to
  * hold over the rows in the relation, so that the join's estimated size is
@@ -1938,7 +2171,9 @@ add_runtime_path(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte, FuncExp
 	double		rows = ppi ? ppi->ppi_rows : rel->rows;
 	AttrNumber	attnum = IsA(cell, Var) ? ((Var *) cell)->varattno : 1;
 
-	if ((ix = cell_index(rel, cell)) == NULL || !join_cone_estimate(root, f->args, &e))
+	if ((ix = cell_index(rel, cell)) == NULL ||
+		!(list_length(f->args) == 4 ? region_join_estimate(root, f->args, &e)
+		  : join_cone_estimate(root, f->args, &e)))
 		return;
 	cp = makeNode(CustomPath);
 	cp->path.pathtype = T_CustomScan;
@@ -1989,6 +2224,74 @@ add_runtime_path(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte, FuncExp
 	add_path(rel, &cp->path);
 }
 
+/*
+ * A region read from another relation's row -- the footprint of an
+ * observation, the sources inside it -- reaches this relation as the
+ * rewrite's range slots and exact test (adql.c), whose rows the planner
+ * cannot estimate: each slot is taken for a ninth of the relation, and a scan
+ * of every row looked cheaper.  Offer the scan parameterized by that
+ * relation, each outer row's region covered as the scan runs, as a
+ * cross-match's cone is (0.54).
+ */
+static void
+add_region_join_paths(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte)
+{
+	ListCell   *lc;
+
+	foreach(lc, rel->joininfo)
+	{
+		RestrictInfo *ri = (RestrictInfo *) lfirst(lc);
+		FuncExpr   *x = (FuncExpr *) ri->clause;
+		Node	   *pos,
+				   *rg,
+				   *ra,
+				   *dec,
+				   *cell = NULL;
+		char	   *name;
+		Relids		outer;
+		ListCell   *lc2;
+		Oid			t[4];
+		Oid			fn;
+
+		if (ri->pseudoconstant || !IsA(x, FuncExpr) || list_length(x->args) != 3 ||
+			!join_clause_is_movable_to(ri, rel) ||
+			(name = get_func_name(x->funcid)) == NULL || strcmp(name, "skycell_in_region") != 0)
+			continue;
+		pos = linitial(x->args);
+		rg = lsecond(x->args);
+		outer = pull_varnos(root, rg);
+		if (bms_is_empty(outer) || bms_overlap(outer, rel->relids) ||
+			!bms_is_subset(pull_varnos(root, pos), rel->relids) ||
+			contain_volatile_functions(rg) || contain_subplans(rg))
+			continue;
+		foreach(lc2, rel->joininfo)
+		{
+			Node	   *c = (Node *) lfirst_node(RestrictInfo, lc2)->clause;
+
+			if (region_slot_clause(c, rg, &cell))
+				break;
+			cell = NULL;
+		}
+		if (cell == NULL || !skycell_pos_coords(x->funcid, pos, &ra, &dec))
+			continue;
+		t[0] = INT8OID;
+		t[1] = FLOAT8OID;
+		t[2] = FLOAT8OID;
+		t[3] = exprType(rg);
+		fn = LookupFuncName(list_make2(makeString(get_namespace_name(get_func_namespace(x->funcid))),
+									   makeString(pstrdup("skycell_region_scan"))),
+							4, t, true);
+		if (!OidIsValid(fn))
+			continue;
+		region_scan_funcid = fn;
+		outer = bms_union(bms_difference(ri->clause_relids, rel->relids), rel->lateral_relids);
+		add_runtime_path(root, rel, rte,
+						 makeFuncExpr(fn, BOOLOID, list_make4(copyObject(cell), ra, dec, copyObject(rg)),
+									  InvalidOid, InvalidOid, COERCE_EXPLICIT_CALL),
+						 get_baserel_parampathinfo(root, rel, outer));
+	}
+}
+
 static void
 cone_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, Index rti, RangeTblEntry *rte)
 {
@@ -2019,6 +2322,8 @@ cone_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, Index rti, RangeTblEnt
 	}
 
 	add_nearest_path(root, rel, rte);
+	if (rel->joininfo != NIL)
+		add_region_join_paths(root, rel, rte);
 	if (!OidIsValid(cone_funcid) && !OidIsValid(region_scan_funcid))
 		return;
 
@@ -2158,6 +2463,7 @@ cone_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, Index rti, RangeTblEnt
 			continue;
 		add_runtime_path(root, rel, rte, f, get_baserel_parampathinfo(root, rel, outer));
 	}
+
 }
 
 /* ------------------------------------------------------------------ */
@@ -3124,6 +3430,51 @@ cone_cover_at(ConeScanState *st, double ra0, double dec0, double radius)
 	return rows;
 }
 
+/* the covering of a region datum, as cone_cover_at() covers a cone (0.54) */
+static void
+cone_cover_region(ConeScanState *st, Datum d)
+{
+	ExprContext *econtext = st->css.ss.ps.ps_ExprContext;
+	EState	   *estate = st->css.ss.ps.state;
+	MemoryContext old;
+	sc_region	reg;
+	sc_cover	cov;
+	sc_cover_params p;
+
+	cone_load_density(st);
+	if (!st->have_keyrange)
+		cone_key_range(st);
+	old = MemoryContextSwitchTo(econtext->ecxt_per_tuple_memory);
+	skycell_region_from_datum(d, &reg);
+	skycell_scan_params(&p, &st->dens);
+	sc_cover_compute(&reg, &st->dens, &p, &cov);
+	MemoryContextSwitchTo(old);
+	if (cov.n > st->rt_cap)
+	{
+		st->rt_cap = Max(cov.n, 2 * st->rt_cap);
+		st->rt_bounds = (st->rt_bounds == NULL)
+			? MemoryContextAlloc(estate->es_query_cxt, sizeof(int64) * 2 * st->rt_cap)
+			: repalloc(st->rt_bounds, sizeof(int64) * 2 * st->rt_cap);
+	}
+	st->nranges = 0;
+	for (int r = 0; r < cov.n; r++)
+	{
+		int64		lo = cov.r[r].lo,
+					hi = cov.r[r].hi;
+
+		if (hi < st->kmin || lo > st->kmax)
+			continue;
+		st->rt_bounds[2 * st->nranges] = Max(lo, st->kmin);
+		st->rt_bounds[2 * st->nranges + 1] = Min(hi, st->kmax);
+		st->nranges++;
+	}
+	st->bounds = st->rt_bounds;
+	st->ncoverings += 1;
+	st->nranges_total += st->nranges;
+	sc_cover_free(&cov);
+	sc_region_free(&reg);
+}
+
 /*
  * A cross-match cone's covering for the current outer row: centre and radius
  * evaluated (the outer row's columns are nestloop parameters by now) and
@@ -3142,6 +3493,16 @@ cone_cover_row(ConeScanState *st)
 
 	st->need_cover = false;
 	st->nranges = 0;
+	if (list_length(st->args) == 1)
+	{
+		/* a per-row region (0.54): a NULL one matches nothing */
+		bool		isnull;
+		Datum		d = ExecEvalExpr((ExprState *) linitial(st->args), econtext, &isnull);
+
+		if (!isnull)
+			cone_cover_region(st, d);
+		return;
+	}
 	foreach(lc, st->args)
 	{
 		bool		isnull;

@@ -156,28 +156,30 @@ CREATE INDEX cat_cell ON cat (skycell_ang2cell(ra, dec));
 ANALYZE cat;
 ```
 
-Write the footprint as a scalar sub-query: it is fetched once, and the
-catalogue is searched with it through its index.
+Join the footprints to the catalogue: each footprint row's region is covered
+as the scan runs, and the catalogue is searched through its index, once per
+footprint, as a cross-match searches it once per target:
 
 ```sql
 EXPLAIN (COSTS OFF)
+SELECT c.source_id FROM cat c JOIN obscore o ON CONTAINS(POINT(c.ra, c.dec), o.s_region) = 1
+WHERE o.obs_id = 'obs42';
+-- expect: Ranges: per outer row
+-- the same with the footprint as a sub-query
+EXPLAIN (COSTS OFF)
 SELECT c.source_id FROM cat c
 WHERE CONTAINS(POINT(c.ra, c.dec), (SELECT s_region FROM obscore WHERE obs_id = 'obs42')) = 1;
--- expect: Bitmap Index Scan on cat_cell
+-- expect: cat_cell
 ```
 
-Written as a join instead (`FROM cat c JOIN obscore o ON CONTAINS(POINT(c.ra,
-c.dec), o.s_region) = 1 WHERE o.obs_id = 'obs42'`), the planner currently
-underestimates the indexed plan and may read the whole catalogue: prefer the
-sub-query form for one footprint. For counts per footprint over many
-footprints, the GiST join above, from the catalogue's side, is the one to
-use:
+Counts per footprint, over a few footprints or many; a footprint column kept
+as STC-S text works too, read with `REGION()`:
 
 ```sql
-SELECT o.obs_id, count(*) AS n
-FROM cat c JOIN obscore o ON CONTAINS(POINT(c.ra, c.dec), o.s_region) = 1
-WHERE c.mag < 10.05
-GROUP BY o.obs_id ORDER BY n DESC LIMIT 5;
+SELECT o.obs_id, count(c.source_id) AS n
+FROM obscore o LEFT JOIN cat c ON CONTAINS(POINT(c.ra, c.dec), o.s_region) = 1
+WHERE o.obs_id IN ('obs1', 'obs2', 'obs3')
+GROUP BY o.obs_id ORDER BY o.obs_id;
 ```
 
 The union of several footprints, as one region, is a search too (MOCs are

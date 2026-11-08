@@ -331,6 +331,45 @@ SELECT count(*) FILTER (WHERE (a.r && b.r) <> (b.r && a.r)) AS asymmetric,
        count(*) FILTER (WHERE a.r && b.r) > count(*) FILTER (WHERE a.fid = b.fid) AS some_meet
 FROM cstore a, cstore b;
 
+-- a stored region from another table against the catalogue: the sources
+-- inside a few footprints, each outer row's region covered as the scan runs
+-- (0.54), from a skypos column and from ra and dec, from a skyregion column
+-- and from STC-S text read with REGION(), on an inner and an outer join, a
+-- NULL footprint included: the rows of the exact test with no index at all
+CREATE INDEX ccat_radec ON ccat (skycell_ang2cell(ra, dec));
+ANALYZE ccat;
+CREATE TABLE cstore_txt AS SELECT fid, r::text AS r FROM cstore;
+INSERT INTO cstore_txt VALUES (999, NULL);
+INSERT INTO cstore VALUES (999, NULL);
+ANALYZE cstore; ANALYZE cstore_txt;
+CREATE FUNCTION cjoin(q text, OUT custom bool, OUT agree bool) LANGUAGE plpgsql AS $$
+DECLARE a text; b text; l text;
+BEGIN
+  custom := false;
+  FOR l IN EXECUTE 'EXPLAIN (COSTS OFF) ' || q LOOP
+    IF l ~ 'SkycellCone' THEN custom := true; END IF;
+  END LOOP;
+  EXECUTE format('SELECT md5(string_agg(x::text, '','' ORDER BY x::text)) FROM (%s) x', q) INTO a;
+  SET LOCAL skycell.custom_scan = off;
+  SET LOCAL enable_indexscan = off;
+  SET LOCAL enable_bitmapscan = off;
+  EXECUTE format('SELECT md5(string_agg(x::text, '','' ORDER BY x::text)) FROM (%s) x', q) INTO b;
+  SET LOCAL skycell.custom_scan = on;
+  SET LOCAL enable_indexscan = on;
+  SET LOCAL enable_bitmapscan = on;
+  agree := a IS NOT DISTINCT FROM b;
+END $$;
+SELECT name, (cjoin(q)).* FROM (VALUES
+  ('skypos column',  'SELECT f.fid, c.id FROM cstore f JOIN ccat c ON c.pos <@ f.r WHERE f.fid IN (101, 102, 103, 201, 999)'),
+  ('ra, dec, ADQL',  'SELECT f.fid, c.id FROM cstore f JOIN ccat c ON CONTAINS(POINT(''ICRS'', c.ra, c.dec), f.r) = 1 WHERE f.fid IN (104, 105, 202)'),
+  ('STC-S text',     'SELECT f.fid, c.id FROM cstore_txt f JOIN ccat c ON CONTAINS(POINT(''ICRS'', c.ra, c.dec), REGION(f.r)) = 1 WHERE f.fid IN (106, 203, 999)'),
+  ('outer join',     'SELECT f.fid, count(c.id) FROM cstore f LEFT JOIN ccat c ON c.pos <@ f.r WHERE f.fid IN (107, 204, 999) GROUP BY 1'),
+  ('with condition', 'SELECT f.fid, c.id FROM cstore f JOIN ccat c ON c.pos <@ f.r AND c.id > 50000 WHERE f.fid IN (108, 205)')
+) v(name, q) ORDER BY name;
+DROP FUNCTION cjoin(text);
+DROP TABLE cstore_txt;
+DROP INDEX ccat_radec;
+
 DROP TABLE cpts, cparts, ccat, cregs, crand, cstore, cprobe, cquery;
 DROP FUNCTION store_counts(), comp_counts(skyregion), comp_plan_uses_index(text),
               rand_region(int), rand_leaf();
