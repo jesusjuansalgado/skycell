@@ -223,6 +223,19 @@ SELECT name, (comp_plan_rows(q)).* FROM (VALUES
 SET skycell.fold_regions = off;
 SELECT comp_plan_kind('SELECT count(*) FROM ccat WHERE pos <@ circle(''ICRS'', 8, 18, 1) OR pos <@ circle(''ICRS'', 12, 22, 1.5)') AS fold_off;
 RESET skycell.fold_regions;
+-- the first query of a session, planned before the library is loaded, which
+-- the planner hook therefore misses: folded all the same (0.54)
+\c -
+DO $$
+DECLARE l text; folded bool := false;
+BEGIN
+  FOR l IN EXECUTE 'EXPLAIN (COSTS OFF) SELECT count(*) FROM ccat
+                    WHERE pos <@ circle(''ICRS'', 8, 18, 1) OR pos <@ circle(''ICRS'', 12, 22, 1.5)' LOOP
+    IF l ~ 'UNION ICRS' AND l ~ 'skycell_region_scan' THEN folded := true; END IF;
+  END LOOP;
+  RAISE NOTICE 'first query folded: %', folded;
+END $$;
+SET extra_float_digits = 0;
 -- the folded region, as the plan shows it
 EXPLAIN (COSTS OFF) SELECT count(*) FROM ccat
 WHERE pos <@ circle('ICRS', 10, 20, 2) AND NOT pos <@ circle('ICRS', 10, 20, 1) AND NOT pos <@ circle('ICRS', 11, 20, 0.3);

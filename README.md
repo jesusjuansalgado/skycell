@@ -259,15 +259,8 @@ schema before `pg_catalog` to use the bare names:
 CREATE SCHEMA sky;
 CREATE EXTENSION skycell SCHEMA sky;
 ALTER DATABASE mydb SET search_path = sky, public, pg_catalog;
-ALTER DATABASE mydb SET session_preload_libraries = 'skycell';
 ```
 
-The second setting loads skycell's library as each session starts. Otherwise
-it loads during the first query that uses it, after that query's planning has
-begun, and that one query misses the planner hook that joins a boolean of
-regions into one ([Booleans of regions](#booleans-of-regions-become-one-region)).
-`shared_preload_libraries = 'skycell'` in `postgresql.conf` does the same for
-every database.
 
 Without that, the forms carrying ADQL's coordinate-system argument —
 `point('ICRS', ra, dec)`, `circle('ICRS', …)` — are unambiguous anyway, and

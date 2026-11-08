@@ -10,7 +10,6 @@ empty database.
 CREATE SCHEMA sky;
 CREATE EXTENSION skycell SCHEMA sky;
 ALTER DATABASE skycell_tutorial SET search_path = sky, public, pg_catalog;
-ALTER DATABASE skycell_tutorial SET session_preload_libraries = 'skycell';
 ```
 
 ```sql

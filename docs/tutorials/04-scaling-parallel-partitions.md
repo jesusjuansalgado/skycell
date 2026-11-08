@@ -9,7 +9,6 @@ database.
 CREATE SCHEMA sky;
 CREATE EXTENSION skycell SCHEMA sky;
 ALTER DATABASE skycell_tutorial SET search_path = sky, public, pg_catalog;
-ALTER DATABASE skycell_tutorial SET session_preload_libraries = 'skycell';
 ```
 
 ```sql
@@ -124,9 +123,6 @@ pruning by cell.
 - **Memory.** The index is one 8-byte key per row: about 21 GiB of index per
   billion sources. A nearest-neighbour search holds its candidate rows in
   `work_mem` and spills to disk beyond it.
-- **Session preload.** `session_preload_libraries` (per database) or
-  `shared_preload_libraries` (server), as in the set-up block above, so the
-  first query of each session is planned like the others.
 - **Upgrades.** `make install` copies the new version; each database then
   needs `ALTER EXTENSION skycell UPDATE` (or `make upgrade` for all of them).
 

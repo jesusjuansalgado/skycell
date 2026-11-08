@@ -28,5 +28,5 @@ expectation:
 PGHOST=/tmp PGPORT=5432 PGUSER=postgres docs/tutorials/check.py
 ```
 
-It needs a superuser (the set-up blocks set `session_preload_libraries`) and
-takes about ten seconds.
+It needs a role that may create databases and the extension, and takes about
+ten seconds.

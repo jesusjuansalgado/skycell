@@ -15,18 +15,9 @@ to skycell's:
 ```sql
 CREATE SCHEMA sky;
 CREATE EXTENSION skycell SCHEMA sky;
--- your database's name here; new sessions pick these up
+-- your database's name here; new sessions pick it up
 ALTER DATABASE skycell_tutorial SET search_path = sky, public, pg_catalog;
-ALTER DATABASE skycell_tutorial SET session_preload_libraries = 'skycell';
 ```
-
-The second setting (a superuser's) loads skycell's library when a session
-starts. Without it the library loads during the first query that uses it,
-after that query's planning has begun, and that one query misses part of
-skycell's planning: a boolean of several regions is not joined into one
-(below). With a connection pool, or many short sessions, set it, or put
-`shared_preload_libraries = 'skycell'` in `postgresql.conf` for every
-database at once.
 
 Without it, `POINT(ra, dec)` is PostgreSQL's point, and
 `CONTAINS(POINT(ra, dec), CIRCLE(...)) = 1` fails with *function

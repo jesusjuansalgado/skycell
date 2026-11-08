@@ -56,6 +56,9 @@
 #include "cover.h"
 #include "skycell_internal.h"
 
+/* add_distance_cones() is simplifying the region tests it left (0.54) */
+static bool late_fold_eval = false;
+
 #define DEG2RAD (M_PI / 180.0)
 #define RAD2DEG (180.0 / M_PI)
 
@@ -2040,6 +2043,15 @@ region_support_simplify(SupportRequestSimplify *req, Oid funcid, Node *pt, Node 
 			   *rg2,
 			   *res = NULL;
 
+	/*
+	 * A query whose planning began before the library was loaded (the first
+	 * of a session, without session_preload_libraries) missed the planner
+	 * hook that joins a boolean of regions into one: its region tests are
+	 * left as written here, and joined and simplified by
+	 * add_distance_cones() once the quals are whole (0.54).
+	 */
+	if (req->root != NULL && skycell_planning_unhooked(req->root) && !late_fold_eval)
+		return NULL;
 	if (req->root != NULL && want_swap(req, funcid, pt, rg, &pt2, &rg2))
 		res = region_simplify_oriented(req, funcid, pt2, rg2);
 	if (res == NULL)
@@ -3481,6 +3493,21 @@ fold_region_bool(Node *n, bool *changed)
 	return (Node *) (b->boolop == OR_EXPR ? make_orclause(args) : make_andclause(args));
 }
 
+/* an implicit-AND list with its booleans of regions folded */
+static List *
+fold_conj(List *conj)
+{
+	List	   *args = NIL,
+			   *folded;
+	bool		inner = false;
+	ListCell   *lc;
+
+	foreach(lc, conj)
+		args = lappend(args, fold_region_bool(lfirst(lc), &inner));
+	folded = fold_region_terms(args, false);
+	return folded != NIL ? folded : args;
+}
+
 /* the WHERE and JOIN ON conditions of a query's join tree, folded */
 static void
 fold_jointree(Node *jt)
@@ -3560,10 +3587,16 @@ add_distance_cones(PlannerInfo *root, Node **quals)
 	int			norig;
 	bool		was_list;
 
+	bool		late = skycell_planning_unhooked(root);
+
 	if (*quals == NULL)
 		return;
 	was_list = IsA(*quals, List);
 	conj = was_list ? list_copy((List *) *quals) : make_ands_implicit((Expr *) *quals);
+	/* the planner hook's fold, missed by this query (region_support_simplify()) */
+	if (late && skycell_fold_regions)
+		conj = fold_conj(conj);
+	late_fold_eval = late;
 	norig = list_length(conj);
 	for (int i = 0; i < norig; i++)
 	{
@@ -3590,6 +3623,14 @@ add_distance_cones(PlannerInfo *root, Node **quals)
 			belows = lappend(belows, below);
 			origs = lappend_int(origs, i);
 		}
+	}
+	/* late: every term, its region tests left as written, simplified now */
+	if (late)
+	{
+		list_free(replaced);
+		replaced = NIL;
+		for (int i = 0; i < norig; i++)
+			replaced = lappend_int(replaced, i);
 	}
 	if (list_length(conj) == norig && replaced == NIL)
 		return;

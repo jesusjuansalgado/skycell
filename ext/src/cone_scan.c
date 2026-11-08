@@ -1693,14 +1693,57 @@ cone_get_relation_info(PlannerInfo *root, Oid relid, bool inhparent, RelOptInfo 
 	}
 }
 
+/*
+ * The queries cone_planner() is planning now, outermost first (a query can be
+ * planned while another is: a function the planner calls may run SPI).
+ */
+#define HOOKED_MAX 32
+static Query *hooked[HOOKED_MAX];
+static int	nhooked = 0;
+
+/*
+ * Whether the query root belongs to began before this library was loaded, so
+ * that cone_planner() did not run for it: the first query of a session that
+ * loads skycell by using it, without session_preload_libraries (0.54).
+ */
+bool
+skycell_planning_unhooked(PlannerInfo *root)
+{
+	PlannerInfo *top = root;
+
+	if (root == NULL)
+		return false;
+	while (top->parent_root != NULL)
+		top = top->parent_root;
+	for (int i = 0; i < Min(nhooked, HOOKED_MAX); i++)
+		if (hooked[i] == top->parse)
+			return false;
+	return true;
+}
+
 static PlannedStmt *
 cone_planner(Query *parse, const char *query_string, int cursorOptions, ParamListInfo boundParams)
 {
+	PlannedStmt *result;
+
 	plan_generation++;
 	skycell_fold_query_regions(parse);
-	if (prev_planner_hook)
-		return prev_planner_hook(parse, query_string, cursorOptions, boundParams);
-	return standard_planner(parse, query_string, cursorOptions, boundParams);
+	if (nhooked < HOOKED_MAX)
+		hooked[nhooked] = parse;
+	nhooked++;
+	PG_TRY();
+	{
+		if (prev_planner_hook)
+			result = prev_planner_hook(parse, query_string, cursorOptions, boundParams);
+		else
+			result = standard_planner(parse, query_string, cursorOptions, boundParams);
+	}
+	PG_FINALLY();
+	{
+		nhooked--;
+	}
+	PG_END_TRY();
+	return result;
 }
 
 static bool join_cone_estimate_uncached(PlannerInfo *root, List *args, join_estimate *e);
