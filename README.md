@@ -50,7 +50,7 @@ circle around each row is planned as the cone around that point, and a
 cross-match probes the larger indexed table whichever side is the point and
 whichever the circle. With pgSphere and Q3C the reversed form is a full table
 scan, or a cross-match that probes the wrong table. Regions read and write as IVOA STC-S, including
-`UNION`, `INTERSECTION`, `DIFFERENCE` and `NOT` of them (since 0.38), and one
+`UNION`, `INTERSECTION`, `DIFFERENCE` and `NOT` of them, and one
 column can hold circles, polygons and their combinations together: instrument
 footprints with detector gaps and masks, stored as they are and searched with
 a plain polygon ([Composite regions](#composite-regions-instrument-footprints)).
@@ -58,6 +58,33 @@ a plain polygon ([Composite regions](#composite-regions-instrument-footprints)).
 The numbers come from randomized paired trials on PostgreSQL 18.6, on 10M-row
 catalogues (synthetic, resampled from the Gaia DR3 density field, and real DR3
 positions) and a 50M-row one; see [Performance](#performance).
+
+## Documentation
+
+Tutorials, each a sequence of SQL that runs as written on an empty database
+(and is checked to, by [`docs/tutorials/check.py`](docs/tutorials/check.py)):
+
+1. [A source catalogue](docs/tutorials/01-source-catalogue.md): installing,
+   indexing, cone, polygon and region searches, cross-matches, nearest
+   neighbours, and what to check when a plan is a sequential scan.
+2. [Regions and footprints](docs/tutorials/02-regions-and-footprints.md): the
+   `skyregion` type and STC-S, an ObsCore `s_region` column, the region
+   indexes and which to choose, footprints against positions, fields and
+   catalogues.
+3. [Density maps, counts and MOCs](docs/tutorials/03-density-and-mocs.md):
+   counts without reading rows, exact per-cell counts, MOCs out and in, and
+   their set operations.
+4. [Large catalogues](docs/tutorials/04-scaling-parallel-partitions.md):
+   parallel cross-matches and searches, partitioning by sky region, upkeep,
+   and reading a plan.
+5. [ADQL, TAP services and migration](docs/tutorials/05-adql-tap-and-migration.md):
+   what a TAP service needs, the IVOA user-defined functions, and moving from
+   Q3C or pgSphere.
+
+The rest of this page is the reference: how skycell works, every function
+and setting, and its limits. The measurements are in
+[`docs/performance.md`](docs/performance.md) and the checks in
+[`docs/testing.md`](docs/testing.md).
 
 ---
 
@@ -120,14 +147,13 @@ not modelled: at plan time skycell covers 32 sampled probes and counts the
 catalogue rows their cones really hold (12,630 estimated against 12,390 actual).
 A probe's rescan is costed as PostgreSQL costs its own index scan on the inner
 side of a nested loop, the pages earlier probes have read counted as cached, so
-a cross-match is weighed fairly against a parallel sequential scan. Since 0.36
-the node is parallel safe: with enough probes the cross-match runs in parallel
-workers, as a Gather over the nested loop with a Parallel Seq Scan of the probes
-on its outer side, each worker covering and scanning the cones of its own
-probes. Since 0.42 a single wide cone or composite search is parallel aware
-too: its covering is cut into chunks that the leader and the workers claim from
-a shared counter, so a cone over a crowded field is read by several processes
-at once. A query ordered by the distance to a point, with a `LIMIT`, gets a
+a cross-match is weighed fairly against a parallel sequential scan. With enough
+probes the cross-match runs in parallel workers, as a Gather over the nested
+loop with a Parallel Seq Scan of the probes on its outer side, each worker
+covering and scanning the cones of its own probes. A single wide cone,
+polygon or composite search is parallel aware too: its covering is cut into
+chunks that the leader and the workers claim from a shared counter, so a cone
+over a crowded field is read by several processes at once. A query ordered by the distance to a point, with a `LIMIT`, gets a
 second node, `SkycellNearest`, which reads widening rings round the point from
 the same index ([Nearest neighbours](#nearest-neighbours)).
 
@@ -141,8 +167,10 @@ Nested Loop
         Mode: ordered
 ```
 
-**5. Polygons and boxes take the same scan.** Since 0.43 a constant polygon or
-box written as a top-level condition goes to the custom scan, as a circle does:
+**5. Polygons, boxes and composites take the same scan.** A constant polygon,
+box or composite written as a top-level condition goes to the custom scan, as a
+circle does, and so does a boolean of constant regions on one position, folded
+into one composite:
 covered once at plan time, its ranges read in cell order, each row tested from
 its `ra` and `dec`, and split among parallel workers when it is large. Anywhere
 else (under an `OR`, per row, or with the custom scan off) a support function
@@ -185,10 +213,6 @@ make upgrade                     # every database the connection can see
 make upgrade PGDATABASE=mydb     # just one
 psql -d mydb -c "ALTER EXTENSION skycell UPDATE"   # or do it by hand
 ```
-
-From 0.36 or 0.37 to 0.38, first drop any index built on the three removed
-operator classes ([Removed operator classes](#operators), under Operators). The
-upgrade names them if any are left.
 
 `make upgrade` reports what it finds and skips databases that are already
 current; connection settings come from the usual `PG*` variables. It is a
@@ -234,8 +258,16 @@ schema before `pg_catalog` to use the bare names:
 ```sql
 CREATE SCHEMA sky;
 CREATE EXTENSION skycell SCHEMA sky;
-SET search_path = sky, public, pg_catalog;
+ALTER DATABASE mydb SET search_path = sky, public, pg_catalog;
+ALTER DATABASE mydb SET session_preload_libraries = 'skycell';
 ```
+
+The second setting loads skycell's library as each session starts. Otherwise
+it loads during the first query that uses it, after that query's planning has
+begun, and that one query misses the planner hook that joins a boolean of
+regions into one ([Booleans of regions](#booleans-of-regions-become-one-region)).
+`shared_preload_libraries = 'skycell'` in `postgresql.conf` does the same for
+every database.
 
 Without that, the forms carrying ADQL's coordinate-system argument —
 `point('ICRS', ra, dec)`, `circle('ICRS', …)` — are unambiguous anyway, and
@@ -297,25 +329,8 @@ works for a `skypos` column with `skycell_cell(pos)`. A constraint not
 validated, or (PostgreSQL 18) not enforced, does not count.
 
 **3. Regions rather than positions** (observation footprints, tiles, MOCs).
-Store each region's covering as MOC cells, one row per cell, and index those:
-
-```sql
-CREATE TABLE fp_cells AS
-  SELECT fid, unnest(skycell_cone_moc(ra0, dec0, radius, 8)) AS nuniq
-  FROM footprint;                               -- 8 cells per region
-CREATE INDEX ON fp_cells (nuniq);
-ANALYZE fp_cells;
-```
-
-A position's candidate regions are then those whose cell is one of its
-ancestors — a handful of equality lookups, followed by the exact test:
-
-```sql
-SELECT f.* FROM probe p
-JOIN fp_cells fc ON fc.nuniq = ANY (skycell_ancestors(p.cell, 4, 11))
-JOIN footprint f ON f.fid = fc.fid
-WHERE skycell_in_cone(p.ra, p.dec, f.ra0, f.dec0, f.radius);
-```
+Store them in a `skyregion` column with a GiST index:
+[Regions and footprints](docs/tutorials/02-regions-and-footprints.md).
 
 **Settings worth knowing.** The statistics target governs how finely the
 density map resolves: 1000 is a good default for 10⁷ rows and above, the
@@ -327,9 +342,8 @@ setting — `range_cost` derives itself from the relation (see
 statistics, so a table whose density structure has changed since the last one
 is covered for the sky it used to have.
 
-**Checking it worked.** A cone should plan as `Custom Scan (SkycellCone)`
-with a `skycell_in_cone` filter (a polygon as an index or bitmap scan with a
-`skycell_in_*` filter), and a nearest-neighbour query as `Custom Scan
+**Checking it worked.** A cone, polygon, box or composite search should plan as
+`Custom Scan (SkycellCone)`, and a nearest-neighbour query as `Custom Scan
 (SkycellNearest)`:
 
 ```sql
@@ -364,7 +378,7 @@ STC-S writes such shapes by combining regions:
 - the `DIFFERENCE` of two (the first less the second);
 - the `NOT` of one (the rest of the sky).
 
-They nest up to 32 deep. Since 0.38 a `skyregion` value can be any of them. An
+They nest up to 32 deep, and a `skyregion` value can be any of them. An
 ObsCore `s_region` column therefore holds the footprints as they are, next to
 circles and polygons, under one index, and the archive asks its usual
 questions of them unchanged. Neither Q3C nor pgSphere has such a type.
@@ -474,7 +488,7 @@ operands' cell classes (inside, outside, straddling) combined by the operator:
 Each operand is classified with a test that is sound in the direction the
 operators above it need, so a covering never misses a row. The exact
 membership test runs on what it keeps. A constant composite written as a
-top-level condition is answered by the custom scan (since 0.39), as a cone is.
+top-level condition is answered by the custom scan, as a cone is.
 It is covered once at plan time, and the scan reads the ranges in cell order,
 testing each row from its `ra` and `dec`. Under an `OR` it is folded with the
 other constant regions of the same position
@@ -515,7 +529,7 @@ STC-S `BOX ICRS ra dec width height` is read as the four-corner polygon
 
 ### Booleans of regions become one region
 
-Since 0.53 a query need not write the composite itself. A position tested
+A query need not write the composite itself. A position tested
 against several constant regions, joined by `OR`, `AND` and `NOT`, is folded
 at plan time into one test against their union, intersection or difference,
 and answered by the custom scan with one covering of the whole shape:
@@ -566,7 +580,7 @@ takes about what planning the `REGION` does, and a third of the unfolded one.
 ## Operators and functions
 
 Every function skycell installs, one by one. Types are `skypos` (a position) and
-`skyregion` (a cone, box or polygon, or since 0.38 a union, intersection,
+`skyregion` (a cone, box or polygon, or a union, intersection,
 difference or complement of regions). The `coordsys` argument is accepted
 for ADQL compatibility and must be `'ICRS'`; convert other frames first with
 `gal2icrs()` / `ecl2icrs()`.
@@ -578,13 +592,13 @@ for ADQL compatibility and must be `'ICRS'`; convert other frames first with
 | `point(ra, dec)`<br>`point(coordsys, ra, dec)` | `skypos` | degrees. ADQL `POINT` |
 | `circle(ra, dec, radius)`<br>`circle(coordsys, ra, dec, radius)` | `skyregion` | radius in degrees. ADQL `CIRCLE` |
 | `box(ra, dec, width, height)`<br>`box(coordsys, …)` | `skyregion` | centre and extent, as ADQL defines it. Errors if it reaches a pole — use a polygon there. ADQL `BOX` |
-| `polygon(ra1, dec1, ra2, dec2, …)`<br>`polygon(coordsys, …)` | `skyregion` | ≥ 3 vertices, convex or not (non-convex since 0.35), but simple: no two edges may cross or touch. It must fit in a hemisphere: some point within 90° of every vertex (since 0.41 not necessarily the vertices' mean, which bunched vertices pull aside). ADQL `POLYGON` |
+| `polygon(ra1, dec1, ra2, dec2, …)`<br>`polygon(coordsys, …)` | `skyregion` | ≥ 3 vertices, convex or not, but simple: no two edges may cross or touch. It must fit in a hemisphere: some point within 90° of every vertex, not necessarily the vertices' mean, which bunched vertices pull aside. ADQL `POLYGON` |
 | `contains(p skypos, r skyregion)`<br>`contains(a skyregion, b skyregion)` | `integer` (1/0) | ADQL `CONTAINS`. Compared with 1 (`contains(…) = 1`, or `1 = …`) in a `WHERE` or `JOIN ON` it is planned as the `<@` operator below, so it is indexed |
-| `intersects(p skypos, r skyregion)`<br>`intersects(r skyregion, p skypos)`<br>`intersects(a skyregion, b skyregion)` | `integer` (1/0) | ADQL `INTERSECTS`, the point on either side (the second form since 0.38). Compared with 1 it is planned as `<@` or `@>` (point-region) or `&&` (region-region) below, so it is indexed |
+| `intersects(p skypos, r skyregion)`<br>`intersects(r skyregion, p skypos)`<br>`intersects(a skyregion, b skyregion)` | `integer` (1/0) | ADQL `INTERSECTS`, the point on either side. Compared with 1 it is planned as `<@` or `@>` (point-region) or `&&` (region-region) below, so it is indexed |
 | `distance(a skypos, b skypos)`<br>`distance(ra1, dec1, ra2, dec2)` | `float8` | degrees. ADQL `DISTANCE`, both forms. `distance(…) < r` (or `<=`) in a `WHERE` or `JOIN ON` is planned as the cone, like `<@` below |
-| `area(r skyregion)` | `float8` | square degrees. ADQL `AREA`. A composite region's is integrated over cells, to about 10⁻³ of its area (since 0.38; exact for a `NOT` of a cone or polygon) |
+| `area(r skyregion)` | `float8` | square degrees. ADQL `AREA`. A composite region's is integrated over cells, to about 10⁻³ of its area (exact for a `NOT` of a cone or polygon) |
 | `coord1(p)` / `coord2(p)` | `float8` | right ascension / declination, degrees |
-| `centroid(r skyregion)` | `skypos` | ADQL `CENTROID`: a cone's centre, a polygon's centre of mass, which may lie outside a non-convex one, as a U's does. Before 0.35 a polygon's was the mean of its vertices. A composite region's is integrated over cells, to about 10⁻³ of its size (since 0.38); an empty one has none, and says so |
+| `centroid(r skyregion)` | `skypos` | ADQL `CENTROID`: a cone's centre, a polygon's centre of mass, which may lie outside a non-convex one, as a U's does. A composite region's is integrated over cells, to about 10⁻³ of its size; an empty one has none, and says so |
 | `region(stcs text)` | `skyregion` | ADQL `REGION`: any region written in STC-S, e.g. `region('DIFFERENCE ICRS (CIRCLE 10 20 2 CIRCLE 10 20 1)')`. The same as casting the text to `skyregion` |
 | `skycell_union(VARIADIC skyregion[])`<br>`skycell_intersection(VARIADIC skyregion[])` | `skyregion` | two regions or more; STC-S `UNION` / `INTERSECTION` |
 | `skycell_difference(a, b)` | `skyregion` | `a` less `b`; STC-S `DIFFERENCE` |
@@ -610,7 +624,7 @@ read more naturally in plain SQL, and are what a pgSphere user already writes.
 
 | Operator | ADQL spelling | Meaning |
 |---|---|---|
-| `skypos <@ skyregion` | `CONTAINS(p, r) = 1`, `INTERSECTS(p, r) = 1` | position inside region. Against a circle (constant, or built per row as in a cross-match) it is planned exactly as `skycell_cone`, through the custom scan; so is a constant polygon, box (since 0.43) or composite (since 0.39). Constant regions of the same position joined by `OR`, `AND` and `NOT` are folded into one composite (since 0.53). A per-row polygon, or one under an `OR` with anything else, is rewritten into index ranges |
+| `skypos <@ skyregion` | `CONTAINS(p, r) = 1`, `INTERSECTS(p, r) = 1` | position inside region. Against a circle (constant, or built per row as in a cross-match) it is planned exactly as `skycell_cone`, through the custom scan; so is a constant polygon, box or composite. Constant regions of the same position joined by `OR`, `AND` and `NOT` are folded into one composite. A per-row polygon, or one under an `OR` with anything else, is rewritten into index ranges |
 | `skyregion @> skypos` | `INTERSECTS(r, p) = 1` | the same, reversed. When `skyregion` is a stored column with a GiST (or MOC GIN) index, indexed through that instead |
 | `skyregion && skyregion` | `INTERSECTS(a, b) = 1` | regions overlap. Indexed by `CREATE INDEX ON t USING gist (region)` |
 | `skyregion @> skyregion` | `CONTAINS(b, a) = 1` | `a` wholly contains `b`. The same index |
@@ -627,9 +641,9 @@ cross-match probes whichever table has the index (the larger one if both do).
 `distance(p1, p2) < r` (also `<=`, `r > distance(…)`, the four-coordinate form
 and `skycell_dist`) gets the same plan: the planner adds the cone next to the
 comparison, which still decides, so the answer is exactly the comparison's,
-and the row estimate is the cone's (as of 0.28).
-Against a constant polygon or box they go through the custom scan (since 0.43;
-the B-tree cell rewrite described above under an `OR`). A `skyregion` column with its
+and the row estimate is the cone's.
+Against a constant polygon or box they go through the custom scan (the B-tree
+cell rewrite described above under an `OR` with other conditions). A `skyregion` column with its
 own GiST index additionally indexes `&&` and both region-region containment
 operators (`@>`/`<@`, in either argument order — they're commutators of each
 other) directly against it, region side non-constant included — what a stored
@@ -664,21 +678,12 @@ GIN index over the region's MOC cells, which the planner uses automatically for
 CREATE INDEX ON t USING gin (skycell_region_moc(region));
 ```
 
-When both a GiST and this GIN index exist on the column, the GIN rewrite wins.
+When both a GiST and this GIN index exist on the column, the planner picks per
+query: typically the GiST for one position, the GIN for a join of many.
 
-**Removed operator classes.** Three operator classes, kept for comparison and
-deprecated in 0.36, were removed in 0.38. None of them beat what replaces it.
-
-| operator class | indexed | use instead |
-|---|---|---|
-| `skyregion_box_gist_ops` | a `skyregion` column, by a `float8` box | the default, `skyregion_box4_gist_ops` |
-| `skypos_spgist_ops` | a `skypos` column, SP-GiST over the HEALPix hierarchy | a B-tree on `skycell_cell(pos)` |
-| `skypos_cap_gist_ops` | a `skypos` column, GiST with a spherical-cap key | a B-tree on `skycell_cell(pos)` |
-
-An index built on one of them has to be dropped before `ALTER EXTENSION
-skycell UPDATE` to 0.38. The upgrade stops, naming each such index, while one
-exists. Once the 0.38 library is installed, a query that reaches such an index
-fails with the same advice until the index is dropped.
+Three operator classes deprecated in 0.36 (`skyregion_box_gist_ops`,
+`skypos_spgist_ops`, `skypos_cap_gist_ops`) were removed in 0.38; an index on
+one must be dropped before upgrading past 0.37, and the upgrade says so.
 
 ### The index key
 
@@ -694,7 +699,7 @@ fails with the same advice until the index is dropped.
 | Function | Notes |
 |---|---|
 | `skycell_cone(cell, ra, dec, ra0, dec0, radius)` | cone test, answered by the custom scan: a constant cone covered at plan time; a per-row cone (a cross-match, `JOIN cat c ON skycell_cone(c.cell, c.ra, c.dec, p.ra, p.dec, r)`) covered per outer row; a generic plan or correlated sub-select covered per rescan |
-| `skycell_poly(cell, ra, dec, poly float8[])` | the same for a polygon; a constant one goes to the custom scan (since 0.43) |
+| `skycell_poly(cell, ra, dec, poly float8[])` | the same for a polygon; a constant one goes to the custom scan |
 | `skycell_radial_query(ra, dec, ra0, dec0, radius)` | Q3C's spelling of the cone test — no cell argument, the planner synthesises `skycell_ang2cell(ra, dec)`; the custom scan answers it through an expression index on that, or a stored column declared to hold it ([setup 2](#setting-up-a-table)) |
 | `skycell_join(ra1, dec1, ra2, dec2, radius)` | Q3C's spelling of the cross-match — likewise; the first pair is the indexed side, as in `q3c_join` |
 | `skycell_in_cone(ra, dec, ra0, dec0, radius [, sel])` | the exact test alone, no index |
@@ -744,7 +749,7 @@ its own. Rows with a NULL distance come last, as `ASC NULLS LAST` puts them.
 Without a `LIMIT`, or ordered `DESC`, the query keeps PostgreSQL's sort.
 
 On a heap out of cell order (the bitmap mode) the first ring is found best
-first (0.52): HEALPix cells are visited nearest first, by the least distance a
+first: HEALPix cells are visited nearest first, by the least distance a
 point of each can have from the point. A cell the statistics expect to hold
 many rows is split into its four children, at no cost to the index, since a
 cell at any order is one key range; the others are read in batches through one
@@ -762,20 +767,19 @@ for an index entry, until an occupied cell is small next to its distance.
 Every nearer cell was found empty, so no row is nearer than that cell's
 closest point, and the next ring starts there.
 
-A partitioned table (0.40) gets the scan on each partition, and PostgreSQL
+A partitioned table gets the scan on each partition, and PostgreSQL
 merges their ordered rows under the `LIMIT` (Merge Append), however the
 partitions are laid out: by declination, by cell range, sub-partitioned, with
 their columns in another order, or with a partition left without the index
 (sorted instead). On 3M uniform rows, the 10 nearest take 2.3 ms with four
 partitions by cell range and 32 ms with four declination bands, against
-730 ms for the sort over the partitions before 0.40 and 0.35 ms on the table
-unpartitioned.
+0.35 ms on the table unpartitioned.
 
 On 10M real Gaia DR3 positions it takes 0.48–0.61 of the time of pgSphere's
 GiST ordering for k from 10 to 1000 (warm, a new point every query, planning
 included); on a clustered ObsCore table with its heap out of cell order, 0.94
-at k = 100 and 0.95 at k = 1000 since 0.52 (1.15 and 1.55 before;
-[`bench/results-nearest/`](bench/results-nearest/)).
+at k = 100 and 0.95 at k = 1000
+([`bench/results-nearest/`](bench/results-nearest/)).
 
 ### Coming from Q3C
 
@@ -816,7 +820,7 @@ skycell_dist(…)` with a `LIMIT` is indexed ([Nearest neighbours](#nearest-neig
 | Function | Returns | Notes |
 |---|---|---|
 | `skycell_cone_ranges(ra0, dec0, radius [, tbl, col])` | `SETOF (lo, hi)` | the covering as index ranges, for hand-built plans (a `LATERAL` cross-match); the plain join through the custom scan is faster. Index with `skycell_cell_ops` (`CREATE INDEX ON t (skycell_ang2cell(ra, dec) skycell_cell_ops)`) so the planner can estimate such a range join |
-| `skycell_cone_cell_lo(ra0, dec0, radius)`<br>`skycell_cone_cell_hi(ra0, dec0, radius)` | `int8` | the lowest and highest order-29 cell the cone can hold (since SQL 0.40). The planner adds `cell >= lo AND cell <= hi` next to a cone on a catalogue range-partitioned by its cell, so PostgreSQL prunes the partitions the cone cannot reach; the custom scan leaves them out of its filter. The whole sky for a cone over 90° or an invalid centre; cones over 10° are bounded more loosely (since 0.45). Constant polygons and composites get the same comparisons, as constants, from their bounding circle |
+| `skycell_cone_cell_lo(ra0, dec0, radius)`<br>`skycell_cone_cell_hi(ra0, dec0, radius)` | `int8` | the lowest and highest order-29 cell the cone can hold. The planner adds `cell >= lo AND cell <= hi` next to a cone on a catalogue range-partitioned by its cell, so PostgreSQL prunes the partitions the cone cannot reach; the custom scan leaves them out of its filter. The whole sky for a cone over 90° or an invalid centre; cones over 10° are bounded more loosely. Constant polygons and composites get the same comparisons, as constants, from their bounding circle |
 | `skycell_poly_ranges(poly [, tbl, col])` | `SETOF (lo, hi)` | the same for a polygon |
 | `skycell_cone_moc(ra0, dec0, radius [, max_cells, max_order])` | `int8[]` | the covering as IVOA MOC `NUNIQ` cells — store these to index a region |
 | `skycell_poly_moc(poly [, max_cells, max_order])` | `int8[]` | likewise |
@@ -840,8 +844,7 @@ archives runs unchanged.
 | `ivo_healpix_center(hpxOrder, hpxIndex)` | `skypos` | catalogue | and back |
 | `icrs2gal` / `gal2icrs` / `icrs2ecl` / `ecl2icrs` | `skypos` | skycell | frame conversion |
 
-NULL arguments to the epoch functions are taken as the catalogue says (since
-0.32): a missing parallax means infinitely remote, a missing proper motion or
+NULL arguments to the epoch functions are taken as the catalogue says: a missing parallax means infinitely remote, a missing proper motion or
 radial velocity is 0, and a missing position or epoch is an error — not a NULL
 result, which would drop every star without a measured radial velocity.
 
@@ -857,7 +860,7 @@ WHERE 1 = CONTAINS(POINT('ICRS', ra, dec), CIRCLE('ICRS', 269.45, 4.69, 0.05 + 0
                    CIRCLE('ICRS', 269.45, 4.69, 0.05));
 ```
 
-### Estimates for sky views (since 0.41)
+### Estimates for sky views
 
 A zoomed-out sky view has no use for millions of points: it wants how many
 sources it holds, and a coarse density map by HiPS tile. skycell reads both
@@ -908,7 +911,7 @@ a 40° × 30° map of 1,713 order-6 cells 1.7 ms; an exact count takes a few
 milliseconds in sparse sky and hundreds where the catalogue is crowded. The
 estimates are as current as the last `ANALYZE`: run it after loading rows.
 
-### Density maps in the database (since 0.42)
+### Density maps in the database
 
 For counts exact per cell, at HiPS orders, kept beside the catalogue and
 rebuilt after each load, `skycell_density_view` makes a materialised view of
@@ -946,7 +949,7 @@ replaces the view it names; anything built on it must be dropped first.
 (`skycell_density_build`, below, is another thing: a finer density model
 the planner reads instead of the histogram.)
 
-### MOC export (since 0.43)
+### MOC export
 
 A region's or a table's coverage as an IVOA MOC 2.0, in its ASCII or JSON
 serialisation, for MOCPy, Aladin, the CDS MOC server or any other tool that
@@ -965,7 +968,7 @@ FROM gaia.gaia_source WHERE phot_g_mean_mag < 12;
 | Function | Returns | Notes |
 |---|---|---|
 | `skycell_moc(r skyregion, max_order int DEFAULT 10, fmt text DEFAULT 'ascii')` | `text` | the cells of `max_order` that meet `r`, as `skycell_cell_overlaps` counts them; cells inside it whole at a coarser order. Orders 0–29 |
-| `skycell_moc_agg(hpx_order int, ipix bigint [, fmt text])` | `text` | aggregate: the MOC of the cells of one order, duplicates allowed. Orders 0–12; no rows, or no row with a cell, give NULL. Runs in parallel (since 0.45) |
+| `skycell_moc_agg(hpx_order int, ipix bigint [, fmt text])` | `text` | aggregate: the MOC of the cells of one order, duplicates allowed. Orders 0–12; no rows, or no row with a cell, give NULL. Runs in parallel |
 | `skycell_coverage_moc(tbl text, max_order int DEFAULT 10, fmt text DEFAULT 'ascii')` | `text` | the cells of `max_order` that hold a row of `tbl`, from its skycell index or stored `cell` column. Orders 0–12; an empty table gives an empty MOC |
 
 `fmt` is `'ascii'` or `'json'`. The output is normalised as MOCPy writes it:
@@ -985,14 +988,14 @@ and 21 of the 50 held cells more, which by dense sampling lie outside the cone
 18 ms; the coverage of the 10M-row Gaia table at order 10, 1.2 s, one pass
 over its index. FITS, the third MOC 2.0 serialisation, is not written.
 
-Since 0.45 `skycell_moc_agg`, and so `skycell_coverage_moc`, runs in parallel:
+`skycell_moc_agg`, and so `skycell_coverage_moc`, runs in parallel:
 each worker marks its own rows' cells and the leader combines them. On a
 sharded database such as Citus, each shard does the same. Its state is a type
 of its own, `skycell_mocstate`, so that it can travel between processes and
 nodes. On the 10M-row Gaia table with four workers: order 10 takes 0.68 s
 against 1.5 s in one process, order 12 takes 1.8 s, and order 3 takes 0.43 s.
 
-### MOCs as search regions (since 0.44)
+### MOCs as search regions
 
 A MOC from MOCPy, Aladin, the CDS MOC server or skycell itself is a region
 like any other: the sources inside a survey's coverage, an observation's
@@ -1058,7 +1061,7 @@ reads them in 1.9 s; the row estimate is within 5% of the count. A constant
 MOC is decoded once a query, not once a row: before that, the same scan took
 50 s.
 
-### MOC set operations (since 0.46)
+### MOC set operations
 
 Footprints kept as MOCs, one per observation, can be combined in the database:
 the area a collection covers, where two surveys overlap, or what one covers
@@ -1122,10 +1125,10 @@ compared with MOCPy's A ∩ (complement of B), because MOCPy 0.21.0's own
 
 | GUC | default | meaning |
 |---|---|---|
-| `skycell.fold_regions` | on | answer a position tested against several constant regions, joined by `OR`, `AND` and `NOT`, as one test against their union, intersection or difference (0.53; [Booleans of regions](#booleans-of-regions-become-one-region)). Off answers each region on its own, as written |
+| `skycell.fold_regions` | on | answer a position tested against several constant regions, joined by `OR`, `AND` and `NOT`, as one test against their union, intersection or difference ([Booleans of regions](#booleans-of-regions-become-one-region)). Off answers each region on its own, as written |
 | `skycell.custom_scan` | on | answer `skycell_cone` (and `skycell_join`, `skycell_radial_query`, and ADQL's `CONTAINS(POINT, CIRCLE) = 1`, `point <@ circle` and `DISTANCE(…) < r`) with the `SkycellCone` scan node instead of rewriting it into B-tree range conditions — constant cones, cross-match cones (a parameterized scan, one covering per outer row) and cones over parameters alone (generic plans, correlated sub-selects). A cone that is not a top-level `AND` term of a `WHERE`/`JOIN ON` (one under an `OR`, say) keeps the rewrite, so it stays indexable. Off restores the rewrite everywhere |
 | `skycell.index_filter` | on | when the cell index also holds the position — `CREATE INDEX ON t ((skycell_ang2cell(ra, dec))) INCLUDE (ra, dec)` — the `SkycellCone` scan tests the cone on each index entry and fetches from the table only the rows inside it, instead of every row of the covering cells (both modes, constant cones and cross-matches). The plan's exact test still applies to every row, so the answer is the same; off reads every row of the covering cells |
-| `skycell.nearest_bestfirst` | on | on a heap out of cell order, find a nearest-neighbour search's first rows by a best-first walk over HEALPix cells (0.52) instead of a first ring sized from the density ([Nearest neighbours](#nearest-neighbours)) |
+| `skycell.nearest_bestfirst` | on | on a heap out of cell order, find a nearest-neighbour search's first rows by a best-first walk over HEALPix cells instead of a first ring sized from the density ([Nearest neighbours](#nearest-neighbours)) |
 | `skycell.nearest_scan` | on | answer `ORDER BY` a distance to a point, with a `LIMIT`, with the `SkycellNearest` scan ([Nearest neighbours](#nearest-neighbours)); needs `skycell.custom_scan`. Off leaves the query to a sort of the relation |
 | `skycell.range_cost` | -1 (derive) | price of one index range, in rows; -1 derives it from the relation's rows/page and the planner's cost factors (for the custom scan, also from how much of the relation `shared_buffers` holds) |
 | `skycell.max_ranges` | 64 | cap on ranges per covering |
@@ -1145,419 +1148,38 @@ compared with MOCPy's A ∩ (complement of B), because MOCPy 0.21.0's own
 
 ## Performance
 
-Against Q3C 2.0.5 and pgSphere 1.5.2 on PostgreSQL 18.6, with skycell's
-defaults throughout (ratio below 1 = skycell faster):
+Randomized paired trials on PostgreSQL 18.6, on 10M-row catalogues
+(synthetic, resampled from the Gaia DR3 density field, and real DR3 positions)
+and a 50M-row one, each method's table in its own key order; ratios are
+skycell's time over the other's, with 95% bootstrap intervals:
 
-| workload | skycell ÷ pgSphere | skycell ÷ Q3C |
+| workload | against | skycell's time |
 |---|---|---|
-| cone searches, 1″–3°, warm | 0.66–0.95 | 0.02–0.58 |
-| cone searches, 1″–3°, cold | 0.40–0.98; level below 6′ on real positions | |
-| cross-matching, 1″–10″ | 0.26–0.33 | 0.73–0.84 |
-| convex polygons, 0.05°–2° | 0.21–0.23 | |
-| non-convex polygons (U, L, comb, star), 0.05°–2°, real Gaia DR3 positions | 0.13–0.29 | |
-| nearest neighbours, k = 10–1000, real Gaia DR3 positions | 0.48–0.67 | |
-| nearest neighbours beyond a distance (10 beyond 2°), real Gaia DR3 positions | 0.25 (since 0.45) | |
-| stored regions: overlap and region-in-region (`&&`, `@>`, `<@` between regions) | 0.12–0.70 | |
-| stored regions: footprints that contain a position (`@>` a point) | 0.57 on x86; 0.75–0.93 on an Apple M3 with 0.6 | |
-
-The stored-region rows were re-measured on the x86 cloud host with skycell 0.34,
-0.35 and 0.36, 8 runs each ([`bench/results-regions/`](bench/results-regions/); 0.36 as
-`main` at b3bb7be, the same library code). Overlap and containment between regions kept their
-margins there (0.11, 0.55, 0.22), and the v0.35 GiST key changed none of them.
-Point-in-footprint was within 5% of pgSphere with 0.34 and 0.35 (0.98 and
-0.95): the index converted the query point to a unit vector at every entry it
-visited. Since 0.36 the point is converted once per index scan, and it takes
-0.57 (interval 0.55–0.60) of pgSphere's time.
+| cone searches, 1″–3°, warm | pgSphere | 0.66–0.95 (faster at every radius) |
+| cone searches, cold, 50M rows | pgSphere | up to 2.5× faster from 30′ |
+| cross-matches, 10³–10⁵ targets, 0.5″–5″ | `q3c_join` / pgSphere | 0.73–0.84 / 0.26–0.33 |
+| convex / non-convex polygons | pgSphere | 0.21–0.23 / 0.13–0.29 |
+| stored regions: overlap, containment, point-in-footprint | pgSphere | 0.11–0.70 |
+| composite footprints meeting a field | pgSphere, one row per detector | 0.04 |
+| nearest neighbours, k = 10–1000 | pgSphere GiST ordering | 0.48–0.61 (Gaia), 0.94–1.01 (clustered ObsCore table) |
 
 Its index is a third the size of pgSphere's (214 MB against 687 MB at 10M
-rows, the size of Q3C's) and builds about 23× faster (3.0 s against 70.2 s),
-and its row estimates stay within 1.4× of the truth where pgSphere's are off
-by up to 7.1× and Q3C's by up to 2.6×. At Gaia
-DR3 scale that is one 38 GiB index where an archive running pgSphere for cones
-and Q3C for cross-matching keeps 160 GiB.
-
-**Partitioned catalogues** (0.44, SQL 0.40, [`bench/results-partition/`](bench/results-partition/)).
-5M real Gaia DR3 positions, once in one table and once in 16 partitions by cell
-range (as by HEALPix index or Gaia `source_id`), cross-matched with 10³–10⁵
-probes at 1″–30″. A cross-match is a nested loop that rescans the partitioned
-table, and so every partition, for each probe. Two changes cut that down:
-
-- Each partition's scan tests a cone against its index's lowest and highest
-  key before covering it, so a partition that cannot hold the cone answers in
-  about 0.3 µs.
-- On a catalogue partitioned by its cell, the planner adds the cone's cell
-  interval next to it (`skycell_cone_cell_lo/hi`), and PostgreSQL prunes at
-  every probe the partitions it cannot reach. Only one partition runs.
-
-Partitioned time over unpartitioned, both tables matching the same rows:
-
-| probes, radius | 0.43 | key test | with pruning | unpartitioned ms |
-|---|---|---|---|---|
-| 10³, 5″ | 4.14 | 1.85 | 1.44 | 8.5 |
-| 10⁴, 5″ | 6.34 | 2.39 | 1.74 | 47.0 |
-| 10⁵, 1″ | 8.11 | 2.37 | 1.51 | 387.7 |
-| 10⁵, 30″ | 5.06 | 1.77 | 1.21 | 759.1 |
-
-The 1.2–1.7 left is PostgreSQL's own work at each rescan: evaluating the bounds,
-finding the partition, restarting its scan, about 2 µs a probe. A constant cone
-on such a catalogue is pruned at plan time to the partitions it touches.
-Since 0.45 constant polygons and composites are pruned at plan time too, by
-the cells of their bounding circle; a `NOT` region, which bounds nothing, is
-not.
-
-Partitioning brings no parallel gain of its own. A parallel cross-match
-shares out its probes, each worker rescanning the partitioned table as above:
-100k probes at 5″ took 175 ms with three workers against 146 ms unpartitioned.
-A wide cone gets a Parallel Append over the partitions it reaches, but the
-unpartitioned table's parallel cone scan (0.42) is faster still: a 10° cone
-took 49 ms against 36, a 30° cone 89 against 73. Partition a sky catalogue to
-load, index, vacuum or archive it by region, not for speed: cones cost the
-same, cross-matches 1.2–1.7 times as much.
-
-**Citus distributed tables** (0.45, [`bench/citus/`](bench/citus/)). On Citus
-13 with a catalogue hash-distributed over 8 shards, every cone, polygon,
-composite and MOC form tried gives the single node's rows. So do nearest
-neighbours and cross-matches against a reference or local probe table. Each
-shard plans its part with skycell and uses the custom scan on its own index.
-Distributed by a coarse cell column kept true by a CHECK constraint, e.g.
-`hpx3 bigint CHECK (hpx3 = skycell_ang2cell(ra, dec) >> 52)`, a constant
-region gets `hpx3 = ANY('{its cells}')`, and Citus sends it only to the shards
-holding them: a 1° cone to 1 shard of 32, a 5° cone to 6.
-`skycell_moc_agg` (and `skycell_coverage_moc`) aggregates on the shards. The
-estimate functions sum over the shards. skycell's settings must be the same
-on every node: a plain `SET` on the coordinator does not reach them. Not yet:
-two distributed catalogues cannot be cross-matched.
-
-**Polygons through the custom scan** (0.43, [`bench/results-polyscan/`](bench/results-polyscan/)).
-Since 0.43 a constant polygon or box takes the custom scan that cones have.
-Before that it was rewritten into an `OR` of index ranges plus a per-row test.
-The benchmark ran 60 centres on the 10M real Gaia DR3 positions, 0.05°–2°
-across, with three shapes: a convex quadrilateral, a box and a non-convex U.
-Each was timed five ways in random order, planning included:
-
-- `skycell_poly` through the custom scan;
-- the same query with `skycell.custom_scan` off (the 0.42 rewrite);
-- ADQL `CONTAINS(POINT, POLYGON)`;
-- pgSphere's `<@ spoly`;
-- Q3C's `q3c_poly_query` (convex shapes only).
-
-All counted the same rows. Summed time over the 0.42 rewrite's, with a 95%
-bootstrap interval:
-
-| shape | scan ÷ rewrite | scan ÷ pgSphere | scan ÷ Q3C |
-|---|---|---|---|
-| quadrilateral | 0.93 [0.89, 0.97] | 0.05 | 0.11 |
-| box | 0.90 [0.87, 0.92] | 0.09 | 0.07 |
-| U | 0.93 [0.89, 0.96] | 0.03 | — |
-
-Per query the gain is modest, because a polygon's covering was already tight.
-It grows with size: a 10° × 10° box (376k rows) takes 58 ms against the
-rewrite's 113 ms. A large polygon is also split among workers like a cone
-(0.42): with two workers, 22.8 ms against the rewrite's parallel bitmap scan at
-43.7 ms ([`parallel.md`](bench/results-polyscan/parallel.md)). The two
-spellings cost the same. In this benchmark, which runs five methods in turn on
-each polygon, ADQL came out about 10% ahead below 0.5°; timed on their own, on
-the same centres and sizes, `skycell_poly` was the faster by 5%.
-
-**Composite regions** (0.39, [`bench/results-composite/`](bench/results-composite/)).
-Five shapes on 60 centres on the 10M real Gaia DR3 positions, 0.05°–2° across.
-Each is written three ways: one `REGION`, the same pieces as a boolean of ADQL
-`CONTAINS` predicates in skycell, and pgSphere's boolean of `<@`. pgSphere has
-no composite region type. Its MOC type, `smoc`, has union and intersection, but
-it is approximate to its cells and no index serves `spoint <@ smoc`, so the
-boolean is how a query gets exact answers there. All three spellings count the
-same rows. Median ms per query, and the `REGION`'s summed time over the others':
-
-| shape | `REGION` | skycell boolean | pgSphere boolean | `REGION` ÷ skycell boolean | `REGION` ÷ pgSphere |
-|---|---|---|---|---|---|
-| annulus (circle less circle) | 0.11 | 0.13 | 0.11 | 0.84 | 0.89 |
-| two circles, union | 0.10 | 0.42 | 0.11 | 0.23 | 0.92 |
-| lens (intersection of two circles) | 0.07 | 0.10 | 0.10 | 0.71 | 0.45 |
-| square less a circle | 0.13 | 0.21 | 0.36 | 0.61 | 0.14 |
-| five circles, union | 0.10 | 0.67 | 0.20 | 0.17 | 0.62 |
-
-A composite is covered from its operands' own coverings: the union of theirs
-for a `UNION`, their intersection for an `INTERSECTION`, the first operand's
-for a `DIFFERENCE` that takes away at most half of it. A circle operand then
-takes the cone's direct path. A `NOT`, and a difference with a large hole, are
-covered by classifying cells against the whole composite, which keeps a thin
-ring from reading its hole.
-
-Since 0.39 a constant composite written as a top-level condition is answered
-by the custom scan, as a circle is: the planner keeps one call,
-`skycell_region_scan(cell, ra, dec, region)`, covers the composite once (cached
-for its estimate and its path), and the scan reads the ranges in cell order,
-testing each row from its `ra` and `dec`.
-In 0.38 the covering became an `OR` of range conditions that the planner costed
-one bitmap index scan at a time, and each row built a `point` for its test.
-That took the annulus from 1.33 to 0.89 of pgSphere's time and the union of two
-circles from 1.39 to 0.92; every shape is now faster than both boolean
-spellings. Under an `OR`, or with `skycell.custom_scan` off, a composite keeps
-the range rewrite.
-
-Before 0.38, an ADQL `OR` of `CONTAINS` predicates was a sequential scan in
-skycell: 2.4 s for two circles and 4.9 s for five on these 10M rows. It is now
-indexed like `<@ OR <@`, which is the skycell boolean column above.
-
-**Stored composite footprints** ([`bench/results-footprint/`](bench/results-footprint/)).
-An ObsCore-like table of 50,000 observations whose `s_region` holds each
-footprint as it is: NIRCam-like (two modules of 2×2 detectors with gaps),
-UVIS-like (two CCDs either side of a gap), coordinated parallels (two fields 7′
-apart) and coronagraphs (a field less its mask), half over the whole sky and
-half in twenty deep fields. skycell keeps one `skyregion` per observation
-under its default GiST. pgSphere, with no composite type, keeps one `spoly` per
-detector and one `scircle` per mask, each under its GiST, and a query returns
-the distinct observations less those whose mask holds the whole field (or the
-position), which for these shapes gives the same rows. Both answered the same
-observations for all 900 queries. Median ms per query, and skycell's summed
-time over pgSphere's:
-
-| workload | skycell | pgSphere | skycell ÷ pgSphere |
-|---|---|---|---|
-| observations meeting a search polygon (1′–20′) | 0.20 | 1.40 | 0.04 |
-| observations containing a position | 0.13 | 0.27 | 0.70 |
-
-The overlap margin is widest in the deep fields, where pgSphere tests every
-detector polygon of every candidate observation (1,500 of them for one 20′
-field) and skycell one footprint each. skycell's index is 2.9 MB against
-pgSphere's 10.1 MB for the detectors and 0.7 MB for the masks.
-
-**Parallel cross-matching.** The comparisons above, like the paper's, are
-serial. They run with `max_parallel_workers_per_gather = 0` for every method.
-With parallelism on, a cross-match with enough probes runs in parallel
-workers. The setup:
-
-- PostgreSQL 18.6 with its default settings, 4 cores.
-- 5M catalogue rows, the heap stored once in cell order and once at random.
-- 200k and 1M probes on sources.
-- Median of 3 warm runs, against v0.35, which cannot run a cross-match in
-  parallel. Every result is identical to the serial one.
-
-| probes | cone | serial | default workers | 3 workers |
-|---|---|---|---|---|
-| 200k (10 MB) | 1″–30″ | 1.4–18.2 s | 1 worker: 1.8–2.2× faster | — |
-| 1M (50 MB) | 1″, cell order | 8.4 s | 2 workers: 2.9× | 3.7× |
-| 1M | 30″, cell order | 20.9 s | 3.3× | 3.9× |
-| 1M | 1″, random order | 6.9 s | 2.7× | 3.6× |
-| 1M | 30″, random order | 92.0 s | 3.4× | 4.6× |
-
-"3 workers" sets the probe table's `parallel_workers`, so the leader and three
-workers use the four cores. Q3C's and pgSphere's cross-matches can run under a
-parallel nested loop too. They were not measured that way, so these figures
-compare skycell with itself only.
-
-**Parallel cone searches.** A single cone with many rows behind it is split
-among processes since 0.42. On `gaia_realc` (10M Gaia DR3 positions, heap in
-cell order, 4 cores), cones centred on the Galactic centre, best of 5 warm runs,
-counts identical to the serial ones:
-
-| search | rows | serial | 2 workers allowed | 4 workers allowed |
-|---|---|---|---|---|
-| 1° cone | 2.8k | 0.6 ms | planned serial | planned serial |
-| 3° | 90k | 14.2 ms | 1 worker: 11.0 ms | 1 worker: 13.1 ms |
-| 5° | 294k | 45.5 ms | 2 workers: 20.9 ms | 2 workers: 20.7 ms |
-| 10° | 1.29M | 189.5 ms | 2 workers: 71.2 ms | 3 workers: 71.9 ms |
-| 15° | 2.20M | 286.8 ms | 2 workers: 136.8 ms | 3 workers: 123.9 ms |
-| annulus 5°–10° (`DIFFERENCE`) | 1.00M | 209.9 ms | 2 workers: 95.9 ms | 3 workers: 124.8 ms |
-
-PostgreSQL picks the workers by the heap pages the search is expected to read,
-as it would for a parallel scan of that many pages, so small cones, which are
-the common case, keep their serial plan and their planning cost. Away from the
-Galactic plane the same 15° cone holds 33k rows and stays serial.
-
-The benchmark scripts behind the paper describing skycell, and the
-documentation of every measurement it quotes, are in [`bench/`](bench/):
-[`bench/README.md`](bench/README.md) maps each table to its directory, and
-[`bench/REPRODUCING.md`](bench/REPRODUCING.md) gives the hosts, settings and run
-order. The paper itself, the raw per-query results, the runs of earlier versions
-and the design notebook (`GIST_REGION_DESIGN.md`) that the "Round …" references
-in the source comments point to are in
-[skycell-paper](https://github.com/jesusjuansalgado/skycell-paper).
-
----
+rows) and builds about 23× faster; at Gaia DR3 scale, one 38 GiB index replaces
+the 160 GiB an archive keeps for pgSphere plus Q3C. The full measurements, the
+protocol and how each figure moved between versions are in
+[`docs/performance.md`](docs/performance.md).
 
 ## Testing
 
-Two layers, both in [`ext/test/`](ext/test/), and a performance check.
-
-**Performance, against the last release** — `make perfcheck` in `ext/`, on a
-development server with the benchmark database (about three minutes;
-[`bench/perfcheck/`](bench/perfcheck/)). The tests below check answers, not
-speed: 0.44 shipped a nearest-neighbour search a third slower at k = 1 that
-none of them could see. The check installs the library just built and the
-latest release tag in turn, over 20 alternating rounds, times ten short
-workloads (cones, a polygon, an annulus, a cross-match, nearest neighbours,
-a partitioned cone and cross-match) at 30 centres, and fails when one is more
-than 10% slower with 95% confidence; both libraries must return the same
-rows. Run against v0.42, it flags v0.44's regression (1.21 [1.13, 1.30]).
-
-**Geometry, standalone** — `make selftest` in `ext/`, no PostgreSQL needed
-(about two minutes):
-
-- `healpix_selftest`: order-0 pixel centres, the pixel → centre → pixel round
-  trip at every order, nesting across orders, every point within `max_pixrad`
-  of its pixel's centre (the bound the covering's *outside* test relies on), and
-  equal area (χ²/dof 1.14 for uniform points over order-3 pixels).
-- `cover_selftest`: brute force on the covering itself. Two million catalogue
-  points; for cones from 1″ to 120° and for convex polygons, under a uniform
-  and a histogram density model, every point inside the region must have its
-  order-29 cell inside one of the ranges. Then the awkward places: 7,552
-  polygons at the poles, zone boundaries, RA wrap-around and face edges (904,809
-  points inside, half within a part per billion of an edge), and 2 × 30,000 cones
-  with 200 points each. Then 1,200 non-convex polygons, from 0.2″ to 55°: L, U,
-  comb and random star shapes, in both orientations, at the same places. Each
-  is checked against a reference that shares none of its code: a crossing-number
-  test in a plane of the test's own choosing, plus a fan sum for the area. That
-  covers 444,683 points, half of them a hair either side of an edge, and each
-  point's membership and covering, the area, the centroid (against brute-force
-  quadrature, every quarter of the shapes) and CONTAINS and INTERSECTS for
-  14,400 small triangles around the notches. Then 300 wide polygons, the same
-  shapes stretched to about 70° from their centre with one edge cut into 60
-  more vertices, so that their vertex mean no longer holds them: membership,
-  covering and area against the same reference. It also prints ranges, cells examined, false-positive
-  fraction and µs per covering. Then 1,500 random composites (unions,
-  intersections, differences and NOTs, up to four deep, of cones and convex and
-  non-convex polygons): every catalogue point inside must be covered, and every
-  cell class must be honest for 128 sampled points per cell, half on cell edges.
-  Then 1,200 pairs of a composite and a cone, polygon or composite nearby,
-  half of them built as SQL's membership path builds them (without the
-  covering tables). Sampled points check every answer: a point in both
-  regions means they overlap, a point of the first outside the second means
-  it is not contained, and every non-empty region holds itself
-  (`SC_SELFTEST_PAIRS=1 SC_SELFTEST_NPAIR=20000` runs only these, more of
-  them: 0 wrong in 20,000). Then AREA and CENTROID of 300 composites against
-  what shares none of their code: a circle's area and moment in closed form,
-  annuli, inclusion–exclusion (A + B = A ∪ B + A ∩ B) for circles and for a
-  polygon with its exact area, and a union against its complement; each within
-  the bounds the integration reports (`SC_SELFTEST_INT=1`, with
-  `SC_SELFTEST_NINT`, runs only these). Current run: **0 false negatives**.
-
-**SQL regression** — `make installcheck` in `ext/`, against a running server:
-
-- `skycell`: every indexed query must return exactly what the exact predicate
-  returns on a sequential scan — no false negatives, no false positives — on a
-  clustered catalogue with clusters at both poles and across RA = 0: cones,
-  polygons, the Q3C-shaped spellings, cross-matches, MOC-stored regions and the
-  GiST region operator classes.
-- `adql`: the ADQL surface — the standard's spelling and the operator form,
-  each indexed (under `OR` and in correlated sub-selects too), and the IVOA
-  UDF astronomy functions.
-- `cone_scan`: the custom scan. Every query returns the same rows with
-  `skycell.custom_scan` on and off, in both of its modes (a heap in cell order
-  and one that is not), rescanned in a nested loop, under a generic plan and
-  through a scrollable cursor; each placement of a cone (under `OR`, in a view,
-  a `JOIN ON`, a sub-select, a target list) gets the plan it should; cross-matches
-  (join, per-row radius, `WHERE` join, `LEFT JOIN`, `EXISTS`, expression index,
-  correlated nearest-neighbour, `skycell_join`), with a NULL centre, a cone round
-  the pole and one across RA = 0, match the rewrite; an invalid centre errors as
-  the rewrite does; and the cross-match row estimate is within 3× of the truth.
-- `polygon`: non-convex polygons, checked against things that do not share
-  their code: a U is written again as three convex pieces, and must hold
-  exactly the pieces' rows, with the pieces' total area. Points in the notch,
-  a cone in the notch and a bridge across it (every vertex inside, an edge
-  outside) are tested, along with self-crossing, self-touching and
-  doubled-back input. The exact test, the range rewrite and the indexed and
-  sequential operator must agree for a U, a comb across RA = 0, a pac-man
-  over the pole, a star at the zone boundary and an arcsecond-sized U. Every
-  GiST region operator class must give the sequential answer for regions
-  that are non-convex polygons.
-- `parallel`: parallel queries, with parallelism made free so that the
-  planner uses it wherever it can.
-  - A cross-match is planned as a Gather over a Parallel Seq Scan of the
-    probes, with the custom scan in ordered and bitmap mode and with the index
-    filter. It must give the serial answer as a join, with a radius column, as
-    a `LEFT JOIN`, an `EXISTS` and an ADQL `CONTAINS`.
-  - Workers are launched, and the rows the index filter removes in them add up
-    to the serial count.
-  - Under `debug_parallel_query` a whole cone search runs inside a worker, in
-    both modes, with the index filter, as a cross-match and as a generic plan's
-    run-time cone, and returns the serial answer.
-  - A single cone, a 40° cone and a composite are planned parallel aware
-    under a Gather, in both modes, and give the serial answer, also when a
-    nested loop rescans the Gather.
-- `nearest`: the nearest-neighbour scan. Every query must return what
-  PostgreSQL's sort returns, the same distances in the same order and the same
-  rows (ties aside): on a catalogue with duplicated positions, NULL
-  coordinates and a knot past RA = 0 at the pole, its heap in and out of cell
-  order, for centres at both poles and either side of RA = 0, k from one row
-  to past the relation (NULL distances last), every spelling of the distance,
-  with conditions that take several rings, a `work_mem` small enough that a
-  ring spills to a tuplesort, a NULL or invalid centre, a generic plan whose
-  centre and `LIMIT` are parameters, `LATERAL` per outer row, and inside a
-  parallel worker. The spellings it does not take (no `LIMIT`, `DESC`, a
-  system column, a centre that reads the row) must keep the sort. A stored
-  `cell` column serves the nearest scan, ADQL's `contains()` and `distance()`,
-  `skycell_radial_query` and `skycell_join` when it is generated or carries a
-  validated `CHECK` with `NOT NULL`, with the plain predicates' answers, and
-  not when the `CHECK` lacks `NOT NULL`, is not validated, not enforced or
-  names another expression, or once it is dropped. A partitioned catalogue
-  (declination bands, one attached with its columns in another order, one
-  split again by right ascension, a default partition for NULL declinations,
-  one band without the index) must give the sort's answer through a Merge
-  Append of the partitions' nearest scans, pruned or not.
-
-- `partition`: catalogues partitioned by cell range (with an empty partition)
-  and by declination band (sub-partitioned, a default partition, a partition
-  without the index), and a table holding one patch of sky. Constant cones,
-  polygons, boxes, composites, distance comparisons and cross-matches must
-  give the unpartitioned table's answers (the patch's, with the custom scan
-  off), and every indexed partition must offer the custom scan. On the
-  catalogue partitioned by cell range (and on one partitioned by a stored cell
-  column), a constant cone must be pruned at plan time to its partition and a
-  cross-match must run only the partition holding its probes; every cell of a
-  cone must lie within `skycell_cone_cell_lo/hi`.
-- `estimate`: row-count and density estimates against exact counts on a
-  catalogue ANALYZE reads whole; density views at several orders against
-  `GROUP BY` counts, their refresh, and `skycell_cell_overlaps` with its
-  index rewrite against testing every cell.
-- `moc`: MOCs of cones, polygons, composites, the whole sky and nothing, in
-  ASCII and JSON; the max-order cells of a region's MOC must be exactly those
-  `skycell_cell_overlaps` counts; the aggregate's merging of duplicates and
-  siblings; a table's coverage by expression index and by stored cell
-  column, and of an empty table; out-of-range orders and formats. The
-  aggregate in parallel (workers only) must give the one-process MOC at
-  orders 0–12, also when workers see no row with a cell.
-- `moc_region`: MOCs read from ASCII, MOC 1.0 commas and JSON, normalised;
-  in STC-S and composites; AREA and CENTROID; malformed MOCs refused. On a
-  catalogue, nine MOCs (single cells, mixed orders, a pole, the whole sky,
-  nothing) must give the rows whose cell is in them, counted independently,
-  by the custom scan, the range rewrite and a sequential scan, and in a
-  DIFFERENCE, INTERSECTION and NOT the boolean combination of the tests.
-  Relations between MOCs, and with cones as the cones' own MOCs answer them;
-  stored MOCs under GiST against a sequential scan; estimates; partition
-  pruning. The set operations (0.46) on chosen MOCs, the identities they must
-  keep (a split by b and joined again is a; a with its complement is the sky;
-  inclusion–exclusion of areas), the union aggregate over 3,000 footprints as
-  MOCs and as circles, in parallel and over no rows; operations refused on a
-  region that is not a MOC.
-- `composite`: unions, intersections, differences and NOTs. STC-S in and
-  out (every malformed form errors with a reason), the constructors, each
-  composite's membership against the boolean combination of its pieces,
-  region-to-region answers that can be checked by hand (a circle in an
-  annulus's hole, one across the gap between a union's pieces, nested NOTs),
-  AREA and CENTROID against exact values, and STC-S `BOX`. A constant composite on the catalogue index (eight fixed
-  shapes and 40 random ones) must give the exact test's and the sequential
-  scan's rows, and take the custom scan as a top-level condition (from a
-  `skypos` column or from `ra`/`dec`, alone or with another condition) and the
-  range rewrite under an `OR` or with the custom scan off; stored composites must give the sequential answer under each
-  region index, for a point, a join, ADQL `CONTAINS` and a correlated
-  sub-select, and for overlap and containment against cones, polygons and
-  composites (`&&`, `@>`, `<@`, ADQL `INTERSECTS` and `CONTAINS`). Every pair
-  of stored regions must overlap symmetrically, and each non-empty one must
-  hold and meet itself.
-- Correlated sub-selects (in `adql`): an outer query's column used as the
-  point, the centre or a polygon vertex in a sub-select must plan, use the
-  index and give the join's answer.
-
-**Reference translators** — [`adql_geometry/tests/`](adql_geometry/tests/): the
-Python translator's tests (pytest), and `cross_check.py`, which requires the
-Python and Java translators to produce identical SQL for every case.
-
-[CI](.github/workflows/ci.yml) runs all of it on every push to `main` and every
-pull request: the SQL regression on PostgreSQL 16, 17 and 18 (packages from
-apt.postgresql.org, a fresh cluster with default settings; the steps are
-[`.github/ci/pg-regress.sh`](.github/ci/pg-regress.sh), which runs as well
-locally), the standalone selftests, and the reference translators.
+The coverings are checked by brute force against points sampled in, out and
+on the edge of every region kind: adversarial cones and polygons at the poles,
+zone boundaries and face edges, non-convex polygons against an independent
+reference, and random composites up to four deep, with zero missed rows. The
+SQL regression suite, run on PostgreSQL 16, 17 and 18 for every change,
+requires every indexed answer to equal a sequential scan with the exact
+predicate. `make perfcheck` guards against slowdowns before a release. Details
+in [`docs/testing.md`](docs/testing.md); the tutorials' own SQL is checked by
+[`docs/tutorials/check.py`](docs/tutorials/check.py).
 
 ## Limitations
 
@@ -1584,44 +1206,37 @@ locally), the standalone selftests, and the reference translators.
   a sort, as it leaves ADQL's `distance()` and `contains()` unindexed. A query
   that reads a system column of the relation
   (`ctid`, `FOR UPDATE`) keeps the sort too, since the scan returns rows from
-  its own buffer. On a clustered relation (an ObsCore table, observations
-  grouped in fields, its heap out of cell order) it was slower than
-  pgSphere's GiST ordering for hundreds of rows or more until 0.51 (1.15 at
-  k = 100, 1.45–1.55 at 1000): it read 2–4 times the rows it returned. Since
-  0.52 the first rows are found by a best-first walk over HEALPix cells
-  ([Nearest neighbours](#nearest-neighbours)), level with pgSphere (0.94 and
-  0.95); the problem as it stood is written up in
-  [`open-problem.md`](bench/results-nearest/open-problem.md). A condition
-  `distance > x` starts the rings at x (since 0.45).
+  its own buffer. The best-first walk that finds the first rows on a heap out
+  of cell order holds them in memory, so a query wanting more rows than about
+  a third of `work_mem` holds uses the rings, which spill to disk, instead.
 - **Where the custom scan applies.** It answers cones, cross-matches and
   constant polygons, boxes and composites; per-row polygons and stored regions
   use the range rewrite and the region indexes. The search must be a top-level
   `AND` term of a `WHERE` or `JOIN ON`, or a boolean of constant regions of
-  one position, which is folded into one (since 0.53); one under an `OR` with
+  one position, which is folded into one; one under an `OR` with
   anything else is rewritten instead and stays indexable through a `BitmapOr`. It reads heap
-  tables only. On a partitioned table each partition gets the scan (since
-  0.44; constant searches kept the rewrite before), and a partition without
-  the cell index a sequential scan. A cross-match against a partitioned
-  catalogue rescans the partitioned table for every probe. Partitioned by its
-  cell (`skycell_ang2cell(ra, dec)` or a stored cell column, range
-  partitioning), the partitions a cone cannot reach are pruned at each probe
-  (SQL 0.40), and 16 partitions cost 1.2–1.7 times the unpartitioned table,
-  against 3.4–8.1 with 0.43. Partitioned otherwise (by declination band, say)
+  tables only. On a partitioned table each partition gets the scan, and a
+  partition without the cell index a sequential scan. A cross-match against a
+  partitioned catalogue rescans the partitioned table for every probe.
+  Partitioned by its cell (`skycell_ang2cell(ra, dec)` or a stored cell
+  column, range partitioning), the partitions a cone cannot reach are pruned
+  at each probe, and 16 partitions cost 1.2–1.7 times the unpartitioned
+  table. Partitioned otherwise (by declination band, say)
   every partition is rescanned, each one whose keys cannot hold the cone
   answering in about 0.3 µs; bands hold cells all over the key space, so
   there it is the covering that costs. A partition left without the index
   stops a cross-match from using the others' scans at all. Constant polygons
-  and composites are pruned by their bounding circle (since 0.45); a cone or
+  and composites are pruned by their bounding circle; a cone or
   circle over 90°, or a `NOT` region, prunes nothing.
   Nearest neighbours on a partitioned table are answered partition by
-  partition and merged (since 0.40), so every partition finds its own nearest
+  partition and merged, so every partition finds its own nearest
   row before the first is returned: one far from the point costs a cell walk
   and a few rings, about 30 ms a query on 3M rows in four declination bands,
   where partitions by cell range, each holding its own part of the sky, take
   2.3 ms. Before PostgreSQL 18 its bitmap mode does not prefetch.
 - **Parallel queries.** A cross-match's probes are shared out among workers,
-  and since 0.42 a single cone or composite search with a fixed region (and
-  since 0.43 a polygon or box) is split among them (its covering in chunks). A cone whose region is known only
+  and a single cone, polygon, box or composite search with a fixed region is
+  split among them (its covering in chunks). A cone whose region is known only
   at run time (a generic plan's parameters) and a nearest-neighbour query are
   not split. PostgreSQL gives
   the probe table workers by its size: none below 8 MB
@@ -1631,6 +1246,13 @@ locally), the standalone selftests, and the reference translators.
   per covering is the leader's own, labelled so, since a node that is not
   parallel aware gets no shared memory to collect the workers' figures; the rows
   removed by the index filter are counted in every process.
+- **A stored region against a catalogue, in a join.** The sources inside one
+  footprint taken from another table (`JOIN obscore o ON CONTAINS(POINT(c.ra,
+  c.dec), o.s_region) = 1 WHERE o.obs_id = ...`) are searched through
+  run-time range slots on the cell index, but the planner overestimates their
+  rows and can prefer reading the whole catalogue. Write the footprint as a
+  scalar sub-query instead, which is searched like a constant region
+  ([tutorial 2](docs/tutorials/02-regions-and-footprints.md#sources-inside-a-footprint)).
 - **Planning costs.** A covering is computed per query: skycell plans a 1″
   cone in 0.054 ms, against 0.040 ms for pgSphere, so on a small table (0.5M
   rows) a small cone at a new position every query can still favour pgSphere.
