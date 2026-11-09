@@ -363,3 +363,75 @@ SELECT (pt_keyed($q$1 = CONTAINS(POINT('ICRS', ra, dec), CIRCLE('ICRS', 120, 30,
 
 DROP FUNCTION pt_cmp(text, text), pt_scans(text, text), pt_keyed(text, text), pt_filter(text);
 DROP TABLE pt_flat, pt_cell, pt_dec, pt_patch, pt_probe, pt_col, pt_key;
+-- the helpers (SQL 0.47): a cell's range of order-29 ids, and a table cut
+-- into the cells of an order in one call, with a default partition for rows
+-- without a position (a NULL cell); searches pruned to the cells they reach
+SELECT * FROM skycell_cell_range(0, 0);
+ lo |         hi         
+----+--------------------
+  0 | 288230376151711743
+(1 row)
+
+SELECT * FROM skycell_cell_range(0, 11);
+         lo          |         hi          
+---------------------+---------------------
+ 3170534137668829184 | 3458764513820540927
+(1 row)
+
+SELECT skycell_ang2cell(10, 10) BETWEEN (skycell_cell_range(5, skycell_ang2pix(5, 10, 10))).lo
+                                    AND (skycell_cell_range(5, skycell_ang2pix(5, 10, 10))).hi AS inside_its_cell;
+ inside_its_cell 
+-----------------
+ t
+(1 row)
+
+SELECT * FROM skycell_cell_range(0, 12);                     -- error: no such cell
+ERROR:  cell 12 does not exist at order 0 (0 to 11)
+CONTEXT:  PL/pgSQL function skycell_cell_range(integer,bigint) line 7 at RAISE
+SELECT * FROM skycell_cell_range(30, 0);                     -- error: order
+ERROR:  HEALPix order 30 is out of range (0-29)
+CONTEXT:  PL/pgSQL function skycell_cell_range(integer,bigint) line 4 at RAISE
+CREATE TABLE hp_cat (id bigint, ra float8, dec float8) PARTITION BY RANGE (skycell_ang2cell(ra, dec));
+SELECT skycell_create_partitions('hp_cat', 1) AS partitions;
+ partitions 
+------------
+         49
+(1 row)
+
+SELECT skycell_create_partitions('hp_cat', 1);               -- error: has partitions
+ERROR:  hp_cat already has partitions
+CONTEXT:  PL/pgSQL function skycell_create_partitions(regclass,integer,boolean) line 19 at RAISE
+INSERT INTO hp_cat SELECT i, mod(i * 137.50776405003785, 360.0)::float8,
+  degrees(asin(1 - 2 * (i + 0.5) / 20000.0)) FROM generate_series(0, 19999) i;
+INSERT INTO hp_cat VALUES (-1, NULL, 10);
+CREATE INDEX ON hp_cat (skycell_ang2cell(ra, dec));
+ANALYZE hp_cat;
+SELECT tableoid::regclass AS no_position_goes_to FROM hp_cat WHERE id = -1;
+ no_position_goes_to 
+---------------------
+ hp_cat_default
+(1 row)
+
+SELECT (SELECT count(*) FROM hp_cat WHERE CONTAINS(POINT('ICRS', ra, dec), CIRCLE('ICRS', 10, 20, 3)) = 1)
+     = (SELECT count(*) FROM hp_cat WHERE skycell_in_cone(ra, dec, 10, 20, 3)) AS same_rows;
+ same_rows 
+-----------
+ t
+(1 row)
+
+DO $$
+DECLARE l text; n int := 0;
+BEGIN
+  FOR l IN EXECUTE 'EXPLAIN (COSTS OFF) SELECT count(*) FROM hp_cat
+                    WHERE CONTAINS(POINT(''ICRS'', ra, dec), CIRCLE(''ICRS'', 10, 20, 1)) = 1' LOOP
+    IF l ~ ' on hp_cat_' THEN n := n + 1; END IF;
+  END LOOP;
+  RAISE NOTICE 'a 1 deg cone reads % of the 49 partitions', CASE WHEN n BETWEEN 1 AND 3 THEN 'one to three' ELSE n::text END;
+END $$;
+NOTICE:  a 1 deg cone reads one to three of the 49 partitions
+CREATE TABLE hp_list (id int, ra float8, dec float8) PARTITION BY LIST (id);
+SELECT skycell_create_partitions('hp_list', 0);              -- error: not by range
+ERROR:  hp_list is not partitioned by RANGE on one key
+HINT:  CREATE TABLE ... PARTITION BY RANGE (skycell_ang2cell(ra, dec)), or on a stored cell column.
+CONTEXT:  PL/pgSQL function skycell_create_partitions(regclass,integer,boolean) line 12 at RAISE
+DROP TABLE hp_cat, hp_list;

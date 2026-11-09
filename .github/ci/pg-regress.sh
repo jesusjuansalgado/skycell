@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Build skycell against one PostgreSQL major version, install it, and run the
-# regression suite (make installcheck) on a fresh cluster of that version.
+# regression suite (make installcheck) and the tutorials' SQL
+# (docs/tutorials/check.py) on a fresh cluster of that version.
 #
 #   .github/ci/pg-regress.sh 17
 #
@@ -43,4 +44,6 @@ make installcheck PG_CONFIG="$PG_CONFIG" PGPORT="$PORT" || status=$?
 if [ "$status" -ne 0 ] && [ -f test/regression.diffs ]; then
   cat test/regression.diffs
 fi
+# the tutorials' SQL, with the plans they promise
+PGPORT="$PORT" python3 "$ROOT/docs/tutorials/check.py" || status=1
 exit "$status"

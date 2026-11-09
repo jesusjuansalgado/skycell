@@ -46,6 +46,7 @@
 #include "utils/array.h"
 #include "utils/builtins.h"
 #include "utils/float.h"
+#include "utils/geo_decls.h"
 #include "utils/fmgroids.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
@@ -55,6 +56,9 @@
 
 #include "cover.h"
 #include "skycell_internal.h"
+
+/* add_distance_cones() is simplifying the region tests it left (0.54) */
+static bool late_fold_eval = false;
 
 #define DEG2RAD (M_PI / 180.0)
 #define RAD2DEG (180.0 / M_PI)
@@ -904,6 +908,54 @@ skycell_point(PG_FUNCTION_ARGS)
 	PG_RETURN_POINTER(skypos_make(PG_GETARG_FLOAT8(0), PG_GETARG_FLOAT8(1)));
 }
 
+/*
+ * PostgreSQL's own point, read as a sky position (0.54; SQL 0.47): x the
+ * right ascension and y the declination, in degrees, as ADQL's POINT(ra, dec)
+ * has them.  The implicit cast that calls it makes the bare ADQL spelling
+ * work where pg_catalog's point(float8, float8) wins the name, as it does
+ * with skycell installed in public: CONTAINS(POINT(ra, dec), CIRCLE(...)).
+ */
+PG_FUNCTION_INFO_V1(skycell_pos_from_point);
+Datum
+skycell_pos_from_point(PG_FUNCTION_ARGS)
+{
+	Point	   *p = PG_GETARG_POINT_P(0);
+
+	PG_RETURN_POINTER(skypos_make(p->x, p->y));
+}
+
+/*
+ * ... and that cast of point(ra, dec) planned as skycell's point(ra, dec),
+ * so that every search reading a position from ra and dec still sees it.
+ */
+PG_FUNCTION_INFO_V1(skycell_pos_from_point_support);
+Datum
+skycell_pos_from_point_support(PG_FUNCTION_ARGS)
+{
+	Node	   *rawreq = (Node *) PG_GETARG_POINTER(0);
+
+	if (IsA(rawreq, SupportRequestSimplify))
+	{
+		SupportRequestSimplify *req = (SupportRequestSimplify *) rawreq;
+		FuncExpr   *arg = (FuncExpr *) linitial(req->fcall->args);
+
+		if (list_length(req->fcall->args) == 1 && IsA(arg, FuncExpr) &&
+			arg->funcid == F_POINT_FLOAT8_FLOAT8 && list_length(arg->args) == 2)
+		{
+			Oid			t[2] = {FLOAT8OID, FLOAT8OID};
+			Oid			fn = LookupFuncName(list_make2(makeString(get_namespace_name(get_func_namespace(req->fcall->funcid))),
+													   makeString(pstrdup("skycell_point"))),
+											2, t, true);
+
+			if (OidIsValid(fn))
+				PG_RETURN_POINTER(makeFuncExpr(fn, req->fcall->funcresulttype,
+											   copyObject(arg->args), InvalidOid, InvalidOid,
+											   COERCE_EXPLICIT_CALL));
+		}
+	}
+	PG_RETURN_POINTER(NULL);
+}
+
 PG_FUNCTION_INFO_V1(skycell_point_cs);
 Datum
 skycell_point_cs(PG_FUNCTION_ARGS)
@@ -1576,6 +1628,23 @@ skycell_cell_corners(PG_FUNCTION_ARGS)
 /* ------------------------------------------------------------------ */
 
 /*
+ * A stored position: a skypos column, or a column of PostgreSQL's point read
+ * through the implicit cast (SQL 0.47), which an index on skycell_cell(pos)
+ * indexes as the same expression.
+ */
+static bool
+pos_column(Node *n)
+{
+	FuncExpr   *f = (FuncExpr *) n;
+	char	   *name;
+
+	if (IsA(n, Var))
+		return true;
+	return IsA(n, FuncExpr) && list_length(f->args) == 1 && IsA(linitial(f->args), Var) &&
+		(name = get_func_name(f->funcid)) != NULL && strcmp(name, "skycell_pos_from_point") == 0;
+}
+
+/*
  * The cell expression this predicate could be answered from, given the
  * position argument: skycell_cell(pos) for a stored skypos, or
  * skycell_ang2cell(ra, dec) for a point() built from two columns.  Unlike
@@ -1587,6 +1656,14 @@ cell_expr_for_point(Oid selfid, Node *pt)
 {
 	Oid			argtypes[2] = {FLOAT8OID, FLOAT8OID};
 
+	if (pos_column(pt) && !IsA(pt, Var))
+	{
+		Oid			one[1] = {exprType(pt)};
+
+		return (Node *) makeFuncExpr(lookup_sibling_func(selfid, "skycell_cell", 1, one),
+									 INT8OID, list_make1(copyObject(pt)),
+									 InvalidOid, InvalidOid, COERCE_EXPLICIT_CALL);
+	}
 	if (IsA(pt, FuncExpr))
 	{
 		FuncExpr   *f = (FuncExpr *) pt;
@@ -1748,11 +1825,18 @@ single_varno(Node *node)
 	return varno;
 }
 
+/* pos_ra_dec() for cone_scan.c: a per-row region's scan (0.54) */
+bool
+skycell_pos_coords(Oid funcid, Node *pt, Node **ra, Node **dec)
+{
+	return pos_ra_dec(funcid, pt, ra, dec);
+}
+
 /* ra and dec of a position: point([coordsys,] ra, dec), a constant or a column */
 static bool
 pos_ra_dec(Oid funcid, Node *pt, Node **ra, Node **dec)
 {
-	if (IsA(pt, FuncExpr))
+	if (IsA(pt, FuncExpr) && !pos_column(pt))
 	{
 		List	   *a = ((FuncExpr *) pt)->args;
 
@@ -1782,7 +1866,7 @@ pos_ra_dec(Oid funcid, Node *pt, Node **ra, Node **dec)
 		*dec = (Node *) float8_const(p->dec);
 		return true;
 	}
-	if (IsA(pt, Var))
+	if (pos_column(pt))
 	{
 		Oid			one[1] = {exprType(pt)};
 
@@ -2033,6 +2117,15 @@ region_support_simplify(SupportRequestSimplify *req, Oid funcid, Node *pt, Node 
 			   *rg2,
 			   *res = NULL;
 
+	/*
+	 * A query whose planning began before the library was loaded (the first
+	 * of a session, without session_preload_libraries) missed the planner
+	 * hook that joins a boolean of regions into one: its region tests are
+	 * left as written here, and joined and simplified by
+	 * add_distance_cones() once the quals are whole (0.54).
+	 */
+	if (req->root != NULL && skycell_planning_unhooked(req->root) && !late_fold_eval)
+		return NULL;
 	if (req->root != NULL && want_swap(req, funcid, pt, rg, &pt2, &rg2))
 		res = region_simplify_oriented(req, funcid, pt2, rg2);
 	if (res == NULL)
@@ -2940,7 +3033,7 @@ plain_pos(Oid funcid, Node *p)
 {
 	char	   *name;
 
-	if (IsA(p, Var) || IsA(p, Const))
+	if (pos_column(p) || IsA(p, Const))
 		return true;
 	if (!IsA(p, FuncExpr) || get_func_namespace(((FuncExpr *) p)->funcid) != get_func_namespace(funcid))
 		return false;
@@ -3474,6 +3567,21 @@ fold_region_bool(Node *n, bool *changed)
 	return (Node *) (b->boolop == OR_EXPR ? make_orclause(args) : make_andclause(args));
 }
 
+/* an implicit-AND list with its booleans of regions folded */
+static List *
+fold_conj(List *conj)
+{
+	List	   *args = NIL,
+			   *folded;
+	bool		inner = false;
+	ListCell   *lc;
+
+	foreach(lc, conj)
+		args = lappend(args, fold_region_bool(lfirst(lc), &inner));
+	folded = fold_region_terms(args, false);
+	return folded != NIL ? folded : args;
+}
+
 /* the WHERE and JOIN ON conditions of a query's join tree, folded */
 static void
 fold_jointree(Node *jt)
@@ -3553,10 +3661,16 @@ add_distance_cones(PlannerInfo *root, Node **quals)
 	int			norig;
 	bool		was_list;
 
+	bool		late = skycell_planning_unhooked(root);
+
 	if (*quals == NULL)
 		return;
 	was_list = IsA(*quals, List);
 	conj = was_list ? list_copy((List *) *quals) : make_ands_implicit((Expr *) *quals);
+	/* the planner hook's fold, missed by this query (region_support_simplify()) */
+	if (late && skycell_fold_regions)
+		conj = fold_conj(conj);
+	late_fold_eval = late;
 	norig = list_length(conj);
 	for (int i = 0; i < norig; i++)
 	{
@@ -3583,6 +3697,14 @@ add_distance_cones(PlannerInfo *root, Node **quals)
 			belows = lappend(belows, below);
 			origs = lappend_int(origs, i);
 		}
+	}
+	/* late: every term, its region tests left as written, simplified now */
+	if (late)
+	{
+		list_free(replaced);
+		replaced = NIL;
+		for (int i = 0; i < norig; i++)
+			replaced = lappend_int(replaced, i);
 	}
 	if (list_length(conj) == norig && replaced == NIL)
 		return;

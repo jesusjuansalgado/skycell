@@ -243,3 +243,36 @@ SELECT (pt_keyed($q$1 = CONTAINS(POINT('ICRS', ra, dec), CIRCLE('ICRS', 120, 30,
 
 DROP FUNCTION pt_cmp(text, text), pt_scans(text, text), pt_keyed(text, text), pt_filter(text);
 DROP TABLE pt_flat, pt_cell, pt_dec, pt_patch, pt_probe, pt_col, pt_key;
+
+-- the helpers (SQL 0.47): a cell's range of order-29 ids, and a table cut
+-- into the cells of an order in one call, with a default partition for rows
+-- without a position (a NULL cell); searches pruned to the cells they reach
+SELECT * FROM skycell_cell_range(0, 0);
+SELECT * FROM skycell_cell_range(0, 11);
+SELECT skycell_ang2cell(10, 10) BETWEEN (skycell_cell_range(5, skycell_ang2pix(5, 10, 10))).lo
+                                    AND (skycell_cell_range(5, skycell_ang2pix(5, 10, 10))).hi AS inside_its_cell;
+SELECT * FROM skycell_cell_range(0, 12);                     -- error: no such cell
+SELECT * FROM skycell_cell_range(30, 0);                     -- error: order
+CREATE TABLE hp_cat (id bigint, ra float8, dec float8) PARTITION BY RANGE (skycell_ang2cell(ra, dec));
+SELECT skycell_create_partitions('hp_cat', 1) AS partitions;
+SELECT skycell_create_partitions('hp_cat', 1);               -- error: has partitions
+INSERT INTO hp_cat SELECT i, mod(i * 137.50776405003785, 360.0)::float8,
+  degrees(asin(1 - 2 * (i + 0.5) / 20000.0)) FROM generate_series(0, 19999) i;
+INSERT INTO hp_cat VALUES (-1, NULL, 10);
+CREATE INDEX ON hp_cat (skycell_ang2cell(ra, dec));
+ANALYZE hp_cat;
+SELECT tableoid::regclass AS no_position_goes_to FROM hp_cat WHERE id = -1;
+SELECT (SELECT count(*) FROM hp_cat WHERE CONTAINS(POINT('ICRS', ra, dec), CIRCLE('ICRS', 10, 20, 3)) = 1)
+     = (SELECT count(*) FROM hp_cat WHERE skycell_in_cone(ra, dec, 10, 20, 3)) AS same_rows;
+DO $$
+DECLARE l text; n int := 0;
+BEGIN
+  FOR l IN EXECUTE 'EXPLAIN (COSTS OFF) SELECT count(*) FROM hp_cat
+                    WHERE CONTAINS(POINT(''ICRS'', ra, dec), CIRCLE(''ICRS'', 10, 20, 1)) = 1' LOOP
+    IF l ~ ' on hp_cat_' THEN n := n + 1; END IF;
+  END LOOP;
+  RAISE NOTICE 'a 1 deg cone reads % of the 49 partitions', CASE WHEN n BETWEEN 1 AND 3 THEN 'one to three' ELSE n::text END;
+END $$;
+CREATE TABLE hp_list (id int, ra float8, dec float8) PARTITION BY LIST (id);
+SELECT skycell_create_partitions('hp_list', 0);              -- error: not by range
+DROP TABLE hp_cat, hp_list;
