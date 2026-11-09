@@ -70,31 +70,36 @@ holding 3·10⁵ rows or more run 2.1–2.7 times faster with two workers.
 
 A catalogue too large to load, vacuum or archive in one piece can be split by
 sky region. Partition by ranges of the cell itself, so that PostgreSQL drops
-the partitions a search cannot reach. The cell of HEALPix order *k* number
-*p* holds the order-29 ids from *p*·4^(29−*k*) to (*p*+1)·4^(29−*k*) − 1;
-the twelve order-0 cells, for instance:
+the partitions a search cannot reach, and let `skycell_create_partitions` cut
+the table into the HEALPix cells of an order: 12 partitions at order 0, 48 at
+order 1, 192 at order 2, and a default partition for rows without a position.
 
 ```sql
 CREATE TABLE catp (source_id bigint, ra float8, dec float8, mag float8)
   PARTITION BY RANGE (skycell_ang2cell(ra, dec));
-SELECT format('CREATE TABLE catp_%s PARTITION OF catp FOR VALUES FROM (%s) TO (%s)',
-              p, p::bigint << 58, (p + 1)::bigint << 58)
-FROM generate_series(0, 11) p \gexec
+SELECT skycell_create_partitions('catp', 0);       -- returns 13: 12 cells and the default
 INSERT INTO catp SELECT * FROM cat;
 CREATE INDEX ON catp (skycell_ang2cell(ra, dec));
 ANALYZE catp;
 ```
 
-(`\gexec` is psql's: it runs each row of the result as a statement. Order 1
-gives 48 partitions, order 2 gives 192.) A constant search is pruned at plan
-time to the partitions it touches; a cross-match tests each partition's key
-range once per target, and skips those that cannot hold the cone; nearest
-neighbours merge one ordered scan per partition:
+Each cell is one range of the order-29 ids the index holds, which
+`skycell_cell_range` gives, for partitions made by hand (a cell of order 5,
+say, as its own partition: `FOR VALUES FROM (lo) TO (hi + 1)`):
+
+```sql
+SELECT * FROM skycell_cell_range(5, skycell_ang2pix(5, 266.4, -28.9));
+```
+
+A constant search is pruned at plan time to the partitions it touches; a
+cross-match tests each partition's key range once per target, and skips those
+that cannot hold the cone; nearest neighbours merge one ordered scan per
+partition:
 
 ```sql
 EXPLAIN (COSTS OFF)
 SELECT * FROM catp WHERE CONTAINS(POINT(ra, dec), CIRCLE(10, 10, 0.5)) = 1;
--- expect: Subplans Removed: 11
+-- expect: Subplans Removed: 12
 EXPLAIN (COSTS OFF)
 SELECT source_id FROM catp ORDER BY DISTANCE(POINT(ra, dec), POINT(10, 10)) LIMIT 5;
 -- expect: Merge Append

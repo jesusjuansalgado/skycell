@@ -686,6 +686,8 @@ one must be dropped before upgrading past 0.37, and the upgrade says so.
 | `skycell_cell(p skypos)` | `int8` | same, from a `skypos` column |
 | `skycell_ang2pix(order, ra, dec)` | `int8` | the cell at any order |
 | `skycell_cell_corners(order, pix)` | `float8[]` | the four corners, as ra, dec, … |
+| `skycell_cell_range(order, pix)` | `(lo int8, hi int8)` | the first and last order-29 ids inside a cell: a partition holding it is `FOR VALUES FROM (lo) TO (hi + 1)` |
+| `skycell_create_partitions(parent regclass, order int [, with_default bool])` | `int` | cut a table partitioned by `RANGE` on the cell into the 12·4^order cells of an order (0–4), one partition each (`<table>_<order>_<cell>`), and a default partition for rows without a position; returns the partitions made ([Large catalogues](docs/tutorials/04-scaling-parallel-partitions.md#partitioning-by-sky-region)) |
 
 ### Indexable predicates
 
