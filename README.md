@@ -247,25 +247,22 @@ Both ADQL 2.0 and 2.1 are accepted; the two implementations are checked to
 produce identical output. For skycell the translation is optional: the
 planner indexes `1 = CONTAINS(…)`, `DISTANCE(…) < r` and `ORDER BY DISTANCE(…)`
 as ADQL writes them, so a TAP service can pass the geometry through unchanged
-once the names resolve ([ADQL names and `search_path`](#adql-names-and-search_path)).
+([ADQL names](#adql-names)).
 
-### ADQL names and `search_path`
+### ADQL names
 
-The functions are named as ADQL names them. PostgreSQL has its own
-`point(float8, float8)`, so install into a schema of its own and put that
-schema before `pg_catalog` to use the bare names:
-
-```sql
-CREATE SCHEMA sky;
-CREATE EXTENSION skycell SCHEMA sky;
-ALTER DATABASE mydb SET search_path = sky, public, pg_catalog;
-```
-
-
-Without that, the forms carrying ADQL's coordinate-system argument —
-`point('ICRS', ra, dec)`, `circle('ICRS', …)` — are unambiguous anyway, and
-`skycell_point`, `skycell_circle`, `skycell_box`, `skycell_polygon` are
-prefixed aliases for the rest.
+The functions are named as ADQL names them: `POINT`, `CIRCLE`, `BOX`,
+`POLYGON`, `REGION`, `CONTAINS`, `INTERSECTS`, `DISTANCE`, `AREA`,
+`CENTROID`, `COORD1`, `COORD2`. PostgreSQL has a geometric
+`point(float8, float8)` of its own, which a bare `POINT(ra, dec)` finds first
+when skycell is installed in `public`; an implicit cast reads that point as the
+sky position (ra, dec) in degrees and plans it as skycell's own, so the ADQL
+spelling is indexed as written (PostgreSQL's geometry keeps its meaning:
+`point <-> point` is still Euclidean). The forms carrying ADQL's
+coordinate-system argument, `point('ICRS', ra, dec)` and `circle('ICRS', …)`,
+and the prefixed `skycell_point`, `skycell_circle`, `skycell_box` and
+`skycell_polygon` are the same functions. Installing into a schema of its own
+works too; put it on the `search_path`.
 
 ### Setting up a table
 
@@ -598,10 +595,11 @@ for ADQL compatibility and must be `'ICRS'`; convert other frames first with
 | `skycell_difference(a, b)` | `skyregion` | `a` less `b`; STC-S `DIFFERENCE` |
 | `skycell_not(r)` | `skyregion` | the rest of the sky; STC-S `NOT` |
 
-If a bare name collides with `pg_catalog` (`point`, `circle`, `box`, `polygon`
-all exist there), either install into a schema that precedes it in
-`search_path`, or use the prefixed aliases: `skycell_point`, `skycell_circle`,
-`skycell_box`, `skycell_polygon`.
+`pg_catalog` has its own `point`, `circle`, `box` and `polygon`. Only `point`
+takes the same arguments as ADQL's; a bare `POINT(ra, dec)` that resolves to it
+is read as the sky position through an implicit cast ([ADQL names](#adql-names)).
+The prefixed aliases `skycell_point`, `skycell_circle`, `skycell_box` and
+`skycell_polygon` never collide.
 
 Composite regions are described, with examples, in
 [Composite regions: instrument footprints](#composite-regions-instrument-footprints).

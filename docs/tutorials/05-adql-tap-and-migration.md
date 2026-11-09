@@ -7,9 +7,7 @@ database from Q3C or pgSphere. Every block runs as written, in order, on an
 empty database.
 
 ```sql
-CREATE SCHEMA sky;
-CREATE EXTENSION skycell SCHEMA sky;
-ALTER DATABASE skycell_tutorial SET search_path = sky, public, pg_catalog;
+CREATE EXTENSION skycell;
 ```
 
 ```sql
@@ -26,15 +24,12 @@ ANALYZE gaia_source;
 
 ## What a TAP service needs
 
-1. **The names to resolve.** The schema and `search_path` of the set-up block
-   above: ADQL's `POINT`, `CIRCLE`, `BOX` and `POLYGON` would otherwise be
-   PostgreSQL's geometric functions. Set it for the role or database the
-   service connects as.
-2. **ADQL's geometry passed through.** `CONTAINS(...) = 1`,
+1. **ADQL's geometry passed through.** ADQL's names are skycell's functions,
+   a bare `POINT(ra, dec)` included. `CONTAINS(...) = 1`,
    `INTERSECTS(...) = 1`, `DISTANCE(...) < r` and `ORDER BY DISTANCE(...)` are
    indexed as ADQL writes them. The rest of ADQL is the service's own job:
    `TOP n` becomes `LIMIT n`, and so on.
-3. **An index per positional table** (tutorials [1](01-source-catalogue.md)
+2. **An index per positional table** (tutorials [1](01-source-catalogue.md)
    and [2](02-regions-and-footprints.md)), and `ANALYZE` after loads.
 
 The queries of the Gaia archive's own examples run as written:

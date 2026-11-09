@@ -395,3 +395,43 @@ SELECT (SELECT count(*) FROM acat WHERE INTERSECTS(CIRCLE('ICRS', 10, 20, 2), po
 (1 row)
 
 DROP FUNCTION bool_counts();
+-- ADQL's bare POINT(ra, dec) with skycell in public, as here: PostgreSQL's own
+-- point(float8, float8) wins the name, and is read as a sky position through
+-- an implicit cast (SQL 0.47), planned as skycell's point(ra, dec), so the
+-- searches stay indexed; PostgreSQL's own geometry keeps its meaning
+SELECT pg_typeof(POINT(10, 20)) AS bare_point_is,
+       CONTAINS(POINT(10.1, 20), CIRCLE(10, 20, 0.5)) AS inside,
+       DISTANCE(POINT(10, 20), POINT(10, 21)) AS one_degree,
+       POINT(1, 2) <-> POINT(4, 6) AS euclidean;
+ bare_point_is | inside | one_degree | euclidean 
+---------------+--------+------------+-----------
+ point         |      1 |          1 |         5
+(1 row)
+
+SELECT (SELECT count(*) FROM acat WHERE CONTAINS(POINT(ra, dec), CIRCLE(10, 20, 2)) = 1)
+     = (SELECT count(*) FROM acat WHERE CONTAINS(POINT('ICRS', ra, dec), CIRCLE('ICRS', 10, 20, 2)) = 1) AS same_rows,
+       adql_plan_uses_index('SELECT * FROM acat WHERE CONTAINS(POINT(ra, dec), CIRCLE(10, 20, 2)) = 1') AS cone,
+       adql_plan_uses_index('SELECT * FROM acat WHERE DISTANCE(POINT(ra, dec), POINT(10, 20)) < 2') AS distance,
+       adql_plan_uses_index('SELECT * FROM acat WHERE POINT(ra, dec) <@ POLYGON(9, 19, 11, 19, 10, 21)') AS polygon;
+ same_rows | cone | distance | polygon 
+-----------+------+----------+---------
+ t         | t    | t        | t
+(1 row)
+
+-- a column of PostgreSQL's point, as a bare POINT(ra, dec) makes it, is a
+-- stored position like a skypos column: indexed on skycell_cell(pos)
+CREATE TABLE apcat AS SELECT id, POINT(ra, dec) AS pos FROM acat;
+CREATE INDEX apcat_cell ON apcat (skycell_cell(pos));
+ANALYZE apcat;
+SELECT pg_typeof(pos) AS column_type,
+       (SELECT count(*) FROM apcat WHERE CONTAINS(pos, CIRCLE(10, 20, 2)) = 1)
+     = (SELECT count(*) FROM acat WHERE CONTAINS(POINT('ICRS', ra, dec), CIRCLE('ICRS', 10, 20, 2)) = 1) AS same_rows,
+       adql_plan_uses_index('SELECT * FROM apcat WHERE CONTAINS(pos, CIRCLE(10, 20, 2)) = 1') AS cone,
+       adql_plan_uses_index('SELECT * FROM apcat WHERE DISTANCE(pos, POINT(10, 20)) < 2') AS distance
+FROM apcat LIMIT 1;
+ column_type | same_rows | cone | distance 
+-------------+-----------+------+----------
+ point       | t         | t    | t
+(1 row)
+
+DROP TABLE apcat;

@@ -6,9 +6,7 @@ database for MOCPy, Aladin or the CDS MOC server, and back in as search
 regions. Every block runs as written, in order, on an empty database.
 
 ```sql
-CREATE SCHEMA sky;
-CREATE EXTENSION skycell SCHEMA sky;
-ALTER DATABASE skycell_tutorial SET search_path = sky, public, pg_catalog;
+CREATE EXTENSION skycell;
 ```
 
 ```sql

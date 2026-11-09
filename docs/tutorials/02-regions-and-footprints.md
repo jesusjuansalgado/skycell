@@ -6,12 +6,9 @@ contain a position, which overlap a search field, which sources lie inside
 one. Every block runs as written, in order, on an empty database.
 
 ```sql
-CREATE SCHEMA sky;
-CREATE EXTENSION skycell SCHEMA sky;
-ALTER DATABASE skycell_tutorial SET search_path = sky, public, pg_catalog;
+CREATE EXTENSION skycell;
 ```
 
-(Why the schema: [tutorial 1](01-source-catalogue.md#installing-into-a-schema-of-its-own).)
 
 ## The `skyregion` type
 

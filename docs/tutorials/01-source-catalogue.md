@@ -5,26 +5,22 @@ searches, cross-matches and nearest neighbours. Every block below runs as
 written, in order, on an empty database (`check.py` in this directory runs
 them).
 
-## Installing into a schema of its own
+## Installing
 
-ADQL's names (`POINT`, `CIRCLE`, `BOX`, `POLYGON`) collide with PostgreSQL's
-own geometric `point`, `circle`, `box` and `polygon`. Install skycell into a
-schema and put it before `pg_catalog`, so that the bare ADQL spellings resolve
-to skycell's:
+`make install` puts the extension on the server (see the
+[README](../../README.md#installation)); each database then creates it:
 
 ```sql
-CREATE SCHEMA sky;
-CREATE EXTENSION skycell SCHEMA sky;
--- your database's name here; new sessions pick it up
-ALTER DATABASE skycell_tutorial SET search_path = sky, public, pg_catalog;
+CREATE EXTENSION skycell;
 ```
 
-Without it, `POINT(ra, dec)` is PostgreSQL's point, and
-`CONTAINS(POINT(ra, dec), CIRCLE(...)) = 1` fails with *function
-contains(point, skyregion) does not exist*. The forms with ADQL's
-coordinate system, `POINT('ICRS', ra, dec)` and `CIRCLE('ICRS', ...)`, work
-either way, as do the prefixed aliases `skycell_point`, `skycell_circle`,
-`skycell_box` and `skycell_polygon`.
+ADQL's names are skycell's functions: `POINT`, `CIRCLE`, `BOX`, `POLYGON`,
+`CONTAINS`, `DISTANCE` and the rest. PostgreSQL has a geometric
+`point(x, y)` of its own, which a bare `POINT(ra, dec)` finds first; skycell
+reads it as the sky position (ra, dec) in degrees, so the ADQL spelling works
+as written. The forms with ADQL's coordinate system, `POINT('ICRS', ra, dec)`
+and `CIRCLE('ICRS', ...)`, and the prefixed `skycell_point`,
+`skycell_circle`, `skycell_box` and `skycell_polygon` are the same functions.
 
 ## A sample catalogue
 
@@ -116,10 +112,13 @@ what `cell` holds. An existing `cell` column can say so with a validated
 `CHECK (cell = skycell_ang2cell(ra, dec))` constraint and `NOT NULL` instead.
 
 A table that stores positions as skycell's `skypos` type is indexed the same
-way, on `skycell_cell(pos)`:
+way, on `skycell_cell(pos)`. Make the column with `skycell_point(ra, dec)` (or
+`POINT('ICRS', ra, dec)`): a bare `POINT(ra, dec)` makes a column of
+PostgreSQL's `point`, which is indexed and searched the same way, through the
+cast that reads it as (ra, dec).
 
 ```sql
-CREATE TABLE cat_pos AS SELECT source_id, point(ra, dec) AS pos, mag FROM cat;
+CREATE TABLE cat_pos AS SELECT source_id, skycell_point(ra, dec) AS pos, mag FROM cat;
 CREATE INDEX cat_pos_cell ON cat_pos (skycell_cell(pos));
 ANALYZE cat_pos;
 EXPLAIN (COSTS OFF) SELECT * FROM cat_pos WHERE CONTAINS(pos, CIRCLE(10, 10, 0.5)) = 1;
@@ -243,8 +242,6 @@ source, is planned as the search of the indexed table.
 - **A different expression**: the index is on `skycell_ang2cell(ra, dec)`,
   but the query's position is another pair of columns, or `skycell_cell(pos)`
   of a `skypos` column the index does not cover.
-- **PostgreSQL's `point`**: `search_path` does not put skycell's schema first
-  (above), and a bare `POINT(ra, dec)` is the geometric type.
 - **A huge region**: a cone over most of the sky reads most of the table
   anyway, and a sequential scan is cheaper. That is the planner being right.
 
