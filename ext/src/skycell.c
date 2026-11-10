@@ -2461,18 +2461,33 @@ skycell_cellsel(PG_FUNCTION_ARGS)
 
 typedef struct cone_cache
 {
-	double		dec0,
+	double		ra0,
+				dec0,
 				radius,
-				cosdec0,
-				thr;			/* sin^2(radius/2), <0 => empty, >1 => all */
+				thr;			/* chord^2 bound, <0 => empty, >4 => all */
+	sc_vec3		centre;
 } cone_cache;
 
+/* right ascension into [0, 360), as skypos_make() stores it */
+static inline double
+ra_norm(double ra)
+{
+	/* the same value for ra already in range, without the division */
+	return (ra >= 0.0 && ra < 360.0) ? ra : ra - floor(ra / 360.0) * 360.0;
+}
+
+/*
+ * The exact cone test.  It computes what the region test of the same circle
+ * computes (sc_region_contains() on CIRCLE(ra0, dec0, radius), the position
+ * read as a skypos): the same normalised coordinates, unit vectors and chord
+ * against 4 sin^2(r/2), so that the custom scan's recheck and a sequential
+ * scan's CONTAINS agree on every row, those exactly on the edge and at
+ * ra = 360 included (0.55).
+ */
 static inline bool
 in_cone(FunctionCallInfo fcinfo, double ra, double dec, double ra0, double dec0, double radius)
 {
 	cone_cache *cc = (cone_cache *) fcinfo->flinfo->fn_extra;
-	double		sdd,
-				sda;
 
 	if (cc == NULL)
 	{
@@ -2480,17 +2495,17 @@ in_cone(FunctionCallInfo fcinfo, double ra, double dec, double ra0, double dec0,
 		cc->dec0 = NAN;
 		fcinfo->flinfo->fn_extra = cc;
 	}
-	if (cc->dec0 != dec0 || cc->radius != radius)
+	if (cc->ra0 != ra0 || cc->dec0 != dec0 || cc->radius != radius)
 	{
+		double		rr = radius * (M_PI / 180.0);
+
+		cc->ra0 = ra0;
 		cc->dec0 = dec0;
 		cc->radius = radius;
-		cc->cosdec0 = cos(dec0 * DEG2RAD);
-		cc->thr = radius < 0 ? -1.0 : (radius >= 180.0 ? 2.0 : pow(sin(radius * DEG2RAD / 2.0), 2));
+		cc->centre = sc_radec2vec(ra_norm(ra0), dec0);
+		cc->thr = !(radius >= 0) ? -1.0 : (rr >= M_PI ? 5.0 : 4.0 * pow(sin(rr / 2.0), 2));
 	}
-	/* haversine */
-	sdd = sin((dec - dec0) * DEG2RAD / 2.0);
-	sda = sin((ra - ra0) * DEG2RAD / 2.0);
-	return sdd * sdd + cos(dec * DEG2RAD) * cc->cosdec0 * sda * sda <= cc->thr;
+	return sc_chord2(sc_radec2vec(ra_norm(ra), dec), cc->centre) <= cc->thr;
 }
 
 PG_FUNCTION_INFO_V1(skycell_in_cone);

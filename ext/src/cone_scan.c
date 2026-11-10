@@ -3283,7 +3283,7 @@ cone_set_centre(ConeScanState *st, double ra0, double dec0, double radius)
 	 * only let a borderline entry through, never hold one back: the plan's
 	 * qual still applies the exact test to every row the filter passes.
 	 */
-	st->thr = thr < 0 ? thr : thr * (1.0 + 1e-9) + 1e-300;
+	st->thr = thr < 0 ? thr : thr * (1.0 + 1e-9) + 1e-28;
 	st->have_centre = true;
 }
 
@@ -3307,8 +3307,12 @@ cone_entry_passes(ConeScanState *st)
 	dec = DatumGetFloat8(index_getattr(s->xs_itup, st->idec, s->xs_itupdesc, &n2));
 	if (!n1 && !n2)
 	{
+		double		dra = ra - st->cra;
+
+		/* the difference wrapped, as the exact test normalises both */
+		dra -= floor(dra / 360.0 + 0.5) * 360.0;
 		sdd = sin((dec - st->cdec) * M_PI / 360.0);
-		sda = sin((ra - st->cra) * M_PI / 360.0);
+		sda = sin(dra * M_PI / 360.0);
 		if (sdd * sdd + cos(dec * M_PI / 180.0) * st->cosdec0 * sda * sda <= st->thr)
 			return true;
 	}

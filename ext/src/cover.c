@@ -1100,7 +1100,7 @@ sc_region_contains(const sc_region *r, sc_vec3 p)
 		return moc_contains(r, p);
 	if (r->kind == SC_REGION_CONE)
 		return r->radius >= 0 &&
-			sc_chord2(p, r->center) <= 4.0 * pow(sin(r->radius / 2.0), 2);
+			(r->radius >= M_PI || sc_chord2(p, r->center) <= 4.0 * pow(sin(r->radius / 2.0), 2));
 
 	/*
 	 * -1e-12, not 0: p and r->n[] are typically computed independently (e.g.
