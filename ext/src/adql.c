@@ -1909,8 +1909,11 @@ circle_args(Oid funcid, Node *rg)
 	return list_length(c) == 3 ? c : NIL;
 }
 
-/* V for coord1(V), coord2(V) of one stored skypos column, else NULL */
-static Var *
+/*
+ * V for coord1(V), coord2(V) of one stored position (a skypos column, or a
+ * point column through its cast: pos_column()), else NULL
+ */
+static Node *
 stored_pos(Node *ra, Node *dec)
 {
 	FuncExpr   *f1 = (FuncExpr *) ra,
@@ -1920,13 +1923,13 @@ stored_pos(Node *ra, Node *dec)
 
 	if (!IsA(ra, FuncExpr) || !IsA(dec, FuncExpr) ||
 		list_length(f1->args) != 1 || list_length(f2->args) != 1 ||
-		!IsA(linitial(f1->args), Var) || !equal(linitial(f1->args), linitial(f2->args)))
+		!pos_column(linitial(f1->args)) || !equal(linitial(f1->args), linitial(f2->args)))
 		return NULL;
 	n1 = get_func_name(f1->funcid);
 	n2 = get_func_name(f2->funcid);
 	if (n1 == NULL || n2 == NULL || strcmp(n1, "coord1") != 0 || strcmp(n2, "coord2") != 0)
 		return NULL;
-	return (Var *) copyObject(linitial(f1->args));
+	return copyObject(linitial(f1->args));
 }
 
 /*

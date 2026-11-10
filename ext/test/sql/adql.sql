@@ -279,6 +279,9 @@ SELECT pg_typeof(pos) AS column_type,
        (SELECT count(*) FROM apcat WHERE CONTAINS(pos, CIRCLE(10, 20, 2)) = 1)
      = (SELECT count(*) FROM acat WHERE CONTAINS(POINT('ICRS', ra, dec), CIRCLE('ICRS', 10, 20, 2)) = 1) AS same_rows,
        adql_plan_uses_index('SELECT * FROM apcat WHERE CONTAINS(pos, CIRCLE(10, 20, 2)) = 1') AS cone,
-       adql_plan_uses_index('SELECT * FROM apcat WHERE DISTANCE(pos, POINT(10, 20)) < 2') AS distance
+       adql_plan_uses_index('SELECT * FROM apcat WHERE DISTANCE(pos, POINT(10, 20)) < 2') AS distance,
+       adql_plan_uses_index('SELECT * FROM apcat WHERE DISTANCE(POINT(10, 20), pos) < 2') AS distance_reversed,
+       (SELECT count(*) FROM apcat WHERE 2 > DISTANCE(POINT(10, 20), pos))
+     = (SELECT count(*) FROM acat WHERE CONTAINS(POINT('ICRS', ra, dec), CIRCLE('ICRS', 10, 20, 2)) = 1) AS same_rows_reversed
 FROM apcat LIMIT 1;
 DROP TABLE apcat;

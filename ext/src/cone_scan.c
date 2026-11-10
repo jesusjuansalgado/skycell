@@ -3963,7 +3963,8 @@ typedef struct NearestScanState
 	TupleTableSlot *put,
 			   *got;
 
-	double		nrings,			/* for EXPLAIN ANALYZE */
+	int			rings;			/* rings read by this search (since the rescan) */
+	double		nrings,			/* for EXPLAIN ANALYZE, over all loops */
 				nread,
 				nprobes;		/* cells probed for emptiness */
 	double		band;			/* after a lower bound: the area of the ring
@@ -5039,7 +5040,7 @@ nearest_ring(NearestScanState *ns)
 	}
 
 	/* the first ring best-first: an unordered heap, no bounds, rows that fit in memory */
-	if (nearest_bestfirst && ns->nrings == 0 && !ns->final && ns->rprev < 0 &&
+	if (nearest_bestfirst && ns->rings == 0 && !ns->final && ns->rprev < 0 &&
 		ns->bound < 0 && st->bitmap && !st->parallel && bestfirst_fits(ns))
 	{
 		nearest_bestfirst_ring(ns);
@@ -5190,6 +5191,7 @@ finish:
 			ns->sorted = ns->nrows;
 		}
 	}
+	ns->rings += 1;
 	ns->nrings += 1;
 }
 
@@ -5250,6 +5252,7 @@ nearest_reset(NearestScanState *ns)
 	nearest_clear_ring(ns);
 	ns->started = ns->final = ns->done = false;
 	ns->nout = 0;
+	ns->rings = 0;
 	ns->cone.cur = -1;
 }
 
