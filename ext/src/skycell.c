@@ -2102,8 +2102,32 @@ simplify_cone5(PlannerInfo *root, FuncExpr *fexpr)
 	Oid			a2c_types[2] = {FLOAT8OID, FLOAT8OID};
 	Oid			a2c_oid = lookup_sibling_func(fexpr->funcid, "skycell_ang2cell",
 											  2, a2c_types);
-	FuncExpr   *six = copyObject(fexpr);
+	FuncExpr   *six;
 	Expr	   *cell;
+
+	/*
+	 * The position a subquery's columns (a view not flattened: a security
+	 * barrier's, say): left as written.  Pushed into the subquery, where its
+	 * table is, it is rewritten there for the index; and as written it is
+	 * LEAKPROOF, which skycell_ang2cell(), rejecting impossible coordinates,
+	 * is not, so it may be pushed through a security barrier (0.57).
+	 */
+	if (root != NULL && root->parse != NULL)
+	{
+		List	   *vars = sc_pull_local_vars((Node *) list_make2(linitial(fexpr->args),
+																  lsecond(fexpr->args)), 0);
+
+		if (vars != NIL && IsA(linitial(vars), Var))
+		{
+			Index		v = ((Var *) linitial(vars))->varno;
+
+			if (v >= 1 && v <= (Index) list_length(root->parse->rtable) &&
+				rt_fetch(v, root->parse->rtable)->rtekind == RTE_SUBQUERY &&
+				!rt_fetch(v, root->parse->rtable)->inh)
+				return NULL;
+		}
+	}
+	six = copyObject(fexpr);
 
 	cell = (Expr *) makeFuncExpr(a2c_oid, INT8OID,
 								 list_make2(copyObject(linitial(fexpr->args)),

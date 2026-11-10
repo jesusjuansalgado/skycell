@@ -521,9 +521,16 @@ region_from_datum_ex(Datum d, sc_region *out, bool need_covering)
 	region_decode(DatumGetSkyRegion(d), out, need_covering);
 }
 
-static void
-region_decode(const SkyRegion *r, sc_region *out, bool need_covering)
+/*
+ * The region a stored value describes, or the reason it describes none.  A
+ * value skyregion's input accepts always decodes; one stored by an older
+ * version without today's checks (a circle of NaN radius) may not.
+ */
+static const char *
+region_decode_soft(const SkyRegion *r, sc_region *out, bool need_covering)
 {
+	const char *err;
+
 	if (SKY_IS_COMPOSITE(r->kind))
 	{
 		const SkyRegion *kids[SKY_MAX_KIDS];
@@ -532,13 +539,14 @@ region_decode(const SkyRegion *r, sc_region *out, bool need_covering)
 
 		check_stack_depth();
 		for (int i = 0; i < n; i++)
-			region_decode(kids[i], &sk[i], need_covering);
-		check_err(sc_region_combine(out, (sc_region_kind) r->kind, sk, n));
+			if ((err = region_decode_soft(kids[i], &sk[i], need_covering)) != NULL)
+				return err;
+		err = sc_region_combine(out, (sc_region_kind) r->kind, sk, n);
 		pfree(sk);
-		return;
+		return err;
 	}
 	if (r->kind == SKY_CONE)
-		check_err(sc_region_cone(out, r->v[0], r->v[1], r->v[2], need_covering));
+		return sc_region_cone(out, r->v[0], r->v[1], r->v[2], need_covering);
 	else if (r->kind == SKY_MOC)
 	{
 		const int64 *d = SKYMOC_DATA(r);
@@ -551,9 +559,10 @@ region_decode(const SkyRegion *r, sc_region *out, bool need_covering)
 			lo[i] = d[1 + 2 * i];
 			hi[i] = d[2 + 2 * i];
 		}
-		check_err(sc_region_moc(out, (int64_t *) lo, (int64_t *) hi, n));
+		err = sc_region_moc(out, (int64_t *) lo, (int64_t *) hi, n);
 		pfree(lo);
 		pfree(hi);
+		return err;
 	}
 	else
 	{
@@ -566,8 +575,14 @@ region_decode(const SkyRegion *r, sc_region *out, bool need_covering)
 			ra[i] = r->v[2 * i];
 			dec[i] = r->v[2 * i + 1];
 		}
-		check_err(sc_region_poly(out, nv, ra, dec, need_covering));
+		return sc_region_poly(out, nv, ra, dec, need_covering);
 	}
+}
+
+static void
+region_decode(const SkyRegion *r, sc_region *out, bool need_covering)
+{
+	check_err(region_decode_soft(r, out, need_covering));
 }
 
 void
@@ -1500,7 +1515,18 @@ cached_region_arg(FunctionCallInfo fcinfo, int argno, int fnarg)
 		slot->last_datum = NULL;
 
 		oldcxt = MemoryContextSwitchTo(slot->cxt);
-		skycell_region_from_datum_lite(arg_datum, &slot->reg);
+
+		/*
+		 * The tests below are LEAKPROOF (0.57): they say nothing of their
+		 * arguments but their result, so a region that does not decode raises
+		 * no error here; it is an empty region, which nothing is in and
+		 * nothing meets.
+		 */
+		if (region_decode_soft(DatumGetSkyRegion(arg_datum), &slot->reg, false) != NULL)
+		{
+			memset(&slot->reg, 0, sizeof(slot->reg));
+			check_err(sc_region_cone(&slot->reg, 0, 0, -1, false));
+		}
 		slot->last_datum = palloc(sz);
 		memcpy(slot->last_datum, b, sz);
 		slot->last_size = sz;

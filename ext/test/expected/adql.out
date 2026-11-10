@@ -547,3 +547,25 @@ SELECT length(skypos_send(skycell_point(1, 2))) AS pos_send_bytes, get_byte(skyr
              16 |             1
 (1 row)
 
+-- through a security-barrier view: the region tests are LEAKPROOF, so a
+-- search reaches the index under the view, and a user's function still sees
+-- no row the view hides (0.57)
+CREATE VIEW acat_sb WITH (security_barrier) AS SELECT * FROM acat WHERE id % 2 = 0;
+CREATE FUNCTION adql_sb_leak(int) RETURNS bool LANGUAGE plpgsql COST 0.0000001 AS $$
+BEGIN
+  IF $1 % 2 = 1 THEN RAISE NOTICE 'hidden row % seen', $1; END IF;
+  RETURN true;
+END $$;
+SELECT adql_plan_uses_index('SELECT * FROM acat_sb WHERE CONTAINS(pos, CIRCLE(10, 20, 2)) = 1') AS skypos_column,
+       adql_plan_uses_index('SELECT * FROM acat_sb WHERE skycell_radial_query(ra, dec, 10, 20, 2)') AS radial_query,
+       adql_plan_uses_index('SELECT * FROM acat_sb WHERE DISTANCE(pos, POINT(10, 20)) < 2') AS distance,
+       NOT adql_plan_uses_index('SELECT * FROM acat_sb WHERE CONTAINS(POINT(''ICRS'', ra, dec), CIRCLE(''ICRS'', 10, 20, 2)) = 1') AS adql_point_stays_out,
+       (SELECT count(*) FROM acat_sb WHERE CONTAINS(pos, CIRCLE(10, 20, 2)) = 1 AND adql_sb_leak(id))
+     = (SELECT count(*) FROM acat WHERE id % 2 = 0 AND CONTAINS(pos, CIRCLE(10, 20, 2)) = 1) AS same_rows;
+ skypos_column | radial_query | distance | adql_point_stays_out | same_rows 
+---------------+--------------+----------+----------------------+-----------
+ t             | t            | t        | t                    | t
+(1 row)
+
+DROP FUNCTION adql_sb_leak(int);
+DROP VIEW acat_sb;

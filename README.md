@@ -272,6 +272,14 @@ is exact, as `float8`'s is, so a dump and restore keeps every value, and both
 types have a binary form, for `COPY ... (FORMAT binary)` and drivers that read
 results in binary.
 
+Through a security-barrier view (or one with `security_barrier`), a search
+reaches the index of the table under the view: the region tests are
+`LEAKPROOF`. That holds for a `skypos` column (`CONTAINS(pos, ...)`,
+`DISTANCE(pos, ...)`), for stored regions, and for `skycell_radial_query`,
+`skycell_join` and `skycell_dist` on `ra` and `dec`; ADQL's `POINT(ra, dec)`
+rejects impossible coordinates with an error, so a condition written with it
+stays outside such a view.
+
 ### Setting up a table
 
 What you index depends on how the positions arrive. In all three cases the
