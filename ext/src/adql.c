@@ -39,6 +39,7 @@
 #include "nodes/supportnodes.h"
 #include "optimizer/clauses.h"
 #include "optimizer/optimizer.h"
+#include "parser/parse_oper.h"
 #include "parser/parse_coerce.h"
 #include "parser/parse_func.h"
 #include "parser/parsetree.h"
@@ -1717,15 +1718,20 @@ cell_expr_for_point(Oid selfid, Node *pt)
  * overlap operator can't be resolved, so the caller falls back exactly as
  * it always has.
  */
+/* the point of a test gin_region_rewrite() kept: left as it is */
+#define GIN_KEPT_LOCATION (-0x5c13)
+
 static Node *
 gin_region_rewrite(Oid funcid, Node *pt, Node *rg, Node *cell,
 					Node *moc_expr, int max_order)
 {
 	Oid			ancestors_types[3] = {INT8OID, INT4OID, INT4OID};
-	Oid			exact_types[3];
+	char	   *nsp = get_namespace_name(get_func_namespace(funcid));
 	FuncExpr   *ancestors;
-	Expr	   *overlap;
-	FuncExpr   *exact;
+	Expr	   *overlap,
+			   *op;
+	Operator	tup;
+	Node	   *kept;
 
 	ancestors = makeFuncExpr(lookup_sibling_func(funcid, "skycell_ancestors", 3, ancestors_types),
 							 INT8ARRAYOID,
@@ -1735,14 +1741,34 @@ gin_region_rewrite(Oid funcid, Node *pt, Node *rg, Node *cell,
 	if (overlap == NULL)
 		return NULL;
 
-	exact_types[0] = exprType(pt);
-	exact_types[1] = exprType(rg);
-	exact_types[2] = FLOAT8OID;
-	exact = makeFuncExpr(lookup_sibling_func(funcid, "skycell_in_region", 3, exact_types),
-						 BOOLOID,
-						 list_make3(copyObject(pt), copyObject(rg), float8_const(-1.0)),
-						 InvalidOid, InvalidOid, COERCE_EXPLICIT_CALL);
-	return (Node *) makeBoolExpr(AND_EXPR, list_make2(overlap, (Expr *) exact), -1);
+	/*
+	 * The test itself stays the operator, pt <@ rg, beside the GIN's
+	 * overlap: it is the exact test on every row the GIN returns, and a
+	 * GiST on the same column can still take it, so the planner chooses
+	 * between the two indexes rather than this rewrite (0.55).  Its point is
+	 * marked, so that simplifying it again does not rewrite it again.
+	 */
+	tup = oper(NULL, list_make2(makeString(nsp), makeString("<@")),
+			   exprType(pt), exprType(rg), true, -1);
+	if (tup == NULL)
+		return NULL;
+	kept = copyObject(pt);
+	if (!IsA(kept, FuncExpr) && !IsA(kept, Var) && !IsA(kept, Const))
+	{
+		ReleaseSysCache(tup);
+		return NULL;
+	}
+	if (IsA(kept, FuncExpr))
+		((FuncExpr *) kept)->location = GIN_KEPT_LOCATION;
+	else if (IsA(kept, Var))
+		((Var *) kept)->location = GIN_KEPT_LOCATION;
+	else
+		((Const *) kept)->location = GIN_KEPT_LOCATION;
+	op = make_opclause(oprid(tup), BOOLOID, false, (Expr *) kept, (Expr *) copyObject(rg),
+					   InvalidOid, InvalidOid);
+	ReleaseSysCache(tup);
+	set_opfuncid((OpExpr *) op);
+	return (Node *) makeBoolExpr(AND_EXPR, list_make2(overlap, op), -1);
 }
 
 static bool pos_ra_dec(Oid funcid, Node *pt, Node **ra, Node **dec);
@@ -2129,6 +2155,9 @@ region_support_simplify(SupportRequestSimplify *req, Oid funcid, Node *pt, Node 
 	 */
 	if (req->root != NULL && skycell_planning_unhooked(req->root) && !late_fold_eval)
 		return NULL;
+	/* the test a GIN rewrite kept beside its overlap */
+	if (node_location(pt) == GIN_KEPT_LOCATION)
+		return NULL;
 	if (req->root != NULL && want_swap(req, funcid, pt, rg, &pt2, &rg2))
 		res = region_simplify_oriented(req, funcid, pt2, rg2);
 	if (res == NULL)
@@ -2245,6 +2274,29 @@ region_simplify_oriented(SupportRequestSimplify *req, Oid funcid, Node *pt, Node
 
 	if (req->root == NULL)
 		return NULL;
+
+	/*
+	 * A constant position against a column of regions: no point-side index
+	 * to search, but a GIN on the regions' cells answers it from the
+	 * position's own cell, beside any GiST that takes the operator.
+	 */
+	if (IsA(pt, Const) && !IsA(rg, Const))
+	{
+		Oid			ff[2] = {FLOAT8OID, FLOAT8OID};
+		Node	   *ra,
+				   *dec,
+				   *moc_expr;
+		int			max_order;
+
+		if (((Const *) pt)->constisnull || !pos_ra_dec(funcid, pt, &ra, &dec) ||
+			!gin_moc_index_for_region(req->root, rg, &moc_expr, &max_order))
+			return NULL;
+		cell = (Node *) makeFuncExpr(lookup_sibling_func(funcid, "skycell_ang2cell", 2, ff),
+									 INT8OID, list_make2(ra, dec),
+									 InvalidOid, InvalidOid, COERCE_EXPLICIT_CALL);
+		return gin_region_rewrite(funcid, pt, rg, eval_const_expressions(req->root, cell),
+								  moc_expr, max_order);
+	}
 
 	cell = cell_expr_for_point(funcid, pt);
 	if (cell == NULL)

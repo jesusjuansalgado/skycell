@@ -503,19 +503,12 @@ SELECT (SELECT count(*) FROM rg_gist_pts p, rg_gist f WHERE p.pos <@ f.region)
 -- support function (region_support_simplify, ext/src/adql.c) recognises a
 -- GIN index on skycell_region_moc(region) and rewrites region_col @> pos /
 -- pos <@ region_col into the array-overlap test the manual MOC-in-a-B-tree
--- recipe (skycell--0.11.sql's own comment block) computes by hand with a
--- side table -- same predicate, no side table, no hand-written join. The
--- rewrite replaces the @>/<@ clause outright whenever this index exists,
--- regardless of whether the planner then goes on to actually use that
--- index or a plain sequential scan of the rewritten form -- on a fixture
--- this small (a few hundred rows), GIN's own per-probe overhead legitimately
--- loses to a sequential scan, the same "not asserting plan_uses_index for
--- this small a table" caveat as the literal-vs-column && test above; the
--- rewrite firing at all, and computing the right answer, is what these
--- checks confirm. See GIST_REGION_DESIGN.md's "Round eight" for the numbers
--- (measured on a much larger fixture) showing this rewrite beats the GiST
--- strategy once a table is actually large enough for either index to pay
--- for itself.
+-- recipe (skycell--0.11.sql's own comment block) computes by hand, keeping
+-- the operator as the exact test.  It applies only where the region column
+-- has no GiST: a GiST takes the operator with no per-row covering to
+-- compute, and is the faster of the two (0.55).  On a fixture this small a
+-- sequential scan may still win; the rewrite firing, and computing the
+-- right answer, is what these checks confirm.
 CREATE FUNCTION plan_mentions(q text, needle text) RETURNS bool LANGUAGE plpgsql AS $$
 DECLARE l text; found bool := false;
 BEGIN
@@ -524,18 +517,19 @@ BEGIN
   END LOOP;
   RETURN found;
 END $$;
-CREATE INDEX rg_gist_moc_gin ON rg_gist USING gin (skycell_region_moc(region));
-ANALYZE rg_gist;
+CREATE TABLE rg_gin AS SELECT * FROM rg_gist;
+CREATE INDEX rg_gin_moc ON rg_gin USING gin (skycell_region_moc(region));
+ANALYZE rg_gin;
 SELECT plan_mentions(
-  $q$SELECT p.pid FROM rg_gist_pts p, rg_gist f WHERE p.pos <@ f.region$q$, 'skycell_region_moc'
+  $q$SELECT p.pid FROM rg_gist_pts p, rg_gin f WHERE p.pos <@ f.region$q$, 'skycell_region_moc'
 ) AS gin_region_contains_rewrite_fires;
  gin_region_contains_rewrite_fires 
 -----------------------------------
  t
 (1 row)
 
-SELECT (SELECT count(*) FROM rg_gist_pts p, rg_gist f WHERE p.pos <@ f.region)
-     = (SELECT count(*) FROM rg_gist_pts p, rg_gist f WHERE skycell_in_region(p.pos, f.region))
+SELECT (SELECT count(*) FROM rg_gist_pts p, rg_gin f WHERE p.pos <@ f.region)
+     = (SELECT count(*) FROM rg_gist_pts p, rg_gin f WHERE skycell_in_region(p.pos, f.region))
      AS gin_region_contains_matches_exact;
  gin_region_contains_matches_exact 
 -----------------------------------
@@ -544,44 +538,74 @@ SELECT (SELECT count(*) FROM rg_gist_pts p, rg_gist f WHERE p.pos <@ f.region)
 
 -- the commutator spelling must rewrite and match identically
 SELECT plan_mentions(
-  $q$SELECT p.pid FROM rg_gist_pts p, rg_gist f WHERE f.region @> p.pos$q$, 'skycell_region_moc'
+  $q$SELECT p.pid FROM rg_gist_pts p, rg_gin f WHERE f.region @> p.pos$q$, 'skycell_region_moc'
 ) AS gin_region_contains_commutator_rewrite_fires;
  gin_region_contains_commutator_rewrite_fires 
 ----------------------------------------------
  t
 (1 row)
 
-SELECT (SELECT count(*) FROM rg_gist_pts p, rg_gist f WHERE f.region @> p.pos)
-     = (SELECT count(*) FROM rg_gist_pts p, rg_gist f WHERE p.pos <@ f.region)
+SELECT (SELECT count(*) FROM rg_gist_pts p, rg_gin f WHERE f.region @> p.pos)
+     = (SELECT count(*) FROM rg_gist_pts p, rg_gin f WHERE p.pos <@ f.region)
      AS gin_region_contains_commutator_agrees;
  gin_region_contains_commutator_agrees 
 ---------------------------------------
  t
 (1 row)
 
+-- a constant position too, from its own cell
+SELECT plan_mentions(
+  $q$SELECT fid FROM rg_gin WHERE CONTAINS(POINT('ICRS', 10.2, 20.1), region) = 1$q$, 'skycell_ancestors'
+) AS gin_region_contains_constant_fires;
+ gin_region_contains_constant_fires 
+------------------------------------
+ t
+(1 row)
+
+SELECT array(SELECT p.pid FROM rg_gist_pts p WHERE (SELECT count(*) FROM rg_gin f WHERE CONTAINS(p.pos, f.region) = 1)
+                                                 <> (SELECT count(*) FROM rg_gin f WHERE skycell_in_region(p.pos, f.region)))
+       = '{}' AS gin_region_contains_constant_matches_exact;
+ gin_region_contains_constant_matches_exact 
+--------------------------------------------
+ t
+(1 row)
+
+-- beside a GiST on the same column, the GiST takes the operator
+CREATE INDEX rg_gist_moc_gin ON rg_gist USING gin (skycell_region_moc(region));
+ANALYZE rg_gist;
+SELECT NOT plan_mentions(
+  $q$SELECT p.pid FROM rg_gist_pts p, rg_gist f WHERE p.pos <@ f.region$q$, 'skycell_region_moc'
+) AS gin_region_contains_leaves_gist;
+ gin_region_contains_leaves_gist 
+---------------------------------
+ t
+(1 row)
+
+DROP INDEX rg_gist_moc_gin;
 -- a smaller, user-chosen max_order at index-creation time is read back and
 -- used as the ancestor lookup's own upper bound (an exact, safe narrowing,
 -- not a guess -- see gin_moc_index_for_region()'s own comment in
 -- skycell.c); still must match exactly, not just rewrite.
-DROP INDEX rg_gist_moc_gin;
-CREATE INDEX rg_gist_moc_gin ON rg_gist USING gin (skycell_region_moc(region, 8, 16));
-ANALYZE rg_gist;
+DROP INDEX rg_gin_moc;
+CREATE INDEX rg_gin_moc ON rg_gin USING gin (skycell_region_moc(region, 8, 16));
+ANALYZE rg_gin;
 SELECT plan_mentions(
-  $q$SELECT p.pid FROM rg_gist_pts p, rg_gist f WHERE p.pos <@ f.region$q$, 'skycell_ancestors.*0, 16'
+  $q$SELECT p.pid FROM rg_gist_pts p, rg_gin f WHERE p.pos <@ f.region$q$, 'skycell_ancestors.*0, 16'
 ) AS gin_region_contains_narrowed_order;
  gin_region_contains_narrowed_order 
 ------------------------------------
  t
 (1 row)
 
-SELECT (SELECT count(*) FROM rg_gist_pts p, rg_gist f WHERE p.pos <@ f.region)
-     = (SELECT count(*) FROM rg_gist_pts p, rg_gist f WHERE skycell_in_region(p.pos, f.region))
+SELECT (SELECT count(*) FROM rg_gist_pts p, rg_gin f WHERE p.pos <@ f.region)
+     = (SELECT count(*) FROM rg_gist_pts p, rg_gin f WHERE skycell_in_region(p.pos, f.region))
      AS gin_region_contains_narrowed_matches_exact;
  gin_region_contains_narrowed_matches_exact 
 --------------------------------------------
  t
 (1 row)
 
+DROP TABLE rg_gin;
 DROP TABLE rg_gist_pts;
 -- third strategy: @>(skyregion,skyregion) ("which rows wholly contain that
 -- other region") -- reuses OVERLAP's own pruning test rather than a tighter

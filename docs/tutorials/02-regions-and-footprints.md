@@ -124,18 +124,22 @@ WHERE a.obs_id = 'obs7' AND b.obs_id <> a.obs_id;
   different scales share a column: survey tiles of degrees beside footprints of
   arcseconds. An index on `area(s_region)` lets the planner see that spread.
 - **MOC cells** (`USING gin (skycell_region_moc(s_region))`) index each
-  region's cells. It answers "which regions contain this position" by exact
-  lookups of the position's cells, and is often the fastest for that question
-  alone, joins of many targets in particular.
+  region's cells, and answer "which regions contain this position" only, by
+  lookups of the position's cells. It is used when the column has no GiST;
+  beside one, the GiST is used, being faster: on 50,000 footprints, 500
+  positions take 4 ms through the default GiST, 12–17 ms through the GIN.
 
-They can coexist on one column, and the planner picks per query:
+The two GiST classes can coexist on one column, and the planner picks per
+query. A footprint table with only the GIN index:
 
 ```sql
-CREATE INDEX obscore_moc ON obscore USING gin (skycell_region_moc(s_region));
-ANALYZE obscore;
+CREATE TABLE obscore_g AS SELECT obs_id, s_region FROM obscore;
+CREATE INDEX obscore_moc ON obscore_g USING gin (skycell_region_moc(s_region));
+ANALYZE obscore_g;
 EXPLAIN (COSTS OFF)
-SELECT t.id, o.obs_id FROM targets t JOIN obscore o ON CONTAINS(POINT(t.ra, t.dec), o.s_region) = 1;
+SELECT t.id, o.obs_id FROM targets t JOIN obscore_g o ON CONTAINS(POINT(t.ra, t.dec), o.s_region) = 1;
 -- expect: obscore_moc
+DROP TABLE obscore_g;
 ```
 
 ## Sources inside a footprint

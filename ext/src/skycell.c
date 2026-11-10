@@ -1481,7 +1481,8 @@ gin_moc_index_for_region(PlannerInfo *root, Node *rg, Node **moc_expr, int *max_
 	Relation	rel;
 	List	   *indexes;
 	Node	   *key;
-	bool		found = false;
+	bool		found = false,
+				other = false;
 
 	foreach(lc, vars)
 	{
@@ -1536,13 +1537,19 @@ gin_moc_index_for_region(PlannerInfo *root, Node *rg, Node **moc_expr, int *max_
 				}
 			}
 		}
+		/*
+		 * A GiST (or SP-GiST) on the region column takes the operator itself,
+		 * with no per-row covering to evaluate: it is used instead (0.55).
+		 */
+		if ((irel->rd_rel->relam == GIST_AM_OID || irel->rd_rel->relam == SPGIST_AM_OID) &&
+			IsA(key, Var) && irel->rd_index->indnatts >= 1 &&
+			irel->rd_index->indkey.values[0] == ((Var *) key)->varattno)
+			other = true;
 		index_close(irel, AccessShareLock);
-		if (found)
-			break;
 	}
 	list_free(indexes);
 	table_close(rel, NoLock);
-	return found;
+	return found && !other;
 }
 
 /*

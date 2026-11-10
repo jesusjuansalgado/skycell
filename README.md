@@ -663,16 +663,17 @@ picks per query; an expression index on `area(region)` lets it estimate the
 column's region sizes. Region-region containment prunes with the `&&` test, so
 it is sound but less selective than `&&` itself.
 
-**"Which of my regions contain this point"** is often best served by a plain
-GIN index over the region's MOC cells, which the planner uses automatically for
-`region @> pos` / `pos <@ region`:
+**"Which of my regions contain this point"** can also be served by a plain
+GIN index over the region's MOC cells, which `region @> pos` / `pos <@ region`
+reach automatically, for one position or a join of many:
 
 ```sql
 CREATE INDEX ON t USING gin (skycell_region_moc(region));
 ```
 
-When both a GiST and this GIN index exist on the column, the planner picks per
-query: typically the GiST for one position, the GIN for a join of many.
+It is used where the column has no GiST; beside one, the GiST is used, being
+faster (500 positions against 50,000 footprints: 4 ms through the default
+GiST, 12–17 ms through the GIN, 17 ms through `skyregion_gist_ops`).
 
 Three operator classes deprecated in 0.36 (`skyregion_box_gist_ops`,
 `skypos_spgist_ops`, `skypos_cap_gist_ops`) were removed in 0.38; an index on
