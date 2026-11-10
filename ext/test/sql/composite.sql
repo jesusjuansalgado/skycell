@@ -116,7 +116,10 @@ SELECT i AS id, ra, dec, skycell_point(ra, dec) AS pos FROM (
             CASE WHEN i % 2 = 0 THEN 16 + 8 * random() ELSE degrees(asin(2 * random() - 1)) END AS dec
   FROM generate_series(1, 100000) i) s;
 CREATE INDEX ccat_pos ON ccat (skycell_cell(pos));
--- statistics fixed for the test: plan checks below are cost-based
+-- statistics fixed for the test: plan checks below are cost-based, so
+-- ANALYZE reads every row (a sample larger than the table) and autovacuum
+-- leaves them alone
+ALTER INDEX ccat_pos ALTER COLUMN 1 SET STATISTICS 10000;
 ALTER TABLE ccat SET (autovacuum_enabled = off);
 ANALYZE ccat;
 
@@ -167,6 +170,7 @@ FROM ccat WHERE contains(pos, region('DIFFERENCE ICRS (CIRCLE 10 20 2 CIRCLE 10 
 -- (0.53); with the custom scan off it keeps the range rewrite.  Every plan must
 -- give the rows of the exact tests, joined as written (no fold, no index).
 CREATE INDEX ccat_radec ON ccat (skycell_ang2cell(ra, dec));
+ALTER INDEX ccat_radec ALTER COLUMN 1 SET STATISTICS 10000;
 ANALYZE ccat;
 CREATE FUNCTION comp_plan_kind(q text) RETURNS text LANGUAGE plpgsql AS $$
 DECLARE l text;
@@ -237,6 +241,9 @@ BEGIN
   END LOOP;
   RAISE NOTICE 'first query folded: %', folded;
 END $$;
+-- a new session: seeded again, so that the random regions below are the same
+-- on every run
+SELECT setseed(0.39);
 SET extra_float_digits = 0;
 -- the folded region, as the plan shows it
 EXPLAIN (COSTS OFF) SELECT count(*) FROM ccat
@@ -352,6 +359,7 @@ FROM cstore a, cstore b;
 -- and from STC-S text read with REGION(), on an inner and an outer join, a
 -- NULL footprint included: the rows of the exact test with no index at all
 CREATE INDEX ccat_radec ON ccat (skycell_ang2cell(ra, dec));
+ALTER INDEX ccat_radec ALTER COLUMN 1 SET STATISTICS 10000;
 ANALYZE ccat;
 CREATE TABLE cstore_txt AS SELECT fid, r::text AS r FROM cstore;
 INSERT INTO cstore_txt VALUES (999, NULL);
