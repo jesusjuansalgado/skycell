@@ -113,7 +113,7 @@ skypos_make(double ra, double dec)
 
 	if (!(dec >= -90.0 && dec <= 90.0))
 		ereport(ERROR, (errcode(ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE),
-						errmsg("declination %g out of range [-90, 90]", dec)));
+						errmsg("declination %.15g out of range [-90, 90]", dec)));
 	if (!isfinite(ra))
 		ereport(ERROR, (errcode(ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE),
 						errmsg("right ascension must be finite")));
@@ -130,6 +130,10 @@ region_cone(double ra, double dec, double radius)
 	SkyRegion  *r = (SkyRegion *) palloc0(sz);
 	SkyPos	   *c = skypos_make(ra, dec);
 
+	/* stored, a NaN or infinite radius would fail every later use (0.55) */
+	if (!isfinite(radius))
+		ereport(ERROR, (errcode(ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE),
+						errmsg("circle radius must be finite")));
 	SET_VARSIZE(r, sz);
 	r->kind = SKY_CONE;
 	r->v[0] = c->ra;
@@ -596,12 +600,13 @@ skypos_in(PG_FUNCTION_ARGS)
 	char	   *str = PG_GETARG_CSTRING(0);
 	double		ra,
 				dec;
-	char		junk;
+	int			n;
 
-	if (sscanf(str, " ( %lf , %lf ) %c", &ra, &dec, &junk) == 2 ||
-		sscanf(str, " %lf , %lf %c", &ra, &dec, &junk) == 2 ||
-		sscanf(str, " %lf %lf %c", &ra, &dec, &junk) == 2)
+	/* the whole string, nothing after it: "(1,2" and "(1,2,3)" are not positions */
+#define SKYPOS_FORM(fmt) (n = -1, sscanf(str, fmt " %n", &ra, &dec, &n) == 2 && n >= 0 && str[n] == '\0')
+	if (SKYPOS_FORM(" ( %lf , %lf )") || SKYPOS_FORM(" %lf , %lf") || SKYPOS_FORM(" %lf %lf"))
 		PG_RETURN_POINTER(skypos_make(ra, dec));
+#undef SKYPOS_FORM
 	ereport(ERROR, (errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
 					errmsg("invalid input syntax for type skypos: \"%s\"", str),
 					errhint("Write a position in degrees, for example (266.4, -28.9).")));
@@ -2187,9 +2192,10 @@ region_support_simplify(SupportRequestSimplify *req, Oid funcid, Node *pt, Node 
 			int			v = single_varno(injected(pt) ? pt : rg);
 
 			if (v > 0 && v <= list_length(req->root->parse->rtable) &&
-				rt_fetch(v, req->root->parse->rtable)->rtekind == RTE_RELATION &&
-				rt_fetch(v, req->root->parse->rtable)->relkind == RELKIND_PARTITIONED_TABLE)
-				return NULL;
+				((rt_fetch(v, req->root->parse->rtable)->rtekind == RTE_RELATION &&
+				  rt_fetch(v, req->root->parse->rtable)->relkind == RELKIND_PARTITIONED_TABLE) ||
+				 skycell_union_all_parent(req->root, v)))
+				return NULL;	/* the members of a UNION ALL too (0.55) */
 		}
 
 		if (name == NULL || strcmp(name, "skycell_cone") != 0)
@@ -2307,6 +2313,42 @@ region_simplify_oriented(SupportRequestSimplify *req, Oid funcid, Node *pt, Node
 	{
 		Node	   *moc_expr;
 		int			max_order;
+
+		/*
+		 * A UNION ALL of tables (a view of catalogues) has no index of its
+		 * own, but its members do, and plan their scans from their copies of
+		 * what is decided here, which they do not simplify again: the scan's
+		 * call is kept for them (0.55).
+		 */
+		if (skycell_union_all_parent(req->root, single_varno(cell)))
+		{
+			Node	   *cone = circle_as_cone(req, funcid, pt, rg, cell);
+			Node	   *ra,
+					   *dec;
+
+			if (cone != NULL)
+				return cone;
+			if (IsA(rg, Const) && !((Const *) rg)->constisnull && !IsA(pt, Const) &&
+				pos_ra_dec(funcid, pt, &ra, &dec))
+			{
+				Oid			t[4] = {INT8OID, FLOAT8OID, FLOAT8OID, exprType(rg)};
+				char	   *nsp = get_namespace_name(get_func_namespace(funcid));
+				Oid			fn = LookupFuncName(list_make2(makeString(nsp),
+														   makeString(pstrdup("skycell_region_scan"))),
+												4, t, true);
+
+				if (OidIsValid(fn))
+				{
+					FuncExpr   *scan = makeFuncExpr(fn, BOOLOID,
+													list_make4(copyObject(cell), ra, dec, copyObject(rg)),
+													InvalidOid, InvalidOid, COERCE_EXPLICIT_CALL);
+
+					if (region_scan_keep(req->root, req->fcall, scan))
+						return (Node *) scan;
+				}
+			}
+			return NULL;
+		}
 
 		/* the classic rewrite below needs a point-side index either way;
 		 * absent one, "many regions" (rg not constant) has its own
@@ -3267,6 +3309,8 @@ distance_cone(Node *qual, Node **below)
 		d = r;
 		r = t;
 		beyond = true;
+		/* a constant, perhaps not yet folded (from the planner hook) */
+		r = eval_const_expressions(NULL, copyObject(r));
 		if (!IsA(r, Const) || ((Const *) r)->constisnull)
 			return NULL;
 	}
@@ -3756,6 +3800,100 @@ skycell_fold_query_regions(Query *parse)
 {
 	if (skycell_fold_regions)
 		fold_query_walker((Node *) parse, NULL);
+}
+
+/*
+ * A query over a UNION ALL of tables (a view of catalogues): its WHERE is
+ * split among the union's members before get_relation_info_hook first runs,
+ * which is where add_distance_cones() turns ADQL's comparisons into what the
+ * index answers.  For such a query that is done here, from the planner hook,
+ * before the planner simplifies the quals: CONTAINS()/INTERSECTS() = 1
+ * become their operator, and a distance comparison gets its cone beside it,
+ * as add_distance_cones() would, the support functions then deciding at the
+ * union's level for its members (0.55).
+ */
+static void
+preconvert_quals(Node **quals)
+{
+	List	   *conj;
+	int			norig;
+	bool		was_list,
+				changed = false;
+
+	if (*quals == NULL)
+		return;
+	was_list = IsA(*quals, List);
+	conj = was_list ? list_copy((List *) *quals) : make_ands_implicit((Expr *) *quals);
+	norig = list_length(conj);
+	for (int i = 0; i < norig; i++)
+	{
+		Node	   *opx = adql_predicate_operator(list_nth(conj, i));
+		Node	   *below,
+				   *cone;
+
+
+		if (opx != NULL)
+		{
+			lfirst(list_nth_cell(conj, i)) = opx;
+			changed = true;
+		}
+		else if ((cone = distance_cone(list_nth(conj, i), &below)) != NULL)
+		{
+			conj = lappend(conj, cone);
+			changed = true;
+		}
+	}
+	if (changed)
+		*quals = was_list ? (Node *) conj : (Node *) make_ands_explicit(conj);
+}
+
+static void
+preconvert_jointree(Node *jt)
+{
+	ListCell   *lc;
+
+	if (jt == NULL)
+		return;
+	if (IsA(jt, FromExpr))
+	{
+		preconvert_quals(&((FromExpr *) jt)->quals);
+		foreach(lc, ((FromExpr *) jt)->fromlist)
+			preconvert_jointree(lfirst(lc));
+	}
+	else if (IsA(jt, JoinExpr))
+	{
+		JoinExpr   *j = (JoinExpr *) jt;
+
+		if (j->jointype != JOIN_FULL)
+			preconvert_quals(&j->quals);
+		preconvert_jointree(j->larg);
+		preconvert_jointree(j->rarg);
+	}
+}
+
+void
+skycell_preconvert_union_query(Query *parse)
+{
+	ListCell   *lc;
+
+	if (parse->commandType != CMD_SELECT || parse->jointree == NULL)
+		return;
+	foreach(lc, parse->rtable)
+	{
+		RangeTblEntry *rte = (RangeTblEntry *) lfirst(lc);
+		SetOperationStmt *op;
+
+
+		if (rte->rtekind != RTE_SUBQUERY || rte->subquery == NULL ||
+			rte->subquery->setOperations == NULL)
+			continue;
+		op = (SetOperationStmt *) rte->subquery->setOperations;
+		if (IsA(op, SetOperationStmt) && op->op == SETOP_UNION && op->all)
+		{
+			preconvert_jointree((Node *) parse->jointree);
+			return;
+		}
+	}
 }
 
 /*

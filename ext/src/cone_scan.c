@@ -1143,6 +1143,37 @@ is_child_rel(PlannerInfo *root, Index varno)
 		root->append_rel_array[varno] != NULL;
 }
 
+/*
+ * Whether varno is the parent of a flattened UNION ALL (an append relation
+ * over subqueries), every member of which is a plain table: its quals are
+ * planned again for each member.
+ */
+bool
+skycell_union_all_parent(PlannerInfo *root, Index varno)
+{
+	RangeTblEntry *rte = rt_fetch(varno, root->parse->rtable);
+	ListCell   *lc;
+	bool		any = false;
+
+	if (rte->rtekind != RTE_SUBQUERY || !rte->inh)
+		return false;
+	foreach(lc, root->append_rel_list)
+	{
+		AppendRelInfo *ai = (AppendRelInfo *) lfirst(lc);
+		RangeTblEntry *c;
+
+		if (ai->parent_relid != varno)
+			continue;
+		c = rt_fetch(ai->child_relid, root->parse->rtable);
+		if (c->rtekind != RTE_RELATION ||
+			(c->relkind != RELKIND_RELATION && c->relkind != RELKIND_MATVIEW &&
+			 c->relkind != RELKIND_PARTITIONED_TABLE))
+			return false;
+		any = true;
+	}
+	return any;
+}
+
 static bool
 keep_cone(PlannerInfo *root, FuncExpr *written, FuncExpr *fcall)
 {
@@ -1164,8 +1195,20 @@ keep_cone(PlannerInfo *root, FuncExpr *written, FuncExpr *fcall)
 			return false;
 		varno = v->varno;
 	}
-	if (varno == 0 || varno > list_length(root->parse->rtable) ||
-		rt_fetch(varno, root->parse->rtable)->rtekind != RTE_RELATION)
+	if (varno == 0 || varno > list_length(root->parse->rtable))
+		return false;
+
+	/*
+	 * A UNION ALL of tables, flattened into an append relation (a view of
+	 * several catalogues): kept for its members, each of which plans its own
+	 * scan from its copy, as a partitioned table's partitions do (0.55).
+	 */
+	if (skycell_union_all_parent(root, varno))
+	{
+		cone_funcid = fcall->funcid;
+		return true;
+	}
+	if (rt_fetch(varno, root->parse->rtable)->rtekind != RTE_RELATION)
 		return false;
 	if (cone_kind(args, varno) == CONE_NONE)
 		return false;
@@ -1224,6 +1267,12 @@ region_scan_keep(PlannerInfo *root, FuncExpr *written, FuncExpr *fcall)
 	}
 	if (varno == 0 || varno > list_length(root->parse->rtable))
 		return false;
+	/* kept for the members of a UNION ALL, as a cone is (keep_cone()) */
+	if (skycell_union_all_parent(root, varno))
+	{
+		region_scan_funcid = fcall->funcid;
+		return true;
+	}
 	rte = rt_fetch(varno, root->parse->rtable);
 	if (rte->rtekind != RTE_RELATION ||
 		(rte->relkind != RELKIND_RELATION && rte->relkind != RELKIND_MATVIEW &&
@@ -1294,6 +1343,29 @@ cell_index(RelOptInfo *rel, Node *cell)
 			best = ix;
 	}
 	return best;
+}
+
+/*
+ * cell_index(), or failing it the index of the stored column known to hold
+ * the cell expression (a generated or checked cell column), *cell becoming
+ * that column.  A cone kept for the members of a UNION ALL names the
+ * expression, which only the member knows a column for (0.55).
+ */
+static IndexOptInfo *
+cell_index_mapped(PlannerInfo *root, RelOptInfo *rel, Node **cell)
+{
+	IndexOptInfo *ix = cell_index(rel, *cell);
+	Node	   *c = *cell;
+	sc_density	d;
+	Oid			statrel;
+	bool		ops;
+
+	if (ix != NULL || IsA(c, Var) ||
+		!skycell_cell_density(root, &c, &d, &statrel, &ops) || c == *cell ||
+		(ix = cell_index(rel, c)) == NULL)
+		return ix;
+	*cell = c;
+	return ix;
 }
 
 /*
@@ -1728,6 +1800,7 @@ cone_planner(Query *parse, const char *query_string, int cursorOptions, ParamLis
 
 	plan_generation++;
 	skycell_fold_query_regions(parse);
+	skycell_preconvert_union_query(parse);
 	if (nhooked < HOOKED_MAX)
 		hooked[nhooked] = parse;
 	nhooked++;
@@ -2212,9 +2285,17 @@ add_runtime_path(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte, FuncExp
 	bool		bitmap;
 	QualCost	recheck = {0, 0};
 	double		rows = ppi ? ppi->ppi_rows : rel->rows;
-	AttrNumber	attnum = IsA(cell, Var) ? ((Var *) cell)->varattno : 1;
+	AttrNumber	attnum;
 
-	if ((ix = cell_index(rel, cell)) == NULL ||
+	ix = cell_index_mapped(root, rel, &cell);
+	attnum = IsA(cell, Var) ? ((Var *) cell)->varattno : 1;
+	if (ix != NULL && cell != linitial(f->args))
+	{
+		/* the estimates read the column's statistics, as the scan reads its index */
+		f = copyObject(f);
+		linitial(f->args) = cell;
+	}
+	if (ix == NULL ||
 		!(list_length(f->args) == 4 ? region_join_estimate(root, f->args, &e)
 		  : join_cone_estimate(root, f->args, &e)))
 		return;
@@ -2390,8 +2471,17 @@ cone_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, Index rti, RangeTblEnt
 			list_length(f->args) == 4)
 		{
 			/* a constant composite: its covering's ranges, as a cone's */
-			if ((ix = cell_index(rel, linitial(f->args))) == NULL ||
-				!skycell_const_region_cover(root, f->args, &reg, &cov, &dens))
+			Node	   *c = linitial(f->args);
+			List	   *args = f->args;
+
+			if ((ix = cell_index_mapped(root, rel, &c)) == NULL)
+				continue;
+			if (c != linitial(f->args))
+			{
+				args = list_copy(f->args);
+				linitial(args) = c;
+			}
+			if (!skycell_const_region_cover(root, args, &reg, &cov, &dens))
 				continue;
 			sc_region_free(&reg);
 		}
@@ -2404,9 +2494,21 @@ cone_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, Index rti, RangeTblEnt
 				add_runtime_path(root, rel, rte, f, NULL);
 				continue;
 			}
-			if ((ix = cell_index(rel, linitial(f->args))) == NULL)
-				continue;
-			if (!skycell_const_cone_cover(root, f->args, &reg, &cov, &dens))
+			{
+				Node	   *c = linitial(f->args);
+				List	   *args = f->args;
+
+				if ((ix = cell_index_mapped(root, rel, &c)) == NULL)
+					continue;
+				if (c != linitial(f->args))
+				{
+					args = list_copy(f->args);
+					linitial(args) = c;
+				}
+				if (!skycell_const_cone_cover(root, args, &reg, &cov, &dens))
+					continue;
+			}
+			if (false)
 				continue;
 		}
 
@@ -3559,6 +3661,9 @@ cone_cover_row(ConeScanState *st)
 			return;
 		v[i++] = DatumGetFloat8(d);
 	}
+	/* a cone that holds nothing (NaN, infinite or negative), as the exact test reads it */
+	if (!sc_cone_search_args(v[0], v[1], &v[2]))
+		return;
 	if (!st->have_keyrange)
 		cone_key_range(st);
 

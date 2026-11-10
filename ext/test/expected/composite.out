@@ -250,6 +250,8 @@ SELECT i AS id, ra, dec, skycell_point(ra, dec) AS pos FROM (
             CASE WHEN i % 2 = 0 THEN 16 + 8 * random() ELSE degrees(asin(2 * random() - 1)) END AS dec
   FROM generate_series(1, 100000) i) s;
 CREATE INDEX ccat_pos ON ccat (skycell_cell(pos));
+-- statistics fixed for the test: plan checks below are cost-based
+ALTER TABLE ccat SET (autovacuum_enabled = off);
 ANALYZE ccat;
 CREATE TABLE cregs(name text, r skyregion);
 INSERT INTO cregs VALUES
@@ -591,6 +593,8 @@ ANALYZE ccat;
 CREATE TABLE cstore_txt AS SELECT fid, r::text AS r FROM cstore;
 INSERT INTO cstore_txt VALUES (999, NULL);
 INSERT INTO cstore VALUES (999, NULL);
+ALTER TABLE cstore SET (autovacuum_enabled = off);
+ALTER TABLE cstore_txt SET (autovacuum_enabled = off);
 ANALYZE cstore; ANALYZE cstore_txt;
 CREATE FUNCTION cjoin(q text, OUT custom bool, OUT agree bool) LANGUAGE plpgsql AS $$
 DECLARE a text; b text; l text;

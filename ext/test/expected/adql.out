@@ -483,3 +483,29 @@ SELECT adql_plan_nearest('SELECT id FROM ascat ORDER BY skycell_dist(coord1(pos)
 
 DROP FUNCTION adql_plan_nearest(text);
 DROP TABLE ascat;
+-- a circle's radius must be finite, as its centre must; a position's text
+-- is the whole string (0.55)
+SELECT circle(10, 10, 'NaN');
+ERROR:  circle radius must be finite
+SELECT region('CIRCLE ICRS 10 10 inf');
+ERROR:  circle radius must be finite
+SELECT '(1,2'::skypos;
+ERROR:  invalid input syntax for type skypos: "(1,2"
+LINE 1: SELECT '(1,2'::skypos;
+               ^
+HINT:  Write a position in degrees, for example (266.4, -28.9).
+SELECT '(1,2,3)'::skypos;
+ERROR:  invalid input syntax for type skypos: "(1,2,3)"
+LINE 1: SELECT '(1,2,3)'::skypos;
+               ^
+HINT:  Write a position in degrees, for example (266.4, -28.9).
+SELECT '(1,90.0000001)'::skypos;
+ERROR:  declination 90.0000001 out of range [-90, 90]
+LINE 1: SELECT '(1,90.0000001)'::skypos;
+               ^
+SELECT ' ( 1 , 2 ) '::skypos AS spaced, '1,2'::skypos AS bare, '1 2'::skypos AS blank, circle(10, 10, -1) AS empty_circle;
+ spaced | bare  | blank |     empty_circle     
+--------+-------+-------+----------------------
+ (1,2)  | (1,2) | (1,2) | CIRCLE ICRS 10 10 -1
+(1 row)
+

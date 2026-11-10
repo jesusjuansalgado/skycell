@@ -315,3 +315,11 @@ END $$;
 SELECT adql_plan_nearest('SELECT id FROM ascat ORDER BY skycell_dist(coord1(pos), coord2(pos), 10, 20) LIMIT 5') AS nearest;
 DROP FUNCTION adql_plan_nearest(text);
 DROP TABLE ascat;
+-- a circle's radius must be finite, as its centre must; a position's text
+-- is the whole string (0.55)
+SELECT circle(10, 10, 'NaN');
+SELECT region('CIRCLE ICRS 10 10 inf');
+SELECT '(1,2'::skypos;
+SELECT '(1,2,3)'::skypos;
+SELECT '(1,90.0000001)'::skypos;
+SELECT ' ( 1 , 2 ) '::skypos AS spaced, '1,2'::skypos AS bare, '1 2'::skypos AS blank, circle(10, 10, -1) AS empty_circle;

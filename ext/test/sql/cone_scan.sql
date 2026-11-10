@@ -530,3 +530,21 @@ FROM (VALUES (0, 0, 0), (360, 0, 0), (10, 10, 100), (10, 10, 180), (10, 10, 200)
 ORDER BY 1, 2, 3;
 DROP FUNCTION cs_edge_ids(text, bool);
 DROP TABLE cs_edge;
+
+-- NaN and infinite cone parameters read as the exact test reads them -- no
+-- rows, or the whole sky -- in every plan, constant or per outer row (0.55)
+CREATE TABLE cs_nan AS SELECT i AS id, 360 * random() AS ra, degrees(asin(2 * random() - 1)) AS dec
+FROM generate_series(1, 5000) i;
+CREATE INDEX ON cs_nan (skycell_ang2cell(ra, dec));
+ANALYZE cs_nan;
+CREATE TEMP TABLE cs_nan_probe AS SELECT i, (ARRAY['NaN', 'Infinity', '-Infinity', '0.5', '-1'])[i]::float8 AS r
+FROM generate_series(1, 5) i;
+SELECT r, (SELECT count(*) FROM cs_nan WHERE skycell_join(ra, dec, 10, 10, p.r))
+         = (SELECT count(*) FROM cs_nan WHERE skycell_in_cone(ra, dec, 10, 10, p.r, -1)) AS as_exact
+FROM cs_nan_probe p ORDER BY i;
+SELECT count(*) = 5000 + (SELECT count(*) FROM cs_nan WHERE skycell_in_cone(ra, dec, 10, 10, 0.5, -1)) AS joined
+FROM cs_nan_probe p JOIN cs_nan c ON skycell_join(c.ra, c.dec, 10, 10, p.r);
+SELECT count(*) AS constant_nan FROM cs_nan WHERE skycell_join(ra, dec, 10, 10, 'NaN');
+SELECT count(*) AS constant_inf FROM cs_nan WHERE skycell_radial_query(ra, dec, 10, 10, 'Infinity');
+SELECT count(*) AS centre_nan FROM cs_nan WHERE skycell_join(ra, dec, 'NaN', 10, 1);
+DROP TABLE cs_nan;

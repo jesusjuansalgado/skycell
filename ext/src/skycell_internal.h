@@ -64,6 +64,7 @@ extern void skycell_scan_params(sc_cover_params *p, const sc_density *d);
 extern void cone_scan_init(void);
 extern bool skycell_fold_regions;	/* adql.c: booleans of constant regions as one (0.53) */
 extern void skycell_fold_query_regions(Query *parse);
+extern void skycell_preconvert_union_query(Query *parse);
 extern bool skycell_planning_unhooked(PlannerInfo *root);
 extern bool cone_scan_keep(PlannerInfo *root, FuncExpr *fcall);
 extern bool cone_scan_keep_as(PlannerInfo *root, FuncExpr *written, FuncExpr *cone6);
@@ -112,6 +113,7 @@ extern bool skycell_pos_coords(Oid funcid, Node *pt, Node **ra, Node **dec);
 extern bool skycell_const_region_cover(PlannerInfo *root, List *args, sc_region *reg,
 									   sc_cover *cov, sc_density *dens);
 extern bool region_scan_keep(PlannerInfo *root, FuncExpr *written, FuncExpr *fcall);
+extern bool skycell_union_all_parent(PlannerInfo *root, Index varno);
 extern FuncExpr *skycell_poly_region_scan(Oid sibling, Node *cell, Node *ra, Node *dec,
 										  ArrayType *arr);
 extern void skycell_region_from_datum_lite(Datum d, sc_region *r);

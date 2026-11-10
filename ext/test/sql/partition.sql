@@ -256,6 +256,52 @@ SELECT k, bool_and(
 FROM (VALUES (120.0, 30.0), (0, 90), (300, -45), (359.99, 0)) c(ra, dec), unnest(ARRAY[1, 32, 33, 500, 3000]) k
 GROUP BY k ORDER BY k;
 
+-- a UNION ALL of catalogues (a view): each member scans its own index, one
+-- on the expression and one on a stored cell column (0.55)
+CREATE TABLE un_a AS SELECT id::bigint AS id, ra, dec FROM pt_flat WHERE id % 2 = 0;
+CREATE TABLE un_b (id bigint, ra float8, dec float8,
+                   cell bigint GENERATED ALWAYS AS (skycell_ang2cell(ra, dec)) STORED);
+INSERT INTO un_b (id, ra, dec) SELECT id, ra, dec FROM pt_flat WHERE id % 2 = 1;
+CREATE INDEX ON un_a (skycell_ang2cell(ra, dec));
+CREATE INDEX ON un_b (cell);
+ANALYZE un_a; ANALYZE un_b;
+CREATE VIEW un_cat AS SELECT id, ra, dec FROM un_a UNION ALL SELECT id, ra, dec FROM un_b;
+CREATE FUNCTION un_scans(q text) RETURNS text LANGUAGE plpgsql AS $$
+DECLARE l text; n int := 0; seq int := 0;
+BEGIN
+  FOR l IN EXECUTE 'EXPLAIN (COSTS OFF) ' || q LOOP
+    IF l ~ 'Skycell(Cone|Nearest)' THEN n := n + 1; END IF;
+    IF l ~ 'Seq Scan on un_' THEN seq := seq + 1; END IF;
+  END LOOP;
+  RETURN n || ' scans, ' || seq || ' seq';
+END $$;
+CREATE FUNCTION un_same(w text) RETURNS bool LANGUAGE plpgsql AS $$
+DECLARE a text; b text;
+BEGIN
+  EXECUTE format('SELECT string_agg(id::text, '','' ORDER BY id) FROM un_cat WHERE %s', w) INTO a;
+  SET LOCAL skycell.custom_scan = off; SET LOCAL enable_indexscan = off; SET LOCAL enable_bitmapscan = off;
+  EXECUTE format('SELECT string_agg(id::text, '','' ORDER BY id) FROM un_cat WHERE %s', w) INTO b;
+  RESET skycell.custom_scan; RESET enable_indexscan; RESET enable_bitmapscan;
+  RETURN a IS NOT DISTINCT FROM b;
+END $$;
+SELECT w, un_scans(format('SELECT id FROM un_cat WHERE %s', w)) AS plan, un_same(w) AS same_rows
+FROM (VALUES ($w$CONTAINS(POINT('ICRS', ra, dec), CIRCLE('ICRS', 120, 30, 2)) = 1$w$),
+             ($w$CONTAINS(POINT('ICRS', ra, dec), POLYGON('ICRS', 119, 29, 121, 29, 120, 31)) = 1$w$),
+             ($w$CONTAINS(POINT('ICRS', ra, dec), REGION('DIFFERENCE ICRS (CIRCLE 120 30 2 CIRCLE 120 30 0.5)')) = 1$w$),
+             ($w$DISTANCE(POINT('ICRS', ra, dec), POINT('ICRS', 120, 30)) < 2$w$),
+             ($w$DISTANCE(POINT('ICRS', ra, dec), POINT('ICRS', 300, -30)) > 178$w$),
+             ($w$skycell_radial_query(ra, dec, 120, 30, 2)$w$)) x(w)
+ORDER BY 1;
+-- a cross-match and nearest neighbours through the view
+SELECT un_scans($q$SELECT p.pid, c.id FROM pt_probe p JOIN un_cat c ON skycell_join(c.ra, c.dec, p.ra, p.dec, 0.01)$q$) AS xmatch,
+       un_scans($q$SELECT p.pid, c.id FROM pt_probe p JOIN un_cat c ON DISTANCE(POINT('ICRS', c.ra, c.dec), POINT('ICRS', p.ra, p.dec)) < 0.01$q$) AS xmatch_adql,
+       un_scans($q$SELECT id FROM un_cat ORDER BY skycell_dist(ra, dec, 120, 30) LIMIT 5$q$) AS nearest,
+       (SELECT count(*) FROM pt_probe p JOIN un_cat c ON skycell_join(c.ra, c.dec, p.ra, p.dec, 0.01))
+     = (SELECT count(*) FROM pt_probe p JOIN pt_flat c ON skycell_dist(c.ra, c.dec, p.ra, p.dec) + 0 < 0.01) AS xmatch_same;
+DROP FUNCTION un_scans(text), un_same(text);
+DROP VIEW un_cat;
+DROP TABLE un_a, un_b;
+
 DROP FUNCTION pt_cmp(text, text), pt_scans(text, text), pt_keyed(text, text), pt_filter(text);
 DROP TABLE pt_flat, pt_cell, pt_dec, pt_patch, pt_probe, pt_col, pt_key;
 

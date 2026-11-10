@@ -1803,14 +1803,19 @@ simplify_cone(PlannerInfo *root, FuncExpr *fexpr)
 		double		sel;
 		Expr	   *exact;
 
+		double		cr = DatumGetFloat8(((Const *) list_nth(args, 5))->constvalue);
+
 		if (anynull)
 			return (Node *) makeBoolConst(false, true);
+		/* a cone that holds nothing, as the exact test reads it */
+		if (!sc_cone_search_args(DatumGetFloat8(((Const *) list_nth(args, 3))->constvalue),
+								 DatumGetFloat8(((Const *) list_nth(args, 4))->constvalue), &cr))
+			return (Node *) makeBoolConst(false, false);
 
 		check_err(sc_region_cone(&reg,
 								 DatumGetFloat8(((Const *) list_nth(args, 3))->constvalue),
 								 DatumGetFloat8(((Const *) list_nth(args, 4))->constvalue),
-								 DatumGetFloat8(((Const *) list_nth(args, 5))->constvalue),
-								 true));
+								 cr, true));
 		current_params(&p, skycell_max_ranges, &dens);
 		cover_cached(&reg, &dens, &p, dens_statrel,
 					 DatumGetFloat8(((Const *) list_nth(args, 3))->constvalue),
@@ -2102,6 +2107,8 @@ skycell_const_cone_cover(PlannerInfo *root, List *args, sc_region *reg,
 	dec0 = DatumGetFloat8(((Const *) list_nth(args, 4))->constvalue);
 	radius = DatumGetFloat8(((Const *) list_nth(args, 5))->constvalue);
 
+	if (!sc_cone_search_args(ra0, dec0, &radius))
+		return false;			/* nothing to scan: simplify_cone() makes it false */
 	density_for_var(root, linitial(args), dens, &statrel, &uses_cell_ops);
 	check_err(sc_region_cone(reg, ra0, dec0, radius, true));
 	current_params_scan(&p, skycell_max_ranges, dens);
@@ -2705,10 +2712,18 @@ skycell_cone_bound(PG_FUNCTION_ARGS)
 		sc_density	d = {ntotal, hc->n, hc->b};
 		int			s;
 
+		double		r2 = radius;
+
 		slot_cache.valid = false;
-		check_err(sc_region_cone(&reg, ra0, dec0, radius, true));
-		current_params(&p, nslots, &d);
-		sc_cover_compute(&reg, &d, &p, &cov);
+		cov.r = NULL;
+		cov.n = 0;
+		/* a cone that holds nothing has no ranges: every slot stays empty */
+		if (sc_cone_search_args(ra0, dec0, &r2))
+		{
+			check_err(sc_region_cone(&reg, ra0, dec0, r2, true));
+			current_params(&p, nslots, &d);
+			sc_cover_compute(&reg, &d, &p, &cov);
+		}
 		for (s = 0; s < cov.n && s < nslots; s++)
 		{
 			slot_cache.lo[s] = cov.r[s].lo;
