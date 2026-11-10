@@ -1254,6 +1254,45 @@ density_for_expr(PlannerInfo *root, Node *arg, sc_density *d, Oid *statrel,
  * column, and the density is its statistics'.  Callers then build their
  * conditions and paths on *cell, which an index answers either way.
  */
+/*
+ * skycell_cell(p) for skycell_ang2cell(coord1(p), coord2(p)), p a skypos
+ * column or a point column through its cast; else NULL.  The two are the same
+ * value: coord1 and coord2 read the normalised coordinates skycell_cell uses.
+ */
+static Node *
+cell_of_stored_pos(Node *cell)
+{
+	FuncExpr   *f = (FuncExpr *) cell,
+			   *c1,
+			   *c2;
+	Node	   *p;
+	char	   *n;
+	Oid			one[1];
+
+	if (!IsA(cell, FuncExpr) || list_length(f->args) != 2)
+		return NULL;
+	c1 = (FuncExpr *) linitial(f->args);
+	c2 = (FuncExpr *) lsecond(f->args);
+	if (!IsA(c1, FuncExpr) || !IsA(c2, FuncExpr) ||
+		list_length(c1->args) != 1 || list_length(c2->args) != 1 ||
+		!equal(linitial(c1->args), linitial(c2->args)))
+		return NULL;
+	p = linitial(c1->args);
+	if (!IsA(p, Var) && !(IsA(p, FuncExpr) && list_length(((FuncExpr *) p)->args) == 1 &&
+						  IsA(linitial(((FuncExpr *) p)->args), Var) &&
+						  (n = get_func_name(((FuncExpr *) p)->funcid)) != NULL &&
+						  strcmp(n, "skycell_pos_from_point") == 0))
+		return NULL;
+	if ((n = get_func_name(f->funcid)) == NULL || strcmp(n, "skycell_ang2cell") != 0 ||
+		(n = get_func_name(c1->funcid)) == NULL || strcmp(n, "coord1") != 0 ||
+		(n = get_func_name(c2->funcid)) == NULL || strcmp(n, "coord2") != 0)
+		return NULL;
+	one[0] = exprType(p);
+	return (Node *) makeFuncExpr(lookup_sibling_func(f->funcid, "skycell_cell", 1, one),
+								 INT8OID, list_make1(copyObject(p)),
+								 InvalidOid, InvalidOid, COERCE_EXPLICIT_CALL);
+}
+
 bool
 skycell_cell_density(PlannerInfo *root, Node **cell, sc_density *d, Oid *statrel,
 					 bool *uses_cell_ops)
@@ -1274,6 +1313,20 @@ skycell_cell_density(PlannerInfo *root, Node **cell, sc_density *d, Oid *statrel
 		return false;
 	if (density_for_expr(root, *cell, d, statrel, uses_cell_ops))
 		return true;
+	{
+		/*
+		 * skycell_ang2cell(coord1(p), coord2(p)) of a stored position p is
+		 * skycell_cell(p), which its index holds: the Q3C spellings and the
+		 * four-argument distance written on a skypos column (0.55).
+		 */
+		Node	   *alt = cell_of_stored_pos(*cell);
+
+		if (alt != NULL && density_for_expr(root, alt, d, statrel, uses_cell_ops))
+		{
+			*cell = alt;
+			return true;
+		}
+	}
 	vars = sc_pull_local_vars(*cell, 0);
 	foreach(lc, vars)
 	{

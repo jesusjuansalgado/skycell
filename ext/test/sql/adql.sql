@@ -285,3 +285,33 @@ SELECT pg_typeof(pos) AS column_type,
      = (SELECT count(*) FROM acat WHERE CONTAINS(POINT('ICRS', ra, dec), CIRCLE('ICRS', 10, 20, 2)) = 1) AS same_rows_reversed
 FROM apcat LIMIT 1;
 DROP TABLE apcat;
+-- the Q3C spellings and the four-argument distance on a skypos column,
+-- through coord1(pos) and coord2(pos), use its skycell_cell(pos) index
+CREATE TABLE ascat AS SELECT id, pos FROM acat;
+CREATE INDEX ascat_cell ON ascat (skycell_cell(pos));
+ANALYZE ascat;
+SELECT adql_plan_uses_index('SELECT * FROM ascat WHERE skycell_radial_query(coord1(pos), coord2(pos), 10, 20, 2)') AS radial_query,
+       adql_plan_uses_index('SELECT * FROM ascat WHERE DISTANCE(coord1(pos), coord2(pos), 10, 20) < 2') AS distance4,
+       adql_plan_uses_index('SELECT * FROM ascat WHERE skycell_dist(coord1(pos), coord2(pos), 10, 20) < 2') AS dist,
+       adql_plan_uses_index('SELECT * FROM ascat WHERE skycell_poly_join(coord1(pos), coord2(pos), ARRAY[9, 19, 11, 19, 10, 21]::float8[])') AS poly_join,
+       (SELECT count(*) FROM ascat WHERE skycell_radial_query(coord1(pos), coord2(pos), 10, 20, 2))
+     = (SELECT count(*) FROM acat WHERE CONTAINS(POINT('ICRS', ra, dec), CIRCLE('ICRS', 10, 20, 2)) = 1) AS same_rows;
+-- beyond a distance past 90 degrees: a cone round the antipode, either way
+-- round, the comparison still deciding
+SELECT adql_plan_uses_index('SELECT * FROM acat WHERE DISTANCE(POINT(ra, dec), POINT(10, 20)) > 178') AS beyond,
+       adql_plan_uses_index('SELECT * FROM acat WHERE 178 <= DISTANCE(POINT(10, 20), POINT(ra, dec))') AS beyond_reversed,
+       adql_plan_uses_index('SELECT * FROM ascat WHERE skycell_dist(coord1(pos), coord2(pos), 10, 20) > 178') AS beyond_pos,
+       NOT adql_plan_uses_index('SELECT * FROM acat WHERE DISTANCE(POINT(ra, dec), POINT(10, 20)) > 60') AS not_below_90,
+       (SELECT array_agg(id ORDER BY id) FROM acat WHERE DISTANCE(POINT(ra, dec), POINT(10, 20)) > 178)
+     = (SELECT array_agg(id ORDER BY id) FROM acat WHERE skycell_dist(ra, dec, 10, 20) + 0 > 178) AS same_rows;
+CREATE FUNCTION adql_plan_nearest(q text) RETURNS bool LANGUAGE plpgsql AS $$
+DECLARE l text; found bool := false;
+BEGIN
+  FOR l IN EXECUTE 'EXPLAIN (COSTS OFF) ' || q LOOP
+    IF l ~ 'SkycellNearest' THEN found := true; END IF;
+  END LOOP;
+  RETURN found;
+END $$;
+SELECT adql_plan_nearest('SELECT id FROM ascat ORDER BY skycell_dist(coord1(pos), coord2(pos), 10, 20) LIMIT 5') AS nearest;
+DROP FUNCTION adql_plan_nearest(text);
+DROP TABLE ascat;

@@ -4844,6 +4844,8 @@ bestfirst_fits(NearestScanState *ns)
 	return 3.0 * need * (width + HEAPTUPLESIZE + sizeof(NearestRow)) <= work_mem * 1024.0;
 }
 
+#define PART_FIRST_ROWS 32
+
 static void
 nearest_bestfirst_ring(NearestScanState *ns)
 {
@@ -4862,6 +4864,18 @@ nearest_bestfirst_ring(NearestScanState *ns)
 	probe_cell *h = palloc(sizeof(probe_cell) * hcap);
 	int64	   *b = palloc(sizeof(int64) * 2 * bcap);
 	bool		exhausted;
+
+	/*
+	 * A partition's scan is one of a Merge Append's, which reads only as
+	 * many of its rows as are nearer than the other partitions' (0.55): its
+	 * first batch is a few rows, and rings continue past them if more are
+	 * read.  A partition far from the centre then costs a few rows, not k.
+	 */
+	if (st->css.ss.ss_currentRelation->rd_rel->relispartition && need > PART_FIRST_ROWS)
+	{
+		need = PART_FIRST_ROWS;
+		split_rows = fmax(8.0, need / 8.0);
+	}
 
 	/* a partition's ranges are clipped to the keys it holds */
 	if (!st->have_keyrange)

@@ -3226,7 +3226,8 @@ distance_cone(Node *qual, Node **below)
 				circle_oid;
 	int			v1,
 				v2;
-	bool		strict;
+	bool		strict,
+				beyond = false;
 
 	*below = NULL;
 	if (!IsA(qual, OpExpr) || list_length(op->args) != 2)
@@ -3251,6 +3252,22 @@ distance_cone(Node *qual, Node **below)
 			strict = (opfn == F_FLOAT8GT || opfn == F_FLOAT48GT);
 			break;
 		default:
+			return NULL;
+	}
+
+	/*
+	 * Beyond a distance: d > r (or r < d).  Past 90 degrees the rows it keeps
+	 * lie in a cap round the antipode, of radius 180 - r, which is the cone
+	 * added; below that the cap is most of the sky, and no help (0.55).
+	 */
+	if (!(IsA(d, FuncExpr) && is_distance_func(((FuncExpr *) d)->funcid)))
+	{
+		Node	   *t = d;
+
+		d = r;
+		r = t;
+		beyond = true;
+		if (!IsA(r, Const) || ((Const *) r)->constisnull)
 			return NULL;
 	}
 	if (!IsA(d, FuncExpr) || !is_distance_func(((FuncExpr *) d)->funcid) ||
@@ -3287,6 +3304,55 @@ distance_cone(Node *qual, Node **below)
 	v2 = single_varno((Node *) list_make2(ra2, dec2));
 	if (v1 < 0 || v2 < 0 || v1 == v2)
 		return NULL;
+
+	if (beyond)
+	{
+		Const	   *rc;
+		double		rv;
+		Node	   *ra1,
+				   *dec1;
+
+		r = coerce_to_target_type(NULL, copyObject(r), exprType(r), FLOAT8OID, -1,
+								  COERCION_IMPLICIT, COERCE_IMPLICIT_CAST, -1);
+		if (r == NULL || !IsA((r = eval_const_expressions(NULL, r)), Const) ||
+			((Const *) r)->constisnull)
+			return NULL;
+		rc = (Const *) r;
+		rv = DatumGetFloat8(rc->constvalue);
+		if (!(rv > 90.0 && rv < 180.0))
+			return NULL;
+
+		/* the circle round the constant side, the position the relation's */
+		if (v1 == 0)
+		{
+			Oid			point_oid = lookup_sibling_func(f->funcid, "point", 2, ff);
+
+			if (!pos_ra_dec(f->funcid, pt, &ra1, &dec1))
+				return NULL;
+			pt = (Node *) makeFuncExpr(point_oid, get_func_rettype(point_oid),
+									   list_make2(copyObject(ra2), copyObject(dec2)),
+									   InvalidOid, InvalidOid, COERCE_EXPLICIT_CALL);
+			ra2 = ra1;
+			dec2 = dec1;
+		}
+		/* the antipode, and the radius round it, a hair wider */
+		ra2 = (Node *) makeFuncExpr(F_FLOAT8PL, FLOAT8OID, list_make2(copyObject(ra2), float8_const(180.0)),
+									InvalidOid, InvalidOid, COERCE_EXPLICIT_CALL);
+		dec2 = (Node *) makeFuncExpr(F_FLOAT8UM, FLOAT8OID, list_make1(copyObject(dec2)),
+									 InvalidOid, InvalidOid, COERCE_EXPLICIT_CALL);
+		radius = (Node *) float8_const(fmin(180.0, (180.0 - rv) * (1.0 + 1e-9) + 1e-12));
+		circle_oid = lookup_sibling_func(f->funcid, "circle", 3, fff);
+		circ = makeFuncExpr(circle_oid, get_func_rettype(circle_oid),
+							list_make3(ra2, dec2, radius),
+							InvalidOid, InvalidOid, COERCE_EXPLICIT_CALL);
+		mark_injected(pt, list_length(f->args) == 4);
+		mark_injected((Node *) circ, list_length(f->args) == 4);
+		types[0] = exprType(pt);
+		types[1] = exprType((Node *) circ);
+		return (Node *) makeFuncExpr(lookup_sibling_func(f->funcid, "skycell_pos_in_region", 2, types),
+									 BOOLOID, list_make2(pt, circ),
+									 InvalidOid, InvalidOid, COERCE_EXPLICIT_CALL);
+	}
 
 	/* r' = least(r * (1 + 1e-9) + 1e-12, 180): NULL and NaN become the sky */
 	r = copyObject(r);

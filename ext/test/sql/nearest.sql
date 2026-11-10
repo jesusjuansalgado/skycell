@@ -137,7 +137,8 @@ SELECT nn_rings('SELECT id FROM nn_cat ORDER BY skycell_dist(ra, dec, 10, 20) LI
                  ORDER BY skycell_dist(ra, dec, 10, 20) LIMIT 20') <= 2 AS starts_past_it;
 
 -- lower bounds in every spelling, with and without an upper one, and ones
--- that keep nothing (NULL, NaN, or beyond the upper bound)
+-- that keep nothing (NULL, NaN, or beyond the upper bound); one past 90
+-- degrees is a cone round the antipode instead (0.55)
 SELECT count(*) AS queries, count(*) FILTER (WHERE nn_same(q)) AS same,
        count(*) FILTER (WHERE nn_plan(q) ~ 'nearest') AS nearest
 FROM (SELECT format('SELECT id, skycell_dist(ra, dec, %s, %s) d FROM nn_%s WHERE %s ORDER BY 2 LIMIT %s',
