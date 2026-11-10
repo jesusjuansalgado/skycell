@@ -18,6 +18,7 @@
 #define SKYCELL_COVER_H
 
 #include <stdbool.h>
+#include <math.h>
 
 #include "healpix.h"
 
@@ -205,6 +206,23 @@ typedef struct sc_cover
  */
 const char *sc_region_cone(sc_region *r, double ra_deg, double dec_deg, double radius_deg,
 							bool need_covering);
+
+/*
+ * The parameters of a cone search, as its exact test reads them: false when
+ * the cone holds nothing (a NaN or infinite centre, a NaN or negative
+ * radius), else true with an infinite radius made the whole sky.  The search
+ * paths call this before sc_region_cone(), which rejects such values as a
+ * constructor must (0.55).
+ */
+static inline bool
+sc_cone_search_args(double ra0, double dec0, double *radius)
+{
+	if (!isfinite(ra0) || !isfinite(dec0) || !(*radius >= 0))
+		return false;
+	if (*radius > 180.0)
+		*radius = 180.0;
+	return true;
+}
 const char *sc_region_poly(sc_region *r, int nv, const double *ra_deg, const double *dec_deg,
 							bool need_covering);
 void		sc_region_free(sc_region *r);
