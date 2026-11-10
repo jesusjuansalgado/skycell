@@ -875,3 +875,43 @@ DROP FUNCTION cs_explain(text);
 DROP TABLE cs_inval;
 DROP FUNCTION cs_filter(text);
 DROP TABLE cs_fwide, cs_fprobe, cs_fcat, cs_fsorted;
+-- The edge of a circle: the custom scan's exact test is the region test of
+-- the same circle, so rows exactly on the edge, ra = 360 against a centre
+-- at 0, and the radius 0 and 180 extremes go the same way in either plan
+-- (0.55).
+CREATE TABLE cs_edge AS
+SELECT i AS id, 360 * random() AS ra, degrees(asin(2 * random() - 1)) AS dec
+FROM generate_series(1, 20000) i;
+INSERT INTO cs_edge VALUES (900001, 0, 0), (900002, 360, 0), (900003, 180, -90),
+  (900004, 0, 90), (900005, 720, 10), (900006, -0.0, 0), (900007, 190, -10);
+CREATE INDEX cs_edge_cell ON cs_edge (skycell_ang2cell(ra, dec));
+ANALYZE cs_edge;
+CREATE FUNCTION cs_edge_ids(q text, scan bool) RETURNS int[] LANGUAGE plpgsql AS $$
+DECLARE r int[];
+BEGIN
+  EXECUTE format('SET LOCAL skycell.custom_scan = %s', scan);
+  EXECUTE format('SELECT coalesce(array_agg(id ORDER BY id), ''{}'') FROM (%s) s', q) INTO r;
+  RETURN r;
+END $$;
+SELECT c.ra0, c.dec0, c.r,
+       cs_edge_ids(q, true) = cs_edge_ids(q, false) AS same_rows,
+       cs_edge_ids(q, true) = (SELECT coalesce(array_agg(id ORDER BY id), '{}') FROM cs_edge
+                               WHERE skycell_in_region(point(ra, dec), circle(c.ra0, c.dec0, c.r))) AS as_region,
+       CASE WHEN c.r < 1 THEN cardinality(cs_edge_ids(q, true)) END AS n
+FROM (VALUES (0, 0, 0), (360, 0, 0), (10, 10, 100), (10, 10, 180), (10, 10, 200), (0, 0, 1e-12))
+       AS c(ra0, dec0, r),
+     LATERAL (SELECT format('SELECT id FROM cs_edge WHERE CONTAINS(POINT(''ICRS'', ra, dec), CIRCLE(''ICRS'', %s, %s, %s)) = 1',
+                            c.ra0, c.dec0, c.r) AS q) x
+ORDER BY 1, 2, 3;
+ ra0 | dec0 |       r        | same_rows | as_region | n 
+-----+------+----------------+-----------+-----------+---
+   0 |    0 |              0 | t         | t         | 3
+   0 |    0 | 0.000000000001 | t         | t         | 3
+  10 |   10 |            100 | t         | t         |  
+  10 |   10 |            180 | t         | t         |  
+  10 |   10 |            200 | t         | t         |  
+ 360 |    0 |              0 | t         | t         | 3
+(6 rows)
+
+DROP FUNCTION cs_edge_ids(text, bool);
+DROP TABLE cs_edge;

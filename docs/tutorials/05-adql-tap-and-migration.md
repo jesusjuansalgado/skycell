@@ -95,6 +95,9 @@ Q3C's spellings have skycell twins with the same arguments, and an index on
 | `q3c_poly_query(ra, dec, poly)` | `skycell_poly_join(ra, dec, poly)` |
 | `q3c_dist(ra1, dec1, ra2, dec2)` | `skycell_dist(ra1, dec1, ra2, dec2)` |
 
+On a `skypos` column, the same functions take `coord1(pos), coord2(pos)` as
+the position and use its `skycell_cell(pos)` index.
+
 ```sql
 CREATE TABLE upload AS SELECT row_number() OVER () AS id, ra + 0.2 / 3600 AS ra, dec
 FROM gaia_source TABLESAMPLE SYSTEM (1);

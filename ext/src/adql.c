@@ -39,6 +39,7 @@
 #include "nodes/supportnodes.h"
 #include "optimizer/clauses.h"
 #include "optimizer/optimizer.h"
+#include "parser/parse_oper.h"
 #include "parser/parse_coerce.h"
 #include "parser/parse_func.h"
 #include "parser/parsetree.h"
@@ -1717,15 +1718,20 @@ cell_expr_for_point(Oid selfid, Node *pt)
  * overlap operator can't be resolved, so the caller falls back exactly as
  * it always has.
  */
+/* the point of a test gin_region_rewrite() kept: left as it is */
+#define GIN_KEPT_LOCATION (-0x5c13)
+
 static Node *
 gin_region_rewrite(Oid funcid, Node *pt, Node *rg, Node *cell,
 					Node *moc_expr, int max_order)
 {
 	Oid			ancestors_types[3] = {INT8OID, INT4OID, INT4OID};
-	Oid			exact_types[3];
+	char	   *nsp = get_namespace_name(get_func_namespace(funcid));
 	FuncExpr   *ancestors;
-	Expr	   *overlap;
-	FuncExpr   *exact;
+	Expr	   *overlap,
+			   *op;
+	Operator	tup;
+	Node	   *kept;
 
 	ancestors = makeFuncExpr(lookup_sibling_func(funcid, "skycell_ancestors", 3, ancestors_types),
 							 INT8ARRAYOID,
@@ -1735,14 +1741,34 @@ gin_region_rewrite(Oid funcid, Node *pt, Node *rg, Node *cell,
 	if (overlap == NULL)
 		return NULL;
 
-	exact_types[0] = exprType(pt);
-	exact_types[1] = exprType(rg);
-	exact_types[2] = FLOAT8OID;
-	exact = makeFuncExpr(lookup_sibling_func(funcid, "skycell_in_region", 3, exact_types),
-						 BOOLOID,
-						 list_make3(copyObject(pt), copyObject(rg), float8_const(-1.0)),
-						 InvalidOid, InvalidOid, COERCE_EXPLICIT_CALL);
-	return (Node *) makeBoolExpr(AND_EXPR, list_make2(overlap, (Expr *) exact), -1);
+	/*
+	 * The test itself stays the operator, pt <@ rg, beside the GIN's
+	 * overlap: it is the exact test on every row the GIN returns, and a
+	 * GiST on the same column can still take it, so the planner chooses
+	 * between the two indexes rather than this rewrite (0.55).  Its point is
+	 * marked, so that simplifying it again does not rewrite it again.
+	 */
+	tup = oper(NULL, list_make2(makeString(nsp), makeString("<@")),
+			   exprType(pt), exprType(rg), true, -1);
+	if (tup == NULL)
+		return NULL;
+	kept = copyObject(pt);
+	if (!IsA(kept, FuncExpr) && !IsA(kept, Var) && !IsA(kept, Const))
+	{
+		ReleaseSysCache(tup);
+		return NULL;
+	}
+	if (IsA(kept, FuncExpr))
+		((FuncExpr *) kept)->location = GIN_KEPT_LOCATION;
+	else if (IsA(kept, Var))
+		((Var *) kept)->location = GIN_KEPT_LOCATION;
+	else
+		((Const *) kept)->location = GIN_KEPT_LOCATION;
+	op = make_opclause(oprid(tup), BOOLOID, false, (Expr *) kept, (Expr *) copyObject(rg),
+					   InvalidOid, InvalidOid);
+	ReleaseSysCache(tup);
+	set_opfuncid((OpExpr *) op);
+	return (Node *) makeBoolExpr(AND_EXPR, list_make2(overlap, op), -1);
 }
 
 static bool pos_ra_dec(Oid funcid, Node *pt, Node **ra, Node **dec);
@@ -1909,8 +1935,11 @@ circle_args(Oid funcid, Node *rg)
 	return list_length(c) == 3 ? c : NIL;
 }
 
-/* V for coord1(V), coord2(V) of one stored skypos column, else NULL */
-static Var *
+/*
+ * V for coord1(V), coord2(V) of one stored position (a skypos column, or a
+ * point column through its cast: pos_column()), else NULL
+ */
+static Node *
 stored_pos(Node *ra, Node *dec)
 {
 	FuncExpr   *f1 = (FuncExpr *) ra,
@@ -1920,13 +1949,13 @@ stored_pos(Node *ra, Node *dec)
 
 	if (!IsA(ra, FuncExpr) || !IsA(dec, FuncExpr) ||
 		list_length(f1->args) != 1 || list_length(f2->args) != 1 ||
-		!IsA(linitial(f1->args), Var) || !equal(linitial(f1->args), linitial(f2->args)))
+		!pos_column(linitial(f1->args)) || !equal(linitial(f1->args), linitial(f2->args)))
 		return NULL;
 	n1 = get_func_name(f1->funcid);
 	n2 = get_func_name(f2->funcid);
 	if (n1 == NULL || n2 == NULL || strcmp(n1, "coord1") != 0 || strcmp(n2, "coord2") != 0)
 		return NULL;
-	return (Var *) copyObject(linitial(f1->args));
+	return copyObject(linitial(f1->args));
 }
 
 /*
@@ -2126,6 +2155,9 @@ region_support_simplify(SupportRequestSimplify *req, Oid funcid, Node *pt, Node 
 	 */
 	if (req->root != NULL && skycell_planning_unhooked(req->root) && !late_fold_eval)
 		return NULL;
+	/* the test a GIN rewrite kept beside its overlap */
+	if (node_location(pt) == GIN_KEPT_LOCATION)
+		return NULL;
 	if (req->root != NULL && want_swap(req, funcid, pt, rg, &pt2, &rg2))
 		res = region_simplify_oriented(req, funcid, pt2, rg2);
 	if (res == NULL)
@@ -2242,6 +2274,29 @@ region_simplify_oriented(SupportRequestSimplify *req, Oid funcid, Node *pt, Node
 
 	if (req->root == NULL)
 		return NULL;
+
+	/*
+	 * A constant position against a column of regions: no point-side index
+	 * to search, but a GIN on the regions' cells answers it from the
+	 * position's own cell, beside any GiST that takes the operator.
+	 */
+	if (IsA(pt, Const) && !IsA(rg, Const))
+	{
+		Oid			ff[2] = {FLOAT8OID, FLOAT8OID};
+		Node	   *ra,
+				   *dec,
+				   *moc_expr;
+		int			max_order;
+
+		if (((Const *) pt)->constisnull || !pos_ra_dec(funcid, pt, &ra, &dec) ||
+			!gin_moc_index_for_region(req->root, rg, &moc_expr, &max_order))
+			return NULL;
+		cell = (Node *) makeFuncExpr(lookup_sibling_func(funcid, "skycell_ang2cell", 2, ff),
+									 INT8OID, list_make2(ra, dec),
+									 InvalidOid, InvalidOid, COERCE_EXPLICIT_CALL);
+		return gin_region_rewrite(funcid, pt, rg, eval_const_expressions(req->root, cell),
+								  moc_expr, max_order);
+	}
 
 	cell = cell_expr_for_point(funcid, pt);
 	if (cell == NULL)
@@ -3171,7 +3226,8 @@ distance_cone(Node *qual, Node **below)
 				circle_oid;
 	int			v1,
 				v2;
-	bool		strict;
+	bool		strict,
+				beyond = false;
 
 	*below = NULL;
 	if (!IsA(qual, OpExpr) || list_length(op->args) != 2)
@@ -3196,6 +3252,22 @@ distance_cone(Node *qual, Node **below)
 			strict = (opfn == F_FLOAT8GT || opfn == F_FLOAT48GT);
 			break;
 		default:
+			return NULL;
+	}
+
+	/*
+	 * Beyond a distance: d > r (or r < d).  Past 90 degrees the rows it keeps
+	 * lie in a cap round the antipode, of radius 180 - r, which is the cone
+	 * added; below that the cap is most of the sky, and no help (0.55).
+	 */
+	if (!(IsA(d, FuncExpr) && is_distance_func(((FuncExpr *) d)->funcid)))
+	{
+		Node	   *t = d;
+
+		d = r;
+		r = t;
+		beyond = true;
+		if (!IsA(r, Const) || ((Const *) r)->constisnull)
 			return NULL;
 	}
 	if (!IsA(d, FuncExpr) || !is_distance_func(((FuncExpr *) d)->funcid) ||
@@ -3232,6 +3304,55 @@ distance_cone(Node *qual, Node **below)
 	v2 = single_varno((Node *) list_make2(ra2, dec2));
 	if (v1 < 0 || v2 < 0 || v1 == v2)
 		return NULL;
+
+	if (beyond)
+	{
+		Const	   *rc;
+		double		rv;
+		Node	   *ra1,
+				   *dec1;
+
+		r = coerce_to_target_type(NULL, copyObject(r), exprType(r), FLOAT8OID, -1,
+								  COERCION_IMPLICIT, COERCE_IMPLICIT_CAST, -1);
+		if (r == NULL || !IsA((r = eval_const_expressions(NULL, r)), Const) ||
+			((Const *) r)->constisnull)
+			return NULL;
+		rc = (Const *) r;
+		rv = DatumGetFloat8(rc->constvalue);
+		if (!(rv > 90.0 && rv < 180.0))
+			return NULL;
+
+		/* the circle round the constant side, the position the relation's */
+		if (v1 == 0)
+		{
+			Oid			point_oid = lookup_sibling_func(f->funcid, "point", 2, ff);
+
+			if (!pos_ra_dec(f->funcid, pt, &ra1, &dec1))
+				return NULL;
+			pt = (Node *) makeFuncExpr(point_oid, get_func_rettype(point_oid),
+									   list_make2(copyObject(ra2), copyObject(dec2)),
+									   InvalidOid, InvalidOid, COERCE_EXPLICIT_CALL);
+			ra2 = ra1;
+			dec2 = dec1;
+		}
+		/* the antipode, and the radius round it, a hair wider */
+		ra2 = (Node *) makeFuncExpr(F_FLOAT8PL, FLOAT8OID, list_make2(copyObject(ra2), float8_const(180.0)),
+									InvalidOid, InvalidOid, COERCE_EXPLICIT_CALL);
+		dec2 = (Node *) makeFuncExpr(F_FLOAT8UM, FLOAT8OID, list_make1(copyObject(dec2)),
+									 InvalidOid, InvalidOid, COERCE_EXPLICIT_CALL);
+		radius = (Node *) float8_const(fmin(180.0, (180.0 - rv) * (1.0 + 1e-9) + 1e-12));
+		circle_oid = lookup_sibling_func(f->funcid, "circle", 3, fff);
+		circ = makeFuncExpr(circle_oid, get_func_rettype(circle_oid),
+							list_make3(ra2, dec2, radius),
+							InvalidOid, InvalidOid, COERCE_EXPLICIT_CALL);
+		mark_injected(pt, list_length(f->args) == 4);
+		mark_injected((Node *) circ, list_length(f->args) == 4);
+		types[0] = exprType(pt);
+		types[1] = exprType((Node *) circ);
+		return (Node *) makeFuncExpr(lookup_sibling_func(f->funcid, "skycell_pos_in_region", 2, types),
+									 BOOLOID, list_make2(pt, circ),
+									 InvalidOid, InvalidOid, COERCE_EXPLICIT_CALL);
+	}
 
 	/* r' = least(r * (1 + 1e-9) + 1e-12, 180): NULL and NaN become the sky */
 	r = copyObject(r);

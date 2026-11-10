@@ -1254,6 +1254,45 @@ density_for_expr(PlannerInfo *root, Node *arg, sc_density *d, Oid *statrel,
  * column, and the density is its statistics'.  Callers then build their
  * conditions and paths on *cell, which an index answers either way.
  */
+/*
+ * skycell_cell(p) for skycell_ang2cell(coord1(p), coord2(p)), p a skypos
+ * column or a point column through its cast; else NULL.  The two are the same
+ * value: coord1 and coord2 read the normalised coordinates skycell_cell uses.
+ */
+static Node *
+cell_of_stored_pos(Node *cell)
+{
+	FuncExpr   *f = (FuncExpr *) cell,
+			   *c1,
+			   *c2;
+	Node	   *p;
+	char	   *n;
+	Oid			one[1];
+
+	if (!IsA(cell, FuncExpr) || list_length(f->args) != 2)
+		return NULL;
+	c1 = (FuncExpr *) linitial(f->args);
+	c2 = (FuncExpr *) lsecond(f->args);
+	if (!IsA(c1, FuncExpr) || !IsA(c2, FuncExpr) ||
+		list_length(c1->args) != 1 || list_length(c2->args) != 1 ||
+		!equal(linitial(c1->args), linitial(c2->args)))
+		return NULL;
+	p = linitial(c1->args);
+	if (!IsA(p, Var) && !(IsA(p, FuncExpr) && list_length(((FuncExpr *) p)->args) == 1 &&
+						  IsA(linitial(((FuncExpr *) p)->args), Var) &&
+						  (n = get_func_name(((FuncExpr *) p)->funcid)) != NULL &&
+						  strcmp(n, "skycell_pos_from_point") == 0))
+		return NULL;
+	if ((n = get_func_name(f->funcid)) == NULL || strcmp(n, "skycell_ang2cell") != 0 ||
+		(n = get_func_name(c1->funcid)) == NULL || strcmp(n, "coord1") != 0 ||
+		(n = get_func_name(c2->funcid)) == NULL || strcmp(n, "coord2") != 0)
+		return NULL;
+	one[0] = exprType(p);
+	return (Node *) makeFuncExpr(lookup_sibling_func(f->funcid, "skycell_cell", 1, one),
+								 INT8OID, list_make1(copyObject(p)),
+								 InvalidOid, InvalidOid, COERCE_EXPLICIT_CALL);
+}
+
 bool
 skycell_cell_density(PlannerInfo *root, Node **cell, sc_density *d, Oid *statrel,
 					 bool *uses_cell_ops)
@@ -1274,6 +1313,20 @@ skycell_cell_density(PlannerInfo *root, Node **cell, sc_density *d, Oid *statrel
 		return false;
 	if (density_for_expr(root, *cell, d, statrel, uses_cell_ops))
 		return true;
+	{
+		/*
+		 * skycell_ang2cell(coord1(p), coord2(p)) of a stored position p is
+		 * skycell_cell(p), which its index holds: the Q3C spellings and the
+		 * four-argument distance written on a skypos column (0.55).
+		 */
+		Node	   *alt = cell_of_stored_pos(*cell);
+
+		if (alt != NULL && density_for_expr(root, alt, d, statrel, uses_cell_ops))
+		{
+			*cell = alt;
+			return true;
+		}
+	}
 	vars = sc_pull_local_vars(*cell, 0);
 	foreach(lc, vars)
 	{
@@ -1481,7 +1534,8 @@ gin_moc_index_for_region(PlannerInfo *root, Node *rg, Node **moc_expr, int *max_
 	Relation	rel;
 	List	   *indexes;
 	Node	   *key;
-	bool		found = false;
+	bool		found = false,
+				other = false;
 
 	foreach(lc, vars)
 	{
@@ -1536,13 +1590,19 @@ gin_moc_index_for_region(PlannerInfo *root, Node *rg, Node **moc_expr, int *max_
 				}
 			}
 		}
+		/*
+		 * A GiST (or SP-GiST) on the region column takes the operator itself,
+		 * with no per-row covering to evaluate: it is used instead (0.55).
+		 */
+		if ((irel->rd_rel->relam == GIST_AM_OID || irel->rd_rel->relam == SPGIST_AM_OID) &&
+			IsA(key, Var) && irel->rd_index->indnatts >= 1 &&
+			irel->rd_index->indkey.values[0] == ((Var *) key)->varattno)
+			other = true;
 		index_close(irel, AccessShareLock);
-		if (found)
-			break;
 	}
 	list_free(indexes);
 	table_close(rel, NoLock);
-	return found;
+	return found && !other;
 }
 
 /*
@@ -2454,18 +2514,33 @@ skycell_cellsel(PG_FUNCTION_ARGS)
 
 typedef struct cone_cache
 {
-	double		dec0,
+	double		ra0,
+				dec0,
 				radius,
-				cosdec0,
-				thr;			/* sin^2(radius/2), <0 => empty, >1 => all */
+				thr;			/* chord^2 bound, <0 => empty, >4 => all */
+	sc_vec3		centre;
 } cone_cache;
 
+/* right ascension into [0, 360), as skypos_make() stores it */
+static inline double
+ra_norm(double ra)
+{
+	/* the same value for ra already in range, without the division */
+	return (ra >= 0.0 && ra < 360.0) ? ra : ra - floor(ra / 360.0) * 360.0;
+}
+
+/*
+ * The exact cone test.  It computes what the region test of the same circle
+ * computes (sc_region_contains() on CIRCLE(ra0, dec0, radius), the position
+ * read as a skypos): the same normalised coordinates, unit vectors and chord
+ * against 4 sin^2(r/2), so that the custom scan's recheck and a sequential
+ * scan's CONTAINS agree on every row, those exactly on the edge and at
+ * ra = 360 included (0.55).
+ */
 static inline bool
 in_cone(FunctionCallInfo fcinfo, double ra, double dec, double ra0, double dec0, double radius)
 {
 	cone_cache *cc = (cone_cache *) fcinfo->flinfo->fn_extra;
-	double		sdd,
-				sda;
 
 	if (cc == NULL)
 	{
@@ -2473,17 +2548,17 @@ in_cone(FunctionCallInfo fcinfo, double ra, double dec, double ra0, double dec0,
 		cc->dec0 = NAN;
 		fcinfo->flinfo->fn_extra = cc;
 	}
-	if (cc->dec0 != dec0 || cc->radius != radius)
+	if (cc->ra0 != ra0 || cc->dec0 != dec0 || cc->radius != radius)
 	{
+		double		rr = radius * (M_PI / 180.0);
+
+		cc->ra0 = ra0;
 		cc->dec0 = dec0;
 		cc->radius = radius;
-		cc->cosdec0 = cos(dec0 * DEG2RAD);
-		cc->thr = radius < 0 ? -1.0 : (radius >= 180.0 ? 2.0 : pow(sin(radius * DEG2RAD / 2.0), 2));
+		cc->centre = sc_radec2vec(ra_norm(ra0), dec0);
+		cc->thr = !(radius >= 0) ? -1.0 : (rr >= M_PI ? 5.0 : 4.0 * pow(sin(rr / 2.0), 2));
 	}
-	/* haversine */
-	sdd = sin((dec - dec0) * DEG2RAD / 2.0);
-	sda = sin((ra - ra0) * DEG2RAD / 2.0);
-	return sdd * sdd + cos(dec * DEG2RAD) * cc->cosdec0 * sda * sda <= cc->thr;
+	return sc_chord2(sc_radec2vec(ra_norm(ra), dec), cc->centre) <= cc->thr;
 }
 
 PG_FUNCTION_INFO_V1(skycell_in_cone);

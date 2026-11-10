@@ -3283,7 +3283,7 @@ cone_set_centre(ConeScanState *st, double ra0, double dec0, double radius)
 	 * only let a borderline entry through, never hold one back: the plan's
 	 * qual still applies the exact test to every row the filter passes.
 	 */
-	st->thr = thr < 0 ? thr : thr * (1.0 + 1e-9) + 1e-300;
+	st->thr = thr < 0 ? thr : thr * (1.0 + 1e-9) + 1e-28;
 	st->have_centre = true;
 }
 
@@ -3307,8 +3307,12 @@ cone_entry_passes(ConeScanState *st)
 	dec = DatumGetFloat8(index_getattr(s->xs_itup, st->idec, s->xs_itupdesc, &n2));
 	if (!n1 && !n2)
 	{
+		double		dra = ra - st->cra;
+
+		/* the difference wrapped, as the exact test normalises both */
+		dra -= floor(dra / 360.0 + 0.5) * 360.0;
 		sdd = sin((dec - st->cdec) * M_PI / 360.0);
-		sda = sin((ra - st->cra) * M_PI / 360.0);
+		sda = sin(dra * M_PI / 360.0);
 		if (sdd * sdd + cos(dec * M_PI / 180.0) * st->cosdec0 * sda * sda <= st->thr)
 			return true;
 	}
@@ -3963,7 +3967,8 @@ typedef struct NearestScanState
 	TupleTableSlot *put,
 			   *got;
 
-	double		nrings,			/* for EXPLAIN ANALYZE */
+	int			rings;			/* rings read by this search (since the rescan) */
+	double		nrings,			/* for EXPLAIN ANALYZE, over all loops */
 				nread,
 				nprobes;		/* cells probed for emptiness */
 	double		band;			/* after a lower bound: the area of the ring
@@ -4839,6 +4844,8 @@ bestfirst_fits(NearestScanState *ns)
 	return 3.0 * need * (width + HEAPTUPLESIZE + sizeof(NearestRow)) <= work_mem * 1024.0;
 }
 
+#define PART_FIRST_ROWS 32
+
 static void
 nearest_bestfirst_ring(NearestScanState *ns)
 {
@@ -4857,6 +4864,18 @@ nearest_bestfirst_ring(NearestScanState *ns)
 	probe_cell *h = palloc(sizeof(probe_cell) * hcap);
 	int64	   *b = palloc(sizeof(int64) * 2 * bcap);
 	bool		exhausted;
+
+	/*
+	 * A partition's scan is one of a Merge Append's, which reads only as
+	 * many of its rows as are nearer than the other partitions' (0.55): its
+	 * first batch is a few rows, and rings continue past them if more are
+	 * read.  A partition far from the centre then costs a few rows, not k.
+	 */
+	if (st->css.ss.ss_currentRelation->rd_rel->relispartition && need > PART_FIRST_ROWS)
+	{
+		need = PART_FIRST_ROWS;
+		split_rows = fmax(8.0, need / 8.0);
+	}
 
 	/* a partition's ranges are clipped to the keys it holds */
 	if (!st->have_keyrange)
@@ -5039,7 +5058,7 @@ nearest_ring(NearestScanState *ns)
 	}
 
 	/* the first ring best-first: an unordered heap, no bounds, rows that fit in memory */
-	if (nearest_bestfirst && ns->nrings == 0 && !ns->final && ns->rprev < 0 &&
+	if (nearest_bestfirst && ns->rings == 0 && !ns->final && ns->rprev < 0 &&
 		ns->bound < 0 && st->bitmap && !st->parallel && bestfirst_fits(ns))
 	{
 		nearest_bestfirst_ring(ns);
@@ -5190,6 +5209,7 @@ finish:
 			ns->sorted = ns->nrows;
 		}
 	}
+	ns->rings += 1;
 	ns->nrings += 1;
 }
 
@@ -5250,6 +5270,7 @@ nearest_reset(NearestScanState *ns)
 	nearest_clear_ring(ns);
 	ns->started = ns->final = ns->done = false;
 	ns->nout = 0;
+	ns->rings = 0;
 	ns->cone.cur = -1;
 }
 

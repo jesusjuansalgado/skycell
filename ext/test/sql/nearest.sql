@@ -137,7 +137,8 @@ SELECT nn_rings('SELECT id FROM nn_cat ORDER BY skycell_dist(ra, dec, 10, 20) LI
                  ORDER BY skycell_dist(ra, dec, 10, 20) LIMIT 20') <= 2 AS starts_past_it;
 
 -- lower bounds in every spelling, with and without an upper one, and ones
--- that keep nothing (NULL, NaN, or beyond the upper bound)
+-- that keep nothing (NULL, NaN, or beyond the upper bound); one past 90
+-- degrees is a cone round the antipode instead (0.55)
 SELECT count(*) AS queries, count(*) FILTER (WHERE nn_same(q)) AS same,
        count(*) FILTER (WHERE nn_plan(q) ~ 'nearest') AS nearest
 FROM (SELECT format('SELECT id, skycell_dist(ra, dec, %s, %s) d FROM nn_%s WHERE %s ORDER BY 2 LIMIT %s',
@@ -413,6 +414,18 @@ BEGIN
 END $$;
 SELECT nn_bf(format('SELECT id FROM nn_clu ORDER BY skycell_dist(ra, dec, %s, %s) LIMIT 200', ra, dec))
 FROM nn_clc WHERE f = 18 AND ra = mod(18 * 23.7 + 0.05, 360.0);
+-- every outer row of a LATERAL search walks best-first, not only the first
+CREATE FUNCTION nn_bf_loops(q text) RETURNS float8 LANGUAGE plpgsql AS $$
+DECLARE l text; b float8 := 0;
+BEGIN
+  FOR l IN EXECUTE 'EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF) ' || q LOOP
+    IF l ~ 'Best-first Batches' THEN b := substring(l from ': ([0-9.]+)')::float8; END IF;
+  END LOOP;
+  RETURN b;
+END $$;
+SELECT nn_bf_loops('SELECT c.f, n.id FROM nn_clc c CROSS JOIN LATERAL (
+  SELECT id FROM nn_clu ORDER BY skycell_dist(ra, dec, c.ra, c.dec) LIMIT 5) n') >= 1 AS every_loop;
+DROP FUNCTION nn_bf_loops(text);
 -- off: the first ring, sized from the density, as before 0.52
 SET skycell.nearest_bestfirst = off;
 SELECT count(*) AS queries, count(*) FILTER (WHERE nn_same(q)) AS same,

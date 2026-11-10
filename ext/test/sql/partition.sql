@@ -241,6 +241,21 @@ ALTER TABLE pt_key DROP CONSTRAINT pt_key_rev;
 ALTER TABLE pt_key ADD CONSTRAINT pt_key_nv CHECK (hpx5 = skycell_ang2cell(ra, dec) >> 48) NOT VALID;
 SELECT (pt_keyed($q$1 = CONTAINS(POINT('ICRS', ra, dec), CIRCLE('ICRS', 120, 30, 2))$q$)).*;
 
+-- nearest neighbours: each partition's scan reads a few rows first, and
+-- more only as the Merge Append takes them; the same answers as unpartitioned
+SELECT k, bool_and(
+         (SELECT array_agg(round(d::numeric, 9)) FROM (SELECT DISTANCE(POINT('ICRS', ra, dec), POINT('ICRS', c.ra, c.dec)) d
+            FROM pt_flat ORDER BY 1 LIMIT k) s)
+       = (SELECT array_agg(round(d::numeric, 9)) FROM (SELECT DISTANCE(POINT('ICRS', ra, dec), POINT('ICRS', c.ra, c.dec)) d
+            FROM pt_cell ORDER BY 1 LIMIT k) s)
+       AND
+         (SELECT array_agg(round(d::numeric, 9)) FROM (SELECT DISTANCE(POINT('ICRS', ra, dec), POINT('ICRS', c.ra, c.dec)) d
+            FROM pt_flat ORDER BY 1 LIMIT k) s)
+       = (SELECT array_agg(round(d::numeric, 9)) FROM (SELECT DISTANCE(POINT('ICRS', ra, dec), POINT('ICRS', c.ra, c.dec)) d
+            FROM pt_dec ORDER BY 1 LIMIT k) s)) AS same
+FROM (VALUES (120.0, 30.0), (0, 90), (300, -45), (359.99, 0)) c(ra, dec), unnest(ARRAY[1, 32, 33, 500, 3000]) k
+GROUP BY k ORDER BY k;
+
 DROP FUNCTION pt_cmp(text, text), pt_scans(text, text), pt_keyed(text, text), pt_filter(text);
 DROP TABLE pt_flat, pt_cell, pt_dec, pt_patch, pt_probe, pt_col, pt_key;
 
