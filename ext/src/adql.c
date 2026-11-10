@@ -32,6 +32,7 @@
 #include "catalog/pg_proc.h"
 #include "catalog/pg_type_d.h"
 #include "fmgr.h"
+#include "common/hashfn.h"
 #include "libpq/pqformat.h"
 #include "miscadmin.h"
 #include "nodes/makefuncs.h"
@@ -619,7 +620,10 @@ skypos_out(PG_FUNCTION_ARGS)
 {
 	SkyPos	   *p = PG_GETARG_SKYPOS(0);
 
-	PG_RETURN_CSTRING(psprintf("(%.15g,%.15g)", p->ra, p->dec));
+	char	   *ra = float8out_internal(p->ra),
+			   *dec = float8out_internal(p->dec);
+
+	PG_RETURN_CSTRING(psprintf("(%s,%s)", ra, dec));
 }
 
 /*
@@ -837,6 +841,21 @@ skyregion_in(PG_FUNCTION_ARGS)
 }
 
 /* STC-S, the frame written once, at the top */
+/*
+ * A coordinate as float8 prints it: the shortest text that reads back to the
+ * same double (extra_float_digits >= 1, the default), so that text I/O --
+ * pg_dump, COPY -- keeps every position and region exactly (0.56).
+ */
+static void
+append_float8(StringInfo buf, double v)
+{
+	char	   *s = float8out_internal(v);
+
+	appendStringInfoChar(buf, ' ');
+	appendStringInfoString(buf, s);
+	pfree(s);
+}
+
 static void
 stcs_print(StringInfo buf, const SkyRegion *r, bool top)
 {
@@ -868,13 +887,16 @@ stcs_print(StringInfo buf, const SkyRegion *r, bool top)
 		appendStringInfoChar(buf, ')');
 	}
 	else if (r->kind == SKY_CONE)
-		appendStringInfo(buf, " %.15g %.15g %.15g", r->v[0], r->v[1], r->v[2]);
+	{
+		for (int i = 0; i < 3; i++)
+			append_float8(buf, r->v[i]);
+	}
 	else
 	{
 		int			nv = SKYREGION_NVERT(r);
 
-		for (int i = 0; i < nv; i++)
-			appendStringInfo(buf, " %.15g %.15g", r->v[2 * i], r->v[2 * i + 1]);
+		for (int i = 0; i < 2 * nv; i++)
+			append_float8(buf, r->v[i]);
 	}
 }
 
@@ -888,6 +910,178 @@ skyregion_out(PG_FUNCTION_ARGS)
 	initStringInfo(&buf);
 	stcs_print(&buf, r, true);
 	PG_RETURN_CSTRING(buf.data);
+}
+
+/* ------------------------------------------------------------------ */
+/* equality, ordering, hashing and binary I/O (0.56)                   */
+/* ------------------------------------------------------------------ */
+
+/*
+ * skypos: equal when both coordinates are (as float8 compares them, so -0
+ * and 0 are equal), ordered by right ascension and then declination.  The
+ * order means nothing on the sky; it is what DISTINCT, GROUP BY, UNION, ORDER
+ * BY and a B-tree on a position need.
+ */
+static int
+skypos_cmp_internal(const SkyPos *a, const SkyPos *b)
+{
+	if (a->ra != b->ra)
+		return a->ra < b->ra ? -1 : 1;
+	if (a->dec != b->dec)
+		return a->dec < b->dec ? -1 : 1;
+	return 0;
+}
+
+#define SKYPOS_CMP_FN(name, test) \
+PG_FUNCTION_INFO_V1(name); \
+Datum \
+name(PG_FUNCTION_ARGS) \
+{ \
+	int			c = skypos_cmp_internal(PG_GETARG_SKYPOS(0), PG_GETARG_SKYPOS(1)); \
+	PG_RETURN_BOOL(test); \
+}
+SKYPOS_CMP_FN(skypos_eq, c == 0)
+SKYPOS_CMP_FN(skypos_ne, c != 0)
+SKYPOS_CMP_FN(skypos_lt, c < 0)
+SKYPOS_CMP_FN(skypos_le, c <= 0)
+SKYPOS_CMP_FN(skypos_gt, c > 0)
+SKYPOS_CMP_FN(skypos_ge, c >= 0)
+
+PG_FUNCTION_INFO_V1(skypos_cmp);
+Datum
+skypos_cmp(PG_FUNCTION_ARGS)
+{
+	PG_RETURN_INT32(skypos_cmp_internal(PG_GETARG_SKYPOS(0), PG_GETARG_SKYPOS(1)));
+}
+
+PG_FUNCTION_INFO_V1(skypos_hash);
+Datum
+skypos_hash(PG_FUNCTION_ARGS)
+{
+	SkyPos	   *p = PG_GETARG_SKYPOS(0);
+	double		v[2] = {p->ra == 0 ? 0.0 : p->ra, p->dec == 0 ? 0.0 : p->dec};
+
+	PG_RETURN_UINT32(hash_bytes((const unsigned char *) v, sizeof(v)));
+}
+
+/* binary: the two coordinates as float8 */
+PG_FUNCTION_INFO_V1(skypos_send);
+Datum
+skypos_send(PG_FUNCTION_ARGS)
+{
+	SkyPos	   *p = PG_GETARG_SKYPOS(0);
+	StringInfoData buf;
+
+	pq_begintypsend(&buf);
+	pq_sendfloat8(&buf, p->ra);
+	pq_sendfloat8(&buf, p->dec);
+	PG_RETURN_BYTEA_P(pq_endtypsend(&buf));
+}
+
+PG_FUNCTION_INFO_V1(skypos_recv);
+Datum
+skypos_recv(PG_FUNCTION_ARGS)
+{
+	StringInfo	buf = (StringInfo) PG_GETARG_POINTER(0);
+	double		ra = pq_getmsgfloat8(buf),
+				dec = pq_getmsgfloat8(buf);
+
+	PG_RETURN_POINTER(skypos_make(ra, dec));
+}
+
+/*
+ * skyregion: equal when stored the same -- the same kind, the same values in
+ * the same order (a polygon from another vertex is another value, as an array
+ * would be).  Ordered by its bytes, consistently, meaninglessly.
+ */
+static int
+skyregion_cmp_internal(SkyRegion *a, SkyRegion *b)
+{
+	Size		la = VARSIZE(a) - VARHDRSZ,
+				lb = VARSIZE(b) - VARHDRSZ;
+	int			c = memcmp(VARDATA(a), VARDATA(b), Min(la, lb));
+
+	if (c != 0)
+		return c < 0 ? -1 : 1;
+	return la == lb ? 0 : (la < lb ? -1 : 1);
+}
+
+#define SKYREGION_CMP_FN(name, test) \
+PG_FUNCTION_INFO_V1(name); \
+Datum \
+name(PG_FUNCTION_ARGS) \
+{ \
+	int			c = skyregion_cmp_internal(PG_GETARG_SKYREGION(0), PG_GETARG_SKYREGION(1)); \
+	PG_RETURN_BOOL(test); \
+}
+SKYREGION_CMP_FN(skyregion_eq, c == 0)
+SKYREGION_CMP_FN(skyregion_ne, c != 0)
+SKYREGION_CMP_FN(skyregion_lt, c < 0)
+SKYREGION_CMP_FN(skyregion_le, c <= 0)
+SKYREGION_CMP_FN(skyregion_gt, c > 0)
+SKYREGION_CMP_FN(skyregion_ge, c >= 0)
+
+PG_FUNCTION_INFO_V1(skyregion_cmp);
+Datum
+skyregion_cmp(PG_FUNCTION_ARGS)
+{
+	PG_RETURN_INT32(skyregion_cmp_internal(PG_GETARG_SKYREGION(0), PG_GETARG_SKYREGION(1)));
+}
+
+PG_FUNCTION_INFO_V1(skyregion_hash);
+Datum
+skyregion_hash(PG_FUNCTION_ARGS)
+{
+	SkyRegion  *r = PG_GETARG_SKYREGION(0);
+
+	PG_RETURN_UINT32(hash_bytes((const unsigned char *) VARDATA(r), VARSIZE(r) - VARHDRSZ));
+}
+
+/*
+ * binary: a format byte (1) and the region's STC-S, written with every digit
+ * whatever extra_float_digits is, so that it reads back to the same value on
+ * any machine.
+ */
+PG_FUNCTION_INFO_V1(skyregion_send);
+Datum
+skyregion_send(PG_FUNCTION_ARGS)
+{
+	SkyRegion  *r = PG_GETARG_SKYREGION(0);
+	StringInfoData text,
+				buf;
+	int			saved = extra_float_digits;
+
+	initStringInfo(&text);
+	extra_float_digits = 1;
+	PG_TRY();
+	{
+		stcs_print(&text, r, true);
+	}
+	PG_FINALLY();
+	{
+		extra_float_digits = saved;
+	}
+	PG_END_TRY();
+	pq_begintypsend(&buf);
+	pq_sendbyte(&buf, 1);
+	pq_sendtext(&buf, text.data, text.len);
+	PG_RETURN_BYTEA_P(pq_endtypsend(&buf));
+}
+
+PG_FUNCTION_INFO_V1(skyregion_recv);
+Datum
+skyregion_recv(PG_FUNCTION_ARGS)
+{
+	StringInfo	buf = (StringInfo) PG_GETARG_POINTER(0);
+	int			version = pq_getmsgbyte(buf);
+	char	   *str;
+	int			nbytes;
+
+	if (version != 1)
+		ereport(ERROR, (errcode(ERRCODE_INVALID_BINARY_REPRESENTATION),
+						errmsg("unsupported skyregion binary format %d", version)));
+	str = pq_getmsgtext(buf, buf->len - buf->cursor, &nbytes);
+	PG_RETURN_DATUM(DirectFunctionCall1(skyregion_in, CStringGetDatum(str)));
 }
 
 /* ------------------------------------------------------------------ */

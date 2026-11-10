@@ -262,7 +262,15 @@ spelling is indexed as written (PostgreSQL's geometry keeps its meaning:
 coordinate-system argument, `point('ICRS', ra, dec)` and `circle('ICRS', …)`,
 and the prefixed `skycell_point`, `skycell_circle`, `skycell_box` and
 `skycell_polygon` are the same functions. Installing into a schema of its own
-works too; put it on the `search_path`.
+works too (`CREATE EXTENSION skycell SCHEMA astro`), on the `search_path` or
+off it with the functions named `astro.CONTAINS(...)`; the extension cannot be
+moved afterwards (`ALTER EXTENSION ... SET SCHEMA`).
+
+Positions and regions compare with `=` and `<>` (a region equals one stored
+the same way), so `DISTINCT`, `GROUP BY` and `UNION` work on them. Their text
+is exact, as `float8`'s is, so a dump and restore keeps every value, and both
+types have a binary form, for `COPY ... (FORMAT binary)` and drivers that read
+results in binary.
 
 ### Setting up a table
 

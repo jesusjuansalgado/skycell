@@ -323,3 +323,22 @@ SELECT '(1,2'::skypos;
 SELECT '(1,2,3)'::skypos;
 SELECT '(1,90.0000001)'::skypos;
 SELECT ' ( 1 , 2 ) '::skypos AS spaced, '1,2'::skypos AS bare, '1 2'::skypos AS blank, circle(10, 10, -1) AS empty_circle;
+
+-- equality, ordering and hashing of positions and regions, and text that
+-- reads back to the same value (0.56)
+SELECT skycell_point(0, 0) = skycell_point(360, 0) AS wrapped_equal,
+       '(-0,1)'::skypos = '(0,1)'::skypos AS minus_zero_equal,
+       skycell_point(1, 2) < skycell_point(1, 3) AS ordered,
+       circle(1, 2, 3) = region('CIRCLE ICRS 1 2 3') AS region_equal,
+       circle(1, 2, 3) <> circle(1, 2, 3.0000001) AS region_differs;
+SELECT count(*) AS rows, count(DISTINCT pos) AS distinct_positions,
+       (SELECT count(*) FROM (SELECT pos FROM acat UNION SELECT pos FROM acat) u) AS unioned,
+       (SELECT count(*) FROM (SELECT r FROM (VALUES (circle(1, 2, 3)), (circle(1, 2, 3)), (polygon(1, 1, 2, 1, 2, 2))) v(r) GROUP BY r) g) AS region_groups
+FROM acat;
+SET extra_float_digits = 1;	-- the default, which pg_regress lowers
+SELECT skycell_point(1.0 / 3, 2.0 / 3) AS shortest_exact, circle(10.123456789012345678, 20.98765432109876, 0.1) AS circle_text,
+       count(*) FILTER (WHERE pos::text::skypos = pos) = count(*) AS positions_round_trip,
+       count(*) FILTER (WHERE circle(ra, dec, 0.1)::text::skyregion = circle(ra, dec, 0.1)) = count(*) AS circles_round_trip
+FROM acat;
+RESET extra_float_digits;
+SELECT length(skypos_send(skycell_point(1, 2))) AS pos_send_bytes, get_byte(skyregion_send(circle(1, 2, 3)), 0) AS region_format;
