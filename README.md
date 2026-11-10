@@ -272,13 +272,16 @@ is exact, as `float8`'s is, so a dump and restore keeps every value, and both
 types have a binary form, for `COPY ... (FORMAT binary)` and drivers that read
 results in binary.
 
-Through a security-barrier view (or one with `security_barrier`), a search
+Through a security-barrier view (a view with `security_barrier`), a search
 reaches the index of the table under the view: the region tests are
-`LEAKPROOF`. That holds for a `skypos` column (`CONTAINS(pos, ...)`,
-`DISTANCE(pos, ...)`), for stored regions, and for `skycell_radial_query`,
-`skycell_join` and `skycell_dist` on `ra` and `dec`; ADQL's `POINT(ra, dec)`
-rejects impossible coordinates with an error, so a condition written with it
-stays outside such a view.
+`LEAKPROOF`, and ADQL's `POINT()` and `CIRCLE()` on the view's columns are read
+as `skycell_point_or_null()` and `skycell_circle_or_null()`, which are too
+(they return NULL where the constructors raise an error, so a row with
+impossible coordinates is not returned). PostgreSQL never pushes a join
+condition into such a view, so a cross-match against one is written with the
+view in a LATERAL subquery kept apart with `OFFSET 0`:
+`... CROSS JOIN LATERAL (SELECT ... FROM v WHERE CONTAINS(POINT('ICRS', v.ra,
+v.dec), CIRCLE('ICRS', t.ra, t.dec, r)) = 1 OFFSET 0) x`.
 
 ### Setting up a table
 

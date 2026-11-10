@@ -11,9 +11,9 @@
 --
 -- Not LEAKPROOF, by design: skycell_ang2cell() and ADQL's POINT(), which
 -- reject impossible coordinates (an error that names the value), and the
--- functions taking a polygon as an array, which reject malformed arrays.  A
--- search on ra and dec columns through a security barrier is written with
--- skycell_radial_query() or skycell_join(), or on a skypos column.
+-- functions taking a polygon as an array, which reject malformed arrays.
+-- POINT() on a security-barrier view's columns is read as
+-- skycell_point_or_null() (below).
 ALTER FUNCTION coord1(skypos) LEAKPROOF;
 ALTER FUNCTION coord2(skypos) LEAKPROOF;
 ALTER FUNCTION distance(skypos, skypos) LEAKPROOF;
@@ -37,3 +37,21 @@ ALTER FUNCTION skycell_region_overlap(skyregion, skyregion) LEAKPROOF;
 ALTER FUNCTION skycell_region_covers(skyregion, skyregion) LEAKPROOF;
 ALTER FUNCTION skycell_region_covered_by(skyregion, skyregion) LEAKPROOF;
 ALTER FUNCTION skycell_region_scan(int8, float8, float8, skyregion) LEAKPROOF;
+
+-- ADQL's POINT(ra, dec) is not LEAKPROOF: it rejects impossible coordinates
+-- with an error naming them.  On a security-barrier view's columns the
+-- planner reads it as skycell_point_or_null(ra, dec), which returns NULL for
+-- them instead -- a position no region holds, so the row is not returned, as
+-- it is not when the index answers -- and so a search written in ADQL
+-- reaches the index under the view.
+CREATE FUNCTION skycell_point_or_null(ra float8, "dec" float8) RETURNS skypos
+AS 'MODULE_PATHNAME' LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE LEAKPROOF;
+COMMENT ON FUNCTION skycell_point_or_null(float8, float8) IS
+  'The position (ra, dec) in degrees, or NULL for coordinates no position has (a non-finite right ascension, a declination outside [-90, 90]).';
+
+-- ADQL's CIRCLE() centred on a security-barrier view's columns (the reversed
+-- cone, a point in a circle round each row) is read as this, likewise.
+CREATE FUNCTION skycell_circle_or_null(ra float8, "dec" float8, radius float8) RETURNS skyregion
+AS 'MODULE_PATHNAME' LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE LEAKPROOF;
+COMMENT ON FUNCTION skycell_circle_or_null(float8, float8, float8) IS
+  'The circle of centre (ra, dec) and radius radius in degrees, or NULL where circle() would reject them.';

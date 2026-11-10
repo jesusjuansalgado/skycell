@@ -1801,6 +1801,7 @@ cone_planner(Query *parse, const char *query_string, int cursorOptions, ParamLis
 	plan_generation++;
 	skycell_fold_query_regions(parse);
 	skycell_preconvert_union_query(parse);
+	skycell_secure_points(parse);
 	if (nhooked < HOOKED_MAX)
 		hooked[nhooked] = parse;
 	nhooked++;

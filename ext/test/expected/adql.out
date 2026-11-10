@@ -559,13 +559,38 @@ END $$;
 SELECT adql_plan_uses_index('SELECT * FROM acat_sb WHERE CONTAINS(pos, CIRCLE(10, 20, 2)) = 1') AS skypos_column,
        adql_plan_uses_index('SELECT * FROM acat_sb WHERE skycell_radial_query(ra, dec, 10, 20, 2)') AS radial_query,
        adql_plan_uses_index('SELECT * FROM acat_sb WHERE DISTANCE(pos, POINT(10, 20)) < 2') AS distance,
-       NOT adql_plan_uses_index('SELECT * FROM acat_sb WHERE CONTAINS(POINT(''ICRS'', ra, dec), CIRCLE(''ICRS'', 10, 20, 2)) = 1') AS adql_point_stays_out,
        (SELECT count(*) FROM acat_sb WHERE CONTAINS(pos, CIRCLE(10, 20, 2)) = 1 AND adql_sb_leak(id))
      = (SELECT count(*) FROM acat WHERE id % 2 = 0 AND CONTAINS(pos, CIRCLE(10, 20, 2)) = 1) AS same_rows;
- skypos_column | radial_query | distance | adql_point_stays_out | same_rows 
----------------+--------------+----------+----------------------+-----------
- t             | t            | t        | t                    | t
+ skypos_column | radial_query | distance | same_rows 
+---------------+--------------+----------+-----------
+ t             | t            | t        | t
 (1 row)
 
+-- ADQL's POINT() and CIRCLE() on the view's columns are read as their
+-- LEAKPROOF twins, which are NULL where the constructors raise an error
+SELECT adql_plan_uses_index('SELECT * FROM acat_sb WHERE CONTAINS(POINT(''ICRS'', ra, dec), CIRCLE(''ICRS'', 10, 20, 2)) = 1') AS adql_cone,
+       adql_plan_uses_index('SELECT * FROM acat_sb WHERE 1 = CONTAINS(POINT(''ICRS'', 10, 20), CIRCLE(''ICRS'', ra, dec, 2))') AS adql_reversed,
+       adql_plan_uses_index('SELECT * FROM acat_sb WHERE DISTANCE(POINT(''ICRS'', ra, dec), POINT(''ICRS'', 10, 20)) < 2') AS adql_distance,
+       adql_plan_uses_index('SELECT * FROM acat_sb WHERE CONTAINS(POINT(''ICRS'', ra, dec), POLYGON(''ICRS'', 9, 19, 11, 19, 10, 21)) = 1') AS adql_polygon,
+       (SELECT count(*) FROM acat_sb WHERE CONTAINS(POINT('ICRS', ra, dec), CIRCLE('ICRS', 10, 20, 2)) = 1 AND adql_sb_leak(id))
+     = (SELECT count(*) FROM acat WHERE id % 2 = 0 AND CONTAINS(POINT('ICRS', ra, dec), CIRCLE('ICRS', 10, 20, 2)) = 1) AS adql_same_rows,
+       skycell_point_or_null(10, 95) IS NULL AND skycell_circle_or_null(10, 20, 'NaN') IS NULL AS or_null;
+ adql_cone | adql_reversed | adql_distance | adql_polygon | adql_same_rows | or_null 
+-----------+---------------+---------------+--------------+----------------+---------
+ t         | t             | t             | t            | t              | t
+(1 row)
+
+-- a cross-match against the view: a LATERAL subquery kept apart (OFFSET 0),
+-- so that each target's cone is pushed into the view
+SELECT adql_plan_uses_index($q$SELECT t.id, x.id FROM (SELECT * FROM acat WHERE id % 1000 = 0) t CROSS JOIN LATERAL
+  (SELECT v.id FROM acat_sb v WHERE CONTAINS(POINT('ICRS', v.ra, v.dec), CIRCLE('ICRS', t.ra, t.dec, 0.5)) = 1 OFFSET 0) x$q$) AS lateral_xmatch;
+ lateral_xmatch 
+----------------
+ t
+(1 row)
+
+SELECT count(*) FROM acat_sb WHERE CONTAINS(POINT('GALACTIC', ra, dec), CIRCLE('ICRS', 10, 20, 2)) = 1;
+ERROR:  coordinate system "GALACTIC" is not supported
+HINT:  skycell works in ICRS; convert with gal2icrs() or ecl2icrs().
 DROP FUNCTION adql_sb_leak(int);
 DROP VIEW acat_sb;

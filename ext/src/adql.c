@@ -18,6 +18,7 @@
  * caller.  Both spellings return the same rows.
  */
 #include "postgres.h"
+#include "commands/extension.h"
 
 #include <ctype.h>
 #include <math.h>
@@ -1171,6 +1172,26 @@ skycell_pos_from_point_support(PG_FUNCTION_ARGS)
 	PG_RETURN_POINTER(NULL);
 }
 
+/*
+ * A position, or NULL for coordinates no position has (0.57).  LEAKPROOF, as
+ * point() cannot be, since its error names the value it rejects: it is what
+ * ADQL's POINT(ra, dec) becomes on a security-barrier view's columns
+ * (skycell_secure_points()), so that a search reaches the index under the
+ * view.  A NULL position is in no region, so such a row is not returned,
+ * as it is not when the index answers.
+ */
+PG_FUNCTION_INFO_V1(skycell_point_or_null);
+Datum
+skycell_point_or_null(PG_FUNCTION_ARGS)
+{
+	double		ra = PG_GETARG_FLOAT8(0),
+				dec = PG_GETARG_FLOAT8(1);
+
+	if (!isfinite(ra) || !(dec >= -90.0 && dec <= 90.0))
+		PG_RETURN_NULL();
+	PG_RETURN_POINTER(skypos_make(ra, dec));
+}
+
 PG_FUNCTION_INFO_V1(skycell_point_cs);
 Datum
 skycell_point_cs(PG_FUNCTION_ARGS)
@@ -1185,6 +1206,24 @@ skycell_circle(PG_FUNCTION_ARGS)
 {
 	PG_RETURN_POINTER(region_cone(PG_GETARG_FLOAT8(0), PG_GETARG_FLOAT8(1),
 								  PG_GETARG_FLOAT8(2)));
+}
+
+/*
+ * A circle, or NULL where circle() raises an error: a centre no position has,
+ * a radius not finite (0.57).  LEAKPROOF; what ADQL's CIRCLE() becomes when
+ * its centre is a security-barrier view's columns (skycell_secure_points()).
+ */
+PG_FUNCTION_INFO_V1(skycell_circle_or_null);
+Datum
+skycell_circle_or_null(PG_FUNCTION_ARGS)
+{
+	double		ra = PG_GETARG_FLOAT8(0),
+				dec = PG_GETARG_FLOAT8(1),
+				r = PG_GETARG_FLOAT8(2);
+
+	if (!isfinite(ra) || !(dec >= -90.0 && dec <= 90.0) || !isfinite(r))
+		PG_RETURN_NULL();
+	PG_RETURN_POINTER(region_cone(ra, dec, r));
 }
 
 PG_FUNCTION_INFO_V1(skycell_circle_cs);
@@ -1897,7 +1936,8 @@ cell_expr_for_point(Oid selfid, Node *pt)
 		List	   *args = f->args;
 
 		if (name != NULL && (strcmp(name, "point") == 0 ||
-							 strcmp(name, "skycell_point") == 0))
+							 strcmp(name, "skycell_point") == 0 ||
+							 strcmp(name, "skycell_point_or_null") == 0))
 		{
 			/* point('ICRS', ra, dec) and point(ra, dec) */
 			if (list_length(args) == 3)
@@ -2144,7 +2184,8 @@ circle_args(Oid funcid, Node *rg)
 		return NIL;
 	f = (FuncExpr *) rg;
 	name = get_func_name(f->funcid);
-	if (name == NULL || (strcmp(name, "circle") != 0 && strcmp(name, "skycell_circle") != 0) ||
+	if (name == NULL || (strcmp(name, "circle") != 0 && strcmp(name, "skycell_circle") != 0 &&
+						 strcmp(name, "skycell_circle_or_null") != 0) ||
 		get_func_namespace(f->funcid) != get_func_namespace(funcid))
 		return NIL;
 	c = f->args;
@@ -3355,7 +3396,8 @@ plain_pos(Oid funcid, Node *p)
 	if (!IsA(p, FuncExpr) || get_func_namespace(((FuncExpr *) p)->funcid) != get_func_namespace(funcid))
 		return false;
 	name = get_func_name(((FuncExpr *) p)->funcid);
-	return name != NULL && (strcmp(name, "point") == 0 || strcmp(name, "skycell_point") == 0);
+	return name != NULL && (strcmp(name, "point") == 0 || strcmp(name, "skycell_point") == 0 ||
+							strcmp(name, "skycell_point_or_null") == 0);
 }
 
 /* false for constant coordinates point() would reject at plan time */
@@ -4089,6 +4131,218 @@ preconvert_jointree(Node *jt)
 		preconvert_jointree(j->larg);
 		preconvert_jointree(j->rarg);
 	}
+}
+
+/*
+ * A security-barrier view keeps outside it any condition holding a function
+ * that reads its columns and is not LEAKPROOF.  ADQL's POINT(ra, dec) is not
+ * (it rejects impossible coordinates, naming them), so a search written with
+ * it read the whole table under the view.  On such a view's columns it
+ * becomes skycell_point_or_null(ra, dec), LEAKPROOF, from the planner hook
+ * before the planner decides what to push into the view (0.57).
+ */
+typedef struct
+{
+	Query	   *parse;
+	Oid			or_null,
+				circle_or_null;
+} secure_points_ctx;
+
+typedef struct
+{
+	Query	   *parse;
+	int			nvars;
+	bool		other;
+} barrier_vars_ctx;
+
+static bool
+barrier_vars_walker(Node *node, barrier_vars_ctx *c)
+{
+	if (node == NULL)
+		return false;
+	if (IsA(node, Var))
+	{
+		Var		   *v = (Var *) node;
+		RangeTblEntry *rte;
+
+		/* an outer query's column (LATERAL, a sublink) is not the view's */
+		if (v->varlevelsup != 0 || v->varno < 1 || v->varno > list_length(c->parse->rtable))
+			c->other = true;
+		else
+		{
+			rte = rt_fetch(v->varno, c->parse->rtable);
+			if (rte->rtekind != RTE_SUBQUERY || !rte->security_barrier)
+				c->other = true;
+		}
+		c->nvars++;
+		return false;
+	}
+	if (IsA(node, Query) || IsA(node, SubLink) || IsA(node, PlaceHolderVar) || IsA(node, Aggref))
+	{
+		c->other = true;
+		return false;
+	}
+	return expression_tree_walker(node, barrier_vars_walker, c);
+}
+
+/* whether n reads columns, and only those of security-barrier views */
+static bool
+reads_only_barrier_views(Node *n, Query *parse)
+{
+	barrier_vars_ctx c = {parse, 0, false};
+
+	(void) barrier_vars_walker(n, &c);
+	return c.nvars > 0 && !c.other;
+}
+
+static void secure_points_query(Query *q, secure_points_ctx *ctx);
+
+static Node *
+secure_points_mutator(Node *node, secure_points_ctx *ctx)
+{
+	if (node == NULL)
+		return NULL;
+	if (IsA(node, FuncExpr))
+	{
+		FuncExpr   *f = (FuncExpr *) node;
+		char	   *src = skycell_c_src(f->funcid);
+		List	   *xy = NIL;
+
+		if (src != NULL && strcmp(src, "skycell_point") == 0 && list_length(f->args) == 2)
+			xy = f->args;
+		else if (src != NULL && strcmp(src, "skycell_point_cs") == 0 && list_length(f->args) == 3 &&
+				 IsA(linitial(f->args), Const) && !((Const *) linitial(f->args))->constisnull)
+		{
+			/* the coordinate system is the query's, not the row's: checked now */
+			check_coordsys(DatumGetTextPP(((Const *) linitial(f->args))->constvalue));
+			xy = list_make2(lsecond(f->args), lthird(f->args));
+		}
+		else if (src != NULL && strcmp(src, "skycell_pos_from_point") == 0 &&
+				 list_length(f->args) == 1 && IsA(linitial(f->args), FuncExpr) &&
+				 ((FuncExpr *) linitial(f->args))->funcid == F_POINT_FLOAT8_FLOAT8)
+			xy = ((FuncExpr *) linitial(f->args))->args;
+		if (xy != NIL && reads_only_barrier_views((Node *) xy, ctx->parse))
+			return (Node *) makeFuncExpr(ctx->or_null, f->funcresulttype, copyObject(xy),
+										 InvalidOid, InvalidOid, COERCE_EXPLICIT_CALL);
+
+		/* a circle centred on the view's columns (the radius may be anything) */
+		if (OidIsValid(ctx->circle_or_null) && src != NULL &&
+			(strcmp(src, "skycell_circle") == 0 || strcmp(src, "skycell_circle_cs") == 0))
+		{
+			List	   *c = f->args;
+
+			if (list_length(c) == 4 && IsA(linitial(c), Const) && !((Const *) linitial(c))->constisnull)
+			{
+				check_coordsys(DatumGetTextPP(((Const *) linitial(c))->constvalue));
+				c = list_delete_first(list_copy(c));
+			}
+			if (list_length(c) == 3 &&
+				reads_only_barrier_views((Node *) list_make2(linitial(c), lsecond(c)), ctx->parse))
+				return (Node *) makeFuncExpr(ctx->circle_or_null, f->funcresulttype,
+											 (List *) expression_tree_mutator((Node *) copyObject(c),
+																			  secure_points_mutator, ctx),
+											 InvalidOid, InvalidOid, COERCE_EXPLICIT_CALL);
+		}
+	}
+	if (IsA(node, SubLink))
+	{
+		SubLink    *sl = (SubLink *) expression_tree_mutator(node, secure_points_mutator, ctx);
+
+		secure_points_query((Query *) sl->subselect, ctx);
+		return (Node *) sl;
+	}
+	return expression_tree_mutator(node, secure_points_mutator, ctx);
+}
+
+static void
+secure_points_jointree(Node *jt, secure_points_ctx *ctx)
+{
+	ListCell   *lc;
+
+	if (jt == NULL)
+		return;
+	if (IsA(jt, FromExpr))
+	{
+		FromExpr   *f = (FromExpr *) jt;
+
+		f->quals = secure_points_mutator(f->quals, ctx);
+		foreach(lc, f->fromlist)
+			secure_points_jointree(lfirst(lc), ctx);
+	}
+	else if (IsA(jt, JoinExpr))
+	{
+		JoinExpr   *j = (JoinExpr *) jt;
+
+		j->quals = secure_points_mutator(j->quals, ctx);
+		secure_points_jointree(j->larg, ctx);
+		secure_points_jointree(j->rarg, ctx);
+	}
+}
+
+/* this query's quals, then those of every query inside it: LATERAL, sublinks, CTEs */
+static void
+secure_points_query(Query *q, secure_points_ctx *ctx)
+{
+	Query	   *saved = ctx->parse;
+	ListCell   *lc;
+
+	if (q == NULL || !IsA(q, Query))
+		return;
+	ctx->parse = q;
+	if (q->jointree != NULL)
+		secure_points_jointree((Node *) q->jointree, ctx);
+	foreach(lc, q->rtable)
+	{
+		RangeTblEntry *rte = (RangeTblEntry *) lfirst(lc);
+
+		if (rte->rtekind == RTE_SUBQUERY && !rte->security_barrier)
+			secure_points_query(rte->subquery, ctx);
+	}
+	foreach(lc, q->cteList)
+		secure_points_query((Query *) ((CommonTableExpr *) lfirst(lc))->ctequery, ctx);
+	ctx->parse = saved;
+}
+
+static bool
+has_barrier_view_walker(Node *node, void *context)
+{
+	if (node == NULL)
+		return false;
+	if (IsA(node, RangeTblEntry))
+	{
+		RangeTblEntry *rte = (RangeTblEntry *) node;
+
+		return rte->rtekind == RTE_SUBQUERY && rte->security_barrier;
+	}
+	if (IsA(node, Query))
+		return query_tree_walker((Query *) node, has_barrier_view_walker, context,
+								 QTW_EXAMINE_RTES_BEFORE);
+	return expression_tree_walker(node, has_barrier_view_walker, context);
+}
+
+void
+skycell_secure_points(Query *parse)
+{
+	secure_points_ctx ctx = {parse, InvalidOid, InvalidOid};
+	Oid			ext,
+				t[2] = {FLOAT8OID, FLOAT8OID},
+				t3[3] = {FLOAT8OID, FLOAT8OID, FLOAT8OID};
+	char	   *nsp;
+
+	if (parse->commandType != CMD_SELECT ||
+		!query_tree_walker(parse, has_barrier_view_walker, NULL, QTW_EXAMINE_RTES_BEFORE))
+		return;
+	ext = get_extension_oid("skycell", true);
+	if (!OidIsValid(ext))
+		return;
+	nsp = get_namespace_name(get_extension_schema(ext));
+	ctx.or_null = LookupFuncName(list_make2(makeString(nsp), makeString("skycell_point_or_null")),
+								 2, t, true);
+	ctx.circle_or_null = LookupFuncName(list_make2(makeString(nsp), makeString("skycell_circle_or_null")),
+										3, t3, true);
+	if (!OidIsValid(ctx.or_null))
+		return;					/* the SQL predates 0.50 */
+	secure_points_query(parse, &ctx);
 }
 
 void
