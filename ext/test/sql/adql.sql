@@ -323,3 +323,53 @@ SELECT '(1,2'::skypos;
 SELECT '(1,2,3)'::skypos;
 SELECT '(1,90.0000001)'::skypos;
 SELECT ' ( 1 , 2 ) '::skypos AS spaced, '1,2'::skypos AS bare, '1 2'::skypos AS blank, circle(10, 10, -1) AS empty_circle;
+
+-- equality, ordering and hashing of positions and regions, and text that
+-- reads back to the same value (0.56)
+SELECT skycell_point(0, 0) = skycell_point(360, 0) AS wrapped_equal,
+       '(-0,1)'::skypos = '(0,1)'::skypos AS minus_zero_equal,
+       skycell_point(1, 2) < skycell_point(1, 3) AS ordered,
+       circle(1, 2, 3) = region('CIRCLE ICRS 1 2 3') AS region_equal,
+       circle(1, 2, 3) <> circle(1, 2, 3.0000001) AS region_differs;
+SELECT count(*) AS rows, count(DISTINCT pos) AS distinct_positions,
+       (SELECT count(*) FROM (SELECT pos FROM acat UNION SELECT pos FROM acat) u) AS unioned,
+       (SELECT count(*) FROM (SELECT r FROM (VALUES (circle(1, 2, 3)), (circle(1, 2, 3)), (polygon(1, 1, 2, 1, 2, 2))) v(r) GROUP BY r) g) AS region_groups
+FROM acat;
+SET extra_float_digits = 1;	-- the default, which pg_regress lowers
+SELECT skycell_point(1.0 / 3, 2.0 / 3) AS shortest_exact, circle(10.123456789012345678, 20.98765432109876, 0.1) AS circle_text,
+       count(*) FILTER (WHERE pos::text::skypos = pos) = count(*) AS positions_round_trip,
+       count(*) FILTER (WHERE circle(ra, dec, 0.1)::text::skyregion = circle(ra, dec, 0.1)) = count(*) AS circles_round_trip
+FROM acat;
+RESET extra_float_digits;
+SELECT length(skypos_send(skycell_point(1, 2))) AS pos_send_bytes, get_byte(skyregion_send(circle(1, 2, 3)), 0) AS region_format;
+
+-- through a security-barrier view: the region tests are LEAKPROOF, so a
+-- search reaches the index under the view, and a user's function still sees
+-- no row the view hides (0.57)
+CREATE VIEW acat_sb WITH (security_barrier) AS SELECT * FROM acat WHERE id % 2 = 0;
+CREATE FUNCTION adql_sb_leak(int) RETURNS bool LANGUAGE plpgsql COST 0.0000001 AS $$
+BEGIN
+  IF $1 % 2 = 1 THEN RAISE NOTICE 'hidden row % seen', $1; END IF;
+  RETURN true;
+END $$;
+SELECT adql_plan_uses_index('SELECT * FROM acat_sb WHERE CONTAINS(pos, CIRCLE(10, 20, 2)) = 1') AS skypos_column,
+       adql_plan_uses_index('SELECT * FROM acat_sb WHERE skycell_radial_query(ra, dec, 10, 20, 2)') AS radial_query,
+       adql_plan_uses_index('SELECT * FROM acat_sb WHERE DISTANCE(pos, POINT(10, 20)) < 2') AS distance,
+       (SELECT count(*) FROM acat_sb WHERE CONTAINS(pos, CIRCLE(10, 20, 2)) = 1 AND adql_sb_leak(id))
+     = (SELECT count(*) FROM acat WHERE id % 2 = 0 AND CONTAINS(pos, CIRCLE(10, 20, 2)) = 1) AS same_rows;
+-- ADQL's POINT() and CIRCLE() on the view's columns are read as their
+-- LEAKPROOF twins, which are NULL where the constructors raise an error
+SELECT adql_plan_uses_index('SELECT * FROM acat_sb WHERE CONTAINS(POINT(''ICRS'', ra, dec), CIRCLE(''ICRS'', 10, 20, 2)) = 1') AS adql_cone,
+       adql_plan_uses_index('SELECT * FROM acat_sb WHERE 1 = CONTAINS(POINT(''ICRS'', 10, 20), CIRCLE(''ICRS'', ra, dec, 2))') AS adql_reversed,
+       adql_plan_uses_index('SELECT * FROM acat_sb WHERE DISTANCE(POINT(''ICRS'', ra, dec), POINT(''ICRS'', 10, 20)) < 2') AS adql_distance,
+       adql_plan_uses_index('SELECT * FROM acat_sb WHERE CONTAINS(POINT(''ICRS'', ra, dec), POLYGON(''ICRS'', 9, 19, 11, 19, 10, 21)) = 1') AS adql_polygon,
+       (SELECT count(*) FROM acat_sb WHERE CONTAINS(POINT('ICRS', ra, dec), CIRCLE('ICRS', 10, 20, 2)) = 1 AND adql_sb_leak(id))
+     = (SELECT count(*) FROM acat WHERE id % 2 = 0 AND CONTAINS(POINT('ICRS', ra, dec), CIRCLE('ICRS', 10, 20, 2)) = 1) AS adql_same_rows,
+       skycell_point_or_null(10, 95) IS NULL AND skycell_circle_or_null(10, 20, 'NaN') IS NULL AS or_null;
+-- a cross-match against the view: a LATERAL subquery kept apart (OFFSET 0),
+-- so that each target's cone is pushed into the view
+SELECT adql_plan_uses_index($q$SELECT t.id, x.id FROM (SELECT * FROM acat WHERE id % 1000 = 0) t CROSS JOIN LATERAL
+  (SELECT v.id FROM acat_sb v WHERE CONTAINS(POINT('ICRS', v.ra, v.dec), CIRCLE('ICRS', t.ra, t.dec, 0.5)) = 1 OFFSET 0) x$q$) AS lateral_xmatch;
+SELECT count(*) FROM acat_sb WHERE CONTAINS(POINT('GALACTIC', ra, dec), CIRCLE('ICRS', 10, 20, 2)) = 1;
+DROP FUNCTION adql_sb_leak(int);
+DROP VIEW acat_sb;

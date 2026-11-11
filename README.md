@@ -262,7 +262,26 @@ spelling is indexed as written (PostgreSQL's geometry keeps its meaning:
 coordinate-system argument, `point('ICRS', ra, dec)` and `circle('ICRS', …)`,
 and the prefixed `skycell_point`, `skycell_circle`, `skycell_box` and
 `skycell_polygon` are the same functions. Installing into a schema of its own
-works too; put it on the `search_path`.
+works too (`CREATE EXTENSION skycell SCHEMA astro`), on the `search_path` or
+off it with the functions named `astro.CONTAINS(...)`; the extension cannot be
+moved afterwards (`ALTER EXTENSION ... SET SCHEMA`).
+
+Positions and regions compare with `=` and `<>` (a region equals one stored
+the same way), so `DISTINCT`, `GROUP BY` and `UNION` work on them. Their text
+is exact, as `float8`'s is, so a dump and restore keeps every value, and both
+types have a binary form, for `COPY ... (FORMAT binary)` and drivers that read
+results in binary.
+
+Through a security-barrier view (a view with `security_barrier`), a search
+reaches the index of the table under the view: the region tests are
+`LEAKPROOF`, and ADQL's `POINT()` and `CIRCLE()` on the view's columns are read
+as `skycell_point_or_null()` and `skycell_circle_or_null()`, which are too
+(they return NULL where the constructors raise an error, so a row with
+impossible coordinates is not returned). PostgreSQL never pushes a join
+condition into such a view, so a cross-match against one is written with the
+view in a LATERAL subquery kept apart with `OFFSET 0`:
+`... CROSS JOIN LATERAL (SELECT ... FROM v WHERE CONTAINS(POINT('ICRS', v.ra,
+v.dec), CIRCLE('ICRS', t.ra, t.dec, r)) = 1 OFFSET 0) x`.
 
 ### Setting up a table
 

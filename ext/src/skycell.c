@@ -25,6 +25,7 @@
  * LATERAL form with a variable number of ranges.
  */
 #include "postgres.h"
+#include "commands/extension.h"
 
 #include <math.h>
 
@@ -768,6 +769,22 @@ map_cell_cmp(const void *a, const void *b)
 	return (x < y) ? -1 : (x > y) ? 1 : 0;
 }
 
+/*
+ * A relation of skycell's by name: on the search_path, else in the schema
+ * the extension was created in, which need not be on it (0.56).
+ */
+Oid
+skycell_own_relid(const char *name)
+{
+	Oid			r = RelnameGetRelid(name);
+	Oid			ext;
+
+	if (OidIsValid(r))
+		return r;
+	ext = get_extension_oid("skycell", true);
+	return OidIsValid(ext) ? get_relname_relid(name, get_extension_schema(ext)) : InvalidOid;
+}
+
 static void
 load_density_map(Oid statrel, AttrNumber attnum, dens_entry *e)
 {
@@ -780,13 +797,14 @@ load_density_map(Oid statrel, AttrNumber attnum, dens_entry *e)
 	map_cell   *cells = NULL;
 	int			cap = 0,
 				n = 0;
+	char	   *relname = NULL;
 
 	e->nmap = 0;
 	e->map_lo = e->map_hi = NULL;
 	e->map_n = NULL;
 	e->map_total = 0;
 
-	maprel = RelnameGetRelid("skycell_density_map");
+	maprel = skycell_own_relid("skycell_density_map");
 	if (!OidIsValid(maprel))
 		return;
 
@@ -797,18 +815,39 @@ load_density_map(Oid statrel, AttrNumber attnum, dens_entry *e)
 		table_close(rel, AccessShareLock);
 		return;
 	}
-	ScanKeyInit(&skey[0], 1, BTEqualStrategyNumber, F_OIDEQ, ObjectIdGetDatum(statrel));
-	ScanKeyInit(&skey[1], 2, BTEqualStrategyNumber, F_INT2EQ, Int16GetDatum(attnum));
-	scan = table_beginscan(rel, GetActiveSnapshot(), 2, skey);
+
+	/*
+	 * The map's rows for statrel: those naming it (0.56), and those of an
+	 * older map, which have only its OID.  A dump and restore keeps names,
+	 * not OIDs: by name, a restored map is found again, and an OID now held
+	 * by another relation finds nothing.
+	 */
+	if (td->natts >= 5 && OidIsValid(get_rel_namespace(statrel)))
+		relname = quote_qualified_identifier(get_namespace_name(get_rel_namespace(statrel)),
+											 get_rel_name(statrel));
+	ScanKeyInit(&skey[0], 2, BTEqualStrategyNumber, F_INT2EQ, Int16GetDatum(attnum));
+	scan = table_beginscan(rel, GetActiveSnapshot(), 1, skey);
 	while ((tup = heap_getnext(scan, ForwardScanDirection)) != NULL)
 	{
 		bool		isnull;
-		Datum		dn = heap_getattr(tup, 3, td, &isnull);
+		Datum		dn;
 		int64		nuniq,
 					cnt,
 					pix;
 		int			order;
 
+		if (relname != NULL)
+		{
+			bool		nnull;
+			Datum		nm = heap_getattr(tup, 5, td, &nnull);
+
+			if (!nnull ? strcmp(TextDatumGetCString(nm), relname) != 0
+				: DatumGetObjectId(heap_getattr(tup, 1, td, &isnull)) != statrel)
+				continue;
+		}
+		else if (DatumGetObjectId(heap_getattr(tup, 1, td, &isnull)) != statrel)
+			continue;
+		dn = heap_getattr(tup, 3, td, &isnull);
 		if (isnull)
 			continue;
 		nuniq = DatumGetInt64(dn);
@@ -946,8 +985,15 @@ Oid
 cell_ops_opfamily(void)
 {
 	List	   *name = list_make1(makeString("skycell_cell_ops"));
+	Oid			f = get_opfamily_oid(BTREE_AM_OID, name, true);
+	Oid			ext;
 
-	return get_opfamily_oid(BTREE_AM_OID, name, true);
+	/* skycell's schema need not be on the search_path (0.56) */
+	if (!OidIsValid(f) && OidIsValid(ext = get_extension_oid("skycell", true)))
+		f = get_opfamily_oid(BTREE_AM_OID,
+							 list_make2(makeString(get_namespace_name(get_extension_schema(ext))),
+										makeString("skycell_cell_ops")), true);
+	return f;
 }
 
 /*
@@ -2056,8 +2102,32 @@ simplify_cone5(PlannerInfo *root, FuncExpr *fexpr)
 	Oid			a2c_types[2] = {FLOAT8OID, FLOAT8OID};
 	Oid			a2c_oid = lookup_sibling_func(fexpr->funcid, "skycell_ang2cell",
 											  2, a2c_types);
-	FuncExpr   *six = copyObject(fexpr);
+	FuncExpr   *six;
 	Expr	   *cell;
+
+	/*
+	 * The position a subquery's columns (a view not flattened: a security
+	 * barrier's, say): left as written.  Pushed into the subquery, where its
+	 * table is, it is rewritten there for the index; and as written it is
+	 * LEAKPROOF, which skycell_ang2cell(), rejecting impossible coordinates,
+	 * is not, so it may be pushed through a security barrier (0.57).
+	 */
+	if (root != NULL && root->parse != NULL)
+	{
+		List	   *vars = sc_pull_local_vars((Node *) list_make2(linitial(fexpr->args),
+																  lsecond(fexpr->args)), 0);
+
+		if (vars != NIL && IsA(linitial(vars), Var))
+		{
+			Index		v = ((Var *) linitial(vars))->varno;
+
+			if (v >= 1 && v <= (Index) list_length(root->parse->rtable) &&
+				rt_fetch(v, root->parse->rtable)->rtekind == RTE_SUBQUERY &&
+				!rt_fetch(v, root->parse->rtable)->inh)
+				return NULL;
+		}
+	}
+	six = copyObject(fexpr);
 
 	cell = (Expr *) makeFuncExpr(a2c_oid, INT8OID,
 								 list_make2(copyObject(linitial(fexpr->args)),

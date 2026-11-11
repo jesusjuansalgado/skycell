@@ -18,6 +18,7 @@
  * caller.  Both spellings return the same rows.
  */
 #include "postgres.h"
+#include "commands/extension.h"
 
 #include <ctype.h>
 #include <math.h>
@@ -32,6 +33,7 @@
 #include "catalog/pg_proc.h"
 #include "catalog/pg_type_d.h"
 #include "fmgr.h"
+#include "common/hashfn.h"
 #include "libpq/pqformat.h"
 #include "miscadmin.h"
 #include "nodes/makefuncs.h"
@@ -520,9 +522,16 @@ region_from_datum_ex(Datum d, sc_region *out, bool need_covering)
 	region_decode(DatumGetSkyRegion(d), out, need_covering);
 }
 
-static void
-region_decode(const SkyRegion *r, sc_region *out, bool need_covering)
+/*
+ * The region a stored value describes, or the reason it describes none.  A
+ * value skyregion's input accepts always decodes; one stored by an older
+ * version without today's checks (a circle of NaN radius) may not.
+ */
+static const char *
+region_decode_soft(const SkyRegion *r, sc_region *out, bool need_covering)
 {
+	const char *err;
+
 	if (SKY_IS_COMPOSITE(r->kind))
 	{
 		const SkyRegion *kids[SKY_MAX_KIDS];
@@ -531,13 +540,14 @@ region_decode(const SkyRegion *r, sc_region *out, bool need_covering)
 
 		check_stack_depth();
 		for (int i = 0; i < n; i++)
-			region_decode(kids[i], &sk[i], need_covering);
-		check_err(sc_region_combine(out, (sc_region_kind) r->kind, sk, n));
+			if ((err = region_decode_soft(kids[i], &sk[i], need_covering)) != NULL)
+				return err;
+		err = sc_region_combine(out, (sc_region_kind) r->kind, sk, n);
 		pfree(sk);
-		return;
+		return err;
 	}
 	if (r->kind == SKY_CONE)
-		check_err(sc_region_cone(out, r->v[0], r->v[1], r->v[2], need_covering));
+		return sc_region_cone(out, r->v[0], r->v[1], r->v[2], need_covering);
 	else if (r->kind == SKY_MOC)
 	{
 		const int64 *d = SKYMOC_DATA(r);
@@ -550,9 +560,10 @@ region_decode(const SkyRegion *r, sc_region *out, bool need_covering)
 			lo[i] = d[1 + 2 * i];
 			hi[i] = d[2 + 2 * i];
 		}
-		check_err(sc_region_moc(out, (int64_t *) lo, (int64_t *) hi, n));
+		err = sc_region_moc(out, (int64_t *) lo, (int64_t *) hi, n);
 		pfree(lo);
 		pfree(hi);
+		return err;
 	}
 	else
 	{
@@ -565,8 +576,14 @@ region_decode(const SkyRegion *r, sc_region *out, bool need_covering)
 			ra[i] = r->v[2 * i];
 			dec[i] = r->v[2 * i + 1];
 		}
-		check_err(sc_region_poly(out, nv, ra, dec, need_covering));
+		return sc_region_poly(out, nv, ra, dec, need_covering);
 	}
+}
+
+static void
+region_decode(const SkyRegion *r, sc_region *out, bool need_covering)
+{
+	check_err(region_decode_soft(r, out, need_covering));
 }
 
 void
@@ -619,7 +636,10 @@ skypos_out(PG_FUNCTION_ARGS)
 {
 	SkyPos	   *p = PG_GETARG_SKYPOS(0);
 
-	PG_RETURN_CSTRING(psprintf("(%.15g,%.15g)", p->ra, p->dec));
+	char	   *ra = float8out_internal(p->ra),
+			   *dec = float8out_internal(p->dec);
+
+	PG_RETURN_CSTRING(psprintf("(%s,%s)", ra, dec));
 }
 
 /*
@@ -837,6 +857,21 @@ skyregion_in(PG_FUNCTION_ARGS)
 }
 
 /* STC-S, the frame written once, at the top */
+/*
+ * A coordinate as float8 prints it: the shortest text that reads back to the
+ * same double (extra_float_digits >= 1, the default), so that text I/O --
+ * pg_dump, COPY -- keeps every position and region exactly (0.56).
+ */
+static void
+append_float8(StringInfo buf, double v)
+{
+	char	   *s = float8out_internal(v);
+
+	appendStringInfoChar(buf, ' ');
+	appendStringInfoString(buf, s);
+	pfree(s);
+}
+
 static void
 stcs_print(StringInfo buf, const SkyRegion *r, bool top)
 {
@@ -868,13 +903,16 @@ stcs_print(StringInfo buf, const SkyRegion *r, bool top)
 		appendStringInfoChar(buf, ')');
 	}
 	else if (r->kind == SKY_CONE)
-		appendStringInfo(buf, " %.15g %.15g %.15g", r->v[0], r->v[1], r->v[2]);
+	{
+		for (int i = 0; i < 3; i++)
+			append_float8(buf, r->v[i]);
+	}
 	else
 	{
 		int			nv = SKYREGION_NVERT(r);
 
-		for (int i = 0; i < nv; i++)
-			appendStringInfo(buf, " %.15g %.15g", r->v[2 * i], r->v[2 * i + 1]);
+		for (int i = 0; i < 2 * nv; i++)
+			append_float8(buf, r->v[i]);
 	}
 }
 
@@ -888,6 +926,178 @@ skyregion_out(PG_FUNCTION_ARGS)
 	initStringInfo(&buf);
 	stcs_print(&buf, r, true);
 	PG_RETURN_CSTRING(buf.data);
+}
+
+/* ------------------------------------------------------------------ */
+/* equality, ordering, hashing and binary I/O (0.56)                   */
+/* ------------------------------------------------------------------ */
+
+/*
+ * skypos: equal when both coordinates are (as float8 compares them, so -0
+ * and 0 are equal), ordered by right ascension and then declination.  The
+ * order means nothing on the sky; it is what DISTINCT, GROUP BY, UNION, ORDER
+ * BY and a B-tree on a position need.
+ */
+static int
+skypos_cmp_internal(const SkyPos *a, const SkyPos *b)
+{
+	if (a->ra != b->ra)
+		return a->ra < b->ra ? -1 : 1;
+	if (a->dec != b->dec)
+		return a->dec < b->dec ? -1 : 1;
+	return 0;
+}
+
+#define SKYPOS_CMP_FN(name, test) \
+PG_FUNCTION_INFO_V1(name); \
+Datum \
+name(PG_FUNCTION_ARGS) \
+{ \
+	int			c = skypos_cmp_internal(PG_GETARG_SKYPOS(0), PG_GETARG_SKYPOS(1)); \
+	PG_RETURN_BOOL(test); \
+}
+SKYPOS_CMP_FN(skypos_eq, c == 0)
+SKYPOS_CMP_FN(skypos_ne, c != 0)
+SKYPOS_CMP_FN(skypos_lt, c < 0)
+SKYPOS_CMP_FN(skypos_le, c <= 0)
+SKYPOS_CMP_FN(skypos_gt, c > 0)
+SKYPOS_CMP_FN(skypos_ge, c >= 0)
+
+PG_FUNCTION_INFO_V1(skypos_cmp);
+Datum
+skypos_cmp(PG_FUNCTION_ARGS)
+{
+	PG_RETURN_INT32(skypos_cmp_internal(PG_GETARG_SKYPOS(0), PG_GETARG_SKYPOS(1)));
+}
+
+PG_FUNCTION_INFO_V1(skypos_hash);
+Datum
+skypos_hash(PG_FUNCTION_ARGS)
+{
+	SkyPos	   *p = PG_GETARG_SKYPOS(0);
+	double		v[2] = {p->ra == 0 ? 0.0 : p->ra, p->dec == 0 ? 0.0 : p->dec};
+
+	PG_RETURN_UINT32(hash_bytes((const unsigned char *) v, sizeof(v)));
+}
+
+/* binary: the two coordinates as float8 */
+PG_FUNCTION_INFO_V1(skypos_send);
+Datum
+skypos_send(PG_FUNCTION_ARGS)
+{
+	SkyPos	   *p = PG_GETARG_SKYPOS(0);
+	StringInfoData buf;
+
+	pq_begintypsend(&buf);
+	pq_sendfloat8(&buf, p->ra);
+	pq_sendfloat8(&buf, p->dec);
+	PG_RETURN_BYTEA_P(pq_endtypsend(&buf));
+}
+
+PG_FUNCTION_INFO_V1(skypos_recv);
+Datum
+skypos_recv(PG_FUNCTION_ARGS)
+{
+	StringInfo	buf = (StringInfo) PG_GETARG_POINTER(0);
+	double		ra = pq_getmsgfloat8(buf),
+				dec = pq_getmsgfloat8(buf);
+
+	PG_RETURN_POINTER(skypos_make(ra, dec));
+}
+
+/*
+ * skyregion: equal when stored the same -- the same kind, the same values in
+ * the same order (a polygon from another vertex is another value, as an array
+ * would be).  Ordered by its bytes, consistently, meaninglessly.
+ */
+static int
+skyregion_cmp_internal(SkyRegion *a, SkyRegion *b)
+{
+	Size		la = VARSIZE(a) - VARHDRSZ,
+				lb = VARSIZE(b) - VARHDRSZ;
+	int			c = memcmp(VARDATA(a), VARDATA(b), Min(la, lb));
+
+	if (c != 0)
+		return c < 0 ? -1 : 1;
+	return la == lb ? 0 : (la < lb ? -1 : 1);
+}
+
+#define SKYREGION_CMP_FN(name, test) \
+PG_FUNCTION_INFO_V1(name); \
+Datum \
+name(PG_FUNCTION_ARGS) \
+{ \
+	int			c = skyregion_cmp_internal(PG_GETARG_SKYREGION(0), PG_GETARG_SKYREGION(1)); \
+	PG_RETURN_BOOL(test); \
+}
+SKYREGION_CMP_FN(skyregion_eq, c == 0)
+SKYREGION_CMP_FN(skyregion_ne, c != 0)
+SKYREGION_CMP_FN(skyregion_lt, c < 0)
+SKYREGION_CMP_FN(skyregion_le, c <= 0)
+SKYREGION_CMP_FN(skyregion_gt, c > 0)
+SKYREGION_CMP_FN(skyregion_ge, c >= 0)
+
+PG_FUNCTION_INFO_V1(skyregion_cmp);
+Datum
+skyregion_cmp(PG_FUNCTION_ARGS)
+{
+	PG_RETURN_INT32(skyregion_cmp_internal(PG_GETARG_SKYREGION(0), PG_GETARG_SKYREGION(1)));
+}
+
+PG_FUNCTION_INFO_V1(skyregion_hash);
+Datum
+skyregion_hash(PG_FUNCTION_ARGS)
+{
+	SkyRegion  *r = PG_GETARG_SKYREGION(0);
+
+	PG_RETURN_UINT32(hash_bytes((const unsigned char *) VARDATA(r), VARSIZE(r) - VARHDRSZ));
+}
+
+/*
+ * binary: a format byte (1) and the region's STC-S, written with every digit
+ * whatever extra_float_digits is, so that it reads back to the same value on
+ * any machine.
+ */
+PG_FUNCTION_INFO_V1(skyregion_send);
+Datum
+skyregion_send(PG_FUNCTION_ARGS)
+{
+	SkyRegion  *r = PG_GETARG_SKYREGION(0);
+	StringInfoData text,
+				buf;
+	int			saved = extra_float_digits;
+
+	initStringInfo(&text);
+	extra_float_digits = 1;
+	PG_TRY();
+	{
+		stcs_print(&text, r, true);
+	}
+	PG_FINALLY();
+	{
+		extra_float_digits = saved;
+	}
+	PG_END_TRY();
+	pq_begintypsend(&buf);
+	pq_sendbyte(&buf, 1);
+	pq_sendtext(&buf, text.data, text.len);
+	PG_RETURN_BYTEA_P(pq_endtypsend(&buf));
+}
+
+PG_FUNCTION_INFO_V1(skyregion_recv);
+Datum
+skyregion_recv(PG_FUNCTION_ARGS)
+{
+	StringInfo	buf = (StringInfo) PG_GETARG_POINTER(0);
+	int			version = pq_getmsgbyte(buf);
+	char	   *str;
+	int			nbytes;
+
+	if (version != 1)
+		ereport(ERROR, (errcode(ERRCODE_INVALID_BINARY_REPRESENTATION),
+						errmsg("unsupported skyregion binary format %d", version)));
+	str = pq_getmsgtext(buf, buf->len - buf->cursor, &nbytes);
+	PG_RETURN_DATUM(DirectFunctionCall1(skyregion_in, CStringGetDatum(str)));
 }
 
 /* ------------------------------------------------------------------ */
@@ -962,6 +1172,26 @@ skycell_pos_from_point_support(PG_FUNCTION_ARGS)
 	PG_RETURN_POINTER(NULL);
 }
 
+/*
+ * A position, or NULL for coordinates no position has (0.57).  LEAKPROOF, as
+ * point() cannot be, since its error names the value it rejects: it is what
+ * ADQL's POINT(ra, dec) becomes on a security-barrier view's columns
+ * (skycell_secure_points()), so that a search reaches the index under the
+ * view.  A NULL position is in no region, so such a row is not returned,
+ * as it is not when the index answers.
+ */
+PG_FUNCTION_INFO_V1(skycell_point_or_null);
+Datum
+skycell_point_or_null(PG_FUNCTION_ARGS)
+{
+	double		ra = PG_GETARG_FLOAT8(0),
+				dec = PG_GETARG_FLOAT8(1);
+
+	if (!isfinite(ra) || !(dec >= -90.0 && dec <= 90.0))
+		PG_RETURN_NULL();
+	PG_RETURN_POINTER(skypos_make(ra, dec));
+}
+
 PG_FUNCTION_INFO_V1(skycell_point_cs);
 Datum
 skycell_point_cs(PG_FUNCTION_ARGS)
@@ -976,6 +1206,24 @@ skycell_circle(PG_FUNCTION_ARGS)
 {
 	PG_RETURN_POINTER(region_cone(PG_GETARG_FLOAT8(0), PG_GETARG_FLOAT8(1),
 								  PG_GETARG_FLOAT8(2)));
+}
+
+/*
+ * A circle, or NULL where circle() raises an error: a centre no position has,
+ * a radius not finite (0.57).  LEAKPROOF; what ADQL's CIRCLE() becomes when
+ * its centre is a security-barrier view's columns (skycell_secure_points()).
+ */
+PG_FUNCTION_INFO_V1(skycell_circle_or_null);
+Datum
+skycell_circle_or_null(PG_FUNCTION_ARGS)
+{
+	double		ra = PG_GETARG_FLOAT8(0),
+				dec = PG_GETARG_FLOAT8(1),
+				r = PG_GETARG_FLOAT8(2);
+
+	if (!isfinite(ra) || !(dec >= -90.0 && dec <= 90.0) || !isfinite(r))
+		PG_RETURN_NULL();
+	PG_RETURN_POINTER(region_cone(ra, dec, r));
 }
 
 PG_FUNCTION_INFO_V1(skycell_circle_cs);
@@ -1306,7 +1554,18 @@ cached_region_arg(FunctionCallInfo fcinfo, int argno, int fnarg)
 		slot->last_datum = NULL;
 
 		oldcxt = MemoryContextSwitchTo(slot->cxt);
-		skycell_region_from_datum_lite(arg_datum, &slot->reg);
+
+		/*
+		 * The tests below are LEAKPROOF (0.57): they say nothing of their
+		 * arguments but their result, so a region that does not decode raises
+		 * no error here; it is an empty region, which nothing is in and
+		 * nothing meets.
+		 */
+		if (region_decode_soft(DatumGetSkyRegion(arg_datum), &slot->reg, false) != NULL)
+		{
+			memset(&slot->reg, 0, sizeof(slot->reg));
+			check_err(sc_region_cone(&slot->reg, 0, 0, -1, false));
+		}
 		slot->last_datum = palloc(sz);
 		memcpy(slot->last_datum, b, sz);
 		slot->last_size = sz;
@@ -1677,7 +1936,8 @@ cell_expr_for_point(Oid selfid, Node *pt)
 		List	   *args = f->args;
 
 		if (name != NULL && (strcmp(name, "point") == 0 ||
-							 strcmp(name, "skycell_point") == 0))
+							 strcmp(name, "skycell_point") == 0 ||
+							 strcmp(name, "skycell_point_or_null") == 0))
 		{
 			/* point('ICRS', ra, dec) and point(ra, dec) */
 			if (list_length(args) == 3)
@@ -1924,7 +2184,8 @@ circle_args(Oid funcid, Node *rg)
 		return NIL;
 	f = (FuncExpr *) rg;
 	name = get_func_name(f->funcid);
-	if (name == NULL || (strcmp(name, "circle") != 0 && strcmp(name, "skycell_circle") != 0) ||
+	if (name == NULL || (strcmp(name, "circle") != 0 && strcmp(name, "skycell_circle") != 0 &&
+						 strcmp(name, "skycell_circle_or_null") != 0) ||
 		get_func_namespace(f->funcid) != get_func_namespace(funcid))
 		return NIL;
 	c = f->args;
@@ -3135,7 +3396,8 @@ plain_pos(Oid funcid, Node *p)
 	if (!IsA(p, FuncExpr) || get_func_namespace(((FuncExpr *) p)->funcid) != get_func_namespace(funcid))
 		return false;
 	name = get_func_name(((FuncExpr *) p)->funcid);
-	return name != NULL && (strcmp(name, "point") == 0 || strcmp(name, "skycell_point") == 0);
+	return name != NULL && (strcmp(name, "point") == 0 || strcmp(name, "skycell_point") == 0 ||
+							strcmp(name, "skycell_point_or_null") == 0);
 }
 
 /* false for constant coordinates point() would reject at plan time */
@@ -3869,6 +4131,218 @@ preconvert_jointree(Node *jt)
 		preconvert_jointree(j->larg);
 		preconvert_jointree(j->rarg);
 	}
+}
+
+/*
+ * A security-barrier view keeps outside it any condition holding a function
+ * that reads its columns and is not LEAKPROOF.  ADQL's POINT(ra, dec) is not
+ * (it rejects impossible coordinates, naming them), so a search written with
+ * it read the whole table under the view.  On such a view's columns it
+ * becomes skycell_point_or_null(ra, dec), LEAKPROOF, from the planner hook
+ * before the planner decides what to push into the view (0.57).
+ */
+typedef struct
+{
+	Query	   *parse;
+	Oid			or_null,
+				circle_or_null;
+} secure_points_ctx;
+
+typedef struct
+{
+	Query	   *parse;
+	int			nvars;
+	bool		other;
+} barrier_vars_ctx;
+
+static bool
+barrier_vars_walker(Node *node, barrier_vars_ctx *c)
+{
+	if (node == NULL)
+		return false;
+	if (IsA(node, Var))
+	{
+		Var		   *v = (Var *) node;
+		RangeTblEntry *rte;
+
+		/* an outer query's column (LATERAL, a sublink) is not the view's */
+		if (v->varlevelsup != 0 || v->varno < 1 || v->varno > list_length(c->parse->rtable))
+			c->other = true;
+		else
+		{
+			rte = rt_fetch(v->varno, c->parse->rtable);
+			if (rte->rtekind != RTE_SUBQUERY || !rte->security_barrier)
+				c->other = true;
+		}
+		c->nvars++;
+		return false;
+	}
+	if (IsA(node, Query) || IsA(node, SubLink) || IsA(node, PlaceHolderVar) || IsA(node, Aggref))
+	{
+		c->other = true;
+		return false;
+	}
+	return expression_tree_walker(node, barrier_vars_walker, c);
+}
+
+/* whether n reads columns, and only those of security-barrier views */
+static bool
+reads_only_barrier_views(Node *n, Query *parse)
+{
+	barrier_vars_ctx c = {parse, 0, false};
+
+	(void) barrier_vars_walker(n, &c);
+	return c.nvars > 0 && !c.other;
+}
+
+static void secure_points_query(Query *q, secure_points_ctx *ctx);
+
+static Node *
+secure_points_mutator(Node *node, secure_points_ctx *ctx)
+{
+	if (node == NULL)
+		return NULL;
+	if (IsA(node, FuncExpr))
+	{
+		FuncExpr   *f = (FuncExpr *) node;
+		char	   *src = skycell_c_src(f->funcid);
+		List	   *xy = NIL;
+
+		if (src != NULL && strcmp(src, "skycell_point") == 0 && list_length(f->args) == 2)
+			xy = f->args;
+		else if (src != NULL && strcmp(src, "skycell_point_cs") == 0 && list_length(f->args) == 3 &&
+				 IsA(linitial(f->args), Const) && !((Const *) linitial(f->args))->constisnull)
+		{
+			/* the coordinate system is the query's, not the row's: checked now */
+			check_coordsys(DatumGetTextPP(((Const *) linitial(f->args))->constvalue));
+			xy = list_make2(lsecond(f->args), lthird(f->args));
+		}
+		else if (src != NULL && strcmp(src, "skycell_pos_from_point") == 0 &&
+				 list_length(f->args) == 1 && IsA(linitial(f->args), FuncExpr) &&
+				 ((FuncExpr *) linitial(f->args))->funcid == F_POINT_FLOAT8_FLOAT8)
+			xy = ((FuncExpr *) linitial(f->args))->args;
+		if (xy != NIL && reads_only_barrier_views((Node *) xy, ctx->parse))
+			return (Node *) makeFuncExpr(ctx->or_null, f->funcresulttype, copyObject(xy),
+										 InvalidOid, InvalidOid, COERCE_EXPLICIT_CALL);
+
+		/* a circle centred on the view's columns (the radius may be anything) */
+		if (OidIsValid(ctx->circle_or_null) && src != NULL &&
+			(strcmp(src, "skycell_circle") == 0 || strcmp(src, "skycell_circle_cs") == 0))
+		{
+			List	   *c = f->args;
+
+			if (list_length(c) == 4 && IsA(linitial(c), Const) && !((Const *) linitial(c))->constisnull)
+			{
+				check_coordsys(DatumGetTextPP(((Const *) linitial(c))->constvalue));
+				c = list_delete_first(list_copy(c));
+			}
+			if (list_length(c) == 3 &&
+				reads_only_barrier_views((Node *) list_make2(linitial(c), lsecond(c)), ctx->parse))
+				return (Node *) makeFuncExpr(ctx->circle_or_null, f->funcresulttype,
+											 (List *) expression_tree_mutator((Node *) copyObject(c),
+																			  secure_points_mutator, ctx),
+											 InvalidOid, InvalidOid, COERCE_EXPLICIT_CALL);
+		}
+	}
+	if (IsA(node, SubLink))
+	{
+		SubLink    *sl = (SubLink *) expression_tree_mutator(node, secure_points_mutator, ctx);
+
+		secure_points_query((Query *) sl->subselect, ctx);
+		return (Node *) sl;
+	}
+	return expression_tree_mutator(node, secure_points_mutator, ctx);
+}
+
+static void
+secure_points_jointree(Node *jt, secure_points_ctx *ctx)
+{
+	ListCell   *lc;
+
+	if (jt == NULL)
+		return;
+	if (IsA(jt, FromExpr))
+	{
+		FromExpr   *f = (FromExpr *) jt;
+
+		f->quals = secure_points_mutator(f->quals, ctx);
+		foreach(lc, f->fromlist)
+			secure_points_jointree(lfirst(lc), ctx);
+	}
+	else if (IsA(jt, JoinExpr))
+	{
+		JoinExpr   *j = (JoinExpr *) jt;
+
+		j->quals = secure_points_mutator(j->quals, ctx);
+		secure_points_jointree(j->larg, ctx);
+		secure_points_jointree(j->rarg, ctx);
+	}
+}
+
+/* this query's quals, then those of every query inside it: LATERAL, sublinks, CTEs */
+static void
+secure_points_query(Query *q, secure_points_ctx *ctx)
+{
+	Query	   *saved = ctx->parse;
+	ListCell   *lc;
+
+	if (q == NULL || !IsA(q, Query))
+		return;
+	ctx->parse = q;
+	if (q->jointree != NULL)
+		secure_points_jointree((Node *) q->jointree, ctx);
+	foreach(lc, q->rtable)
+	{
+		RangeTblEntry *rte = (RangeTblEntry *) lfirst(lc);
+
+		if (rte->rtekind == RTE_SUBQUERY && !rte->security_barrier)
+			secure_points_query(rte->subquery, ctx);
+	}
+	foreach(lc, q->cteList)
+		secure_points_query((Query *) ((CommonTableExpr *) lfirst(lc))->ctequery, ctx);
+	ctx->parse = saved;
+}
+
+static bool
+has_barrier_view_walker(Node *node, void *context)
+{
+	if (node == NULL)
+		return false;
+	if (IsA(node, RangeTblEntry))
+	{
+		RangeTblEntry *rte = (RangeTblEntry *) node;
+
+		return rte->rtekind == RTE_SUBQUERY && rte->security_barrier;
+	}
+	if (IsA(node, Query))
+		return query_tree_walker((Query *) node, has_barrier_view_walker, context,
+								 QTW_EXAMINE_RTES_BEFORE);
+	return expression_tree_walker(node, has_barrier_view_walker, context);
+}
+
+void
+skycell_secure_points(Query *parse)
+{
+	secure_points_ctx ctx = {parse, InvalidOid, InvalidOid};
+	Oid			ext,
+				t[2] = {FLOAT8OID, FLOAT8OID},
+				t3[3] = {FLOAT8OID, FLOAT8OID, FLOAT8OID};
+	char	   *nsp;
+
+	if (parse->commandType != CMD_SELECT ||
+		!query_tree_walker(parse, has_barrier_view_walker, NULL, QTW_EXAMINE_RTES_BEFORE))
+		return;
+	ext = get_extension_oid("skycell", true);
+	if (!OidIsValid(ext))
+		return;
+	nsp = get_namespace_name(get_extension_schema(ext));
+	ctx.or_null = LookupFuncName(list_make2(makeString(nsp), makeString("skycell_point_or_null")),
+								 2, t, true);
+	ctx.circle_or_null = LookupFuncName(list_make2(makeString(nsp), makeString("skycell_circle_or_null")),
+										3, t3, true);
+	if (!OidIsValid(ctx.or_null))
+		return;					/* the SQL predates 0.50 */
+	secure_points_query(parse, &ctx);
 }
 
 void
