@@ -278,10 +278,13 @@ reaches the index of the table under the view: the region tests are
 as `skycell_point_or_null()` and `skycell_circle_or_null()`, which are too
 (they return NULL where the constructors raise an error, so a row with
 impossible coordinates is not returned). PostgreSQL never pushes a join
-condition into such a view, so a cross-match against one is written with the
-view in a LATERAL subquery kept apart with `OFFSET 0`:
-`... CROSS JOIN LATERAL (SELECT ... FROM v WHERE CONTAINS(POINT('ICRS', v.ra,
-v.dec), CIRCLE('ICRS', t.ra, t.dec, r)) = 1 OFFSET 0) x`.
+condition into such a view, so skycell rewrites a cross-match against one,
+`FROM t JOIN v ON CONTAINS(POINT('ICRS', v.ra, v.dec), CIRCLE('ICRS', t.ra,
+t.dec, r)) = 1` (or the same condition in `WHERE`, or a `LEFT JOIN` with the
+view on the right), into `t CROSS JOIN LATERAL (SELECT * FROM v WHERE ... OFFSET
+0) v`, where each row of `t` searches the view's index. Only the conditions
+that read the view and another table and call a skycell function move; the
+view stays a security barrier, with its permissions checked as before.
 
 ### Setting up a table
 
