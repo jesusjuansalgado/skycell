@@ -4152,7 +4152,8 @@ typedef struct
 {
 	Query	   *parse;
 	int			nvars;
-	bool		other;
+	bool		other,
+				outer_ok;
 } barrier_vars_ctx;
 
 static bool
@@ -4165,8 +4166,19 @@ barrier_vars_walker(Node *node, barrier_vars_ctx *c)
 		Var		   *v = (Var *) node;
 		RangeTblEntry *rte;
 
-		/* an outer query's column (LATERAL, a sublink) is not the view's */
-		if (v->varlevelsup != 0 || v->varno < 1 || v->varno > list_length(c->parse->rtable))
+		/*
+		 * An outer query's column (LATERAL, a sublink) is not the view's, but
+		 * where this query reads a view it is a Param inside it: one that a
+		 * function that is not LEAKPROOF keeps out of the view since
+		 * PostgreSQL 16.16, 17.12 and 18.7 (CVE-2026-116327), as a column of
+		 * the view does.
+		 */
+		if (v->varlevelsup != 0)
+		{
+			if (!c->outer_ok)
+				c->other = true;
+		}
+		else if (v->varno < 1 || v->varno > list_length(c->parse->rtable))
 			c->other = true;
 		else
 		{
@@ -4185,11 +4197,23 @@ barrier_vars_walker(Node *node, barrier_vars_ctx *c)
 	return expression_tree_walker(node, barrier_vars_walker, c);
 }
 
-/* whether n reads columns, and only those of security-barrier views */
+/*
+ * whether n reads columns, and only those of security-barrier views or, where
+ * this query reads such a view, of the queries around it
+ */
 static bool
 reads_only_barrier_views(Node *n, Query *parse)
 {
-	barrier_vars_ctx c = {parse, 0, false};
+	barrier_vars_ctx c = {parse, 0, false, false};
+	ListCell   *lc;
+
+	foreach(lc, parse->rtable)
+	{
+		RangeTblEntry *rte = (RangeTblEntry *) lfirst(lc);
+
+		if (rte->rtekind == RTE_SUBQUERY && rte->security_barrier)
+			c.outer_ok = true;
+	}
 
 	(void) barrier_vars_walker(n, &c);
 	return c.nvars > 0 && !c.other;

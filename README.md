@@ -274,10 +274,13 @@ results in binary.
 
 Through a security-barrier view (a view with `security_barrier`), a search
 reaches the index of the table under the view: the region tests are
-`LEAKPROOF`, and ADQL's `POINT()` and `CIRCLE()` on the view's columns are read
-as `skycell_point_or_null()` and `skycell_circle_or_null()`, which are too
-(they return NULL where the constructors raise an error, so a row with
-impossible coordinates is not returned). PostgreSQL never pushes a join
+`LEAKPROOF`, and ADQL's `POINT()` and `CIRCLE()` on the view's columns, or on
+an outer query's (a LATERAL or correlated subquery's), are read as
+`skycell_point_or_null()` and `skycell_circle_or_null()`, which are too (they
+return NULL where the constructors raise an error, so a row with impossible
+coordinates matches nothing). Since PostgreSQL 16.16, 17.12 and 18.7 an outer
+query's column counts as the view's here: a constructor that is not
+`LEAKPROOF` on it would keep the search out of the view. PostgreSQL never pushes a join
 condition into such a view, so skycell rewrites a cross-match against one,
 `FROM t JOIN v ON CONTAINS(POINT('ICRS', v.ra, v.dec), CIRCLE('ICRS', t.ra,
 t.dec, r)) = 1` (or the same condition in `WHERE`, or a `LEFT JOIN` with the
