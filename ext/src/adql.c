@@ -4152,7 +4152,8 @@ typedef struct
 {
 	Query	   *parse;
 	int			nvars;
-	bool		other;
+	bool		other,
+				outer_ok;
 } barrier_vars_ctx;
 
 static bool
@@ -4165,8 +4166,19 @@ barrier_vars_walker(Node *node, barrier_vars_ctx *c)
 		Var		   *v = (Var *) node;
 		RangeTblEntry *rte;
 
-		/* an outer query's column (LATERAL, a sublink) is not the view's */
-		if (v->varlevelsup != 0 || v->varno < 1 || v->varno > list_length(c->parse->rtable))
+		/*
+		 * An outer query's column (LATERAL, a sublink) is not the view's, but
+		 * where this query reads a view it is a Param inside it: one that a
+		 * function that is not LEAKPROOF keeps out of the view since
+		 * PostgreSQL 16.16, 17.12 and 18.7 (CVE-2026-116327), as a column of
+		 * the view does.
+		 */
+		if (v->varlevelsup != 0)
+		{
+			if (!c->outer_ok)
+				c->other = true;
+		}
+		else if (v->varno < 1 || v->varno > list_length(c->parse->rtable))
 			c->other = true;
 		else
 		{
@@ -4185,11 +4197,23 @@ barrier_vars_walker(Node *node, barrier_vars_ctx *c)
 	return expression_tree_walker(node, barrier_vars_walker, c);
 }
 
-/* whether n reads columns, and only those of security-barrier views */
+/*
+ * whether n reads columns, and only those of security-barrier views or, where
+ * this query reads such a view, of the queries around it
+ */
 static bool
 reads_only_barrier_views(Node *n, Query *parse)
 {
-	barrier_vars_ctx c = {parse, 0, false};
+	barrier_vars_ctx c = {parse, 0, false, false};
+	ListCell   *lc;
+
+	foreach(lc, parse->rtable)
+	{
+		RangeTblEntry *rte = (RangeTblEntry *) lfirst(lc);
+
+		if (rte->rtekind == RTE_SUBQUERY && rte->security_barrier)
+			c.outer_ok = true;
+	}
 
 	(void) barrier_vars_walker(n, &c);
 	return c.nvars > 0 && !c.other;
@@ -4318,6 +4342,300 @@ has_barrier_view_walker(Node *node, void *context)
 		return query_tree_walker((Query *) node, has_barrier_view_walker, context,
 								 QTW_EXAMINE_RTES_BEFORE);
 	return expression_tree_walker(node, has_barrier_view_walker, context);
+}
+
+/*
+ * A cross-match against a security-barrier view, as LATERAL (0.58).
+ * PostgreSQL never pushes a join condition into a subquery, so a search of
+ * the view per row of another table read the whole table under the view:
+ *
+ *   FROM t JOIN v ON CONTAINS(POINT(v.ra, v.dec), CIRCLE(t.ra, t.dec, r)) = 1
+ *
+ * becomes, from the planner hook, with v kept at its place in the range table
+ * and its columns numbered as before,
+ *
+ *   FROM t CROSS JOIN LATERAL
+ *     (SELECT * FROM v WHERE CONTAINS(...) = 1 OFFSET 0) v
+ *
+ * in which the condition reads t's columns as the outer row's, and is pushed
+ * into the view like any other (skycell_secure_points() runs after this), so
+ * each row of t searches the view's index.  OFFSET 0 keeps the subquery
+ * from being flattened back into the join.  Moved: the conjuncts that read
+ * the view and another relation and hold a skycell function, of a WHERE or an
+ * inner join over the view, or of a LEFT JOIN with the view on its right.
+ */
+static bool
+has_skycell_func_walker(Node *node, void *context)
+{
+	if (node == NULL)
+		return false;
+	if (IsA(node, FuncExpr) && skycell_c_src(((FuncExpr *) node)->funcid) != NULL)
+		return true;
+	if (IsA(node, OpExpr))
+	{
+		OpExpr	   *o = (OpExpr *) node;
+		Oid			fn = OidIsValid(o->opfuncid) ? o->opfuncid : get_opcode(o->opno);
+
+		if (skycell_c_src(fn) != NULL)
+			return true;
+	}
+	return expression_tree_walker(node, has_skycell_func_walker, context);
+}
+
+typedef struct
+{
+	Index		v;
+	bool		reads_v,
+				reads_other,
+				unsafe;
+} lateral_scan_ctx;
+
+static bool
+lateral_vars_walker(Node *node, lateral_scan_ctx *c)
+{
+	if (node == NULL)
+		return false;
+	if (IsA(node, Var))
+	{
+		Var		   *var = (Var *) node;
+
+		if (var->varlevelsup == 0)
+		{
+			if (var->varno == c->v)
+				c->reads_v = true;
+			else
+				c->reads_other = true;
+		}
+		return false;
+	}
+	if (IsA(node, SubLink) || IsA(node, Aggref) || IsA(node, WindowFunc) ||
+		IsA(node, PlaceHolderVar) || IsA(node, GroupingFunc))
+	{
+		c->unsafe = true;
+		return false;
+	}
+	return expression_tree_walker(node, lateral_vars_walker, c);
+}
+
+
+static Node *
+lateral_view_vars_mutator(Node *node, Index *v)
+{
+	if (node == NULL)
+		return NULL;
+	if (IsA(node, Var))
+	{
+		Var		   *var = (Var *) copyObject(node);
+
+		if (var->varlevelsup == 1 && var->varno == *v)
+		{
+			var->varlevelsup = 0;
+			var->varno = 1;
+			var->varnosyn = 1;
+		}
+		return (Node *) var;
+	}
+	return expression_tree_mutator(node, lateral_view_vars_mutator, v);
+}
+
+static Node *
+lateral_view_vars(Node *qual, Index v)
+{
+	return lateral_view_vars_mutator(qual, &v);
+}
+
+/* a conjunct that is a cross-match of the view against other relations */
+static bool
+lateral_movable(Node *q, Index v)
+{
+	lateral_scan_ctx c = {v, false, false, false};
+
+	(void) lateral_vars_walker(q, &c);
+	return c.reads_v && c.reads_other && !c.unsafe && !contain_volatile_functions(q) &&
+		has_skycell_func_walker(q, NULL);
+}
+
+/* the view's range table entry made the LATERAL subquery holding the conditions */
+static void
+make_lateral_view(Query *parse, Index v, List *conds)
+{
+	RangeTblEntry *rte = rt_fetch(v, parse->rtable);
+	RangeTblEntry *inner = copyObject(rte);
+	Query	   *sub = makeNode(Query);
+	List	   *tlist = NIL;
+	ListCell   *lc;
+	Node	   *qual;
+
+	/* the view itself, inside: still a security barrier, its permissions checked */
+	if (rte->perminfoindex > 0)
+	{
+		sub->rteperminfos = list_make1(copyObject(list_nth(parse->rteperminfos,
+															rte->perminfoindex - 1)));
+		inner->perminfoindex = 1;
+	}
+	inner->lateral = false;
+	sub->commandType = CMD_SELECT;
+	sub->querySource = QSRC_ORIGINAL;
+	sub->canSetTag = true;
+	sub->rtable = list_make1(inner);
+	sub->hasRowSecurity = parse->hasRowSecurity;
+	foreach(lc, rte->subquery->targetList)
+	{
+		TargetEntry *te = (TargetEntry *) lfirst(lc);
+
+		tlist = lappend(tlist,
+						makeTargetEntry((Expr *) makeVar(1, te->resno, exprType((Node *) te->expr),
+														 exprTypmod((Node *) te->expr),
+														 exprCollation((Node *) te->expr), 0),
+										te->resno, te->resname ? pstrdup(te->resname) : NULL,
+										te->resjunk));
+	}
+	sub->targetList = tlist;
+
+	/* the conditions, seen from inside: the view is 1, the rest one level up */
+	qual = (Node *) make_ands_explicit(copyObject(conds));
+	IncrementVarSublevelsUp(qual, 1, 0);
+	qual = lateral_view_vars(qual, v);
+	{
+		RangeTblRef *rtr = makeNode(RangeTblRef);
+
+		rtr->rtindex = 1;
+		sub->jointree = makeFromExpr(list_make1(rtr), qual);
+	}
+	sub->limitOffset = (Node *) makeConst(INT8OID, -1, InvalidOid, sizeof(int64),
+										  Int64GetDatum(0), false, FLOAT8PASSBYVAL);
+	sub->limitOption = LIMIT_OPTION_COUNT;
+
+	rte->subquery = sub;
+	rte->lateral = true;
+	rte->security_barrier = false;
+	rte->relid = InvalidOid;
+	rte->relkind = 0;
+	rte->rellockmode = NoLock;
+	rte->perminfoindex = 0;
+}
+
+static bool
+is_barrier_view_ref(Query *parse, Node *n, Index *v)
+{
+	RangeTblEntry *rte;
+
+	if (!IsA(n, RangeTblRef))
+		return false;
+	*v = ((RangeTblRef *) n)->rtindex;
+	rte = rt_fetch(*v, parse->rtable);
+	return rte->rtekind == RTE_SUBQUERY && rte->security_barrier && !rte->lateral &&
+		rte->subquery != NULL;
+}
+
+/* split the conjuncts of *quals that cross-match view v, returning them */
+static List *
+take_lateral_conds(Node **quals, Index v)
+{
+	List	   *conj,
+			   *keep = NIL,
+			   *moved = NIL;
+	ListCell   *lc;
+	if (*quals == NULL)
+		return NIL;
+	conj = make_ands_implicit((Expr *) *quals);
+	foreach(lc, conj)
+	{
+		if (lateral_movable(lfirst(lc), v))
+			moved = lappend(moved, lfirst(lc));
+		else
+			keep = lappend(keep, lfirst(lc));
+	}
+	if (moved != NIL)
+		*quals = keep == NIL ? NULL : (Node *) make_ands_explicit(keep);
+	return moved;
+}
+
+static void
+lateral_jointree(Query *parse, Node *jt)
+{
+	ListCell   *lc;
+
+	if (jt == NULL)
+		return;
+	if (IsA(jt, FromExpr))
+	{
+		FromExpr   *f = (FromExpr *) jt;
+		Index		v;
+		List	   *views = NIL;
+
+		foreach(lc, f->fromlist)
+			lateral_jointree(parse, lfirst(lc));
+		/* a view in this FROM list, cross-matched in this WHERE: last, LATERAL */
+		foreach(lc, f->fromlist)
+			if (is_barrier_view_ref(parse, lfirst(lc), &v))
+				views = lappend(views, lfirst(lc));
+		foreach(lc, views)
+		{
+			List	   *moved;
+
+			v = ((RangeTblRef *) lfirst(lc))->rtindex;
+			if (list_length(f->fromlist) < 2 || (moved = take_lateral_conds(&f->quals, v)) == NIL)
+				continue;
+			make_lateral_view(parse, v, moved);
+			f->fromlist = lappend(list_delete_ptr(f->fromlist, lfirst(lc)), lfirst(lc));
+		}
+	}
+	else if (IsA(jt, JoinExpr))
+	{
+		JoinExpr   *j = (JoinExpr *) jt;
+		Index		v;
+		List	   *moved;
+
+		lateral_jointree(parse, j->larg);
+		lateral_jointree(parse, j->rarg);
+		if (j->jointype == JOIN_INNER && is_barrier_view_ref(parse, j->larg, &v) &&
+			!is_barrier_view_ref(parse, j->rarg, &v))
+		{
+			Node	   *t = j->larg;
+
+			/* inner: the view to the right, where LATERAL can see the left */
+			j->larg = j->rarg;
+			j->rarg = t;
+		}
+		if ((j->jointype == JOIN_INNER || j->jointype == JOIN_LEFT) &&
+			is_barrier_view_ref(parse, j->rarg, &v) && j->usingClause == NIL &&
+			(moved = take_lateral_conds(&j->quals, v)) != NIL)
+		{
+			make_lateral_view(parse, v, moved);
+			if (j->quals == NULL)
+				j->quals = (Node *) makeBoolConst(true, false);
+		}
+	}
+}
+
+static void
+lateral_query(Query *q)
+{
+	ListCell   *lc;
+
+	if (q == NULL || !IsA(q, Query) || q->commandType != CMD_SELECT)
+		return;
+	foreach(lc, q->rtable)
+	{
+		RangeTblEntry *rte = (RangeTblEntry *) lfirst(lc);
+
+		if (rte->rtekind == RTE_SUBQUERY && !rte->security_barrier)
+			lateral_query(rte->subquery);
+	}
+	foreach(lc, q->cteList)
+		lateral_query((Query *) ((CommonTableExpr *) lfirst(lc))->ctequery);
+	if (q->jointree != NULL)
+		lateral_jointree(q, (Node *) q->jointree);
+}
+
+/* see make_lateral_view() */
+void
+skycell_lateral_barrier_views(Query *parse)
+{
+	if (parse->commandType == CMD_SELECT &&
+		query_tree_walker(parse, has_barrier_view_walker, NULL, QTW_EXAMINE_RTES_BEFORE))
+		lateral_query(parse);
 }
 
 void

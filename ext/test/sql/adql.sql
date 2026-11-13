@@ -370,6 +370,28 @@ SELECT adql_plan_uses_index('SELECT * FROM acat_sb WHERE CONTAINS(POINT(''ICRS''
 -- so that each target's cone is pushed into the view
 SELECT adql_plan_uses_index($q$SELECT t.id, x.id FROM (SELECT * FROM acat WHERE id % 1000 = 0) t CROSS JOIN LATERAL
   (SELECT v.id FROM acat_sb v WHERE CONTAINS(POINT('ICRS', v.ra, v.dec), CIRCLE('ICRS', t.ra, t.dec, 0.5)) = 1 OFFSET 0) x$q$) AS lateral_xmatch;
+-- and the same written as a join, or in WHERE: made that LATERAL subquery by
+-- the planner hook, with the same rows as against the table (0.58)
+CREATE TABLE adql_sb_targets AS SELECT id AS tid, ra + 0.01 AS ra, dec FROM acat WHERE id % 500 IN (0, 1);
+SELECT adql_plan_uses_index($q$SELECT t.tid, v.id FROM adql_sb_targets t JOIN acat_sb v
+         ON CONTAINS(POINT('ICRS', v.ra, v.dec), CIRCLE('ICRS', t.ra, t.dec, 0.5)) = 1$q$) AS join_xmatch,
+       adql_plan_uses_index($q$SELECT t.tid, v.id FROM acat_sb v JOIN adql_sb_targets t
+         ON DISTANCE(POINT('ICRS', v.ra, v.dec), POINT('ICRS', t.ra, t.dec)) < 0.5$q$) AS view_first,
+       adql_plan_uses_index($q$SELECT t.tid, v.id FROM adql_sb_targets t, acat_sb v
+         WHERE CONTAINS(POINT('ICRS', v.ra, v.dec), CIRCLE('ICRS', t.ra, t.dec, 0.5)) = 1 AND v.id > 2$q$) AS where_xmatch,
+       adql_plan_uses_index($q$SELECT t.tid, v.id FROM adql_sb_targets t LEFT JOIN acat_sb v
+         ON CONTAINS(POINT('ICRS', v.ra, v.dec), CIRCLE('ICRS', t.ra, t.dec, 0.5)) = 1$q$) AS left_xmatch;
+SELECT (SELECT array_agg(t.tid::text || ':' || v.id ORDER BY t.tid, v.id) FROM adql_sb_targets t JOIN acat_sb v
+          ON CONTAINS(POINT('ICRS', v.ra, v.dec), CIRCLE('ICRS', t.ra, t.dec, 0.5)) = 1 AND adql_sb_leak(v.id))
+     = (SELECT array_agg(t.tid::text || ':' || v.id ORDER BY t.tid, v.id) FROM adql_sb_targets t JOIN acat v
+          ON v.id % 2 = 0 AND CONTAINS(POINT('ICRS', v.ra, v.dec), CIRCLE('ICRS', t.ra, t.dec, 0.5)) = 1) AS join_same_rows,
+       (SELECT count(*) || '/' || count(v.id) FROM adql_sb_targets t LEFT JOIN acat_sb v
+          ON CONTAINS(POINT('ICRS', v.ra, v.dec), CIRCLE('ICRS', t.ra, t.dec, 0.5)) = 1)
+     = (SELECT count(*) || '/' || count(v.id) FROM adql_sb_targets t LEFT JOIN acat v
+          ON v.id % 2 = 0 AND CONTAINS(POINT('ICRS', v.ra, v.dec), CIRCLE('ICRS', t.ra, t.dec, 0.5)) = 1) AS left_same_rows,
+       (SELECT count(*) FROM adql_sb_targets t JOIN acat_sb v
+          ON CONTAINS(POINT('ICRS', v.ra, v.dec), CIRCLE('ICRS', t.ra, t.dec, 0.5)) = 1 OR adql_sb_leak(v.id + t.tid * 0)) > 0 AS leaky_or;
+DROP TABLE adql_sb_targets;
 SELECT count(*) FROM acat_sb WHERE CONTAINS(POINT('GALACTIC', ra, dec), CIRCLE('ICRS', 10, 20, 2)) = 1;
 DROP FUNCTION adql_sb_leak(int);
 DROP VIEW acat_sb;
