@@ -86,6 +86,11 @@ and setting, and its limits. The measurements are in
 [`docs/performance.md`](docs/performance.md) and the checks in
 [`docs/testing.md`](docs/testing.md).
 
+The design, the measurements and the comparison with pgSphere and Q3C are
+described in the paper
+([doi:10.5281/zenodo.24236318](https://doi.org/10.5281/zenodo.24236318));
+see [Citing skycell](#citing-skycell).
+
 ---
 
 ## What it does differently
@@ -1281,6 +1286,26 @@ in [`docs/testing.md`](docs/testing.md); the tutorials' own SQL is checked by
   cluster smaller than one of its buckets; `max_area_ratio` bounds the damage
   rather than fixing it, and the experimental count map
   (`skycell_density_build`) replaces the histogram where it is too coarse.
+
+## Citing skycell
+
+If you use skycell in your work, please cite:
+
+> Salgado, J. & Delli Veneri, M. (2026). *skycell: a cost-based HEALPix index
+> for sky positions in PostgreSQL, with native support for IVOA standards.*
+> Zenodo. [doi:10.5281/zenodo.24236318](https://doi.org/10.5281/zenodo.24236318)
+
+```bibtex
+@article{salgado2026skycell,
+  author    = {Salgado, Jesus and Delli Veneri, Michele},
+  title     = {skycell: a cost-based {HEALPix} index for sky positions in
+               {PostgreSQL}, with native support for {IVOA} standards},
+  year      = {2026},
+  publisher = {Zenodo},
+  doi       = {10.5281/zenodo.24236318},
+  url       = {https://doi.org/10.5281/zenodo.24236318}
+}
+```
 
 ## License
 
