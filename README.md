@@ -476,9 +476,9 @@ SELECT * FROM gaia WHERE CONTAINS(POINT('ICRS', ra, dec), REGION(
 Without a composite type, a footprint is kept as one polygon per detector and
 one circle per mask. A query then returns the distinct observations among
 them, less those whose mask holds the whole field. pgSphere's MOC type,
-`smoc`, has a union and an intersection, but it is approximate to its cells,
-and no index serves a position test against it. So a query that needs an exact
-answer spells the shape out as a boolean of predicates. On an ObsCore-like
+`smoc`, has a union and an intersection but no difference or complement, and
+holds a shape only to the resolution of its cells. So a query that needs an
+exact answer spells the shape out as a boolean of predicates. On an ObsCore-like
 table of 50,000 NIRCam-, UVIS-, parallel- and coronagraph-like footprints
 ([Performance](#performance)):
 
